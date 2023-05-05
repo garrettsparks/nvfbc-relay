@@ -115,6 +115,10 @@ void Cleanup()
         delete pNVFBCLib;
         pNVFBCLib = NULL;
     }
+    if (timer)
+    {
+        CloseHandle(timer);
+    }
 
 }
 
