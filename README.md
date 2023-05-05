@@ -82,7 +82,7 @@ The third way is Shadowplay. Shadowplay uses NvFBC for capture and can perform e
 the captured frame ever leaving VRAM. It is highly performant and will capture HDR to local 
 recordings. It will not, however, automatically tonemap HDR capture to SDR for streaming, instead 
 just refusing to start. You are also required to use GeForce Experience to utilize Shadowplay.\
-About 5% performance impact nominally. Slightly higher performance impact and much higher input 
+About 5% performance impact for local recording. Slightly higher for streaming. Slightly higher performance impact and much higher input 
 latency when using desktop capture.
 
 ## NvFBCR
@@ -122,7 +122,9 @@ There are some unique benefits to NvFBC-Relay in comparison to the existing opti
 
 * Its performance is the best of the options in most scenarios, typically 2-3% performance impact. 
 * It provides great flexibility with the output stream. Since NvFBCR outputs to any arbitrary display, 
-a capture card can be used to take this output and manipulate it as desired.
+a capture card can be used to take this output and manipulate it as desired on a separate system. This removes
+some painful limitations like Shadowplay being unable to
+stream HDR sources.
 * Capture is entirely agnostic of running games and does not rely on application hooks, 
 and will capture the desktop without increasing performance impact like OBS or input latency like Shadowplay.
 
