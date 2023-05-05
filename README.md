@@ -69,7 +69,7 @@ This is basically where the capture card acts like a second display output
 and you just use Windows display settings to clone your primary display to
 the capture card. This is limited in the fact that HDR cannot be enabled
 on either display on this mode, meaning that you are stuck in SDR not only in the capture 
-stream but also on the primary viewing monitor. You can get around this by instead extending 
+stream but also on the primary viewing monitor. You can get around this by extending 
 the capture card as a side display instead of setting it as a clone of the primary, then using 
 software like OBS to capture the primary and re-present to the capture card. This nullifies 
 the performance penalty of encoding when paired with a separate PC, but still uses DXGI
@@ -100,7 +100,11 @@ No shared memory resources are ever explicitly utilized, everything stays in DX9
 Shadowplay does. The GPU itself does nearly zero work since no rendering resources are utilized;
 we don't even initialize a DX9 rendering pipeline, it's just there to hold the surface and swap 
 chain. \
-This does come with a drawback: DX9 has no capability to output HDR, and while
+This simplicity comes with drawbacks. \
+The most obvious one is that we consider it outside our scope to provide an encoder;
+we explcitly do not want to use NVENC because it has a nonzero,
+though small, performance impact. Encoding the output stream is left to the capture card host.\
+DX9 has no capability to output HDR, and while
 it does seem possible to utilize a shared surface to pass the NvFBC output to DX11, there doesn't
 seem to be any easy way to directly present a surface in DX11 aside from rendering it as a texture,
 which both greatly increases complexity and probably throws away all performance benefits at these 
@@ -121,8 +125,6 @@ There are some unique benefits to NvFBC-Relay in comparison to the existing opti
 a capture card can be used to take this output and manipulate it as desired.
 * Capture is entirely agnostic of running games and does not rely on application hooks, 
 and will capture the desktop without increasing performance impact like OBS or input latency like Shadowplay.
-
-
 
 
 
