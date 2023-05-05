@@ -15,7 +15,9 @@ Except in Horizon Zero Dawn.
 As with any application leveraging NvFBC, this is only officially supported
 on Tesla & Quadro professional cards. There are other ways to enable NvFBC
 on GeForce which are unsupported and definitely not the intended target of
-this program.
+this program. \
+
+HDCP also needs to be disabled. Thanks, DRM.
 
 ---
 
