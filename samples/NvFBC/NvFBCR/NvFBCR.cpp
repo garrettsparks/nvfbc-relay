@@ -66,7 +66,9 @@ NvFBCLibrary *pNVFBCLib;
 int BUF_WIDTH;
 int BUF_HEIGHT;
 
-int loopIntervalMs = 16;
+HANDLE timer;
+LARGE_INTEGER li;
+int framerate = 60;
 
 struct DisplayPosition {
     int dxAdapterIndex;
@@ -75,7 +77,6 @@ struct DisplayPosition {
 } source, target;
 
 std::vector <DisplayPosition> displays;
-
 
 void Cleanup()
 {
@@ -209,7 +210,7 @@ int readIntFromCmd(std::string prompt) {
     std::cout << prompt;
     std::string cinString;
     getline(std::cin, cinString);
-    return stoi(cinString);
+    return cinString.empty() ? -1 : stoi(cinString);
 }
 
 void consoleUserInput() {
@@ -230,13 +231,18 @@ void consoleUserInput() {
 
     int sourceIndex;
     int outputIndex;
-    for (sourceIndex = readIntFromCmd("Capture Display Index ? "); sourceIndex < 0 || sourceIndex > displays.size() - 1;) {}
-    for (outputIndex = readIntFromCmd("Output Display Index ? "); outputIndex < 0 || outputIndex > displays.size() - 1;) {}
-    std::cout << "Capture/Present interval in ms (blank to default 16ms/60fps) ? ";
+    for (sourceIndex = readIntFromCmd("Capture Display Index ? "); sourceIndex < 0 || sourceIndex > displays.size() - 1;) {
+        sourceIndex = readIntFromCmd("Capture Display Index ? ");
+    }
+    for (outputIndex = readIntFromCmd("Output Display Index ? "); outputIndex < 0 || outputIndex > displays.size() - 1;) {
+        outputIndex = readIntFromCmd("Output Display Index ? ");
+    }
+    std::cout << "Capture/Present framerate (blank to default 60fps) ? ";
     std::string cinString;
     getline(std::cin, cinString);
     if (!cinString.empty())
-        loopIntervalMs = stoi(cinString);
+        framerate = stoi(cinString);
+        
 
     for (std::vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
 
@@ -372,8 +378,15 @@ int WINAPI WinMain(HINSTANCE hInstance,
         fbcDX9GrabParams.pNvFBCFrameGrabInfo = &frameGrabInfo;
     }
 
+    li.QuadPart = -(10000000 / framerate);
+    timer = CreateWaitableTimer(NULL, TRUE, NULL);
+
     while (TRUE)
     {
+
+        SetWaitableTimer(timer, &li, 0, NULL, NULL, FALSE);
+        fbcRes = NvFBCDX9->NvFBCToDx9VidGrabFrame(&fbcDX9GrabParams);
+        g_pD3D9Device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE); //D3DPRESENT_FORCEIMMEDIATE
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
         {
             TranslateMessage(&msg);
@@ -382,10 +395,7 @@ int WINAPI WinMain(HINSTANCE hInstance,
         if (msg.message == WM_QUIT)
             break;
 
-        Sleep(loopIntervalMs);
-
-        fbcRes = NvFBCDX9->NvFBCToDx9VidGrabFrame(&fbcDX9GrabParams);
-        g_pD3D9Device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE); //D3DPRESENT_FORCEIMMEDIATE
+        WaitForSingleObject(timer, INFINITE);
 
     }
 
@@ -393,6 +403,7 @@ int WINAPI WinMain(HINSTANCE hInstance,
 
     return msg.wParam;
 }
+
 
 
 
