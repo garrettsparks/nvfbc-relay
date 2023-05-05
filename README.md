@@ -104,7 +104,7 @@ we don't even initialize a DX9 rendering pipeline, it's just there to hold the s
 chain. \
 This simplicity comes with drawbacks. \
 The most obvious one is that we consider it outside our scope to provide an encoder;
-we explcitly do not want to use NVENC because it has a nonzero,
+we explicitly do not want to use NVENC because it has a nonzero,
 though small, performance impact. Encoding the output stream is left to the capture card host.\
 DX9 has no capability to output HDR, and while
 it does seem possible to utilize a shared surface to pass the NvFBC output to DX11, there doesn't
@@ -113,6 +113,7 @@ which both greatly increases complexity and probably throws away all performance
 small margins.\
 That means that while NvFBCR will capture a display outputting HDR, it will only output on an SDR
 surface.\
+Frame delivery pacing could be better and tearing is allowed for lowest performance impact.\
 Additionally, I have observed a much larger performance impact than is typical using NvFBC in both 
 NvFBCR and in Shadowplay specifically in Horizon: Zero Dawn. I've found no other application to 
 exhibit this apparent CPU-related regression, but HZD also has a weird bug where ReBAR causes 
