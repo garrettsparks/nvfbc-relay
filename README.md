@@ -33,6 +33,17 @@ If you want to make yourself, you should be able to clone the whole repo, open `
 
 Sorry for the weak build instructions, I'm not good with Windows.
 
+---
+
+# Note about Display coordinates
+
+Displays can be oriented in any fashion, but we don't do any automatic checking
+of output dimensions during runtime. So starting NvFBC and then starting an application fullscreen in a different resolution may 
+cause the coordinate of the output window to break if the target display's coordinate is dependent on the capture display.
+
+In other words, if your target display is to the right/below the capture display, window offset bugs will occur when changing resolutions.
+
+Place the target window to the left of the capture window or keep the capture display at a static resolution.
 
 ---
 
