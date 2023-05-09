@@ -43,7 +43,7 @@ cause the coordinate of the output window to break if the target display's coord
 
 In other words, if your target display is to the right/below the capture display, window offset bugs will occur when changing resolutions.
 
-Place the target window to the left of the capture window or keep the capture display at a static resolution.
+Place the target display to the left of the capture display or keep the capture display at a static resolution.
 
 ---
 
