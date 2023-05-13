@@ -67,7 +67,7 @@ and lessen the performance impact on the capture system.
 | ------ | ------ | ------ | ------ |
 | OBS | 8-15% | Very flexible outputs, HDR support everywhere | Overall performance cost
 | DXGI & Capture Card | 5-7% | Lowest performance impact for HDR streaming | Heavy performance cost for what is essentially just a screen copy
-| Shadowplay | ~5% | Lowest performance impact for HDR recording | Cannot stream at all from an HDR source, need to login to Nvidia & link accounts to use
+| Shadowplay | ~5% | Lowest performance impact for HDR recording | Cannot stream at all from an HDR source, input latency induced by desktop capture mode, need to login to Nvidia & link accounts to use
 | NvFBCR | 2-3% | Lowest total performance impact, requires no application hook, can view an HDR source | Output clamped to SDR can cause HDR sources to look washed out, but restorable in post-processing
 
 ### OBS
