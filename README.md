@@ -72,8 +72,10 @@ dedicated encoding ASICs aboard modern GPUs. \
 Still, this performance impact 
 as tested on a RTX 4090 can be between 8-10% when using OBS with new NVENC H.264/H.265 for local 
 capture. It can be up to 15% when combined with tonemapping to SDR and streaming. These figures were
-found using application capture mode. It is greater than this when using desktop capture, but not all 
-applications play nicely with application capture mode, forcing occasional use of desktop capture mode.
+found using application capture mode, and not all 
+applications play nicely with application capture. The 
+performance penalty is even greater than this when using 
+desktop capture.
 
 
 ### DXGI & capture card
