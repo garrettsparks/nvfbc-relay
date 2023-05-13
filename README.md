@@ -51,6 +51,8 @@ Place the target display to the left of the capture display or keep the capture 
 
 TL;DR higher FPS lower latency (mostly)
 
+
+
 Assuming you do not want to or cannot use HDMI passthrough on a capture card (personally, I 
 need to use DisplayPort to get the most out of my monitor), there are 
 basically 3 ways to do screen capture in Windows, and the functions of these exist on two axes.\
@@ -60,6 +62,13 @@ than DXGI.\
 The second axis is available output formats. The typical use case is to directly encode output
 to a local video file or stream. Using dedicated capture hardware can provide better flexibility
 and lessen the performance impact on the capture system.
+
+| Capture Method | Performance Cost | Positives | Negatives |
+| ------ | ------ | ------ | ------ |
+| OBS | 8-15% | Very flexible outputs, HDR support everywhere | Overall performance cost
+| DXGI & Capture Card | 5-7% | Lowest performance impact for HDR streaming | Heavy performance cost for what is essentially just a screen copy
+| Shadowplay | ~5% | Lowest performance impact for HDR recording | Cannot stream at all from an HDR source, need to login to Nvidia & link accounts to use
+| NvFBCR | 2-3% | Lowest total performance impact, requires no application hook, can view an HDR source | Outputs SDR only
 
 ### OBS
 The first method is to use some dedicated capture or streaming software to 
