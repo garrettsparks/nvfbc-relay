@@ -160,6 +160,3 @@ and will capture the desktop without increasing performance impact like OBS or i
 
 
 
-# License
-GPLv3 for new bits, whatever Nvidia says for the capture SDK stuff
-
