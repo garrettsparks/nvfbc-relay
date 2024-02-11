@@ -8,11 +8,11 @@
  * and presents that surface on the window through the same DX9 context.
  * 
  * It is very efficient because everything remains in VRAM and as few copies as possible are done to achieve this.
- * Many features and frills typical of capture software are omitted for speed and flexibility.
+ * Many features and frills typical of capture software are omitted for speed and downstream flexibility.
  * 
  * The process is as follows:
  * 
- * Discover all physical heads on the system and ask the user to choose a capture and target display, capture interval.
+ * Discover all physical heads on the system and ask the user to choose a capture and target display with a capture interval.
  * Create a window (in windowed mode) on the target display in pseudo-fullscreen, i.e., no borders or bar.
  * Create a DX9 context for that window and get a pointer to its single backbuffer as a DX9 surface (using immediate presentation).
  * Set up NvFBC capture device with the window's backbuffer as the target capture surface.
@@ -152,12 +152,15 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd)
 
     d3dpp.Windowed = TRUE;
     d3dpp.BackBufferFormat = D3DFMT_A2R10G10B10;
+    //d3dpp.BackBufferFormat = D3DFMT_X8R8G8B8;
 
     d3dpp.BackBufferWidth  = BUF_WIDTH;
     d3dpp.BackBufferHeight = BUF_HEIGHT;
     d3dpp.BackBufferCount = 1;
     d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    //d3dpp.SwapEffect = D3DSWAPEFFECT_FLIPEX;
     d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    //d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_ONE;
     //d3dpp.Flags = D3DPRESENTFLAG_VIDEO;
     d3dpp.hDeviceWindow = hwnd;
     DWORD dwBehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING;
@@ -182,6 +185,7 @@ HRESULT InitD3D9Surfaces()
     
     if (g_pD3D9Device)
     {
+        
         hr = g_pD3D9Device->CreateOffscreenPlainSurface(BUF_WIDTH, BUF_HEIGHT, D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT, &g_backbuffer, NULL); //D3DFMT_A8R8G8B8 D3DFMT_A2B10G10R10
         if (FAILED(hr))
         {
@@ -264,7 +268,7 @@ void consoleUserInput() {
 }
 
 // the entry point for any Windows program
-int WINAPI WinMain(HINSTANCE hInstance,
+_Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     HINSTANCE hPrevInstance,
     LPSTR lpCmdLine,
     int nCmdShow)
@@ -390,7 +394,7 @@ int WINAPI WinMain(HINSTANCE hInstance,
 
         SetWaitableTimer(timer, &li, 0, NULL, NULL, FALSE);
         fbcRes = NvFBCDX9->NvFBCToDx9VidGrabFrame(&fbcDX9GrabParams);
-        g_pD3D9Device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE); //D3DPRESENT_FORCEIMMEDIATE
+        g_pD3D9Device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE); //D3DPRESENT_FORCEIMMEDIATE //D3DPRESENT_INTERVAL_IMMEDIATE
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
         {
             TranslateMessage(&msg);
