@@ -49,6 +49,8 @@
 #include <NvFBCLibrary.h>
 #include <NvFBC/NvFBCToDx9vid.h>
 
+using namespace std;
+
 
 #define _CRT_SECURE_NO_WARNINGS  1
 
@@ -72,8 +74,9 @@ int framerate = 60;
 
 struct DisplayPosition {
     int dxAdapterIndex;
-    tagRECT position;
+    RECT position;
     char deviceName[32];
+    std::string friendlyName;
 } source, target;
 
 std::vector <DisplayPosition> displays;
@@ -122,7 +125,7 @@ void Cleanup()
 
 }
 
-void initDisplays() {
+int InitDisplays() {
 
     Direct3DCreate9Ex(D3D_SDK_VERSION, &g_pD3DEx);
     unsigned int adapterCount = g_pD3DEx->GetAdapterCount();
@@ -139,7 +142,70 @@ void initDisplays() {
         };
         strcpy(newMon.deviceName, mi.szDevice);
         displays.push_back(newMon);
+
     }
+
+
+    vector<DISPLAYCONFIG_PATH_INFO> paths;
+    vector<DISPLAYCONFIG_MODE_INFO> modes;
+    UINT32 flags = QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE;
+    LONG result = ERROR_SUCCESS;
+
+    do
+    {
+        // Determine how many path and mode structures to allocate
+        UINT32 pathCount, modeCount;
+        result = GetDisplayConfigBufferSizes(flags, &pathCount, &modeCount);
+
+        if (result != ERROR_SUCCESS)
+        {
+            return HRESULT_FROM_WIN32(result);
+        }
+
+        // Allocate the path and mode arrays
+        paths.resize(pathCount);
+        modes.resize(modeCount);
+
+        // Get all active paths and their modes
+        result = QueryDisplayConfig(flags, &pathCount, paths.data(), &modeCount, modes.data(), nullptr);
+
+        // The function may have returned fewer paths/modes than estimated
+        paths.resize(pathCount);
+        modes.resize(modeCount);
+
+        // It's possible that between the call to GetDisplayConfigBufferSizes and QueryDisplayConfig
+        // that the display state changed, so loop on the case of ERROR_INSUFFICIENT_BUFFER.
+    } while (result == ERROR_INSUFFICIENT_BUFFER);
+
+    if (result != ERROR_SUCCESS)
+    {
+        return HRESULT_FROM_WIN32(result);
+    }
+    
+    int i = 0;
+    // For each active path
+    for (int i = 0; i < paths.size(); i++)
+    {
+        // Find the target (monitor) friendly name
+        DISPLAYCONFIG_TARGET_DEVICE_NAME targetName = {};
+        targetName.header.adapterId = paths[i].targetInfo.adapterId;
+        targetName.header.id = paths[i].targetInfo.id;
+        targetName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        targetName.header.size = sizeof(targetName);
+        result = DisplayConfigGetDeviceInfo(&targetName.header);
+
+        if (result != ERROR_SUCCESS)
+        {
+            return HRESULT_FROM_WIN32(result);
+        }
+
+        char devNameStr[64];
+        char DefChar = ' ';
+        WideCharToMultiByte(CP_ACP, 0, targetName.monitorFriendlyDeviceName, -1, devNameStr, 64, &DefChar, NULL);
+
+        displays[i].friendlyName = std::string(devNameStr);
+    }
+    return 1;
 }
 
 HRESULT InitD3D9(unsigned int deviceID, HWND hwnd)
@@ -214,14 +280,14 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPara
 
 
 
-int readIntFromCmd(std::string prompt) {
+int ReadIntFromCmd(std::string prompt) {
     std::cout << prompt;
     std::string cinString;
     getline(std::cin, cinString);
     return cinString.empty() ? -1 : stoi(cinString);
 }
 
-void consoleUserInput() {
+void ConsoleUserInput() {
     AllocConsole();
     FILE* fDummy;
     freopen_s(&fDummy, "CONOUT$", "w", stdout);
@@ -229,21 +295,27 @@ void consoleUserInput() {
     std::cout.clear();
     std::clog.clear();
     std::cin.clear();
+    std::cout << std::endl;
     for (std::vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
 
         std::cout << "Adapter index [" << iter->dxAdapterIndex << "]"
-            << " | Absolute Position Top Left [" << iter->position.left << "," << iter->position.top << "]"
-            << " | Absolute Position Bottom Right [" << iter->position.right << "," << iter->position.bottom << "]"
-            << " | Name [" << iter->deviceName << "]" << std::endl;
+            << std::endl << "\t"
+            << "Scaled Position Top Left [" << iter->position.left << "," << iter->position.top << "]"
+            << " | Scaled Position Bottom Right [" << iter->position.right << "," << iter->position.bottom << "]"
+            << std::endl << "\t"
+            << "Identifier [" << iter->deviceName << "]" 
+            << std::endl << "\t" 
+            << "Name [" << iter->friendlyName << "]"
+            << std::endl;
     }
 
     int sourceIndex;
     int outputIndex;
-    for (sourceIndex = readIntFromCmd("Capture Display Index ? "); sourceIndex < 0 || sourceIndex > displays.size() - 1;) {
-        sourceIndex = readIntFromCmd("Capture Display Index ? ");
+    for (sourceIndex = ReadIntFromCmd("Capture Display Index ? "); sourceIndex < 0 || sourceIndex > displays.size() - 1;) {
+        sourceIndex = ReadIntFromCmd("Capture Display Index ? ");
     }
-    for (outputIndex = readIntFromCmd("Output Display Index ? "); outputIndex < 0 || outputIndex > displays.size() - 1;) {
-        outputIndex = readIntFromCmd("Output Display Index ? ");
+    for (outputIndex = ReadIntFromCmd("Output Display Index ? "); outputIndex < 0 || outputIndex > displays.size() - 1;) {
+        outputIndex = ReadIntFromCmd("Output Display Index ? ");
     }
     std::cout << "Capture/Present framerate (blank to default 60fps) ? ";
     std::string cinString;
@@ -274,9 +346,11 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     int nCmdShow)
 {
 
-    initDisplays();
-    consoleUserInput();
-    
+    if (!InitDisplays()) {
+        fprintf(stderr, "Unable to enumerate display adapters");
+        return -1;
+    }
+    ConsoleUserInput();
 
     BUF_WIDTH = target.position.right - target.position.left;
     BUF_HEIGHT = target.position.bottom - target.position.top;
@@ -388,6 +462,12 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 
     li.QuadPart = -(10000000 / framerate);
     timer = CreateWaitableTimer(NULL, TRUE, NULL);
+
+    if (NULL == timer)
+    {
+        printf("CreateWaitableTimer failed (%d)\n", GetLastError());
+        return 1;
+    }
 
     while (TRUE)
     {
