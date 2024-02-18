@@ -76,10 +76,10 @@ struct DisplayPosition {
     int dxAdapterIndex;
     RECT position;
     char deviceName[32];
-    std::string friendlyName;
+    string friendlyName;
 } source, target;
 
-std::vector <DisplayPosition> displays;
+vector <DisplayPosition> displays;
 
 void Cleanup()
 {
@@ -203,7 +203,7 @@ int InitDisplays() {
         char DefChar = ' ';
         WideCharToMultiByte(CP_ACP, 0, targetName.monitorFriendlyDeviceName, -1, devNameStr, 64, &DefChar, NULL);
 
-        displays[i].friendlyName = std::string(devNameStr);
+        displays[i].friendlyName = string(devNameStr);
     }
     return 1;
 }
@@ -280,10 +280,10 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPara
 
 
 
-int ReadIntFromCmd(std::string prompt) {
-    std::cout << prompt;
-    std::string cinString;
-    getline(std::cin, cinString);
+int ReadIntFromCmd(string prompt) {
+    cout << prompt;
+    string cinString;
+    getline(cin, cinString);
     return cinString.empty() ? -1 : stoi(cinString);
 }
 
@@ -292,21 +292,21 @@ void ConsoleUserInput() {
     FILE* fDummy;
     freopen_s(&fDummy, "CONOUT$", "w", stdout);
     freopen_s(&fDummy, "CONIN$", "r", stdin);
-    std::cout.clear();
-    std::clog.clear();
-    std::cin.clear();
-    std::cout << std::endl;
-    for (std::vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
+    cout.clear();
+    clog.clear();
+    cin.clear();
+    cout << endl;
+    for (vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
 
-        std::cout << "Adapter index [" << iter->dxAdapterIndex << "]"
-            << std::endl << "\t"
+        cout << "Adapter index [" << iter->dxAdapterIndex << "]"
+            << endl << "\t"
             << "Scaled Position Top Left [" << iter->position.left << "," << iter->position.top << "]"
             << " | Scaled Position Bottom Right [" << iter->position.right << "," << iter->position.bottom << "]"
-            << std::endl << "\t"
+            << endl << "\t"
             << "Identifier [" << iter->deviceName << "]" 
-            << std::endl << "\t" 
+            << endl << "\t" 
             << "Name [" << iter->friendlyName << "]"
-            << std::endl;
+            << endl;
     }
 
     int sourceIndex;
@@ -317,14 +317,14 @@ void ConsoleUserInput() {
     for (outputIndex = ReadIntFromCmd("Output Display Index ? "); outputIndex < 0 || outputIndex > displays.size() - 1;) {
         outputIndex = ReadIntFromCmd("Output Display Index ? ");
     }
-    std::cout << "Capture/Present framerate (blank to default 60fps) ? ";
-    std::string cinString;
-    getline(std::cin, cinString);
+    cout << "Capture/Present framerate (blank to default 60fps) ? ";
+    string cinString;
+    getline(cin, cinString);
     if (!cinString.empty())
         framerate = stoi(cinString);
         
 
-    for (std::vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
+    for (vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
 
         if (iter->dxAdapterIndex == outputIndex) {
             target = *iter;
