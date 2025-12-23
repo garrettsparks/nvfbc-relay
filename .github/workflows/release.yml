@@ -1,0 +1,50 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Triggers on version tags like v1.0.0
+  workflow_dispatch:  # Allows manual triggering
+
+permissions:
+  contents: write  # Required for creating releases
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code with submodules
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Create source archive with submodules
+      run: |
+        $tag = $env:GITHUB_REF -replace 'refs/tags/', ''
+        Compress-Archive -Path * -DestinationPath nvfbc-relay-$tag.zip -Force
+      shell: pwsh
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build Solution
+      run: msbuild samples/NvFBC/NvFBCR/NvFBCR_2013.sln /p:Configuration=Release /p:Platform=x64
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: nvfbc-relay-build
+        path: samples/Release/x64/*.exe
+
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          samples/Release/x64/*.exe
+          nvfbc-relay-*.zip
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
