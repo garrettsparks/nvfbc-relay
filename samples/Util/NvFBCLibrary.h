@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include "NvFBC/nvFBC.h"
+#include "SimpleLogger.h"
 #include <string>
 
 #define NVFBC64_LIBRARY_NAME "NvFBC64.dll"
@@ -19,8 +20,10 @@ public:
     NvFBCLibrary()
         : m_handle(NULL)
         , pfn_get_status(NULL)
+        , pfn_set_global_flags(NULL)
         , pfn_create(NULL)
         , pfn_enable(NULL)
+        , fnIsWow64Process(NULL)
     {}
 
     ~NvFBCLibrary()
@@ -36,19 +39,27 @@ public:
     bool load(std::string fileName = std::string())
     {
         if(NULL != m_handle)
+        {
+            LOG("NvFBC library already loaded");
             return true;
+        }
 
         if(!fileName.empty())
-            m_handle = ::LoadLibraryA(fileName.c_str());
-
-        if(NULL == m_handle)
         {
-            m_handle = ::LoadLibraryA(getDefaultPath().c_str());
+            LOG("Attempting to load NvFBC from: %s", fileName.c_str());
+            m_handle = ::LoadLibraryA(fileName.c_str());
         }
 
         if(NULL == m_handle)
         {
-            fprintf(stderr, "Unable to load NvFBC.\n");
+            std::string defaultPath = getDefaultPath();
+            LOG("Attempting to load NvFBC from default path: %s", defaultPath.c_str());
+            m_handle = ::LoadLibraryA(defaultPath.c_str());
+        }
+
+        if(NULL == m_handle)
+        {
+            LOGERR("Unable to load NvFBC (error: %d)", GetLastError());
             return false;
         }
 
@@ -60,12 +71,14 @@ public:
 
         if((NULL == pfn_create) || (NULL == pfn_set_global_flags) || (NULL == pfn_get_status) || (NULL == pfn_enable))
         {
-            fprintf(stderr, "Unable to load the NvFBC function pointers.\n");
+            LOGERR("Unable to load NvFBC function pointers (create:%p, flags:%p, status:%p, enable:%p)", 
+                   pfn_create, pfn_set_global_flags, pfn_get_status, pfn_enable);
             close();
 
             return false;
         }
 
+        LOG("NvFBC library loaded successfully");
         return true;
     }
 
@@ -73,7 +86,10 @@ public:
     void close()
     {
         if(NULL != m_handle)
+        {
             FreeLibrary(m_handle);
+            LOG("NvFBC library closed");
+        }
 
         m_handle = NULL;
         pfn_create = NULL;
@@ -94,6 +110,7 @@ public:
     {
         setTargetAdapter(adapter);
         pfn_set_global_flags(flags);
+        LOG("Set NvFBC global flags: 0x%X (adapter: %d)", flags, adapter);
     }
 
     // Creates an instance of the provided NvFBC type if possible
@@ -105,7 +122,10 @@ public:
     void *create(DWORD type, DWORD *maxWidth, DWORD *maxHeight, int adapter = 0, void *devicePtr = NULL)
     {
         if(NULL == m_handle)
+        {
+            LOGERR("Cannot create NvFBC instance - library not loaded");
             return NULL;
+        }
 
         NVFBCRESULT res = NVFBC_SUCCESS;
         NvFBCStatusEx status = {0};
@@ -115,21 +135,21 @@ public:
 
         if (res != NVFBC_SUCCESS)
         {
-            fprintf(stderr, "NvFBC not supported on this device + driver.\r\n");
+            LOGERR("NvFBC getStatus failed (result: 0x%X)", res);
             return NULL;
         }
 
         // Check to see if the device and driver are supported
         if(!status.bIsCapturePossible)
         {
-            fprintf(stderr, "Unsupported device or driver.\r\n");
+            LOGERR("NvFBC not enabled (bIsCapturePossible=false)");
             return NULL;
         }
 
         // Check to see if an instance can be created
         if(!status.bCanCreateNow)
         {
-            fprintf(stderr, "Unable to create an instance of NvFBC.\r\n");
+            LOGERR("NvFBC not enabled (bCanCreateNow=false)");
             return NULL;
         }
 
@@ -142,6 +162,16 @@ public:
 
         res = pfn_create(&createParams);
         
+        if(res == NVFBC_SUCCESS)
+        {
+            LOG("NvFBC instance created successfully (type: 0x%X, adapter: %d, maxRes: %dx%d)", 
+                type, adapter, createParams.dwMaxDisplayWidth, createParams.dwMaxDisplayHeight);
+        }
+        else
+        {
+            LOGERR("Failed to create NvFBC instance (result: 0x%X)", res);
+        }
+
         *maxWidth = createParams.dwMaxDisplayWidth;
         *maxHeight = createParams.dwMaxDisplayHeight;
         
@@ -156,12 +186,13 @@ public:
 
         if (res != NVFBC_SUCCESS)
         {
-            fprintf(stderr, "Failed to %s. Insufficient privilege\n", nvFBCState == 0?"disable":"enable");
+            LOGERR("Failed to %s NvFBC - insufficient privilege (result: 0x%X)", 
+                   nvFBCState == 0 ? "disable" : "enable", res);
             return;
         }
         else
         {
-            fprintf(stdout, "NvFBC is %s\n", nvFBCState == 0 ? "disabled" : "enabled");
+            LOG("NvFBC is %s", nvFBCState == 0 ? "disabled" : "enabled");
             return;
         }
     }
@@ -169,7 +200,7 @@ public:
 protected:
     // Get the default NvFBC library path
     typedef BOOL (WINAPI *pfnIsWow64Process) (HANDLE, PBOOL);
-    pfnIsWow64Process fnIsWow64Process;
+    pfnIsWow64Process fnIsWow64Process = NULL;
 
     BOOL IsWow64()
     {
@@ -197,13 +228,13 @@ protected:
 
         if(0 != _dupenv_s(&libPath, &pathSize, "SystemRoot"))
         {
-            fprintf(stderr, "Unable to get the SystemRoot environment variable\n");
+            LOGERR("Unable to get the SystemRoot environment variable");
             return defaultPath;
         }
 
         if(0 == pathSize)
         {
-            fprintf(stderr, "The SystemRoot environment variable is not set\n");
+            LOGERR("The SystemRoot environment variable is not set");
             return defaultPath;
         }
 #ifdef _WIN64
@@ -230,9 +261,9 @@ protected:
 
 
 protected:
-    HMODULE m_handle;
-    NvFBC_GetStatusExFunctionType pfn_get_status;
-    NvFBC_SetGlobalFlagsType      pfn_set_global_flags;
-    NvFBC_CreateFunctionExType    pfn_create;
-    NvFBC_EnableFunctionType      pfn_enable;
+    HMODULE                       m_handle = NULL;
+    NvFBC_GetStatusExFunctionType pfn_get_status = NULL;
+    NvFBC_SetGlobalFlagsType      pfn_set_global_flags = NULL;
+    NvFBC_CreateFunctionExType    pfn_create = NULL;
+    NvFBC_EnableFunctionType      pfn_enable = NULL;
 };

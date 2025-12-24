@@ -47,6 +47,7 @@
 #include <vector>
 
 #include <NvFBCLibrary.h>
+#include <SimpleLogger.h>
 #include <NvFBC/NvFBCToDx9vid.h>
 
 using namespace std;
@@ -83,6 +84,7 @@ vector <DisplayPosition> displays;
 
 void Cleanup()
 {
+    LOG("Cleanup started");
 
     //! Release the NvFBCDX9 instance
     if (NvFBCDX9)
@@ -123,12 +125,14 @@ void Cleanup()
         CloseHandle(timer);
     }
 
+    LOG("Cleanup completed");
+    SimpleLogger::getInstance().flush();
 }
 
 int InitDisplays() {
 
     Direct3DCreate9Ex(D3D_SDK_VERSION, &g_pD3DEx);
-    unsigned int adapterCount = g_pD3DEx->GetAdapterCount();
+    int adapterCount = static_cast<int>(g_pD3DEx->GetAdapterCount());
 
     for (int i = 0; i < adapterCount; i++) {
         MONITORINFOEX mi;
@@ -159,6 +163,7 @@ int InitDisplays() {
 
         if (result != ERROR_SUCCESS)
         {
+            LOGERR("GetDisplayConfigBufferSizes failed (error: 0x%08x)", result);
             return HRESULT_FROM_WIN32(result);
         }
 
@@ -179,9 +184,10 @@ int InitDisplays() {
 
     if (result != ERROR_SUCCESS)
     {
+        LOGERR("QueryDisplayConfig failed (error: 0x%08x)", result);
         return HRESULT_FROM_WIN32(result);
     }
-    
+
     int i = 0;
     // For each active path
     for (int i = 0; i < paths.size(); i++)
@@ -255,7 +261,7 @@ HRESULT InitD3D9Surfaces()
         hr = g_pD3D9Device->CreateOffscreenPlainSurface(BUF_WIDTH, BUF_HEIGHT, D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT, &g_backbuffer, NULL); //D3DFMT_A8R8G8B8 D3DFMT_A2B10G10R10
         if (FAILED(hr))
         {
-            fprintf(stderr, "Failed to create D3D9 surfaces D3DFMT_A2B10G10R10 for output. Error 0x%08x\n", hr);
+            LOGERR("Failed to create D3D9 surface D3DFMT_A2B10G10R10 (error: 0x%08x)", hr);
         }
         g_pD3D9Device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &g_backbuffer);
     }
@@ -277,8 +283,6 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPara
 
     return DefWindowProc(hWnd, message, wParam, lParam);
 }
-
-
 
 int ReadIntFromCmd(string prompt) {
     cout << prompt;
@@ -347,10 +351,16 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 {
 
     if (!InitDisplays()) {
-        fprintf(stderr, "Unable to enumerate display adapters");
+        LOGERR("Unable to enumerate display adapters");
         return -1;
     }
     ConsoleUserInput();
+
+    LOG("=== NvFBCR Starting ===");
+    LOG("Source display: [%d] %s (%s)", source.dxAdapterIndex, source.friendlyName.c_str(), source.deviceName);
+    LOG("Target display: [%d] %s (%s)", target.dxAdapterIndex, target.friendlyName.c_str(), target.deviceName);
+    LOG("Framerate: %d fps", framerate);
+    LOG("Buffer size: %dx%d", BUF_WIDTH, BUF_HEIGHT);
 
     BUF_WIDTH = target.position.right - target.position.left;
     BUF_HEIGHT = target.position.bottom - target.position.top;
@@ -394,21 +404,21 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     pNVFBCLib = new NvFBCLibrary();
     if (!pNVFBCLib->load())
     {
-        fprintf(stderr, "Unable to load the NvFBC library\n");
+        LOGERR("Unable to load the NvFBC library");
         return -1;
     }
 
     g_bNvFBCLibLoaded = true;
     if (!SUCCEEDED(InitD3D9(source.dxAdapterIndex, hWnd)))
     {
-        fprintf(stderr, "Unable to create a D3D9Ex Device\n");
+        LOGERR("Unable to create D3D9Ex Device");
         Cleanup();
         return -1;
     }
 
     if (!SUCCEEDED(InitD3D9Surfaces()))
     {
-        fprintf(stderr, "Unable to create a D3D9Ex Device\n");
+        LOGERR("Unable to create D3D9Ex surfaces");
         Cleanup();
         return -1;
     }
@@ -416,14 +426,14 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     NvFBCDX9 = (NvFBCToDx9Vid*)pNVFBCLib->create(NVFBC_TO_DX9_VID, &maxDisplayWidth, &maxDisplayHeight, 0, (void*)g_pD3D9Device);
     if (!NvFBCDX9)
     {
-        fprintf(stderr, "Failed to create an instance of NvFBCToDx9Vid.  Please check the following requirements\n");
-        fprintf(stderr, "1) A driver R355 or newer with capable Tesla/Quadro/GRID capable product\n");
-        fprintf(stderr, "2) Run \"NvFBCEnable -enable\" after a new driver installation\n");
+        LOGERR("Failed to create NvFBCToDx9Vid instance");
+        LOGERR("    Requirement 1) Driver R355+ with Tesla/Quadro/GRID");
+        LOGERR("    Requirement 2) Run 'NvFBCEnable -enable' after driver installation");
         Cleanup();
         return -1;
     }
 
-    fprintf(stderr, "NvFBCToDX9Vid CreateEx() success!\n");
+    LOG("NvFBCToDX9Vid instance created successfully");
 
     NvFBC_OutBuf[0].pPrimary = g_backbuffer;
 
@@ -441,7 +451,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 
     if (NVFBC_SUCCESS != NvFBCDX9->NvFBCToDx9VidSetUp(&DX9SetupParams))
     {
-        fprintf(stderr, "Failed when calling NvFBCDX9->NvFBCToDX9VidSetup()\n");
+        LOGERR("Failed calling NvFBCToDx9VidSetUp()");
         Cleanup();
         return -1;
     }
@@ -465,9 +475,11 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 
     if (NULL == timer)
     {
-        printf("CreateWaitableTimer failed (%d)\n", GetLastError());
+        LOGERR("CreateWaitableTimer failed (error: %d)", GetLastError());
         return 1;
     }
+
+    LOG("Entering capture loop");
 
     while (TRUE)
     {
@@ -489,11 +501,5 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 
     Cleanup();
 
-    return msg.wParam;
+    return static_cast<int>(msg.wParam);
 }
-
-
-
-
-
-
