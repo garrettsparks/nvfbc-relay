@@ -2,38 +2,38 @@
  * \defgroup NvFBCR
  * \brief
  * Nvidia Framebuffer Capture Relay
- * 
+ *
  * This is a simple application that captures display to a DirectX 9 surface,
- * sets up a pseudo-fullscreen window on another display, 
+ * sets up a pseudo-fullscreen window on another display,
  * and presents that surface on the window through the same DX9 context.
- * 
+ *
  * It is very efficient because everything remains in VRAM and as few copies as possible are done to achieve this.
  * Many features and frills typical of capture software are omitted for speed and downstream flexibility.
- * 
+ *
  * The process is as follows:
- * 
+ *
  * Discover all physical heads on the system and ask the user to choose a capture and target display with a capture interval.
  * Create a window (in windowed mode) on the target display in pseudo-fullscreen, i.e., no borders or bar.
  * Create a DX9 context for that window and get a pointer to its single backbuffer as a DX9 surface (using immediate presentation).
  * Set up NvFBC capture device with the window's backbuffer as the target capture surface.
- * In a loop, 
+ * In a loop,
  *      Call NvFBC capture, thereby writing the captured frame directly to the window's backbuffer with no copies involved.
- *      Call Present. 
- *          
- * 
- * Potential improvement is to use FLIPEX presentation model. Because this is a DX9 window not using FLIPEX presentation, 
+ *      Call Present.
+ *
+ *
+ * Potential improvement is to use FLIPEX presentation model. Because this is a DX9 window not using FLIPEX presentation,
  *      a blt copy is performed as DWM manages the render. I couldn't get FLIPEX to work, primarily because
- * 
+ *
  * https://learn.microsoft.com/en-us/windows/win32/direct3darticles/direct3d-9ex-improvements#direct3d-9ex-flip-mode-presentation
- * "If Windowed is set to TRUE and SwapEffect is set to D3DSWAPEFFECT_FLIPEX, the runtime creates one extra back buffer and rotates 
+ * "If Windowed is set to TRUE and SwapEffect is set to D3DSWAPEFFECT_FLIPEX, the runtime creates one extra back buffer and rotates
  * whichever handle belongs to the buffer that becomes the front buffer at presentation time."
  *
  * This appears to be true - when modified with a backbuffer count of 2 as suggested in the FLIPEX documentation, every third frame
  * appears to be blank, which seems evidential of this extra back buffer. But I can't get a surface pointer to this buffer
  * through the dx9 device like I can for the buffers I explicitly requested on device creation.
- * 
- * Stranger still, when I hold the NvFBC output buffer constant to one back buffer and just copy it to the other back buffer 
- * using StretchRect on every frame, this works and does not skip every third frame, without obviously touching this third implicit back buffer. 
+ *
+ * Stranger still, when I hold the NvFBC output buffer constant to one back buffer and just copy it to the other back buffer
+ * using StretchRect on every frame, this works and does not skip every third frame, without obviously touching this third implicit back buffer.
  * But doing this copy defeats the purpose of using FLIPEX, which is to eliminate the extra copy.
  *
  */
@@ -254,10 +254,10 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd)
 HRESULT InitD3D9Surfaces()
 {
     HRESULT hr = E_FAIL;
-    
+
     if (g_pD3D9Device)
     {
-        
+
         hr = g_pD3D9Device->CreateOffscreenPlainSurface(BUF_WIDTH, BUF_HEIGHT, D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT, &g_backbuffer, NULL); //D3DFMT_A8R8G8B8 D3DFMT_A2B10G10R10
         if (FAILED(hr))
         {
@@ -307,8 +307,8 @@ void ConsoleUserInput() {
             << "Scaled Position Top Left [" << iter->position.left << "," << iter->position.top << "]"
             << " | Scaled Position Bottom Right [" << iter->position.right << "," << iter->position.bottom << "]"
             << endl << "\t"
-            << "Identifier [" << iter->deviceName << "]" 
-            << endl << "\t" 
+            << "Identifier [" << iter->deviceName << "]"
+            << endl << "\t"
             << "Name [" << iter->friendlyName << "]"
             << endl;
     }
@@ -326,7 +326,6 @@ void ConsoleUserInput() {
     getline(cin, cinString);
     if (!cinString.empty())
         framerate = stoi(cinString);
-        
 
     for (vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
 
@@ -387,7 +386,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         "NvFBCR",
         WS_EX_TOPMOST | WS_POPUP, // pseudo fullscreen //WS_OVERLAPPEDWINDOW for windowed
         target.position.left, target.position.top,    // the starting x and y positions
-        BUF_WIDTH, BUF_HEIGHT,    
+        BUF_WIDTH, BUF_HEIGHT,
         NULL,
         NULL,
         hInstance,
@@ -426,6 +425,31 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     NvFBCDX9 = (NvFBCToDx9Vid*)pNVFBCLib->create(NVFBC_TO_DX9_VID, &maxDisplayWidth, &maxDisplayHeight, 0, (void*)g_pD3D9Device);
     if (!NvFBCDX9)
     {
+        if (pNVFBCLib->wasJustEnabled())
+        {
+            LOG("NvFBC was just enabled - restarting application...");
+            Cleanup();
+
+            // Restart the process
+            STARTUPINFO si = { 0 };
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi = { 0 };
+            char exePath[MAX_PATH];
+            GetModuleFileNameA(NULL, exePath, MAX_PATH);
+
+            if (CreateProcessA(exePath, lpCmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
+            {
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+                return 0;
+            }
+            else
+            {
+                LOGERR("Failed to restart process (error: %d)", GetLastError());
+                return -1;
+            }
+        }
+
         LOGERR("Failed to create NvFBCToDx9Vid instance");
         LOGERR("    Requirement 1) Driver R355+ with Tesla/Quadro/GRID");
         LOGERR("    Requirement 2) Run 'NvFBCEnable -enable' after driver installation");
