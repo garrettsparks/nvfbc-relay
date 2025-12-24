@@ -61,8 +61,8 @@ void PrintStatus(NvFBCLibrary* pLib, int adapter = 0)
 
     NVFBCRESULT res = pLib->getStatus(&status);
 
-    cout << "\n=== NvFBC Status (Adapter " << adapter << ") ===\n";
-    cout << "  Running as Administrator:  " << (IsRunningAsAdmin() ? "YES" : "NO") << "\n";
+    cout << "\n====== NvFBC Status (Adapter " << adapter << ") ======\n";
+    cout << "  Running as Administrator:     " << (IsRunningAsAdmin() ? "YES" : "NO") << "\n";
 
     if (res != NVFBC_SUCCESS)
     {
@@ -70,12 +70,12 @@ void PrintStatus(NvFBCLibrary* pLib, int adapter = 0)
         return;
     }
 
-    cout << "  bIsCapturePossible:        " << (status.bIsCapturePossible ? "YES" : "NO") << "\n";
-    cout << "  bCurrentlyCapturing:       " << (status.bCurrentlyCapturing ? "YES" : "NO") << "\n";
-    cout << "  bSupportMultiHead:         " << (status.bSupportMultiHead ? "YES" : "NO") << "\n";
-    cout << "  bSupportConfigurableDiffMap: " << (status.bSupportConfigurableDiffMap ? "YES" : "NO") << "\n";
-    cout << "  bSupportImageClassification: " << (status.bSupportImageClassification ? "YES" : "NO") << "\n";
-    cout << "  dwNvFBCVersion:            0x" << hex << status.dwNvFBCVersion << dec << "\n";
+    cout << "  bIsCapturePossible:           " << (status.bIsCapturePossible ? "YES" : "NO") << "\n";
+    cout << "  bCurrentlyCapturing:          " << (status.bCurrentlyCapturing ? "YES" : "NO") << "\n";
+    cout << "  bSupportMultiHead:            " << (status.bSupportMultiHead ? "YES" : "NO") << "\n";
+    cout << "  bSupportConfigurableDiffMap:  " << (status.bSupportConfigurableDiffMap ? "YES" : "NO") << "\n";
+    cout << "  bSupportImageClassification:  " << (status.bSupportImageClassification ? "YES" : "NO") << "\n";
+    cout << "  dwNvFBCVersion:               0x" << hex << status.dwNvFBCVersion << dec << "\n";
 
     if (status.bIsCapturePossible)
     {
@@ -96,7 +96,6 @@ void WaitForEnter()
 
 void ShowMenu()
 {
-    cout << "\n=== NvFBC Control Menu ===\n";
     cout << "1. Enable NvFBC\n";
     cout << "2. Disable NvFBC\n";
     cout << "3. Check Status\n";
@@ -133,7 +132,7 @@ void HandleEnable(NvFBCLibrary* nvfbcLib, int adapter = 0)
 
     if (res == NVFBC_SUCCESS && statusAfter.bIsCapturePossible)
     {
-        cout << "\nSUCCESS: NvFBC enabled and ready immediately!\n";
+        cout << "\nSUCCESS: NvFBC enabled and ready.\n";
     }
     else
     {
@@ -196,7 +195,7 @@ int main(int argc, char* argv[])
                 {
                     HandleEnable(&nvfbcLib, 0);
                 }
-                WaitForEnter();
+                cout << "\n";
             }
             else if (choice == "2")
             {
@@ -210,12 +209,12 @@ int main(int argc, char* argv[])
                 {
                     HandleDisable(&nvfbcLib, 0);
                 }
-                WaitForEnter();
+                cout << "\n";
             }
             else if (choice == "3")
             {
                 PrintStatus(&nvfbcLib, 0);
-                WaitForEnter();
+                cout << "\n";
             }
             else if (choice == "4")
             {
@@ -224,8 +223,7 @@ int main(int argc, char* argv[])
             }
             else
             {
-                cerr << "\nInvalid option. Please select 1-4.\n";
-                WaitForEnter();
+                cerr << "\nInvalid option. Please select 1-4.\n\n";
             }
         }
         return 0;
@@ -239,6 +237,7 @@ int main(int argc, char* argv[])
     {
         cerr << "ERROR: This operation requires Administrator privileges.\n";
         cerr << "Please run this program as Administrator.\n";
+        WaitForEnter();
         return -1;
     }
 
@@ -258,8 +257,10 @@ int main(int argc, char* argv[])
     {
         cerr << "ERROR: Unknown command '" << command << "'\n\n";
         PrintUsage();
+        WaitForEnter();
         return 1;
     }
 
+    WaitForEnter();
     return 0;
 }
