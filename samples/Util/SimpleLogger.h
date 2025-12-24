@@ -39,7 +39,7 @@ public:
         // Format location string with padding
         char location[64];
         snprintf(location, sizeof(location), "[%s:%d]", fileName, line);
-        
+
         // Format the log line with padded location
         char logLine[2300];
         snprintf(logLine, sizeof(logLine), "%-*s | %s\n", LOCATION_WIDTH, location, buffer);
@@ -79,7 +79,7 @@ private:
 
         if (hFind != INVALID_HANDLE_VALUE) {
             FindClose(hFind);
-            
+
             // Open file using Win32 API, truncating any existing content
             m_fileHandle = CreateFileA(
                 LOG_FILENAME,
@@ -90,7 +90,7 @@ private:
                 FILE_ATTRIBUTE_NORMAL,
                 NULL
             );
-            
+
             if (m_fileHandle != INVALID_HANDLE_VALUE) {
                 m_enabled = true;
             }
