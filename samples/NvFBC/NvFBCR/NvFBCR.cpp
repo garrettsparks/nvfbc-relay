@@ -425,9 +425,25 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     NvFBCDX9 = (NvFBCToDx9Vid*)pNVFBCLib->create(NVFBC_TO_DX9_VID, &maxDisplayWidth, &maxDisplayHeight, 0, (void*)g_pD3D9Device);
     if (!NvFBCDX9)
     {
-        if (pNVFBCLib->wasJustEnabled())
+        // Check if NvFBC is not enabled
+        NvFBCStatusEx status = {0};
+        status.dwVersion = NVFBC_STATUS_VER;
+        status.dwAdapterIdx = 0;
+        NVFBCRESULT statusRes = pNVFBCLib->getStatus(&status);
+
+        if (statusRes == NVFBC_SUCCESS && !status.bIsCapturePossible)
         {
-            LOG("NvFBC was just enabled - restarting application...");
+            LOG("NvFBC not enabled (bIsCapturePossible=false), attempting to enable...");
+            NVFBCRESULT enableRes = pNVFBCLib->enable(NVFBC_STATE_ENABLE);
+
+            if (enableRes != NVFBC_SUCCESS)
+            {
+                LOGERR("Failed to enable NvFBC (result: 0x%X) - cannot proceed", enableRes);
+                Cleanup();
+                return -1;
+            }
+
+            LOG("NvFBC enabled successfully - restarting application...");
             Cleanup();
 
             // Restart the process

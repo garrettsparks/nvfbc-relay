@@ -142,12 +142,7 @@ public:
         // Check to see if the device and driver are supported
         if(!status.bIsCapturePossible)
         {
-            LOG("NvFBC not enabled (bIsCapturePossible=false), attempting to enable...");
-            enable(NVFBC_STATE_ENABLE);
-
-            m_bJustEnabled = true;
-
-            LOG("NvFBC enabled successfully - application restart required");
+            LOGERR("NvFBC not enabled (bIsCapturePossible=false)");
             return NULL;
         }
 
@@ -184,22 +179,21 @@ public:
     }
 
     // enable/disable NVFBC
-    void enable(NVFBC_STATE nvFBCState)
+    NVFBCRESULT enable(NVFBC_STATE nvFBCState)
     {
-        NVFBCRESULT res = NVFBC_SUCCESS;
-        res = pfn_enable(nvFBCState);
+        NVFBCRESULT res = pfn_enable(nvFBCState);
 
         if (res != NVFBC_SUCCESS)
         {
             LOGERR("Failed to %s NvFBC - insufficient privilege (result: 0x%X)",
                    nvFBCState == 0 ? "disable" : "enable", res);
-            return;
         }
         else
         {
             LOG("NvFBC is %s", nvFBCState == 0 ? "disabled" : "enabled");
-            return;
         }
+
+        return res;
     }
 
 protected:
@@ -271,8 +265,4 @@ protected:
     NvFBC_SetGlobalFlagsType      pfn_set_global_flags = NULL;
     NvFBC_CreateFunctionExType    pfn_create = NULL;
     NvFBC_EnableFunctionType      pfn_enable = NULL;
-    bool                          m_bJustEnabled = false;
-
-public:
-    bool wasJustEnabled() const { return m_bJustEnabled; }
 };
