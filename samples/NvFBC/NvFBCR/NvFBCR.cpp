@@ -291,6 +291,59 @@ int ReadIntFromCmd(string prompt) {
     return cinString.empty() ? -1 : stoi(cinString);
 }
 
+bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, int* framerateValue) {
+    *sourceIndex = -1;
+    *targetIndex = -1;
+    *framerateValue = -1;
+
+    if (!lpCmdLine || strlen(lpCmdLine) == 0) {
+        return false;
+    }
+
+    string cmdLine(lpCmdLine);
+    vector<string> args;
+
+    // Split command line into tokens
+    size_t pos = 0;
+    while (pos < cmdLine.length()) {
+        // Skip whitespace
+        while (pos < cmdLine.length() && cmdLine[pos] == ' ') {
+            pos++;
+        }
+        if (pos >= cmdLine.length()) break;
+
+        // Extract token
+        size_t tokenStart = pos;
+        while (pos < cmdLine.length() && cmdLine[pos] != ' ') {
+            pos++;
+        }
+        args.push_back(cmdLine.substr(tokenStart, pos - tokenStart));
+    }
+
+    bool foundAny = false;
+
+    // Parse arguments
+    for (size_t i = 0; i < args.size(); i++) {
+        if (args[i] == "-source" && i + 1 < args.size()) {
+            *sourceIndex = stoi(args[i + 1]);
+            foundAny = true;
+            i++; // Skip the value
+        }
+        else if (args[i] == "-target" && i + 1 < args.size()) {
+            *targetIndex = stoi(args[i + 1]);
+            foundAny = true;
+            i++; // Skip the value
+        }
+        else if (args[i] == "-framerate" && i + 1 < args.size()) {
+            *framerateValue = stoi(args[i + 1]);
+            foundAny = true;
+            i++; // Skip the value
+        }
+    }
+
+    return foundAny;
+}
+
 void ConsoleUserInput() {
     AllocConsole();
     FILE* fDummy;
@@ -353,7 +406,36 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         LOGERR("Unable to enumerate display adapters");
         return -1;
     }
-    ConsoleUserInput();
+
+    // Try to parse command line arguments
+    LOG("Command line received: '%s'", lpCmdLine ? lpCmdLine : "(null)");
+    int argSourceIndex = -1;
+    int argTargetIndex = -1;
+    int argFramerate = -1;
+    bool hasArgs = ParseCommandLineArgs(lpCmdLine, &argSourceIndex, &argTargetIndex, &argFramerate);
+    LOG("Parsed args - hasArgs: %d, source: %d, target: %d, framerate: %d", hasArgs, argSourceIndex, argTargetIndex, argFramerate);
+
+    // If all required args are provided via command line, use them
+    if (hasArgs && argSourceIndex >= 0 && argTargetIndex >= 0 &&
+        argSourceIndex < static_cast<int>(displays.size()) && argTargetIndex < static_cast<int>(displays.size())) {
+        // Set source and target from command line args
+        for (vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
+            if (iter->dxAdapterIndex == argTargetIndex) {
+                target = *iter;
+            }
+            if (iter->dxAdapterIndex == argSourceIndex) {
+                source = *iter;
+            }
+        }
+
+        // Set framerate if provided, otherwise use default
+        if (argFramerate > 0) {
+            framerate = argFramerate;
+        }
+    } else {
+        // Fall back to interactive console input
+        ConsoleUserInput();
+    }
 
     LOG("=== NvFBCR Starting ===");
     LOG("Source display: [%d] %s (%s)", source.dxAdapterIndex, source.friendlyName.c_str(), source.deviceName);
@@ -446,14 +528,24 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
             LOG("NvFBC enabled successfully - restarting application...");
             Cleanup();
 
-            // Restart the process
+            // Restart the process with current configuration
             STARTUPINFO si = { 0 };
             si.cb = sizeof(si);
             PROCESS_INFORMATION pi = { 0 };
             char exePath[MAX_PATH];
             GetModuleFileNameA(NULL, exePath, MAX_PATH);
 
-            if (CreateProcessA(exePath, lpCmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
+            // Build command line with current values
+            // Note: lpCommandLine must include the exe name as first token when lpApplicationName is non-NULL
+            // Windows will strip the first token and pass the rest to WinMain's lpCmdLine
+            char newCmdLine[512];
+            sprintf_s(newCmdLine, sizeof(newCmdLine), "\"%s\" -source %d -target %d -framerate %d",
+                exePath, source.dxAdapterIndex, target.dxAdapterIndex, framerate);
+
+            LOG("Relaunching with command line: '%s'", newCmdLine);
+            LOG("Executable path: '%s'", exePath);
+
+            if (CreateProcessA(NULL, newCmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
             {
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread);
