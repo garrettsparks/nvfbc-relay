@@ -49,6 +49,7 @@
 #include <NvFBCLibrary.h>
 #include <SimpleLogger.h>
 #include <NvFBC/NvFBCToDx9vid.h>
+#include <AdminCheck.h>
 
 using namespace std;
 
@@ -516,6 +517,39 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         if (statusRes == NVFBC_SUCCESS && !status.bIsCapturePossible)
         {
             LOG("NvFBC not enabled (bIsCapturePossible=false), attempting to enable...");
+
+            // Check if running as admin before attempting to enable
+            if (!IsRunningAsAdmin())
+            {
+                LOGERR("Failed to enable NvFBC: Administrator privileges required");
+                LOGERR("Please run NvFBCR.exe as Administrator to enable NvFBC");
+                LOGERR("Alternatively, run NvFBCEnable.exe as Administrator first, then run NvFBCR.exe");
+
+                // Show error to user in console
+                AllocConsole();
+                FILE* fDummy;
+                freopen_s(&fDummy, "CONOUT$", "w", stdout);
+                freopen_s(&fDummy, "CONIN$", "r", stdin);
+                cout.clear();
+                cin.clear();
+
+                cout << "\nERROR: Failed to enable NvFBC\n";
+                cout << "---------------------------------------\n";
+                cout << "Administrator privileges are required to enable NvFBC.\n\n";
+                cout << "Please either:\n";
+                cout << "  1. Run NvFBCR.exe as Administrator, OR\n";
+                cout << "  2. Run NvFBCEnable.exe as Administrator first, then run NvFBCR.exe normally\n\n";
+                cout << "Press Enter to exit...";
+                cin.get();
+
+                fclose(stdin);
+                fclose(stdout);
+                FreeConsole();
+
+                Cleanup();
+                return -1;
+            }
+
             NVFBCRESULT enableRes = pNVFBCLib->enable(NVFBC_STATE_ENABLE);
 
             if (enableRes != NVFBC_SUCCESS)

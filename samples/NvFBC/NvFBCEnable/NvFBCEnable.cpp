@@ -14,34 +14,9 @@
 #include <string>
 #include "NvFBCLibrary.h"
 #include "NvFBC/nvFBC.h"
+#include "AdminCheck.h"
 
 using namespace std;
-
-bool IsRunningAsAdmin()
-{
-    BOOL isAdmin = FALSE;
-    PSID adminGroup = NULL;
-
-    // Allocate and initialize a SID for the administrators group
-    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
-    if (AllocateAndInitializeSid(
-            &ntAuthority,
-            2,
-            SECURITY_BUILTIN_DOMAIN_RID,
-            DOMAIN_ALIAS_RID_ADMINS,
-            0, 0, 0, 0, 0, 0,
-            &adminGroup))
-    {
-        // Check if the current process token is a member of the administrators group
-        if (!CheckTokenMembership(NULL, adminGroup, &isAdmin))
-        {
-            isAdmin = FALSE;
-        }
-        FreeSid(adminGroup);
-    }
-
-    return isAdmin;
-}
 
 void PrintUsage()
 {
