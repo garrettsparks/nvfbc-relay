@@ -548,6 +548,40 @@ HRESULT CompileAndCreateShaders()
     return S_OK;
 }
 
+HRESULT InitBlendingRenderStates()
+{
+    HRESULT hr = S_OK;
+
+    // Configure sampler states for both texture stages (these never change)
+    // Sampler 0 (before frame)
+    g_pD3D9Device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    g_pD3D9Device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    g_pD3D9Device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    g_pD3D9Device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+    // Sampler 1 (after frame)
+    g_pD3D9Device->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    g_pD3D9Device->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    g_pD3D9Device->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    g_pD3D9Device->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+    // Set static render states
+    g_pD3D9Device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    g_pD3D9Device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    g_pD3D9Device->SetRenderState(D3DRS_LIGHTING, FALSE);
+
+    // Set vertex declaration and stream source (always the same)
+    g_pD3D9Device->SetVertexDeclaration(g_vertexDeclaration);
+    g_pD3D9Device->SetStreamSource(0, g_quadVertexBuffer, 0, sizeof(QuadVertex));
+
+    // Set shaders (they don't change during rendering)
+    g_pD3D9Device->SetVertexShader(g_vertexShader);
+    g_pD3D9Device->SetPixelShader(g_pixelShader);
+
+    LOG("Static render states initialized");
+    return S_OK;
+}
+
 HRESULT InitFrameBlending()
 {
     HRESULT hr = S_OK;
@@ -665,6 +699,18 @@ HRESULT InitFrameBlending()
                 }
             }
         }
+
+        // Initialize static render states for shader-based blending
+        if (g_shaderInterpolationAvailable)
+        {
+            hr = InitBlendingRenderStates();
+            if (FAILED(hr))
+            {
+                LOGERR("Failed to initialize blending render states (error: 0x%08x)", hr);
+                // Don't fail completely, just disable shader interpolation
+                g_shaderInterpolationAvailable = false;
+            }
+        }
     }
     else
     {
@@ -755,37 +801,13 @@ void BlendFramesToBackbuffer(LARGE_INTEGER targetTime)
         // Set up rendering state
         g_pD3D9Device->SetRenderTarget(0, g_backbuffer);
 
-        // Set textures
+        // Set textures (dynamic - change based on which frames we're blending)
         g_pD3D9Device->SetTexture(0, g_frameTextures[bestBefore]);
         g_pD3D9Device->SetTexture(1, g_frameTextures[bestAfter]);
 
-        // Configure texture sampling (linear filtering for quality)
-        g_pD3D9Device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-        g_pD3D9Device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-        g_pD3D9Device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-        g_pD3D9Device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-
-        g_pD3D9Device->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-        g_pD3D9Device->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-        g_pD3D9Device->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-        g_pD3D9Device->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-
-        // Set shaders
-        g_pD3D9Device->SetVertexShader(g_vertexShader);
-        g_pD3D9Device->SetPixelShader(g_pixelShader);
-
-        // Set blend weight constant
+        // Set blend weight constant (dynamic - changes every frame)
         float constants[4] = { weight, 0.0f, 0.0f, 0.0f };
         g_pD3D9Device->SetPixelShaderConstantF(0, constants, 1);
-
-        // Set render states for proper blending
-        g_pD3D9Device->SetRenderState(D3DRS_ZENABLE, FALSE);
-        g_pD3D9Device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-        g_pD3D9Device->SetRenderState(D3DRS_LIGHTING, FALSE);
-
-        // Set vertex declaration and stream source
-        g_pD3D9Device->SetVertexDeclaration(g_vertexDeclaration);
-        g_pD3D9Device->SetStreamSource(0, g_quadVertexBuffer, 0, sizeof(QuadVertex));
 
         // Begin scene for rendering
         HRESULT hr = g_pD3D9Device->BeginScene();
@@ -820,9 +842,7 @@ void BlendFramesToBackbuffer(LARGE_INTEGER targetTime)
                 D3DTEXF_NONE);
         }
 
-        // Clean up state
-        g_pD3D9Device->SetVertexShader(NULL);
-        g_pD3D9Device->SetPixelShader(NULL);
+        // Clean up dynamic state (clear texture references)
         g_pD3D9Device->SetTexture(0, NULL);
         g_pD3D9Device->SetTexture(1, NULL);
     }
