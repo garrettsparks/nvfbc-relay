@@ -553,15 +553,16 @@ HRESULT InitBlendingRenderStates()
     HRESULT hr = S_OK;
 
     // Configure sampler states for both texture stages (these never change)
+    // Use point sampling since we're doing 1:1 pixel mapping (no scaling/rotation)
     // Sampler 0 (before frame)
-    g_pD3D9Device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-    g_pD3D9Device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    g_pD3D9Device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    g_pD3D9Device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
     g_pD3D9Device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
     g_pD3D9Device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
     // Sampler 1 (after frame)
-    g_pD3D9Device->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-    g_pD3D9Device->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    g_pD3D9Device->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    g_pD3D9Device->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
     g_pD3D9Device->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
     g_pD3D9Device->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
