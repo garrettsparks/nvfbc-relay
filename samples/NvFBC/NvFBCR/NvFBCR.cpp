@@ -77,6 +77,7 @@ int framerate = 60;
 
 // Frame blending resources
 #define FRAME_HISTORY_SIZE 2  // Reduced from 3 for better performance
+#define BLEND_WEIGHT_THRESHOLD 0.1f  // Skip GPU blending if weight < this or > (1.0 - this)
 struct FrameHistoryEntry {
     IDirect3DSurface9* surface;
     LARGE_INTEGER timestamp;
@@ -799,6 +800,32 @@ void BlendFramesToBackbuffer(LARGE_INTEGER targetTime)
                                     g_frameHistory[bestBefore].timestamp.QuadPart);
         float weight = totalDiff > 0 ? (float)((double)smallestBeforeDiff / totalDiff) : 0.5f;
 
+        // Early-out: if blend weight is very close to 0 or 1, skip GPU blending
+        // and just copy the dominant frame directly (much faster)
+        if (weight < BLEND_WEIGHT_THRESHOLD)
+        {
+            // Weight ~0.0: use before frame (it's >90% of the result anyway)
+            g_pD3D9Device->StretchRect(
+                g_frameHistory[bestBefore].surface,
+                &srcRect,
+                g_backbuffer,
+                &srcRect,
+                D3DTEXF_NONE);
+        }
+        else if (weight > (1.0f - BLEND_WEIGHT_THRESHOLD))
+        {
+            // Weight ~1.0: use after frame (it's >90% of the result anyway)
+            g_pD3D9Device->StretchRect(
+                g_frameHistory[bestAfter].surface,
+                &srcRect,
+                g_backbuffer,
+                &srcRect,
+                D3DTEXF_NONE);
+        }
+        else
+        {
+            // Weight is between threshold and (1.0 - threshold): do GPU blending
+
         // Set up rendering state
         g_pD3D9Device->SetRenderTarget(0, g_backbuffer);
 
@@ -843,9 +870,10 @@ void BlendFramesToBackbuffer(LARGE_INTEGER targetTime)
                 D3DTEXF_NONE);
         }
 
-        // Clean up dynamic state (clear texture references)
-        g_pD3D9Device->SetTexture(0, NULL);
-        g_pD3D9Device->SetTexture(1, NULL);
+            // Clean up dynamic state (clear texture references)
+            g_pD3D9Device->SetTexture(0, NULL);
+            g_pD3D9Device->SetTexture(1, NULL);
+        }  // End of else block (GPU blending path)
     }
     else if (bestBefore >= 0 && bestAfter >= 0 && !g_shaderInterpolationAvailable)
     {
