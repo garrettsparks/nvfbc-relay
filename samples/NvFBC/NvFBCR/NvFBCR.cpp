@@ -44,6 +44,7 @@
 #include <iostream>
 #include <assert.h>
 #include <d3d9.h>
+#include <d3dcompiler.h>
 #include <vector>
 
 #include <NvFBCLibrary.h>
@@ -86,6 +87,19 @@ int g_currentHistoryIndex = 0;
 IDirect3DSurface9* g_captureTarget = NULL;  // Intermediate capture surface
 LARGE_INTEGER g_perfFreq;
 
+// Shader interpolation resources
+IDirect3DTexture9* g_frameTextures[FRAME_HISTORY_SIZE];
+IDirect3DTexture9* g_captureTexture = NULL;
+IDirect3DVertexShader9* g_vertexShader = NULL;
+IDirect3DPixelShader9* g_pixelShader = NULL;
+IDirect3DVertexDeclaration9* g_vertexDeclaration = NULL;
+bool g_shaderInterpolationAvailable = false;
+
+struct QuadVertex {
+    float x, y, z;
+    float u, v;
+};
+
 struct DisplayPosition {
     int dxAdapterIndex;
     RECT position;
@@ -104,6 +118,41 @@ void Cleanup()
     {
         NvFBCDX9->NvFBCToDx9VidRelease();
         NvFBCDX9 = NULL;
+    }
+
+    // Release shader resources
+    if (g_pixelShader)
+    {
+        g_pixelShader->Release();
+        g_pixelShader = NULL;
+    }
+
+    if (g_vertexShader)
+    {
+        g_vertexShader->Release();
+        g_vertexShader = NULL;
+    }
+
+    if (g_vertexDeclaration)
+    {
+        g_vertexDeclaration->Release();
+        g_vertexDeclaration = NULL;
+    }
+
+    // Release frame textures
+    for (int i = 0; i < FRAME_HISTORY_SIZE; i++)
+    {
+        if (g_frameTextures[i])
+        {
+            g_frameTextures[i]->Release();
+            g_frameTextures[i] = NULL;
+        }
+    }
+
+    if (g_captureTexture)
+    {
+        g_captureTexture->Release();
+        g_captureTexture = NULL;
     }
 
     // Release frame history surfaces
@@ -298,6 +347,146 @@ HRESULT InitD3D9Surfaces()
     return hr;
 }
 
+HRESULT CompileAndCreateShaders()
+{
+    HRESULT hr = S_OK;
+    ID3DBlob* vsBlob = NULL;
+    ID3DBlob* psBlob = NULL;
+    ID3DBlob* errorBlob = NULL;
+
+    // Vertex Shader: Transform position and pass through texture coordinates
+    const char* vertexShaderCode =
+        "struct VS_INPUT {\n"
+        "    float3 pos : POSITION;\n"
+        "    float2 uv : TEXCOORD0;\n"
+        "};\n"
+        "struct VS_OUTPUT {\n"
+        "    float4 pos : POSITION;\n"
+        "    float2 uv : TEXCOORD0;\n"
+        "};\n"
+        "VS_OUTPUT main(VS_INPUT input) {\n"
+        "    VS_OUTPUT output;\n"
+        "    output.pos = float4(input.pos, 1.0);\n"
+        "    output.uv = input.uv;\n"
+        "    return output;\n"
+        "}\n";
+
+    // Pixel Shader: Sample two textures and blend based on weight
+    const char* pixelShaderCode =
+        "sampler2D texBefore : register(s0);\n"
+        "sampler2D texAfter : register(s1);\n"
+        "float blendWeight : register(c0);  // 0.0 = all before, 1.0 = all after\n"
+        "struct PS_INPUT {\n"
+        "    float2 uv : TEXCOORD0;\n"
+        "};\n"
+        "float4 main(PS_INPUT input) : COLOR0 {\n"
+        "    float4 colorBefore = tex2D(texBefore, input.uv);\n"
+        "    float4 colorAfter = tex2D(texAfter, input.uv);\n"
+        "    return lerp(colorBefore, colorAfter, blendWeight);\n"
+        "}\n";
+
+    // Compile vertex shader
+    hr = D3DCompile(
+        vertexShaderCode,
+        strlen(vertexShaderCode),
+        "VertexShader",
+        NULL,
+        NULL,
+        "main",
+        "vs_3_0",  // Shader Model 3.0 for D3D9
+        0,
+        0,
+        &vsBlob,
+        &errorBlob);
+
+    if (FAILED(hr))
+    {
+        if (errorBlob)
+        {
+            LOGERR("Vertex shader compile error: %s", (char*)errorBlob->GetBufferPointer());
+            errorBlob->Release();
+        }
+        return hr;
+    }
+
+    // Compile pixel shader
+    hr = D3DCompile(
+        pixelShaderCode,
+        strlen(pixelShaderCode),
+        "PixelShader",
+        NULL,
+        NULL,
+        "main",
+        "ps_3_0",  // Shader Model 3.0 for D3D9
+        0,
+        0,
+        &psBlob,
+        &errorBlob);
+
+    if (FAILED(hr))
+    {
+        if (errorBlob)
+        {
+            LOGERR("Pixel shader compile error: %s", (char*)errorBlob->GetBufferPointer());
+            errorBlob->Release();
+        }
+        if (vsBlob) vsBlob->Release();
+        return hr;
+    }
+
+    // Create vertex shader
+    hr = g_pD3D9Device->CreateVertexShader(
+        (DWORD*)vsBlob->GetBufferPointer(),
+        &g_vertexShader);
+
+    if (FAILED(hr))
+    {
+        LOGERR("Failed to create vertex shader (error: 0x%08x)", hr);
+        vsBlob->Release();
+        psBlob->Release();
+        return hr;
+    }
+
+    // Create pixel shader
+    hr = g_pD3D9Device->CreatePixelShader(
+        (DWORD*)psBlob->GetBufferPointer(),
+        &g_pixelShader);
+
+    if (FAILED(hr))
+    {
+        LOGERR("Failed to create pixel shader (error: 0x%08x)", hr);
+        g_vertexShader->Release();
+        g_vertexShader = NULL;
+        vsBlob->Release();
+        psBlob->Release();
+        return hr;
+    }
+
+    vsBlob->Release();
+    psBlob->Release();
+
+    // Create vertex declaration for programmable vertex shader
+    D3DVERTEXELEMENT9 vertexElements[] = {
+        { 0, 0,  D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },
+        { 0, 12, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0 },
+        D3DDECL_END()
+    };
+
+    hr = g_pD3D9Device->CreateVertexDeclaration(vertexElements, &g_vertexDeclaration);
+    if (FAILED(hr))
+    {
+        LOGERR("Failed to create vertex declaration (error: 0x%08x)", hr);
+        g_vertexShader->Release();
+        g_vertexShader = NULL;
+        g_pixelShader->Release();
+        g_pixelShader = NULL;
+        return hr;
+    }
+
+    LOG("Shaders compiled and created successfully");
+    return S_OK;
+}
+
 HRESULT InitFrameBlending()
 {
     HRESULT hr = S_OK;
@@ -308,42 +497,161 @@ HRESULT InitFrameBlending()
         g_frameHistory[i].surface = NULL;
         g_frameHistory[i].valid = false;
         g_frameHistory[i].timestamp.QuadPart = 0;
+        g_frameTextures[i] = NULL;
     }
 
-    // Create capture target surface (where NvFBC will write)
-    hr = g_pD3D9Device->CreateOffscreenPlainSurface(
-        BUF_WIDTH, BUF_HEIGHT,
-        D3DFMT_A2B10G10R10,
-        D3DPOOL_DEFAULT,
-        &g_captureTarget,
-        NULL);
-
-    if (FAILED(hr))
+    // Try to create shaders first
+    hr = CompileAndCreateShaders();
+    if (SUCCEEDED(hr))
     {
-        LOGERR("Failed to create capture target surface (error: 0x%08x)", hr);
-        return hr;
-    }
+        g_shaderInterpolationAvailable = true;
+        LOG("Shader interpolation enabled");
 
-    // Create frame history surfaces
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++)
-    {
-        hr = g_pD3D9Device->CreateOffscreenPlainSurface(
+        // Create capture texture (where NvFBC will write)
+        hr = g_pD3D9Device->CreateTexture(
             BUF_WIDTH, BUF_HEIGHT,
+            1,  // mip levels
+            D3DUSAGE_RENDERTARGET,
             D3DFMT_A2B10G10R10,
             D3DPOOL_DEFAULT,
-            &g_frameHistory[i].surface,
+            &g_captureTexture,
             NULL);
 
         if (FAILED(hr))
         {
-            LOGERR("Failed to create frame history surface %d (error: 0x%08x)", i, hr);
+            LOGERR("Failed to create capture texture (error: 0x%08x), falling back to surface mode", hr);
+            g_shaderInterpolationAvailable = false;
+        }
+        else
+        {
+            // Get surface from texture for NvFBC to write to
+            hr = g_captureTexture->GetSurfaceLevel(0, &g_captureTarget);
+            if (FAILED(hr))
+            {
+                LOGERR("Failed to get surface from capture texture (error: 0x%08x)", hr);
+                g_captureTexture->Release();
+                g_captureTexture = NULL;
+                g_shaderInterpolationAvailable = false;
+            }
+        }
+
+        // Create frame history textures
+        if (g_shaderInterpolationAvailable)
+        {
+            for (int i = 0; i < FRAME_HISTORY_SIZE; i++)
+            {
+                hr = g_pD3D9Device->CreateTexture(
+                    BUF_WIDTH, BUF_HEIGHT,
+                    1,  // mip levels
+                    D3DUSAGE_RENDERTARGET,
+                    D3DFMT_A2B10G10R10,
+                    D3DPOOL_DEFAULT,
+                    &g_frameTextures[i],
+                    NULL);
+
+                if (FAILED(hr))
+                {
+                    LOGERR("Failed to create frame texture %d (error: 0x%08x), falling back", i, hr);
+                    // Clean up any textures we created
+                    for (int j = 0; j < i; j++)
+                    {
+                        if (g_frameTextures[j])
+                        {
+                            g_frameTextures[j]->Release();
+                            g_frameTextures[j] = NULL;
+                        }
+                    }
+                    if (g_captureTarget)
+                    {
+                        g_captureTarget->Release();
+                        g_captureTarget = NULL;
+                    }
+                    if (g_captureTexture)
+                    {
+                        g_captureTexture->Release();
+                        g_captureTexture = NULL;
+                    }
+                    g_shaderInterpolationAvailable = false;
+                    break;
+                }
+
+                // Get surface level for StretchRect operations
+                hr = g_frameTextures[i]->GetSurfaceLevel(0, &g_frameHistory[i].surface);
+                if (FAILED(hr))
+                {
+                    LOGERR("Failed to get surface from frame texture %d (error: 0x%08x)", i, hr);
+                    // Continue with cleanup as above
+                    for (int j = 0; j <= i; j++)
+                    {
+                        if (g_frameTextures[j])
+                        {
+                            g_frameTextures[j]->Release();
+                            g_frameTextures[j] = NULL;
+                        }
+                    }
+                    if (g_captureTarget)
+                    {
+                        g_captureTarget->Release();
+                        g_captureTarget = NULL;
+                    }
+                    if (g_captureTexture)
+                    {
+                        g_captureTexture->Release();
+                        g_captureTexture = NULL;
+                    }
+                    g_shaderInterpolationAvailable = false;
+                    break;
+                }
+            }
+        }
+    }
+    else
+    {
+        LOG("Shader compilation failed, using fallback mode");
+        g_shaderInterpolationAvailable = false;
+    }
+
+    // Fallback: create plain surfaces if shader path failed
+    if (!g_shaderInterpolationAvailable)
+    {
+        LOG("Initializing fallback surface-based blending");
+
+        // Create capture target surface (where NvFBC will write)
+        hr = g_pD3D9Device->CreateOffscreenPlainSurface(
+            BUF_WIDTH, BUF_HEIGHT,
+            D3DFMT_A2B10G10R10,
+            D3DPOOL_DEFAULT,
+            &g_captureTarget,
+            NULL);
+
+        if (FAILED(hr))
+        {
+            LOGERR("Failed to create capture target surface (error: 0x%08x)", hr);
             return hr;
+        }
+
+        // Create frame history surfaces
+        for (int i = 0; i < FRAME_HISTORY_SIZE; i++)
+        {
+            hr = g_pD3D9Device->CreateOffscreenPlainSurface(
+                BUF_WIDTH, BUF_HEIGHT,
+                D3DFMT_A2B10G10R10,
+                D3DPOOL_DEFAULT,
+                &g_frameHistory[i].surface,
+                NULL);
+
+            if (FAILED(hr))
+            {
+                LOGERR("Failed to create frame history surface %d (error: 0x%08x)", i, hr);
+                return hr;
+            }
         }
     }
 
     QueryPerformanceFrequency(&g_perfFreq);
 
-    LOG("Frame blending initialized (history size: %d)", FRAME_HISTORY_SIZE);
+    LOG("Frame blending initialized (shader mode: %s, history size: %d)",
+        g_shaderInterpolationAvailable ? "enabled" : "fallback", FRAME_HISTORY_SIZE);
     return S_OK;
 }
 
@@ -373,35 +681,117 @@ void BlendFramesToBackbuffer(LARGE_INTEGER targetTime)
         }
     }
 
-    // If we have frames to blend
-    if (bestBefore >= 0 && bestAfter >= 0)
+    RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
+
+    // If we have frames to blend and shader interpolation is available
+    if (bestBefore >= 0 && bestAfter >= 0 && g_shaderInterpolationAvailable)
     {
         // Calculate blend weight (0.0 = use before frame, 1.0 = use after frame)
-        double totalDiff = (double)(g_frameHistory[bestAfter].timestamp.QuadPart - g_frameHistory[bestBefore].timestamp.QuadPart);
-        double weight = totalDiff > 0 ? (double)smallestBeforeDiff / totalDiff : 0.5;
+        double totalDiff = (double)(g_frameHistory[bestAfter].timestamp.QuadPart -
+                                    g_frameHistory[bestBefore].timestamp.QuadPart);
+        float weight = totalDiff > 0 ? (float)((double)smallestBeforeDiff / totalDiff) : 0.5f;
 
-        // For D3D9 without pixel shaders, we'll use a simple approach:
-        // Blit first frame at reduced alpha, then second frame on top
-        // This creates a blended effect
+        // Set up rendering state
+        g_pD3D9Device->SetRenderTarget(0, g_backbuffer);
 
-        RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
+        // Set textures
+        g_pD3D9Device->SetTexture(0, g_frameTextures[bestBefore]);
+        g_pD3D9Device->SetTexture(1, g_frameTextures[bestAfter]);
 
-        // Copy "before" frame to backbuffer
+        // Configure texture sampling (linear filtering for quality)
+        g_pD3D9Device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        g_pD3D9Device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        g_pD3D9Device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        g_pD3D9Device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+        g_pD3D9Device->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        g_pD3D9Device->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        g_pD3D9Device->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        g_pD3D9Device->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+        // Set shaders
+        g_pD3D9Device->SetVertexShader(g_vertexShader);
+        g_pD3D9Device->SetPixelShader(g_pixelShader);
+
+        // Set blend weight constant
+        float constants[4] = { weight, 0.0f, 0.0f, 0.0f };
+        g_pD3D9Device->SetPixelShaderConstantF(0, constants, 1);
+
+        // Set render states for proper blending
+        g_pD3D9Device->SetRenderState(D3DRS_ZENABLE, FALSE);
+        g_pD3D9Device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        g_pD3D9Device->SetRenderState(D3DRS_LIGHTING, FALSE);
+
+        // Create fullscreen quad vertices
+        // D3D9 screen space: (-1,-1) is bottom-left, (1,1) is top-right
+        // UV space: (0,0) is top-left, (1,1) is bottom-right
+        QuadVertex vertices[6] = {
+            // Triangle 1
+            { -1.0f,  1.0f, 0.5f,  0.0f, 0.0f },  // Top-left
+            {  1.0f,  1.0f, 0.5f,  1.0f, 0.0f },  // Top-right
+            { -1.0f, -1.0f, 0.5f,  0.0f, 1.0f },  // Bottom-left
+
+            // Triangle 2
+            {  1.0f,  1.0f, 0.5f,  1.0f, 0.0f },  // Top-right
+            {  1.0f, -1.0f, 0.5f,  1.0f, 1.0f },  // Bottom-right
+            { -1.0f, -1.0f, 0.5f,  0.0f, 1.0f },  // Bottom-left
+        };
+
+        // Set vertex declaration for programmable shader
+        g_pD3D9Device->SetVertexDeclaration(g_vertexDeclaration);
+
+        // Begin scene for rendering
+        HRESULT hr = g_pD3D9Device->BeginScene();
+        if (SUCCEEDED(hr))
+        {
+            // Draw the quad
+            hr = g_pD3D9Device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 2, vertices, sizeof(QuadVertex));
+
+            g_pD3D9Device->EndScene();
+
+            if (FAILED(hr))
+            {
+                LOGERR("DrawPrimitiveUP failed (error: 0x%08x), falling back to StretchRect", hr);
+                // Fallback to simple copy
+                g_pD3D9Device->StretchRect(
+                    g_frameHistory[bestBefore].surface,
+                    &srcRect,
+                    g_backbuffer,
+                    &srcRect,
+                    D3DTEXF_NONE);
+            }
+        }
+        else
+        {
+            LOGERR("BeginScene failed (error: 0x%08x), falling back to StretchRect", hr);
+            // Fallback to simple copy
+            g_pD3D9Device->StretchRect(
+                g_frameHistory[bestBefore].surface,
+                &srcRect,
+                g_backbuffer,
+                &srcRect,
+                D3DTEXF_NONE);
+        }
+
+        // Clean up state
+        g_pD3D9Device->SetVertexShader(NULL);
+        g_pD3D9Device->SetPixelShader(NULL);
+        g_pD3D9Device->SetTexture(0, NULL);
+        g_pD3D9Device->SetTexture(1, NULL);
+    }
+    else if (bestBefore >= 0 && bestAfter >= 0 && !g_shaderInterpolationAvailable)
+    {
+        // Fallback mode: just use nearest neighbor (before frame)
         g_pD3D9Device->StretchRect(
             g_frameHistory[bestBefore].surface,
             &srcRect,
             g_backbuffer,
             &srcRect,
             D3DTEXF_NONE);
-
-        // Note: True alpha blending would require render target + textures + pixel shader
-        // For now, we'll just use the closest frame (simple nearest-neighbor selection)
-        // A full implementation would need a more complex setup
     }
     else if (bestBefore >= 0)
     {
         // Only have a "before" frame, use it
-        RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
         g_pD3D9Device->StretchRect(
             g_frameHistory[bestBefore].surface,
             &srcRect,
@@ -412,7 +802,6 @@ void BlendFramesToBackbuffer(LARGE_INTEGER targetTime)
     else if (bestAfter >= 0)
     {
         // Only have an "after" frame, use it
-        RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
         g_pD3D9Device->StretchRect(
             g_frameHistory[bestAfter].surface,
             &srcRect,
