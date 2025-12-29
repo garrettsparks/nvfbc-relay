@@ -93,6 +93,7 @@ IDirect3DTexture9* g_captureTexture = NULL;
 IDirect3DVertexShader9* g_vertexShader = NULL;
 IDirect3DPixelShader9* g_pixelShader = NULL;
 IDirect3DVertexDeclaration9* g_vertexDeclaration = NULL;
+IDirect3DVertexBuffer9* g_quadVertexBuffer = NULL;
 bool g_shaderInterpolationAvailable = false;
 
 struct QuadVertex {
@@ -137,6 +138,12 @@ void Cleanup()
     {
         g_vertexDeclaration->Release();
         g_vertexDeclaration = NULL;
+    }
+
+    if (g_quadVertexBuffer)
+    {
+        g_quadVertexBuffer->Release();
+        g_quadVertexBuffer = NULL;
     }
 
     // Release frame textures
@@ -483,6 +490,60 @@ HRESULT CompileAndCreateShaders()
         return hr;
     }
 
+    // Create vertex buffer for fullscreen quad (eliminates per-frame DrawPrimitiveUP overhead)
+    hr = g_pD3D9Device->CreateVertexBuffer(
+        6 * sizeof(QuadVertex),  // 6 vertices (2 triangles)
+        D3DUSAGE_WRITEONLY,
+        0,  // FVF not used (we have vertex declaration)
+        D3DPOOL_DEFAULT,
+        &g_quadVertexBuffer,
+        NULL);
+
+    if (FAILED(hr))
+    {
+        LOGERR("Failed to create vertex buffer (error: 0x%08x)", hr);
+        g_vertexDeclaration->Release();
+        g_vertexDeclaration = NULL;
+        g_vertexShader->Release();
+        g_vertexShader = NULL;
+        g_pixelShader->Release();
+        g_pixelShader = NULL;
+        return hr;
+    }
+
+    // Fill vertex buffer with fullscreen quad data
+    // D3D9 screen space: (-1,-1) is bottom-left, (1,1) is top-right
+    // UV space: (0,0) is top-left, (1,1) is bottom-right
+    QuadVertex* pVertices = NULL;
+    hr = g_quadVertexBuffer->Lock(0, 0, (void**)&pVertices, 0);
+    if (SUCCEEDED(hr))
+    {
+        // Triangle 1
+        pVertices[0] = { -1.0f,  1.0f, 0.5f,  0.0f, 0.0f };  // Top-left
+        pVertices[1] = {  1.0f,  1.0f, 0.5f,  1.0f, 0.0f };  // Top-right
+        pVertices[2] = { -1.0f, -1.0f, 0.5f,  0.0f, 1.0f };  // Bottom-left
+
+        // Triangle 2
+        pVertices[3] = {  1.0f,  1.0f, 0.5f,  1.0f, 0.0f };  // Top-right
+        pVertices[4] = {  1.0f, -1.0f, 0.5f,  1.0f, 1.0f };  // Bottom-right
+        pVertices[5] = { -1.0f, -1.0f, 0.5f,  0.0f, 1.0f };  // Bottom-left
+
+        g_quadVertexBuffer->Unlock();
+    }
+    else
+    {
+        LOGERR("Failed to lock vertex buffer (error: 0x%08x)", hr);
+        g_quadVertexBuffer->Release();
+        g_quadVertexBuffer = NULL;
+        g_vertexDeclaration->Release();
+        g_vertexDeclaration = NULL;
+        g_vertexShader->Release();
+        g_vertexShader = NULL;
+        g_pixelShader->Release();
+        g_pixelShader = NULL;
+        return hr;
+    }
+
     LOG("Shaders compiled and created successfully");
     return S_OK;
 }
@@ -722,36 +783,22 @@ void BlendFramesToBackbuffer(LARGE_INTEGER targetTime)
         g_pD3D9Device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
         g_pD3D9Device->SetRenderState(D3DRS_LIGHTING, FALSE);
 
-        // Create fullscreen quad vertices
-        // D3D9 screen space: (-1,-1) is bottom-left, (1,1) is top-right
-        // UV space: (0,0) is top-left, (1,1) is bottom-right
-        QuadVertex vertices[6] = {
-            // Triangle 1
-            { -1.0f,  1.0f, 0.5f,  0.0f, 0.0f },  // Top-left
-            {  1.0f,  1.0f, 0.5f,  1.0f, 0.0f },  // Top-right
-            { -1.0f, -1.0f, 0.5f,  0.0f, 1.0f },  // Bottom-left
-
-            // Triangle 2
-            {  1.0f,  1.0f, 0.5f,  1.0f, 0.0f },  // Top-right
-            {  1.0f, -1.0f, 0.5f,  1.0f, 1.0f },  // Bottom-right
-            { -1.0f, -1.0f, 0.5f,  0.0f, 1.0f },  // Bottom-left
-        };
-
-        // Set vertex declaration for programmable shader
+        // Set vertex declaration and stream source
         g_pD3D9Device->SetVertexDeclaration(g_vertexDeclaration);
+        g_pD3D9Device->SetStreamSource(0, g_quadVertexBuffer, 0, sizeof(QuadVertex));
 
         // Begin scene for rendering
         HRESULT hr = g_pD3D9Device->BeginScene();
         if (SUCCEEDED(hr))
         {
-            // Draw the quad
-            hr = g_pD3D9Device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 2, vertices, sizeof(QuadVertex));
+            // Draw the quad from vertex buffer
+            hr = g_pD3D9Device->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 2);
 
             g_pD3D9Device->EndScene();
 
             if (FAILED(hr))
             {
-                LOGERR("DrawPrimitiveUP failed (error: 0x%08x), falling back to StretchRect", hr);
+                LOGERR("DrawPrimitive failed (error: 0x%08x), falling back to StretchRect", hr);
                 // Fallback to simple copy
                 g_pD3D9Device->StretchRect(
                     g_frameHistory[bestBefore].surface,
