@@ -636,33 +636,34 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         fbcDX9GrabParams.pNvFBCFrameGrabInfo = &frameGrabInfo;
     }
 
-    li.QuadPart = -(10000000 / framerate);
-    timer = CreateWaitableTimer(NULL, TRUE, NULL);
-
-    if (NULL == timer)
-    {
-        LOGERR("CreateWaitableTimer failed (error: %d)", GetLastError());
-        return 1;
-    }
-
-    LOG("Entering capture loop");
+    LOG("Entering capture loop (NOWAIT polling, VSync-driven presentation)");
+    LOG("VSync will control frame timing - target monitor refresh rate determines output FPS");
 
     while (TRUE)
     {
-
-        SetWaitableTimer(timer, &li, 0, NULL, NULL, FALSE);
+        // Poll for latest frame (never blocks - always gets most recent frame available)
         fbcRes = NvFBCDX9->NvFBCToDx9VidGrabFrame(&fbcDX9GrabParams);
-        g_pD3D9Device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE); //D3DPRESENT_FORCEIMMEDIATE //D3DPRESENT_INTERVAL_IMMEDIATE
+
+        if (fbcRes == NVFBC_ERROR_INVALIDATED_SESSION)
+        {
+            LOGERR("NvFBC session invalidated - session needs to be recreated");
+            break;
+        }
+        // Ignore other errors (e.g., no new frame) - we'll just present what we have
+
+        // Present and wait for VSync - this blocks until monitor refresh
+        // This synchronizes our output with the actual display hardware
+        g_pD3D9Device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_ONE);
+
+        // Process Windows messages
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
         {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
+
         if (msg.message == WM_QUIT)
             break;
-
-        WaitForSingleObject(timer, INFINITE);
-
     }
 
     Cleanup();
