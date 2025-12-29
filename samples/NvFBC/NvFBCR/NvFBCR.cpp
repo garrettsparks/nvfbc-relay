@@ -796,9 +796,9 @@ void BlendFramesToBackbuffer(LARGE_INTEGER targetTime)
     if (bestBefore >= 0 && bestAfter >= 0 && g_shaderInterpolationAvailable)
     {
         // Calculate blend weight (0.0 = use before frame, 1.0 = use after frame)
-        double totalDiff = (double)(g_frameHistory[bestAfter].timestamp.QuadPart -
-                                    g_frameHistory[bestBefore].timestamp.QuadPart);
-        float weight = totalDiff > 0 ? (float)((double)smallestBeforeDiff / totalDiff) : 0.5f;
+        LONGLONG totalDiff = g_frameHistory[bestAfter].timestamp.QuadPart -
+                             g_frameHistory[bestBefore].timestamp.QuadPart;
+        float weight = totalDiff > 0 ? (float)smallestBeforeDiff / (float)totalDiff : 0.5f;
 
         // Early-out: if blend weight is very close to 0 or 1, skip GPU blending
         // and just copy the dominant frame directly (much faster)
