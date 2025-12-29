@@ -57,6 +57,23 @@ using namespace std;
 
 #define _CRT_SECURE_NO_WARNINGS  1
 
+// ============================================================================
+// Capture Mode Interface - Clean abstraction for different capture strategies
+// ============================================================================
+
+class ICaptureMode {
+public:
+    virtual ~ICaptureMode() {}
+
+    virtual HRESULT Initialize() = 0;
+    virtual IDirect3DSurface9* GetCaptureTarget() = 0;
+    virtual void OnFrameCaptured(LARGE_INTEGER captureTime) = 0;
+    virtual void PreparePresent(LARGE_INTEGER presentTime) = 0;
+    virtual UINT GetPresentInterval() = 0;
+    virtual bool ShouldPresentThisFrame() = 0;
+    virtual void Cleanup() = 0;
+};
+
 
 // DirectX resources
 IDirect3D9Ex        *g_pD3DEx = NULL;
@@ -77,12 +94,12 @@ int framerate = 60;
 
 // Capture mode configuration
 enum CaptureMode {
-    CAPTURE_MODE_DIRECT = 0,    // Timer-based, immediate present, NvFBC -> backbuffer
-    CAPTURE_MODE_VSYNC = 1,     // Display-synced, D3DPRESENT_INTERVAL_ONE
-    CAPTURE_MODE_BLENDING = 2   // Shader-based temporal interpolation
+    CAPTURE_MODE_DIRECT = 0,     // DirectCaptureMode - timer-based
+    CAPTURE_MODE_VSYNC = 1,      // VsyncCaptureMode - display-synced
+    CAPTURE_MODE_BLENDING = 2    // BlendingCaptureMode - shader interpolation
 };
 
-#define ACTIVE_CAPTURE_MODE CAPTURE_MODE_BLENDING
+const CaptureMode ACTIVE_CAPTURE_MODE = CAPTURE_MODE_BLENDING;
 
 // Frame blending resources (only used in CAPTURE_MODE_BLENDING)
 #define FRAME_HISTORY_SIZE 2  // Reduced from 3 for better performance
@@ -917,6 +934,155 @@ void BlendFramesToBackbuffer(LARGE_INTEGER targetTime)
     // If no valid frames, backbuffer will just show whatever was there before
 }
 
+// ============================================================================
+// Capture Mode Implementations
+// ============================================================================
+
+// Mode 0: Direct - Original timer-based immediate present
+class DirectCaptureMode : public ICaptureMode {
+private:
+    LARGE_INTEGER m_nextPresentTime;
+
+public:
+    HRESULT Initialize() override {
+        QueryPerformanceCounter(&m_nextPresentTime);
+        return S_OK;
+    }
+
+    IDirect3DSurface9* GetCaptureTarget() override {
+        return g_backbuffer;  // NvFBC writes directly to backbuffer
+    }
+
+    void OnFrameCaptured(LARGE_INTEGER captureTime) override {
+        // No-op: frame already in backbuffer
+    }
+
+    void PreparePresent(LARGE_INTEGER presentTime) override {
+        // No-op: no blending needed
+    }
+
+    UINT GetPresentInterval() override {
+        return D3DPRESENT_INTERVAL_IMMEDIATE;
+    }
+
+    bool ShouldPresentThisFrame() override {
+        LARGE_INTEGER currentTime;
+        QueryPerformanceCounter(&currentTime);
+
+        if (currentTime.QuadPart >= m_nextPresentTime.QuadPart) {
+            m_nextPresentTime.QuadPart += (g_perfFreq.QuadPart / framerate);
+            if (m_nextPresentTime.QuadPart < currentTime.QuadPart) {
+                m_nextPresentTime = currentTime;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void Cleanup() override {
+        // No resources
+    }
+};
+
+// Mode 1: Vsync - Display-synced presentation
+class VsyncCaptureMode : public ICaptureMode {
+public:
+    HRESULT Initialize() override {
+        return S_OK;
+    }
+
+    IDirect3DSurface9* GetCaptureTarget() override {
+        return g_backbuffer;
+    }
+
+    void OnFrameCaptured(LARGE_INTEGER captureTime) override {
+        // No-op
+    }
+
+    void PreparePresent(LARGE_INTEGER presentTime) override {
+        // No-op
+    }
+
+    UINT GetPresentInterval() override {
+        return D3DPRESENT_INTERVAL_ONE;  // Vsync
+    }
+
+    bool ShouldPresentThisFrame() override {
+        return true;  // Always present, let vsync control timing
+    }
+
+    void Cleanup() override {
+        // No resources
+    }
+};
+
+// Mode 2: Blending - Shader-based temporal interpolation
+class BlendingCaptureMode : public ICaptureMode {
+private:
+    LARGE_INTEGER m_nextPresentTime;
+    LONGLONG m_ticksPerFrame;
+
+public:
+    HRESULT Initialize() override {
+        HRESULT hr = InitFrameBlending();  // Calls existing global function
+        if (SUCCEEDED(hr)) {
+            QueryPerformanceCounter(&m_nextPresentTime);
+            m_ticksPerFrame = g_perfFreq.QuadPart / framerate;
+        }
+        return hr;
+    }
+
+    IDirect3DSurface9* GetCaptureTarget() override {
+        return g_captureTarget;  // NvFBC writes to intermediate surface
+    }
+
+    void OnFrameCaptured(LARGE_INTEGER captureTime) override {
+        // Copy captured frame to history (existing logic from main loop)
+        LONGLONG timeUntilPresent = m_nextPresentTime.QuadPart - captureTime.QuadPart;
+
+        // Only store if close to present time (within 2 frame periods)
+        if (timeUntilPresent < (m_ticksPerFrame * 2)) {
+            RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
+            g_pD3D9Device->StretchRect(
+                g_captureTarget,
+                &srcRect,
+                g_frameHistory[g_currentHistoryIndex].surface,
+                &srcRect,
+                D3DTEXF_NONE);
+
+            g_frameHistory[g_currentHistoryIndex].timestamp = captureTime;
+            g_frameHistory[g_currentHistoryIndex].valid = true;
+            g_currentHistoryIndex = (g_currentHistoryIndex + 1) % FRAME_HISTORY_SIZE;
+        }
+    }
+
+    void PreparePresent(LARGE_INTEGER presentTime) override {
+        BlendFramesToBackbuffer(presentTime);  // Calls existing global function
+    }
+
+    UINT GetPresentInterval() override {
+        return D3DPRESENT_INTERVAL_IMMEDIATE;
+    }
+
+    bool ShouldPresentThisFrame() override {
+        LARGE_INTEGER currentTime;
+        QueryPerformanceCounter(&currentTime);
+
+        if (currentTime.QuadPart >= m_nextPresentTime.QuadPart) {
+            m_nextPresentTime.QuadPart += m_ticksPerFrame;
+            if (m_nextPresentTime.QuadPart < currentTime.QuadPart) {
+                m_nextPresentTime = currentTime;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void Cleanup() override {
+        // Cleanup handled by global Cleanup() function
+    }
+};
+
 // this is the main message handler for the program
 LRESULT CALLBACK WindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
@@ -1152,23 +1318,29 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         return -1;
     }
 
-    // Initialize mode-specific resources
+    // Create and initialize capture mode
+    ICaptureMode* captureMode = nullptr;
     switch (ACTIVE_CAPTURE_MODE) {
         case CAPTURE_MODE_DIRECT:
             LOG("Capture mode: Direct (timer-based, immediate present)");
+            captureMode = new DirectCaptureMode();
             break;
         case CAPTURE_MODE_VSYNC:
             LOG("Capture mode: Vsync (display-synced)");
+            captureMode = new VsyncCaptureMode();
             break;
         case CAPTURE_MODE_BLENDING:
             LOG("Capture mode: Blending (shader interpolation)");
-            if (!SUCCEEDED(InitFrameBlending()))
-            {
-                LOGERR("Unable to initialize frame blending");
-                Cleanup();
-                return -1;
-            }
+            captureMode = new BlendingCaptureMode();
             break;
+    }
+
+    if (!captureMode || !SUCCEEDED(captureMode->Initialize()))
+    {
+        LOGERR("Unable to initialize capture mode");
+        if (captureMode) delete captureMode;
+        Cleanup();
+        return -1;
     }
 
     //! Create an instance of the NvFBCDX9 class, the first argument specifies the frame buffer
@@ -1268,18 +1440,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 
     LOG("NvFBCToDX9Vid instance created successfully");
 
-    // Set NvFBC capture target based on mode
-    switch (ACTIVE_CAPTURE_MODE) {
-        case CAPTURE_MODE_DIRECT:
-        case CAPTURE_MODE_VSYNC:
-            // Direct modes: NvFBC writes directly to backbuffer
-            NvFBC_OutBuf[0].pPrimary = g_backbuffer;
-            break;
-        case CAPTURE_MODE_BLENDING:
-            // Blending mode: NvFBC writes to intermediate surface
-            NvFBC_OutBuf[0].pPrimary = g_captureTarget;
-            break;
-    }
+    // Set NvFBC capture target from mode
+    NvFBC_OutBuf[0].pPrimary = captureMode->GetCaptureTarget();
 
     NVFBC_TODX9VID_SETUP_PARAMS DX9SetupParams = {};
     DX9SetupParams.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
@@ -1315,26 +1477,10 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 
     LOG("Entering capture loop");
 
-    LARGE_INTEGER nextPresentTime, currentTime;
-    QueryPerformanceCounter(&nextPresentTime);
-    LONGLONG ticksPerFrame = g_perfFreq.QuadPart / framerate;
+    LARGE_INTEGER currentTime;
 
     while (TRUE)
     {
-        QueryPerformanceCounter(&currentTime);
-
-        // Calculate time until next present
-        LONGLONG timeUntilPresent = nextPresentTime.QuadPart - currentTime.QuadPart;
-        DWORD msUntilPresent = timeUntilPresent > 0 ?
-            (DWORD)((timeUntilPresent * 1000) / g_perfFreq.QuadPart) : 0;
-
-        // Smart sleep: if we're far from present time, sleep most of it
-        if (msUntilPresent > 5)
-        {
-            Sleep(msUntilPresent - 4);  // Wake up 4ms before present time
-            continue;  // Skip frame capture, just loop back to check timing
-        }
-
         // Poll for latest frame (NOWAIT - never blocks)
         fbcRes = NvFBCDX9->NvFBCToDx9VidGrabFrame(&fbcDX9GrabParams);
 
@@ -1344,83 +1490,17 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
             break;
         }
 
-        // Handle successful frame capture based on mode
+        // Handle successful frame capture
         if (fbcRes == NVFBC_SUCCESS) {
-            switch (ACTIVE_CAPTURE_MODE) {
-                case CAPTURE_MODE_BLENDING:
-                    // Only store frame if we're close to present time (within 2 frame periods)
-                    // This reduces copies from ~224/sec to ~120/sec
-                    if (timeUntilPresent < (ticksPerFrame * 2))
-                    {
-                        QueryPerformanceCounter(&currentTime);
-
-                        // Copy captured frame to current history slot
-                        RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
-                        g_pD3D9Device->StretchRect(
-                            g_captureTarget,
-                            &srcRect,
-                            g_frameHistory[g_currentHistoryIndex].surface,
-                            &srcRect,
-                            D3DTEXF_NONE);
-
-                        // Update timestamp and mark valid
-                        g_frameHistory[g_currentHistoryIndex].timestamp = currentTime;
-                        g_frameHistory[g_currentHistoryIndex].valid = true;
-
-                        // Advance to next slot
-                        g_currentHistoryIndex = (g_currentHistoryIndex + 1) % FRAME_HISTORY_SIZE;
-                    }
-                    break;
-                case CAPTURE_MODE_DIRECT:
-                case CAPTURE_MODE_VSYNC:
-                    // Direct modes: frame is already in backbuffer, nothing to do
-                    break;
-            }
+            QueryPerformanceCounter(&currentTime);
+            captureMode->OnFrameCaptured(currentTime);
         }
 
-        // Render and present based on mode
+        // Check if it's time to present
         QueryPerformanceCounter(&currentTime);
-        bool shouldPresent = false;
-
-        switch (ACTIVE_CAPTURE_MODE) {
-            case CAPTURE_MODE_DIRECT:
-                // Timer-based presentation - check if it's time
-                if (currentTime.QuadPart >= nextPresentTime.QuadPart) {
-                    shouldPresent = true;
-                    nextPresentTime.QuadPart += (g_perfFreq.QuadPart / framerate);
-                    if (nextPresentTime.QuadPart < currentTime.QuadPart) {
-                        nextPresentTime = currentTime;
-                    }
-                }
-                break;
-
-            case CAPTURE_MODE_VSYNC:
-                // Always present immediately (display handles sync)
-                shouldPresent = true;
-                break;
-
-            case CAPTURE_MODE_BLENDING:
-                // Smart polling - check if it's time to present
-                if (currentTime.QuadPart >= nextPresentTime.QuadPart) {
-                    // Blend frames from history to backbuffer based on target present time
-                    BlendFramesToBackbuffer(nextPresentTime);
-                    shouldPresent = true;
-
-                    // Schedule next present
-                    nextPresentTime.QuadPart += ticksPerFrame;
-
-                    // Prevent falling too far behind
-                    if (nextPresentTime.QuadPart < currentTime.QuadPart) {
-                        nextPresentTime = currentTime;
-                    }
-                }
-                break;
-        }
-
-        if (shouldPresent) {
-            UINT presentInterval = (ACTIVE_CAPTURE_MODE == CAPTURE_MODE_VSYNC) ?
-                D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
-            g_pD3D9Device->PresentEx(NULL, NULL, NULL, NULL, presentInterval);
+        if (captureMode->ShouldPresentThisFrame()) {
+            captureMode->PreparePresent(currentTime);
+            g_pD3D9Device->PresentEx(NULL, NULL, NULL, NULL, captureMode->GetPresentInterval());
         }
 
         // Process Windows messages
@@ -1432,6 +1512,12 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 
         if (msg.message == WM_QUIT)
             break;
+    }
+
+    // Cleanup capture mode
+    if (captureMode) {
+        captureMode->Cleanup();
+        delete captureMode;
     }
 
     Cleanup();
