@@ -57,6 +57,197 @@ using namespace std;
 #define _CRT_SECURE_NO_WARNINGS  1
 
 
+// ===============================================
+// Frame Capture Mode Interface and Implementations
+// ===============================================
+
+// Abstract interface for frame capture modes
+class IFrameCaptureMode {
+public:
+    virtual ~IFrameCaptureMode() {}
+
+    // Get the D3DPRESENT_INTERVAL value for device creation
+    virtual UINT GetPresentationInterval() const = 0;
+
+    // Setup mode-specific resources
+    virtual bool Setup() = 0;
+
+    // Run the entire capture loop (including message processing)
+    virtual void Run(
+        NvFBCToDx9Vid* nvfbcDx9,
+        NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
+        IDirect3DDevice9Ex* device,
+        HWND hwnd) = 0;
+
+    // Get descriptive name for logging
+    virtual const char* GetModeName() const = 0;
+};
+
+// VSync-driven capture mode
+class VsyncCaptureMode : public IFrameCaptureMode {
+public:
+    VsyncCaptureMode() {}
+    virtual ~VsyncCaptureMode() {}
+
+    virtual UINT GetPresentationInterval() const override {
+        return D3DPRESENT_INTERVAL_ONE;
+    }
+
+    virtual bool Setup() override {
+        LOG("VSync mode initialized - VSync will control frame timing");
+        LOG("Output FPS will match target monitor's refresh rate");
+        return true;
+    }
+
+    virtual void Run(
+        NvFBCToDx9Vid* nvfbcDx9,
+        NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
+        IDirect3DDevice9Ex* device,
+        HWND hwnd) override
+    {
+        MSG msg;
+
+        while (TRUE)
+        {
+            // Poll for latest frame (never blocks - always gets most recent frame available)
+            NVFBCRESULT fbcRes = nvfbcDx9->NvFBCToDx9VidGrabFrame(grabParams);
+
+            if (fbcRes == NVFBC_ERROR_INVALIDATED_SESSION)
+            {
+                LOGERR("NvFBC session invalidated - session needs to be recreated");
+                break;
+            }
+            // Ignore other errors (e.g., no new frame) - we'll just present what we have
+
+            // Present and wait for VSync - this blocks until monitor refresh
+            // This synchronizes our output with the actual display hardware
+            device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_ONE);
+
+            // Process Windows messages
+            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+
+            if (msg.message == WM_QUIT)
+                break;
+        }
+    }
+
+    virtual const char* GetModeName() const override {
+        return "VSync";
+    }
+};
+
+// Timer-driven capture mode
+class TimerCaptureMode : public IFrameCaptureMode {
+private:
+    HANDLE m_timer;
+    LARGE_INTEGER m_interval;
+    int m_framerate;
+
+public:
+    TimerCaptureMode(int framerate)
+        : m_timer(NULL)
+        , m_framerate(framerate)
+    {
+        m_interval.QuadPart = -(10000000 / framerate);
+    }
+
+    virtual ~TimerCaptureMode() {
+        if (m_timer) {
+            CloseHandle(m_timer);
+            m_timer = NULL;
+        }
+    }
+
+    virtual UINT GetPresentationInterval() const override {
+        return D3DPRESENT_INTERVAL_IMMEDIATE;
+    }
+
+    virtual bool Setup() override {
+        m_timer = CreateWaitableTimer(NULL, TRUE, NULL);
+
+        if (NULL == m_timer) {
+            LOGERR("CreateWaitableTimer failed (error: %d)", GetLastError());
+            return false;
+        }
+
+        LOG("Timer mode initialized - target framerate: %d fps", m_framerate);
+        return true;
+    }
+
+    virtual void Run(
+        NvFBCToDx9Vid* nvfbcDx9,
+        NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
+        IDirect3DDevice9Ex* device,
+        HWND hwnd) override
+    {
+        MSG msg;
+
+        while (TRUE)
+        {
+            // Set timer for this frame
+            SetWaitableTimer(m_timer, &m_interval, 0, NULL, NULL, FALSE);
+
+            // Grab frame
+            NVFBCRESULT fbcRes = nvfbcDx9->NvFBCToDx9VidGrabFrame(grabParams);
+
+            if (fbcRes == NVFBC_ERROR_INVALIDATED_SESSION)
+            {
+                LOGERR("NvFBC session invalidated - session needs to be recreated");
+                break;
+            }
+
+            // Present immediately (non-blocking)
+            device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
+
+            // Process Windows messages
+            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+
+            if (msg.message == WM_QUIT)
+                break;
+
+            // Wait for timer to maintain target framerate
+            WaitForSingleObject(m_timer, INFINITE);
+        }
+    }
+
+    virtual const char* GetModeName() const override {
+        return "Timer";
+    }
+};
+
+// Helper function to parse capture mode string and create appropriate mode instance
+IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
+    if (modeStr.empty() || _stricmp(modeStr.c_str(), "vsync") == 0) {
+        // Default to vsync mode
+        return new VsyncCaptureMode();
+    }
+
+    // Try to parse as numeric framerate
+    try {
+        int framerate = stoi(modeStr);
+        if (framerate > 0 && framerate <= 1000) {
+            return new TimerCaptureMode(framerate);
+        }
+    }
+    catch (...) {
+        // Not a valid number
+    }
+
+    LOGERR("Invalid capture mode: '%s' (use 'vsync' or numeric fps like '60')", modeStr.c_str());
+    return NULL;
+}
+
+// ===============================================
+
+
 // DirectX resources
 IDirect3D9Ex        *g_pD3DEx = NULL;
 IDirect3DDevice9Ex  *g_pD3D9Device = NULL;
@@ -69,10 +260,6 @@ NvFBCLibrary *pNVFBCLib;
 
 int BUF_WIDTH;
 int BUF_HEIGHT;
-
-HANDLE timer;
-LARGE_INTEGER li;
-int framerate = 60;
 
 struct DisplayPosition {
     int dxAdapterIndex;
@@ -120,10 +307,6 @@ void Cleanup()
     {
         delete pNVFBCLib;
         pNVFBCLib = NULL;
-    }
-    if (timer)
-    {
-        CloseHandle(timer);
     }
 
     LOG("Cleanup completed");
@@ -215,7 +398,7 @@ int InitDisplays() {
     return 1;
 }
 
-HRESULT InitD3D9(unsigned int deviceID, HWND hwnd)
+HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
 {
     HRESULT hr = S_OK;
     D3DPRESENT_PARAMETERS d3dpp;
@@ -232,8 +415,7 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd)
     d3dpp.BackBufferCount = 1;
     d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
     //d3dpp.SwapEffect = D3DSWAPEFFECT_FLIPEX;
-    d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
-    //d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_ONE;
+    d3dpp.PresentationInterval = presentationInterval;
     //d3dpp.Flags = D3DPRESENTFLAG_VIDEO;
     d3dpp.hDeviceWindow = hwnd;
     DWORD dwBehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING;
@@ -292,10 +474,10 @@ int ReadIntFromCmd(string prompt) {
     return cinString.empty() ? -1 : stoi(cinString);
 }
 
-bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, int* framerateValue) {
+bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, string* framerateStr) {
     *sourceIndex = -1;
     *targetIndex = -1;
-    *framerateValue = -1;
+    *framerateStr = "";
 
     if (!lpCmdLine || strlen(lpCmdLine) == 0) {
         return false;
@@ -336,7 +518,7 @@ bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, i
             i++; // Skip the value
         }
         else if (args[i] == "-framerate" && i + 1 < args.size()) {
-            *framerateValue = stoi(args[i + 1]);
+            *framerateStr = args[i + 1];  // Store as string instead of converting to int
             foundAny = true;
             i++; // Skip the value
         }
@@ -345,7 +527,7 @@ bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, i
     return foundAny;
 }
 
-void ConsoleUserInput() {
+void ConsoleUserInput(string* framerateStr) {
     AllocConsole();
     FILE* fDummy;
     freopen_s(&fDummy, "CONOUT$", "w", stdout);
@@ -375,11 +557,11 @@ void ConsoleUserInput() {
     for (outputIndex = ReadIntFromCmd("Output Display Index ? "); outputIndex < 0 || outputIndex > displays.size() - 1;) {
         outputIndex = ReadIntFromCmd("Output Display Index ? ");
     }
-    cout << "Capture/Present framerate (blank to default 60fps) ? ";
+    cout << "Capture/Present framerate ('vsync' or fps number, blank for vsync) ? ";
     string cinString;
     getline(cin, cinString);
     if (!cinString.empty())
-        framerate = stoi(cinString);
+        *framerateStr = cinString;
 
     for (vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
 
@@ -412,9 +594,9 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     LOG("Command line received: '%s'", lpCmdLine ? lpCmdLine : "(null)");
     int argSourceIndex = -1;
     int argTargetIndex = -1;
-    int argFramerate = -1;
-    bool hasArgs = ParseCommandLineArgs(lpCmdLine, &argSourceIndex, &argTargetIndex, &argFramerate);
-    LOG("Parsed args - hasArgs: %d, source: %d, target: %d, framerate: %d", hasArgs, argSourceIndex, argTargetIndex, argFramerate);
+    string framerateStr = "";
+    bool hasArgs = ParseCommandLineArgs(lpCmdLine, &argSourceIndex, &argTargetIndex, &framerateStr);
+    LOG("Parsed args - hasArgs: %d, source: %d, target: %d, framerate: %s", hasArgs, argSourceIndex, argTargetIndex, framerateStr.c_str());
 
     // If all required args are provided via command line, use them
     if (hasArgs && argSourceIndex >= 0 && argTargetIndex >= 0 &&
@@ -428,20 +610,23 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
                 source = *iter;
             }
         }
-
-        // Set framerate if provided, otherwise use default
-        if (argFramerate > 0) {
-            framerate = argFramerate;
-        }
     } else {
         // Fall back to interactive console input
-        ConsoleUserInput();
+        ConsoleUserInput(&framerateStr);
+    }
+
+    // Create capture mode instance
+    IFrameCaptureMode* captureMode = ParseCaptureMode(framerateStr);
+    if (!captureMode) {
+        LOGERR("Failed to create capture mode");
+        Cleanup();
+        return -1;
     }
 
     LOG("=== NvFBCR Starting ===");
     LOG("Source display: [%d] %s (%s)", source.dxAdapterIndex, source.friendlyName.c_str(), source.deviceName);
     LOG("Target display: [%d] %s (%s)", target.dxAdapterIndex, target.friendlyName.c_str(), target.deviceName);
-    LOG("Framerate: %d fps", framerate);
+    LOG("Capture mode: %s", captureMode->GetModeName());
     LOG("Buffer size: %dx%d", BUF_WIDTH, BUF_HEIGHT);
 
     BUF_WIDTH = target.position.right - target.position.left;
@@ -491,9 +676,10 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     }
 
     g_bNvFBCLibLoaded = true;
-    if (!SUCCEEDED(InitD3D9(source.dxAdapterIndex, hWnd)))
+    if (!SUCCEEDED(InitD3D9(source.dxAdapterIndex, hWnd, captureMode->GetPresentationInterval())))
     {
         LOGERR("Unable to create D3D9Ex Device");
+        delete captureMode;
         Cleanup();
         return -1;
     }
@@ -573,8 +759,9 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
             // Note: lpCommandLine must include the exe name as first token when lpApplicationName is non-NULL
             // Windows will strip the first token and pass the rest to WinMain's lpCmdLine
             char newCmdLine[512];
-            sprintf_s(newCmdLine, sizeof(newCmdLine), "\"%s\" -source %d -target %d -framerate %d",
-                exePath, source.dxAdapterIndex, target.dxAdapterIndex, framerate);
+            sprintf_s(newCmdLine, sizeof(newCmdLine), "\"%s\" -source %d -target %d -framerate %s",
+                exePath, source.dxAdapterIndex, target.dxAdapterIndex,
+                framerateStr.empty() ? "vsync" : framerateStr.c_str());
 
             LOG("Relaunching with command line: '%s'", newCmdLine);
             LOG("Executable path: '%s'", exePath);
@@ -622,11 +809,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         return -1;
     }
 
-    MSG msg;
-
     //! Setup NvFBC Grab Parameters
     NVFBC_TODX9VID_GRAB_FRAME_PARAMS fbcDX9GrabParams = { 0 };
-    NVFBCRESULT fbcRes = NVFBC_SUCCESS;
     {
         fbcDX9GrabParams.dwVersion = NVFBC_TODX9VID_GRAB_FRAME_PARAMS_V1_VER;
         fbcDX9GrabParams.dwFlags = NVFBC_TODX9VID_NOWAIT;
@@ -636,37 +820,23 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         fbcDX9GrabParams.pNvFBCFrameGrabInfo = &frameGrabInfo;
     }
 
-    LOG("Entering capture loop (NOWAIT polling, VSync-driven presentation)");
-    LOG("VSync will control frame timing - target monitor refresh rate determines output FPS");
-
-    while (TRUE)
-    {
-        // Poll for latest frame (never blocks - always gets most recent frame available)
-        fbcRes = NvFBCDX9->NvFBCToDx9VidGrabFrame(&fbcDX9GrabParams);
-
-        if (fbcRes == NVFBC_ERROR_INVALIDATED_SESSION)
-        {
-            LOGERR("NvFBC session invalidated - session needs to be recreated");
-            break;
-        }
-        // Ignore other errors (e.g., no new frame) - we'll just present what we have
-
-        // Present and wait for VSync - this blocks until monitor refresh
-        // This synchronizes our output with the actual display hardware
-        g_pD3D9Device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_ONE);
-
-        // Process Windows messages
-        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
-        {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-
-        if (msg.message == WM_QUIT)
-            break;
+    // Setup and run capture mode
+    if (!captureMode->Setup()) {
+        LOGERR("Failed to setup capture mode");
+        delete captureMode;
+        Cleanup();
+        return -1;
     }
+
+    LOG("Entering capture loop - mode: %s", captureMode->GetModeName());
+
+    // Run the mode's capture loop (contains entire loop logic including message processing)
+    captureMode->Run(NvFBCDX9, &fbcDX9GrabParams, g_pD3D9Device, hWnd);
+
+    // Clean up capture mode
+    delete captureMode;
 
     Cleanup();
 
-    return static_cast<int>(msg.wParam);
+    return 0;
 }
