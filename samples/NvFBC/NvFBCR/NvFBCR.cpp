@@ -223,11 +223,290 @@ public:
     }
 };
 
+// Frame selection capture mode - temporal frame selection for smooth VRR capture
+class FrameSelectionCaptureMode : public IFrameCaptureMode {
+private:
+    static const int FRAME_HISTORY_SIZE = 2;
+
+    struct FrameHistoryEntry {
+        IDirect3DSurface9* surface;
+        LARGE_INTEGER timestamp;
+        bool valid;
+    };
+
+    FrameHistoryEntry m_frameHistory[FRAME_HISTORY_SIZE];
+    int m_currentHistoryIndex;
+    IDirect3DSurface9* m_captureTarget;
+    LARGE_INTEGER m_perfFreq;
+    int m_targetFramerate;
+    IDirect3DDevice9Ex* m_device;  // Store device pointer for StretchRect
+
+public:
+    FrameSelectionCaptureMode(int framerate)
+        : m_currentHistoryIndex(0)
+        , m_captureTarget(NULL)
+        , m_targetFramerate(framerate)
+        , m_device(NULL)
+    {
+        for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
+            m_frameHistory[i].surface = NULL;
+            m_frameHistory[i].valid = false;
+            m_frameHistory[i].timestamp.QuadPart = 0;
+        }
+        m_perfFreq.QuadPart = 0;
+    }
+
+    virtual ~FrameSelectionCaptureMode() {
+        // Release frame history surfaces
+        for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
+            if (m_frameHistory[i].surface) {
+                m_frameHistory[i].surface->Release();
+                m_frameHistory[i].surface = NULL;
+            }
+        }
+
+        if (m_captureTarget) {
+            m_captureTarget->Release();
+            m_captureTarget = NULL;
+        }
+    }
+
+    virtual UINT GetPresentationInterval() const override {
+        return D3DPRESENT_INTERVAL_IMMEDIATE;
+    }
+
+    virtual bool Setup() override {
+        // Need to access globals - these are extern'd below
+        extern IDirect3DDevice9Ex* g_pD3D9Device;
+        extern int BUF_WIDTH;
+        extern int BUF_HEIGHT;
+
+        m_device = g_pD3D9Device;
+
+        // Create capture target surface (where NvFBC will write)
+        HRESULT hr = m_device->CreateOffscreenPlainSurface(
+            BUF_WIDTH, BUF_HEIGHT,
+            D3DFMT_A2B10G10R10,
+            D3DPOOL_DEFAULT,
+            &m_captureTarget,
+            NULL);
+
+        if (FAILED(hr)) {
+            LOGERR("Failed to create capture target surface (error: 0x%08x)", hr);
+            return false;
+        }
+
+        // Create frame history surfaces
+        for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
+            hr = m_device->CreateOffscreenPlainSurface(
+                BUF_WIDTH, BUF_HEIGHT,
+                D3DFMT_A2B10G10R10,
+                D3DPOOL_DEFAULT,
+                &m_frameHistory[i].surface,
+                NULL);
+
+            if (FAILED(hr)) {
+                LOGERR("Failed to create frame history surface %d (error: 0x%08x)", i, hr);
+                return false;
+            }
+        }
+
+        QueryPerformanceFrequency(&m_perfFreq);
+
+        LOG("Frame selection mode initialized - target framerate: %d fps", m_targetFramerate);
+        LOG("Frame history size: %d (temporal frame selection for smooth VRR capture)", FRAME_HISTORY_SIZE);
+        return true;
+    }
+
+    virtual void Run(
+        NvFBCToDx9Vid* nvfbcDx9,
+        NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
+        IDirect3DDevice9Ex* device,
+        HWND hwnd) override
+    {
+        extern int BUF_WIDTH;
+        extern int BUF_HEIGHT;
+        extern IDirect3DSurface9* g_backbuffer;
+
+        MSG msg;
+        LARGE_INTEGER nextPresentTime, currentTime;
+        QueryPerformanceCounter(&nextPresentTime);
+        LONGLONG ticksPerFrame = m_perfFreq.QuadPart / m_targetFramerate;
+
+        // Update NvFBC to write to our capture target instead of backbuffer
+        NVFBC_TODX9VID_OUT_BUF outBuf[1];
+        outBuf[0].pPrimary = m_captureTarget;
+
+        NVFBC_TODX9VID_SETUP_PARAMS setupParams = {};
+        setupParams.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
+        setupParams.bWithHWCursor = 1;
+        setupParams.bStereoGrab = 0;
+        setupParams.bDiffMap = 0;
+        setupParams.ppBuffer = outBuf;
+        setupParams.eMode = NVFBC_TODX9VID_ARGB10;
+        setupParams.dwNumBuffers = 1;
+        setupParams.bHDRRequest = TRUE;
+
+        if (NVFBC_SUCCESS != nvfbcDx9->NvFBCToDx9VidSetUp(&setupParams)) {
+            LOGERR("Failed to reconfigure NvFBC for frame selection mode");
+            return;
+        }
+
+        while (TRUE)
+        {
+            QueryPerformanceCounter(&currentTime);
+
+            // Calculate time until next present
+            LONGLONG timeUntilPresent = nextPresentTime.QuadPart - currentTime.QuadPart;
+            DWORD msUntilPresent = timeUntilPresent > 0 ?
+                (DWORD)((timeUntilPresent * 1000) / m_perfFreq.QuadPart) : 0;
+
+            // Smart sleep: if we're far from present time, sleep most of it
+            if (msUntilPresent > 5) {
+                Sleep(msUntilPresent - 4);  // Wake up 4ms before present time
+                continue;
+            }
+
+            // Poll for latest frame (NOWAIT - never blocks)
+            NVFBCRESULT fbcRes = nvfbcDx9->NvFBCToDx9VidGrabFrame(grabParams);
+
+            if (fbcRes == NVFBC_ERROR_INVALIDATED_SESSION) {
+                LOGERR("NvFBC session invalidated - session needs to be recreated");
+                break;
+            }
+
+            // Only store frame if we're close to present time (within 2 frame periods)
+            if (fbcRes == NVFBC_SUCCESS && timeUntilPresent < (ticksPerFrame * 2)) {
+                QueryPerformanceCounter(&currentTime);
+
+                // Copy captured frame to current history slot
+                RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
+                device->StretchRect(
+                    m_captureTarget,
+                    &srcRect,
+                    m_frameHistory[m_currentHistoryIndex].surface,
+                    &srcRect,
+                    D3DTEXF_NONE);
+
+                // Update timestamp and mark valid
+                m_frameHistory[m_currentHistoryIndex].timestamp = currentTime;
+                m_frameHistory[m_currentHistoryIndex].valid = true;
+
+                // Advance to next slot
+                m_currentHistoryIndex = (m_currentHistoryIndex + 1) % FRAME_HISTORY_SIZE;
+            }
+
+            // Check if it's time to present
+            QueryPerformanceCounter(&currentTime);
+            if (currentTime.QuadPart >= nextPresentTime.QuadPart) {
+                // Select best frame from history based on target present time
+                SelectFrameToBackbuffer(nextPresentTime, g_backbuffer);
+
+                // Present the selected frame
+                device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
+
+                // Schedule next present
+                nextPresentTime.QuadPart += ticksPerFrame;
+
+                // Prevent falling too far behind
+                if (nextPresentTime.QuadPart < currentTime.QuadPart) {
+                    nextPresentTime = currentTime;
+                }
+            }
+
+            // Process Windows messages
+            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+
+            if (msg.message == WM_QUIT)
+                break;
+        }
+    }
+
+    virtual const char* GetModeName() const override {
+        return "FrameSelection";
+    }
+
+private:
+    void SelectFrameToBackbuffer(LARGE_INTEGER targetTime, IDirect3DSurface9* backbuffer) {
+        extern int BUF_WIDTH;
+        extern int BUF_HEIGHT;
+
+        // Find the two frames that bracket the target time
+        int bestBefore = -1;
+        int bestAfter = -1;
+        LONGLONG smallestBeforeDiff = LLONG_MAX;
+        LONGLONG smallestAfterDiff = LLONG_MAX;
+
+        for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
+            if (!m_frameHistory[i].valid) continue;
+
+            LONGLONG diff = targetTime.QuadPart - m_frameHistory[i].timestamp.QuadPart;
+
+            if (diff >= 0 && diff < smallestBeforeDiff) {
+                smallestBeforeDiff = diff;
+                bestBefore = i;
+            }
+            else if (diff < 0 && -diff < smallestAfterDiff) {
+                smallestAfterDiff = -diff;
+                bestAfter = i;
+            }
+        }
+
+        RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
+
+        // Prefer frames from the past (before target time)
+        if (bestBefore >= 0 && bestAfter >= 0) {
+            // Both available - use the "before" frame
+            m_device->StretchRect(
+                m_frameHistory[bestBefore].surface,
+                &srcRect,
+                backbuffer,
+                &srcRect,
+                D3DTEXF_NONE);
+        }
+        else if (bestBefore >= 0) {
+            // Only have a "before" frame, use it
+            m_device->StretchRect(
+                m_frameHistory[bestBefore].surface,
+                &srcRect,
+                backbuffer,
+                &srcRect,
+                D3DTEXF_NONE);
+        }
+        else if (bestAfter >= 0) {
+            // Only have an "after" frame, use it
+            m_device->StretchRect(
+                m_frameHistory[bestAfter].surface,
+                &srcRect,
+                backbuffer,
+                &srcRect,
+                D3DTEXF_NONE);
+        }
+        // If no valid frames, backbuffer will just show whatever was there before
+    }
+};
+
 // Helper function to parse capture mode string and create appropriate mode instance
 IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     if (modeStr.empty() || _stricmp(modeStr.c_str(), "vsync") == 0) {
         // Default to vsync mode
         return new VsyncCaptureMode();
+    }
+
+    // Check for temporal frame selection mode (t:60 format)
+    if (modeStr.length() > 2 && modeStr[0] == 't' && modeStr[1] == ':') {
+        try {
+            int framerate = stoi(modeStr.substr(2));
+            if (framerate > 0 && framerate <= 1000) {
+                return new FrameSelectionCaptureMode(framerate);
+            }
+        }
+        catch (...) {
+            // Invalid number after t:
+        }
     }
 
     // Try to parse as numeric framerate
@@ -241,7 +520,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         // Not a valid number
     }
 
-    LOGERR("Invalid capture mode: '%s' (use 'vsync' or numeric fps like '60')", modeStr.c_str());
+    LOGERR("Invalid capture mode: '%s' (use 'vsync', 't:60' for temporal, or numeric fps like '60')", modeStr.c_str());
     return NULL;
 }
 
@@ -557,7 +836,7 @@ void ConsoleUserInput(string* framerateStr) {
     for (outputIndex = ReadIntFromCmd("Output Display Index ? "); outputIndex < 0 || outputIndex > displays.size() - 1;) {
         outputIndex = ReadIntFromCmd("Output Display Index ? ");
     }
-    cout << "Capture/Present framerate ('vsync' or fps number, blank for vsync) ? ";
+    cout << "Capture/Present framerate ('vsync', 't:60' for temporal, or fps number, blank for vsync) ? ";
     string cinString;
     getline(cin, cinString);
     if (!cinString.empty())
