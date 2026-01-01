@@ -146,14 +146,14 @@ class TimerCaptureMode : public IFrameCaptureMode {
 private:
     HANDLE m_timer;
     LARGE_INTEGER m_interval;
-    int m_framerate;
+    float m_framerate;
 
 public:
-    TimerCaptureMode(int framerate)
+    TimerCaptureMode(float framerate)
         : m_timer(NULL)
         , m_framerate(framerate)
     {
-        m_interval.QuadPart = -(10000000 / framerate);
+        m_interval.QuadPart = -(LONGLONG)(10000000.0f / framerate);
     }
 
     virtual ~TimerCaptureMode() {
@@ -175,7 +175,7 @@ public:
             return false;
         }
 
-        LOG("Timer mode initialized - target framerate: %d fps", m_framerate);
+        LOG("Timer mode initialized - target framerate: %.2f fps", m_framerate);
         return true;
     }
 
@@ -239,11 +239,11 @@ private:
     int m_currentHistoryIndex;
     IDirect3DSurface9* m_captureTarget;
     LARGE_INTEGER m_perfFreq;
-    int m_targetFramerate;
+    float m_targetFramerate;
     IDirect3DDevice9Ex* m_device;  // Store device pointer for StretchRect
 
 public:
-    FrameSelectionCaptureMode(int framerate)
+    FrameSelectionCaptureMode(float framerate)
         : m_currentHistoryIndex(0)
         , m_captureTarget(NULL)
         , m_targetFramerate(framerate)
@@ -314,7 +314,7 @@ public:
 
         QueryPerformanceFrequency(&m_perfFreq);
 
-        LOG("Frame selection mode initialized - target framerate: %d fps", m_targetFramerate);
+        LOG("Frame selection mode initialized - target framerate: %.2f fps", m_targetFramerate);
         LOG("Frame history size: %d (temporal frame selection for smooth VRR capture)", FRAME_HISTORY_SIZE);
         return true;
     }
@@ -332,7 +332,7 @@ public:
         MSG msg;
         LARGE_INTEGER nextPresentTime, currentTime;
         QueryPerformanceCounter(&nextPresentTime);
-        LONGLONG ticksPerFrame = m_perfFreq.QuadPart / m_targetFramerate;
+        LONGLONG ticksPerFrame = (LONGLONG)(m_perfFreq.QuadPart / m_targetFramerate);
 
         // Update NvFBC to write to our capture target instead of backbuffer
         NVFBC_TODX9VID_OUT_BUF outBuf[1];
@@ -494,7 +494,7 @@ private:
 class FrameBlendCaptureMode : public IFrameCaptureMode {
 private:
     static const int FRAME_HISTORY_SIZE = 2;
-    static constexpr float BLEND_WEIGHT_THRESHOLD = 0.9f;  // Skip GPU blending if weight < (1.0 - this) or > this
+    static constexpr float BLEND_WEIGHT_THRESHOLD = 0.05f;  // Skip GPU blending if weight < (1.0 - this) or > this
 
     struct FrameHistoryEntry {
         IDirect3DSurface9* surface;
@@ -517,13 +517,13 @@ private:
     IDirect3DVertexDeclaration9* m_vertexDeclaration;
     IDirect3DVertexBuffer9* m_quadVertexBuffer;
     LARGE_INTEGER m_perfFreq;
-    int m_targetFramerate;
+    float m_targetFramerate;
     IDirect3DDevice9Ex* m_device;
     LARGE_INTEGER m_lastGrabTime;
     bool m_shaderAvailable;
 
 public:
-    FrameBlendCaptureMode(int framerate)
+    FrameBlendCaptureMode(float framerate)
         : m_currentHistoryIndex(0)
         , m_captureTarget(NULL)
         , m_captureTexture(NULL)
@@ -656,7 +656,7 @@ public:
 
         m_shaderAvailable = true;
 
-        LOG("Frame blend mode initialized - target framerate: %d fps", m_targetFramerate);
+        LOG("Frame blend mode initialized - target framerate: %.2f fps", m_targetFramerate);
         LOG("GPU pixel shader blending enabled (blend threshold: %.1f)", BLEND_WEIGHT_THRESHOLD);
         return true;
     }
@@ -674,7 +674,7 @@ public:
         MSG msg;
         LARGE_INTEGER nextPresentTime, currentTime;
         QueryPerformanceCounter(&nextPresentTime);
-        LONGLONG ticksPerFrame = m_perfFreq.QuadPart / m_targetFramerate;
+        LONGLONG ticksPerFrame = (LONGLONG)(m_perfFreq.QuadPart / m_targetFramerate);
 
         // Update NvFBC to write to our capture target
         NVFBC_TODX9VID_OUT_BUF outBuf[1];
@@ -696,7 +696,7 @@ public:
         }
 
         // Calculate minimum interval between grabs (3x output rate)
-        LONGLONG minGrabInterval = m_perfFreq.QuadPart / (m_targetFramerate * 3);
+        LONGLONG minGrabInterval = (LONGLONG)(m_perfFreq.QuadPart / (m_targetFramerate * 3.0f));
 
         while (TRUE)
         {
@@ -1047,8 +1047,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     // Check for temporal frame selection mode (t:60 format)
     if (modeStr.length() > 2 && modeStr[0] == 't' && modeStr[1] == ':') {
         try {
-            int framerate = stoi(modeStr.substr(2));
-            if (framerate > 0 && framerate <= 1000) {
+            float framerate = stof(modeStr.substr(2));
+            if (framerate > 0.0f && framerate <= 1000.0f) {
                 return new FrameSelectionCaptureMode(framerate);
             }
         }
@@ -1060,8 +1060,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     // Check for frame blend mode (b:60 format)
     if (modeStr.length() > 2 && modeStr[0] == 'b' && modeStr[1] == ':') {
         try {
-            int framerate = stoi(modeStr.substr(2));
-            if (framerate > 0 && framerate <= 1000) {
+            float framerate = stof(modeStr.substr(2));
+            if (framerate > 0.0f && framerate <= 1000.0f) {
                 return new FrameBlendCaptureMode(framerate);
             }
         }
@@ -1072,8 +1072,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
 
     // Try to parse as numeric framerate
     try {
-        int framerate = stoi(modeStr);
-        if (framerate > 0 && framerate <= 1000) {
+        float framerate = stof(modeStr);
+        if (framerate > 0.0f && framerate <= 1000.0f) {
             return new TimerCaptureMode(framerate);
         }
     }
