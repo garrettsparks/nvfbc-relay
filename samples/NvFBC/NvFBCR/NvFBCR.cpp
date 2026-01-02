@@ -1907,7 +1907,14 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         // Not a valid number
     }
 
-    LOGERR("Invalid capture mode: '%s' (use 'vsync', 't' or 't:vsync' for vsync temporal, 't:60' for timed temporal, 'b' or 'b:vsync' for vsync blend, 'b:60' for timed blend, or numeric fps like '60')", modeStr.c_str());
+    LOGERR("Invalid capture mode: '%s'", modeStr.c_str());
+    LOGERR("Valid modes:");
+    LOGERR("  vsync          - VSync-driven presentation");
+    LOGERR("  t, t:vsync     - VSync temporal (frame selection, auto refresh rate)");
+    LOGERR("  t:59.94        - Timed temporal (frame selection, manual framerate)");
+    LOGERR("  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)");
+    LOGERR("  b:59.94        - Timed blend (GPU shader blending, manual framerate)");
+    LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
     return NULL;
 }
 
@@ -2218,7 +2225,19 @@ void ConsoleUserInput(string* framerateStr) {
     for (outputIndex = ReadIntFromCmd("Output Display Index ? "); outputIndex < 0 || outputIndex > displays.size() - 1;) {
         outputIndex = ReadIntFromCmd("Output Display Index ? ");
     }
-    cout << "Capture/Present framerate ('vsync', 't' for vsync temporal, 't:60' for timed temporal, 'b' for vsync blend, 'b:60' for timed blend, or fps number, blank for vsync) ? ";
+
+    cout << endl << "Available capture modes:" << endl;
+    cout << "  vsync          - VSync-driven presentation (matches target display refresh)" << endl;
+    cout << endl;
+    cout << "  t, t:vsync     - VSync temporal (frame selection, auto refresh rate)" << endl;
+    cout << "  t:59.94        - Timed temporal (frame selection, manual framerate)" << endl;
+    cout << endl;
+    cout << "  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)" << endl;
+    cout << "  b:59.94        - Timed blend (GPU shader blending, manual framerate)" << endl;
+    cout << endl;
+    cout << "  60             - Timer mode (simple timer-driven at specified fps)" << endl;
+    cout << endl;
+    cout << "Capture/Present framerate (blank for vsync) ? ";
     string cinString;
     getline(cin, cinString);
     if (!cinString.empty())
