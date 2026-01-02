@@ -59,6 +59,7 @@
 #include "FrameBlendCaptureMode.h"
 #include "VsyncBlendCaptureMode.h"
 #include "VsyncTemporalCaptureMode.h"
+#include "VsyncWindowFollowCaptureMode.h"
 
 using namespace std;
 
@@ -116,6 +117,17 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         }
     }
 
+    // Check for window follow mode (w:AFOP.exe or w:WindowTitle)
+    if (modeStr.length() > 2 && modeStr[0] == 'w' && modeStr[1] == ':') {
+        try {
+            string windowTitle = modeStr.substr(2);
+            return new VsyncWindowFollowCaptureMode(windowTitle);
+        }
+        catch (...) {
+            // Invalid string after w:
+        }
+    }
+
     // Try to parse as numeric framerate
     try {
         float framerate = stof(modeStr);
@@ -134,6 +146,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  t:59.94        - Timed temporal (frame selection, manual framerate)");
     LOGERR("  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)");
     LOGERR("  b:59.94        - Timed blend (GPU shader blending, manual framerate)");
+    LOGERR("  w:WindowTitle  - Window tracking (follows and crops to specific window)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
     return NULL;
 }
@@ -454,6 +467,8 @@ void ConsoleUserInput(string* framerateStr) {
     cout << endl;
     cout << "  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)" << endl;
     cout << "  b:59.94        - Timed blend (GPU shader blending, manual framerate)" << endl;
+    cout << endl;
+    cout << "  w:WindowTitle  - Window tracking (follows and crops to specific window)" << endl;
     cout << endl;
     cout << "  60             - Timer mode (simple timer-driven at specified fps)" << endl;
     cout << endl;

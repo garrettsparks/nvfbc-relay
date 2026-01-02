@@ -196,6 +196,7 @@
     <ClCompile Include="VsyncBlendCaptureMode.cpp" />
     <ClCompile Include="VsyncCaptureMode.cpp" />
     <ClCompile Include="VsyncTemporalCaptureMode.cpp" />
+    <ClCompile Include="VsyncWindowFollowCaptureMode.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\..\inc\NvFBC\NvFBCToDx9vid.h" />
@@ -206,6 +207,7 @@
     <ClInclude Include="VsyncBlendCaptureMode.h" />
     <ClInclude Include="VsyncCaptureMode.h" />
     <ClInclude Include="VsyncTemporalCaptureMode.h" />
+    <ClInclude Include="VsyncWindowFollowCaptureMode.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
