@@ -6,7 +6,7 @@
 class FrameBlendCaptureMode : public IFrameCaptureMode {
 private:
     static const int FRAME_HISTORY_SIZE = 2;
-    static constexpr float BLEND_WEIGHT_THRESHOLD = 0.05f;  // Skip GPU blending if weight < (1.0 - this) or > this
+    static constexpr float BLEND_WEIGHT_THRESHOLD = 0.05f;  // Skip GPU blending if weight < this or > (1.0 - this)
 
     struct FrameHistoryEntry {
         IDirect3DSurface9* surface;

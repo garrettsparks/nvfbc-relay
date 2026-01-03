@@ -189,7 +189,7 @@ void FrameBlendCaptureMode::Run(
             continue;
         }
 
-        // Rate limit grabs
+        // Rate limit grabs to 3x output rate to ensure temporal separation
         LONGLONG timeSinceLastGrab = currentTime.QuadPart - m_lastGrabTime.QuadPart;
         if (timeSinceLastGrab < minGrabInterval) {
             Sleep(1);
@@ -204,7 +204,8 @@ void FrameBlendCaptureMode::Run(
             break;
         }
 
-        if (fbcRes == NVFBC_SUCCESS && timeUntilPresent < (ticksPerFrame * 2)) {
+        // Store all successful grabs to build frame history
+        if (fbcRes == NVFBC_SUCCESS) {
             QueryPerformanceCounter(&currentTime);
 
             RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
@@ -223,15 +224,29 @@ void FrameBlendCaptureMode::Run(
 
         QueryPerformanceCounter(&currentTime);
         if (currentTime.QuadPart >= nextPresentTime.QuadPart) {
-            BlendFramesToBackbuffer(nextPresentTime, g_backbuffer);
-
-            device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
-
-            nextPresentTime.QuadPart += ticksPerFrame;
-
-            if (nextPresentTime.QuadPart < currentTime.QuadPart) {
-                nextPresentTime = currentTime;
+            // Check if we have a frame AFTER the target present time for interpolation
+            bool hasAfterFrame = false;
+            for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
+                if (m_frameHistory[i].valid &&
+                    m_frameHistory[i].timestamp.QuadPart > nextPresentTime.QuadPart) {
+                    hasAfterFrame = true;
+                    break;
+                }
             }
+
+            // Only present if we have frames bracketing the present time
+            // This adds latency but gives true temporal interpolation
+            if (hasAfterFrame) {
+                BlendFramesToBackbuffer(nextPresentTime, g_backbuffer);
+                device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
+
+                nextPresentTime.QuadPart += ticksPerFrame;
+
+                if (nextPresentTime.QuadPart < currentTime.QuadPart) {
+                    nextPresentTime = currentTime;
+                }
+            }
+            // Otherwise keep looping to capture more frames
         }
 
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -438,8 +453,9 @@ void FrameBlendCaptureMode::BlendFramesToBackbuffer(LARGE_INTEGER targetTime, ID
                              m_frameHistory[bestBefore].timestamp.QuadPart;
         float weight = totalDiff > 0 ? (float)smallestBeforeDiff / (float)totalDiff : 0.5f;
 
-        // Skip GPU blending if weight is extreme (>90% one frame or the other)
-        if (weight < (1.0f - BLEND_WEIGHT_THRESHOLD)) {
+        // Skip GPU blending if weight is extreme - just use the dominant frame
+        if (weight < BLEND_WEIGHT_THRESHOLD) {
+            // Target time very close to "before" frame - just copy it
             m_device->StretchRect(
                 m_frameHistory[bestBefore].surface,
                 &srcRect,
@@ -447,7 +463,8 @@ void FrameBlendCaptureMode::BlendFramesToBackbuffer(LARGE_INTEGER targetTime, ID
                 &srcRect,
                 D3DTEXF_NONE);
         }
-        else if (weight > BLEND_WEIGHT_THRESHOLD) {
+        else if (weight > (1.0f - BLEND_WEIGHT_THRESHOLD)) {
+            // Target time very close to "after" frame - just copy it
             m_device->StretchRect(
                 m_frameHistory[bestAfter].surface,
                 &srcRect,
