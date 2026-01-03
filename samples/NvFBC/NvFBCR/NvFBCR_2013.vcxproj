@@ -192,6 +192,7 @@
     <ClCompile Include="FrameBlendCaptureMode.cpp" />
     <ClCompile Include="FrameTemporalCaptureMode.cpp" />
     <ClCompile Include="NvFBCR.cpp" />
+    <ClCompile Include="OpticalFlowCaptureMode.cpp" />
     <ClCompile Include="TimerCaptureMode.cpp" />
     <ClCompile Include="VsyncBlendCaptureMode.cpp" />
     <ClCompile Include="VsyncCaptureMode.cpp" />
@@ -202,6 +203,7 @@
     <ClInclude Include="FrameBlendCaptureMode.h" />
     <ClInclude Include="FrameTemporalCaptureMode.h" />
     <ClInclude Include="IFrameCaptureMode.h" />
+    <ClInclude Include="OpticalFlowCaptureMode.h" />
     <ClInclude Include="TimerCaptureMode.h" />
     <ClInclude Include="VsyncBlendCaptureMode.h" />
     <ClInclude Include="VsyncCaptureMode.h" />

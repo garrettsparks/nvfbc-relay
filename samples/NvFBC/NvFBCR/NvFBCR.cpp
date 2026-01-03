@@ -57,6 +57,7 @@
 #include "TimerCaptureMode.h"
 #include "FrameTemporalCaptureMode.h"
 #include "FrameBlendCaptureMode.h"
+#include "OpticalFlowCaptureMode.h"
 #include "VsyncBlendCaptureMode.h"
 #include "VsyncTemporalCaptureMode.h"
 
@@ -114,6 +115,21 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         catch (...) {
             // Invalid number after b:
         }
+    }
+
+    // In ParseCaptureMode function, add:
+    if (_stricmp(modeStr.c_str(), "of") == 0 || _stricmp(modeStr.c_str(), "of:vsync") == 0) {
+        return new OpticalFlowCaptureMode(0.0f);  // vsync
+    }
+
+    if (modeStr.length() > 3 && modeStr[0] == 'o' && modeStr[1] == 'f' && modeStr[2] == ':') {
+        try {
+            float framerate = stof(modeStr.substr(3));
+            if (framerate > 0.0f && framerate <= 1000.0f) {
+                return new OpticalFlowCaptureMode(framerate);
+            }
+        }
+        catch (...) {}
     }
 
     // Try to parse as numeric framerate
