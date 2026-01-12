@@ -109,7 +109,7 @@
     <ClCompile>
       <Optimization>Disabled</Optimization>
       <OmitFramePointers>true</OmitFramePointers>
-      <AdditionalIncludeDirectories>../../../inc;../../Util;../../Common;%(AdditionalIncludeDirectories);</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(CUDA_PATH)\include;OpticalFlow;../../../inc;../../Util;../../Common;%(AdditionalIncludeDirectories);</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_CRT_SECURE_NO_WARNINGS;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MinimalRebuild>true</MinimalRebuild>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
@@ -119,8 +119,8 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>d3dcompiler.lib;dxva2.lib;d3d9.lib;winmm.lib;Util.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(ProjectDir)\..\..\Util\$(Configuration)\$(Platform)\;$(DXSDK_DIR)\lib\x64;..\..\Util\$(ConfigurationName)\$(PlatformName);</AdditionalLibraryDirectories>
+      <AdditionalDependencies>cuda.lib;cudart.lib;d3dcompiler.lib;dxva2.lib;d3d9.lib;winmm.lib;Util.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(CUDA_PATH)\lib\x64;$(ProjectDir)\..\..\Util\$(Configuration)\$(Platform)\;$(DXSDK_DIR)\lib\x64;..\..\Util\$(ConfigurationName)\$(PlatformName);</AdditionalLibraryDirectories>
       <IgnoreSpecificDefaultLibraries>
       </IgnoreSpecificDefaultLibraries>
       <GenerateDebugInformation>true</GenerateDebugInformation>
@@ -166,7 +166,7 @@
       <Optimization>Disabled</Optimization>
       <OmitFramePointers>false</OmitFramePointers>
       <WholeProgramOptimization>false</WholeProgramOptimization>
-      <AdditionalIncludeDirectories>../../../inc;../../Util;../../Common;%(AdditionalIncludeDirectories);</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(CUDA_PATH)\include;OpticalFlow;../../../inc;../../Util;../../Common;%(AdditionalIncludeDirectories);</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_CRT_SECURE_NO_WARNINGS;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <PrecompiledHeader>
@@ -175,8 +175,8 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>d3dcompiler.lib;dxva2.lib;d3d9.lib;winmm.lib;Util.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(ProjectDir)\..\..\Util\$(Configuration)\$(Platform)\;$(DXSDK_DIR)\lib\x64;..\..\Util\$(ConfigurationName)\$(PlatformName);</AdditionalLibraryDirectories>
+      <AdditionalDependencies>cuda.lib;cudart.lib;d3dcompiler.lib;dxva2.lib;d3d9.lib;winmm.lib;Util.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(CUDA_PATH)\lib\x64;$(ProjectDir)\..\..\Util\$(Configuration)\$(Platform)\;$(DXSDK_DIR)\lib\x64;..\..\Util\$(ConfigurationName)\$(PlatformName);</AdditionalLibraryDirectories>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <GenerateMapFile>true</GenerateMapFile>
       <SubSystem>Windows</SubSystem>
@@ -192,6 +192,9 @@
     <ClCompile Include="FrameBlendCaptureMode.cpp" />
     <ClCompile Include="FrameTemporalCaptureMode.cpp" />
     <ClCompile Include="NvFBCR.cpp" />
+    <ClCompile Include="OpticalFlowCaptureMode.cpp" />
+    <ClCompile Include="OpticalFlow\NvOF.cpp" />
+    <ClCompile Include="OpticalFlow\NvOFCuda.cpp" />
     <ClCompile Include="TimerCaptureMode.cpp" />
     <ClCompile Include="VsyncBlendCaptureMode.cpp" />
     <ClCompile Include="VsyncCaptureMode.cpp" />
@@ -202,10 +205,19 @@
     <ClInclude Include="FrameBlendCaptureMode.h" />
     <ClInclude Include="FrameTemporalCaptureMode.h" />
     <ClInclude Include="IFrameCaptureMode.h" />
+    <ClInclude Include="OpticalFlowCaptureMode.h" />
+    <ClInclude Include="OpticalFlow\NvOF.h" />
+    <ClInclude Include="OpticalFlow\NvOFCuda.h" />
+    <ClInclude Include="OpticalFlow\NvOFDefines.h" />
+    <ClInclude Include="OpticalFlow\nvOpticalFlowCommon.h" />
+    <ClInclude Include="OpticalFlow\nvOpticalFlowCuda.h" />
     <ClInclude Include="TimerCaptureMode.h" />
     <ClInclude Include="VsyncBlendCaptureMode.h" />
     <ClInclude Include="VsyncCaptureMode.h" />
     <ClInclude Include="VsyncTemporalCaptureMode.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="optical_flow_implementation_guide.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
