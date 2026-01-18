@@ -116,6 +116,26 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         }
     }
 
+    // Check for optical flow mode (o or o:vsync)
+    if (_stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
+        LOG("Optical flow mode requested (not yet implemented - using vsync fallback)");
+        return new VsyncCaptureMode();  // Temporary fallback
+    }
+
+    // Check for optical flow timed mode (o:60 format)
+    if (modeStr.length() > 2 && modeStr[0] == 'o' && modeStr[1] == ':') {
+        try {
+            float framerate = stof(modeStr.substr(2));
+            if (framerate > 0.0f && framerate <= 1000.0f) {
+                LOG("Optical flow timed mode requested: %.2f fps (not yet implemented - using timer fallback)", framerate);
+                return new TimerCaptureMode(framerate);  // Temporary fallback
+            }
+        }
+        catch (...) {
+            // Invalid number after o:
+        }
+    }
+
     // Try to parse as numeric framerate
     try {
         float framerate = stof(modeStr);
@@ -134,6 +154,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  t:59.94        - Timed temporal (frame selection, manual framerate)");
     LOGERR("  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)");
     LOGERR("  b:59.94        - Timed blend (GPU shader blending, manual framerate)");
+    LOGERR("  o, o:vsync     - Optical flow interpolation (FRUC, auto refresh rate)");
+    LOGERR("  o:59.94        - Optical flow interpolation (FRUC, manual framerate)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
     return NULL;
 }
@@ -454,6 +476,9 @@ void ConsoleUserInput(string* framerateStr) {
     cout << endl;
     cout << "  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)" << endl;
     cout << "  b:59.94        - Timed blend (GPU shader blending, manual framerate)" << endl;
+    cout << endl;
+    cout << "  o, o:vsync     - Optical flow interpolation (FRUC, auto refresh rate)" << endl;
+    cout << "  o:59.94        - Optical flow interpolation (FRUC, manual framerate)" << endl;
     cout << endl;
     cout << "  60             - Timer mode (simple timer-driven at specified fps)" << endl;
     cout << endl;
