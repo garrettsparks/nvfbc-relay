@@ -59,6 +59,7 @@
 #include "FrameBlendCaptureMode.h"
 #include "VsyncBlendCaptureMode.h"
 #include "VsyncTemporalCaptureMode.h"
+#include "FrucCaptureMode.h"
 
 using namespace std;
 
@@ -118,8 +119,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
 
     // Check for optical flow mode (o or o:vsync)
     if (_stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
-        LOG("Optical flow mode requested (not yet implemented - using vsync fallback)");
-        return new VsyncCaptureMode();  // Temporary fallback
+        return new FrucCaptureMode(0.0f);  // 0.0 = vsync mode
     }
 
     // Check for optical flow timed mode (o:60 format)
@@ -127,8 +127,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         try {
             float framerate = stof(modeStr.substr(2));
             if (framerate > 0.0f && framerate <= 1000.0f) {
-                LOG("Optical flow timed mode requested: %.2f fps (not yet implemented - using timer fallback)", framerate);
-                return new TimerCaptureMode(framerate);  // Temporary fallback
+                return new FrucCaptureMode(framerate);
             }
         }
         catch (...) {
