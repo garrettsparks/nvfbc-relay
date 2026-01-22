@@ -9,24 +9,26 @@ FrucCaptureMode::FrucCaptureMode(float framerate)
     , m_cuContext(nullptr)
     , m_cuDevice(0)
     , m_cudaInitialized(false)
-    , m_currentHistoryIndex(0)
     , m_capturedFrameCount(0)
     , m_device(nullptr)
 {
-    LOG("=== FrucCaptureMode Phase 3 ===");
+    LOG("=== FrucCaptureMode Phase 3 (Single-Buffer) ===");
     LOG("Target framerate: %.2f fps", m_targetFramerate);
     LOG("VSync mode: %s", m_isVsyncMode ? "yes" : "no");
 
-    // Initialize frame history
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        m_frameHistory[i].d3dSurface = nullptr;
-        m_frameHistory[i].cudaResource = nullptr;
-        m_frameHistory[i].cudaPtr = 0;
-        m_frameHistory[i].pitch = 0;
-        m_frameHistory[i].timestamp.QuadPart = 0;
-        m_frameHistory[i].valid = false;
-        m_frameHistory[i].isMapped = false;
-    }
+    // Initialize NvFBC buffer
+    m_nvfbcBuffer.d3dSurface = nullptr;
+    m_nvfbcBuffer.cudaResource = nullptr;
+    m_nvfbcBuffer.cudaPtr = nullptr;
+    m_nvfbcBuffer.pitch = 0;
+    m_nvfbcBuffer.isMapped = false;
+
+    // Initialize CUDA buffer
+    m_cudaBuffer.d3dSurface = nullptr;
+    m_cudaBuffer.cudaResource = nullptr;
+    m_cudaBuffer.cudaPtr = nullptr;
+    m_cudaBuffer.pitch = 0;
+    m_cudaBuffer.isMapped = false;
 
     // Get performance counter frequency
     QueryPerformanceFrequency(&m_perfFreq);
@@ -39,19 +41,24 @@ FrucCaptureMode::~FrucCaptureMode() {
 }
 
 void FrucCaptureMode::Cleanup() {
-    // Unmap and unregister all CUDA resources
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        if (m_frameHistory[i].isMapped && m_frameHistory[i].cudaResource) {
-            cudaGraphicsUnmapResources(1, &m_frameHistory[i].cudaResource, 0);
-            m_frameHistory[i].isMapped = false;
-        }
-        if (m_frameHistory[i].cudaResource) {
-            cudaGraphicsUnregisterResource(m_frameHistory[i].cudaResource);
-            m_frameHistory[i].cudaResource = nullptr;
-        }
-        // Note: We don't release d3dSurface - it's owned by NvFBC
-        m_frameHistory[i].d3dSurface = nullptr;
+    // Cleanup CUDA buffer (registered with CUDA)
+    if (m_cudaBuffer.isMapped && m_cudaBuffer.cudaResource) {
+        cudaGraphicsUnmapResources(1, &m_cudaBuffer.cudaResource, 0);
+        m_cudaBuffer.isMapped = false;
     }
+    if (m_cudaBuffer.cudaResource) {
+        cudaGraphicsUnregisterResource(m_cudaBuffer.cudaResource);
+        m_cudaBuffer.cudaResource = nullptr;
+    }
+    if (m_cudaBuffer.d3dSurface) {
+        m_cudaBuffer.d3dSurface->Release();
+        m_cudaBuffer.d3dSurface = nullptr;
+    }
+
+    // NvFBC buffer is NOT registered with CUDA - just clear pointer
+    // Note: We don't release d3dSurface - it's owned by NvFBC
+    m_nvfbcBuffer.d3dSurface = nullptr;
+    m_nvfbcBuffer.cudaResource = nullptr;
 
     // Destroy CUDA context
     if (m_cuContext) {
@@ -132,11 +139,8 @@ bool FrucCaptureMode::Setup() {
 }
 
 bool FrucCaptureMode::CaptureFrame(NvFBCToDx9Vid* nvfbcDx9, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
-    // Get current frame history entry
-    FrameHistoryEntry* entry = &m_frameHistory[m_currentHistoryIndex];
-
-    // Set NvFBC to capture into the current ring buffer index
-    grabParams->dwBufferIdx = m_currentHistoryIndex;
+    // Always capture to buffer index 0 (single NvFBC buffer)
+    grabParams->dwBufferIdx = 0;
 
     // Capture frame from NvFBC
     NVFBCRESULT fbcRes = nvfbcDx9->NvFBCToDx9VidGrabFrame(grabParams);
@@ -149,43 +153,21 @@ bool FrucCaptureMode::CaptureFrame(NvFBCToDx9Vid* nvfbcDx9, NVFBC_TODX9VID_GRAB_
     if (fbcRes != NVFBC_SUCCESS) {
         // No new frame available - not an error, just skip
         if (m_capturedFrameCount < 10) {
-            LOG("Frame %d: No new frame (bufferIdx=%d, result=0x%x)", m_capturedFrameCount, m_currentHistoryIndex, fbcRes);
+            LOG("Frame %d: No new frame (result=0x%x)", m_capturedFrameCount, fbcRes);
         }
         return true;
     }
 
-    // Capture timestamp
-    QueryPerformanceCounter(&entry->timestamp);
-
-    // Mark entry as valid
-    entry->valid = true;
     m_capturedFrameCount++;
 
     // Debug first few captures
     if (m_capturedFrameCount <= 10) {
-        LOG("Captured frame %d to buffer %d", m_capturedFrameCount, m_currentHistoryIndex);
+        LOG("Captured frame %d", m_capturedFrameCount);
     }
-
-    // Advance ring buffer index
-    m_currentHistoryIndex = (m_currentHistoryIndex + 1) % FRAME_HISTORY_SIZE;
 
     return true;
 }
 
-FrucCaptureMode::FrameHistoryEntry* FrucCaptureMode::GetMostRecentFrame() {
-    // Find most recent valid frame
-    int checkIndex = (m_currentHistoryIndex + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE;
-
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        FrameHistoryEntry* entry = &m_frameHistory[checkIndex];
-        if (entry->valid) {
-            return entry;
-        }
-        checkIndex = (checkIndex + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE;
-    }
-
-    return nullptr;  // No valid frames yet
-}
 
 void FrucCaptureMode::Run(
     NvFBCToDx9Vid* nvfbcDx9,
@@ -193,7 +175,7 @@ void FrucCaptureMode::Run(
     IDirect3DDevice9Ex* device,
     HWND hwnd)
 {
-    LOG("FrucCaptureMode::Run() - Phase 3: Zero-copy frame history via NvFBC multi-buffer");
+    LOG("FrucCaptureMode::Run() - Phase 3: Single buffer capture (FRUC handles frame history)");
     LOG("Presentation: %s", m_isVsyncMode ? "VSync" : "Timed");
 
     // Get dimensions from globals (now initialized)
@@ -201,29 +183,27 @@ void FrucCaptureMode::Run(
     m_height = BUF_HEIGHT;
     LOG("Frame buffer dimensions: %dx%d", m_width, m_height);
 
-    // ===== Configure NvFBC with 4 output buffers =====
-    NVFBC_TODX9VID_OUT_BUF outBuf[FRAME_HISTORY_SIZE];
+    // ===== Create single NvFBC output buffer =====
+    NVFBC_TODX9VID_OUT_BUF outBuf[1];
 
-    // Create D3D9 surfaces for each NvFBC output buffer
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        HRESULT hr = device->CreateOffscreenPlainSurface(
-            m_width, m_height,
-            D3DFMT_A2B10G10R10,  // Match NvFBC format
-            D3DPOOL_DEFAULT,
-            &outBuf[i].pPrimary,
-            NULL
-        );
+    HRESULT hr = device->CreateOffscreenPlainSurface(
+        m_width, m_height,
+        D3DFMT_A2B10G10R10,  // Match NvFBC format for HDR
+        D3DPOOL_DEFAULT,
+        &outBuf[0].pPrimary,
+        NULL
+    );
 
-        if (FAILED(hr)) {
-            LOGERR("Failed to create NvFBC output surface %d (HRESULT: 0x%08x)", i, hr);
-            return;
-        }
-
-        outBuf[i].pSecondary = nullptr;  // Not used
-        LOG("Created NvFBC output buffer %d surface", i);
+    if (FAILED(hr)) {
+        LOGERR("Failed to create NvFBC output surface (HRESULT: 0x%08x)", hr);
+        return;
     }
 
-    // Configure NvFBC with 4 buffers
+    outBuf[0].pSecondary = nullptr;
+    m_nvfbcBuffer.d3dSurface = outBuf[0].pPrimary;
+    LOG("Created NvFBC output surface: %p", m_nvfbcBuffer.d3dSurface);
+
+    // ===== Configure NvFBC with single buffer =====
     NVFBC_TODX9VID_SETUP_PARAMS setupParams = {};
     setupParams.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
     setupParams.bWithHWCursor = 1;
@@ -231,51 +211,49 @@ void FrucCaptureMode::Run(
     setupParams.bDiffMap = 0;
     setupParams.bClassificationMap = 0;
     setupParams.ppBuffer = outBuf;
-    setupParams.ppDiffMap = nullptr;  // Not using diffmap
-    setupParams.ppClassificationMap = nullptr;  // Not using classification
+    setupParams.ppDiffMap = nullptr;
+    setupParams.ppClassificationMap = nullptr;
     setupParams.eMode = NVFBC_TODX9VID_ARGB10;
-    setupParams.dwNumBuffers = FRAME_HISTORY_SIZE;
+    setupParams.dwNumBuffers = 1;
     setupParams.bHDRRequest = TRUE;
 
     NVFBCRESULT setupResult = nvfbcDx9->NvFBCToDx9VidSetUp(&setupParams);
     if (NVFBC_SUCCESS != setupResult) {
-        LOGERR("Failed to reconfigure NvFBC for FRUC mode (error code: 0x%08x)", setupResult);
-        LOGERR("Setup params: width=%d, height=%d, numBuffers=%d", m_width, m_height, FRAME_HISTORY_SIZE);
+        LOGERR("Failed to configure NvFBC for FRUC mode (error code: 0x%08x)", setupResult);
         return;
     }
 
-    LOG("NvFBC configured with %d output buffers", FRAME_HISTORY_SIZE);
+    LOG("NvFBC configured with single output buffer");
 
-    // ===== Store NvFBC buffer surface pointers =====
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        // Store pointer to NvFBC buffer surface (we don't own it)
-        m_frameHistory[i].d3dSurface = outBuf[i].pPrimary;
-        LOG("Frame history %d -> surface %p", i, outBuf[i].pPrimary);
+    // ===== Create CUDA buffer for FRUC input =====
+    hr = device->CreateOffscreenPlainSurface(
+        m_width, m_height,
+        D3DFMT_A2B10G10R10,
+        D3DPOOL_DEFAULT,
+        &m_cudaBuffer.d3dSurface,
+        NULL
+    );
+
+    if (FAILED(hr)) {
+        LOGERR("Failed to create CUDA buffer surface (HRESULT: 0x%08x)", hr);
+        return;
     }
 
-    // TEMPORARY DIAGNOSTIC: Skip CUDA registration to see if it's preventing NvFBC writes
-    LOG("WARNING: CUDA registration temporarily disabled for black screen diagnostic");
+    LOG("Created CUDA buffer surface: %p", m_cudaBuffer.d3dSurface);
 
-    /*
-    // ===== Register NvFBC buffer surfaces with CUDA =====
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        // Register with CUDA for zero-copy interop
-        cudaError_t cudaErr = cudaGraphicsD3D9RegisterResource(
-            &m_frameHistory[i].cudaResource,
-            m_frameHistory[i].d3dSurface,
-            cudaGraphicsRegisterFlagsNone
-        );
+    // Register CUDA buffer with CUDA for future FRUC use
+    cudaError_t cudaErr = cudaGraphicsD3D9RegisterResource(
+        &m_cudaBuffer.cudaResource,
+        m_cudaBuffer.d3dSurface,
+        cudaGraphicsRegisterFlagsNone
+    );
 
-        if (cudaErr != cudaSuccess) {
-            LOGERR("cudaGraphicsD3D9RegisterResource failed for buffer %d: %s", i, cudaGetErrorString(cudaErr));
-            return;
-        }
-
-        LOG("Registered NvFBC buffer %d with CUDA", i);
+    if (cudaErr != cudaSuccess) {
+        LOGERR("CUDA registration failed: %s", cudaGetErrorString(cudaErr));
+        return;
     }
 
-    LOG("All NvFBC buffers registered with CUDA successfully");
-    */
+    LOG("CUDA buffer registered successfully");
 
     // ===== Main capture/presentation loop =====
     MSG msg;
@@ -285,55 +263,45 @@ void FrucCaptureMode::Run(
     QueryPerformanceCounter(&m_lastPresentTime);
 
     int framesSinceLog = 0;
-    const int LOG_INTERVAL = 300;  // Log every 300 frames (5 seconds at 60fps)
+    const int LOG_INTERVAL = 300;  // Log every 300 frames (~5 seconds at 60fps)
 
-    int presentCount = 0;
     while (TRUE) {
-        // Capture frame to ring buffer
+        // Capture frame from NvFBC
         if (!CaptureFrame(nvfbcDx9, grabParams)) {
             LOGERR("Fatal error during frame capture");
             break;
         }
 
-        // Get most recent captured frame
-        FrameHistoryEntry* recentFrame = GetMostRecentFrame();
+        // Copy captured frame to CUDA buffer (for Phase 4 FRUC input)
+        if (m_nvfbcBuffer.d3dSurface && m_cudaBuffer.d3dSurface) {
+            hr = device->StretchRect(
+                m_nvfbcBuffer.d3dSurface, NULL,
+                m_cudaBuffer.d3dSurface, NULL,
+                D3DTEXF_NONE
+            );
 
-        if (presentCount < 10) {
-            LOG("Present iteration %d: recentFrame=%p, surface=%p, valid=%d",
-                presentCount, recentFrame, recentFrame ? recentFrame->d3dSurface : nullptr,
-                recentFrame ? recentFrame->valid : 0);
+            // TODO Phase 4: Pass m_cudaBuffer to FRUC here
+            // FRUC maintains its own internal frame history
         }
 
-        if (recentFrame && recentFrame->d3dSurface) {
-            // Copy most recent frame to backbuffer for presentation
+        // Present the captured frame
+        if (m_nvfbcBuffer.d3dSurface) {
             IDirect3DSurface9* backbuffer = nullptr;
-            HRESULT hr = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
-
-            if (presentCount < 10) {
-                LOG("GetBackBuffer result: 0x%08x, backbuffer=%p", hr, backbuffer);
-            }
+            hr = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
 
             if (backbuffer) {
-                HRESULT stretchResult = device->StretchRect(
-                    recentFrame->d3dSurface, NULL,
+                device->StretchRect(
+                    m_nvfbcBuffer.d3dSurface, NULL,
                     backbuffer, NULL,
                     D3DTEXF_NONE
                 );
-
-                if (presentCount < 10) {
-                    LOG("StretchRect result: 0x%08x", stretchResult);
-                }
-
                 backbuffer->Release();
             }
-            presentCount++;
 
             // Present with appropriate timing
             if (m_isVsyncMode) {
-                // VSync mode: present and wait for vsync
                 device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_ONE);
             } else {
-                // Timed mode: present when target frame time elapsed
                 QueryPerformanceCounter(&now);
                 LONGLONG elapsed = now.QuadPart - m_lastPresentTime.QuadPart;
 
@@ -345,7 +313,7 @@ void FrucCaptureMode::Run(
 
             framesSinceLog++;
             if (framesSinceLog >= LOG_INTERVAL) {
-                LOG("Phase 3 running - captured %d frames, presenting most recent", m_capturedFrameCount);
+                LOG("Phase 3 running - captured %d frames", m_capturedFrameCount);
                 framesSinceLog = 0;
             }
         }

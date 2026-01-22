@@ -21,15 +21,14 @@ extern int BUF_HEIGHT;
 // Phase 3: Async capture with frame history (zero-copy via D3D9-CUDA interop)
 class FrucCaptureMode : public IFrameCaptureMode {
 private:
-    // Frame history entry - stores captured frame with timestamp
-    static const int FRAME_HISTORY_SIZE = 2;  // Testing with 2 buffers first
-    struct FrameHistoryEntry {
-        IDirect3DSurface9* d3dSurface;           // Pointer to NvFBC output buffer surface (not owned)
-        struct cudaGraphicsResource* cudaResource; // CUDA Runtime API interop resource (modern API)
+    // NOTE: FRUC maintains its own internal frame cache.
+    // We only need 1 NvFBC buffer + 1 CUDA buffer (not multi-buffer history)
+
+    struct FrameBuffer {
+        IDirect3DSurface9* d3dSurface;           // D3D9 surface
+        struct cudaGraphicsResource* cudaResource; // CUDA Runtime API interop resource
         void* cudaPtr;                           // Mapped CUDA pointer (when mapped)
         size_t pitch;                            // Buffer pitch in bytes
-        LARGE_INTEGER timestamp;                 // High-precision capture timestamp
-        bool valid;                              // Whether entry contains valid data
         bool isMapped;                           // Whether CUDA resource is currently mapped
     };
 
@@ -44,9 +43,9 @@ private:
     CUdevice m_cuDevice;
     bool m_cudaInitialized;
 
-    // ===== Frame History Ring Buffer =====
-    FrameHistoryEntry m_frameHistory[FRAME_HISTORY_SIZE];
-    int m_currentHistoryIndex;              // Write index for ring buffer
+    // ===== Frame Buffers =====
+    FrameBuffer m_nvfbcBuffer;              // NvFBC captures here (not CUDA-registered)
+    FrameBuffer m_cudaBuffer;               // CUDA-registered surface (for Phase 4 FRUC)
     int m_capturedFrameCount;               // Total frames captured
 
     // ===== D3D9 Resources =====
@@ -76,7 +75,6 @@ private:
 
     // ===== Frame Management =====
     bool CaptureFrame(NvFBCToDx9Vid* nvfbcDx9, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
-    FrameHistoryEntry* GetMostRecentFrame();
 
     // ===== Utility =====
     void LogCudaError(const char* operation, CUresult result);
