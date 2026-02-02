@@ -60,6 +60,10 @@
   <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(CUDA_PATH)\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.6.props" Condition="exists('$(CUDA_PATH)\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.6.props')" />
+    <Import Project="$(CUDA_PATH)\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.0.props" Condition="exists('$(CUDA_PATH)\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.0.props') AND !exists('$(CUDA_PATH)\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.6.props')" />
+  </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
     <_ProjectFileVersion>10.0.40219.1</_ProjectFileVersion>
@@ -197,6 +201,20 @@
     <ClCompile Include="VsyncBlendCaptureMode.cpp" />
     <ClCompile Include="VsyncCaptureMode.cpp" />
     <ClCompile Include="VsyncTemporalCaptureMode.cpp" />
+    <ClCompile Include="NvOFSDK\NvOF.cpp" />
+    <ClCompile Include="NvOFSDK\NvOFCuda.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="InterpolateKernel.cu">
+      <Command>nvcc -c "%(FullPath)" -o "$(IntDir)%(Filename).obj" -cudart=static -allow-unsupported-compiler --generate-code arch=compute_75,code=sm_75 --generate-code arch=compute_86,code=sm_86 --generate-code arch=compute_89,code=sm_89 --generate-code arch=compute_120,code=sm_120 -Xcompiler /EHa -Xcompiler /W3</Command>
+      <Outputs>$(IntDir)%(Filename).obj</Outputs>
+      <AdditionalInputs>$(ProjectFile)</AdditionalInputs>
+      <LinkObjects>true</LinkObjects>
+      <Description>Compiling CUDA kernel %(Filename)%(Extension)...</Description>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Object Include="$(IntDir)InterpolateKernel.obj" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\..\inc\NvFBC\NvFBCToDx9vid.h" />
@@ -218,4 +236,8 @@
     <ClInclude Include="NvOFSDK\NvOFDefines.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(CUDA_PATH)\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.6.targets" Condition="exists('$(CUDA_PATH)\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.6.targets')" />
+    <Import Project="$(CUDA_PATH)\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.0.targets" Condition="exists('$(CUDA_PATH)\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.0.targets') AND !exists('$(CUDA_PATH)\extras\visual_studio_integration\MSBuildExtensions\CUDA 12.6.targets')" />
+  </ImportGroup>
 </Project>

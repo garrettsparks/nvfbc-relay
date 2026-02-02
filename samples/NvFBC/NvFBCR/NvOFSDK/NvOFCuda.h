@@ -30,7 +30,7 @@
 #include "nvOpticalFlowCommon.h"
 #include "nvOpticalFlowCuda.h"
 #include "NvOF.h"
-#include "NvOFUtils.h"
+// NvOFUtils.h removed - not needed for our use case (upsampling/file writing utilities)
 
 #define CUDA_DRVAPI_CALL( call )                                                                                                 \
     do                                                                                                                           \
@@ -193,10 +193,4 @@ private:
     friend class NvOFCuda;
 };
 
-class NvOFUtilsCuda : public NvOFUtils
-{
-public:
-    NvOFUtilsCuda(NV_OF_MODE eMode);
-    virtual void Upsample(NvOFBuffer *srcBuffer, NvOFBuffer *dstBuffer, uint32_t nScaleFactor) override;
-};
-
+// NvOFUtilsCuda removed - not needed for our use case (upsampling functionality)
