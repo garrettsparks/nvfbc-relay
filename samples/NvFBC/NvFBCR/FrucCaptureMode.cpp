@@ -669,7 +669,10 @@ void FrucCaptureMode::Run(
     int presentCount = 0;
 
     while (TRUE) {
-        // Capture frame to ring buffer
+        LARGE_INTEGER currentTime;
+        QueryPerformanceCounter(&currentTime);
+
+        // Continuously capture frames to keep ring buffer fresh (non-blocking)
         int capturedBefore = m_capturedFrameCount;
         if (!CaptureFrame(nvfbcDx9, grabParams)) {
             LOGERR("Fatal error during frame capture");
@@ -701,10 +704,24 @@ void FrucCaptureMode::Run(
 
                 // New frame pair means flow needs recomputation
                 flowComputedForCurrentPair = false;
+            }
+        }
 
-                // Present all target times that fall between frame0 and frame1
-                // We always stay behind the latest capture so we have both past and future frames
-                while (targetPresentTime.QuadPart <= t1) {
+        // Check if it's time to present
+        // Only do expensive work (optical flow, interpolation, present) when we're at target time
+        if (targetInitialized) {
+            QueryPerformanceCounter(&currentTime);
+
+            // Get current frame pair for presentation
+            FrameHistoryEntry* frame0 = GetFrame(1);
+            FrameHistoryEntry* frame1 = GetFrame(0);
+
+            if (frame0 && frame1 && frame0->valid && frame1->valid) {
+                LONGLONG t0 = frame0->timestamp.QuadPart;
+                LONGLONG t1 = frame1->timestamp.QuadPart;
+
+                // Present all target times that fall between frame0 and frame1 AND are ready now
+                while (targetPresentTime.QuadPart <= t1 && currentTime.QuadPart >= targetPresentTime.QuadPart) {
                     // Skip any targets that fell before frame0 (catch-up after hiccup)
                     if (targetPresentTime.QuadPart < t0) {
                         targetPresentTime.QuadPart += targetFrameTime;
@@ -727,35 +744,43 @@ void FrucCaptureMode::Run(
                         weight = (float)(rawWeight < 0.0 ? 0.0 : (rawWeight > 1.0 ? 1.0 : rawWeight));
                     }
 
-                    // Debug logging for first 120 presents (2 seconds at 60fps)
-                    if (presentCount < 120) {
-                        double t0Ms = (double)t0 * 1000.0 / m_perfFreq.QuadPart;
-                        double t1Ms = (double)t1 * 1000.0 / m_perfFreq.QuadPart;
-                        double tTargetMs = (double)targetPresentTime.QuadPart * 1000.0 / m_perfFreq.QuadPart;
-                        LONGLONG actualPresentTime;
-                        QueryPerformanceCounter((LARGE_INTEGER*)&actualPresentTime);
-                        double actualMs = (double)actualPresentTime * 1000.0 / m_perfFreq.QuadPart;
-                        double latencyMs = actualMs - tTargetMs;
-                        LOG("Present[%d]: target=%.2fms, actual=%.2fms, latency=%.2fms, weight=%.3f, bracket=[%.2fms, %.2fms]",
-                            presentCount, tTargetMs, actualMs, latencyMs, weight, t0Ms, t1Ms);
-                    }
-
                     // Interpolate and present
                     if (InterpolateFrame(weight)) {
                         D3DLOCKED_RECT lockedRect;
                         HRESULT hr = m_outputSurface->LockRect(&lockedRect, NULL, 0);
                         if (SUCCEEDED(hr)) {
+                            // Convert from NvOF ABGR8 (R,G,B,A in memory) back to D3D9 A8R8G8B8 (B,G,R,A in memory)
                             for (int y = 0; y < m_height; y++) {
-                                memcpy(
-                                    (uint8_t*)lockedRect.pBits + y * lockedRect.Pitch,
-                                    m_hostOutputBuffer + y * m_width * 4,
-                                    m_width * 4
-                                );
+                                const uint8_t* src = m_hostOutputBuffer + y * m_width * 4;
+                                uint8_t* dst = (uint8_t*)lockedRect.pBits + y * lockedRect.Pitch;
+                                for (int x = 0; x < m_width; x++) {
+                                    // NvOF ABGR8 memory: R, G, B, A
+                                    // D3D9 A8R8G8B8 memory: B, G, R, A
+                                    dst[x * 4 + 0] = src[x * 4 + 2];  // B <- B
+                                    dst[x * 4 + 1] = src[x * 4 + 1];  // G <- G
+                                    dst[x * 4 + 2] = src[x * 4 + 0];  // R <- R
+                                    dst[x * 4 + 3] = src[x * 4 + 3];  // A <- A
+                                }
                             }
                             m_outputSurface->UnlockRect();
 
                             HRESULT stretchHr = device->StretchRect(m_outputSurface, NULL, g_backbuffer, NULL, D3DTEXF_NONE);
                             HRESULT presentHr = device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
+
+                            // Measure actual present time (after PresentEx completes)
+                            LARGE_INTEGER actualPresentTime;
+                            QueryPerformanceCounter(&actualPresentTime);
+
+                            // Debug logging for first 120 presents (2 seconds at 60fps)
+                            if (presentCount < 120) {
+                                double t0Ms = (double)t0 * 1000.0 / m_perfFreq.QuadPart;
+                                double t1Ms = (double)t1 * 1000.0 / m_perfFreq.QuadPart;
+                                double tTargetMs = (double)targetPresentTime.QuadPart * 1000.0 / m_perfFreq.QuadPart;
+                                double actualMs = (double)actualPresentTime.QuadPart * 1000.0 / m_perfFreq.QuadPart;
+                                double latencyMs = actualMs - tTargetMs;
+                                LOG("Present[%d]: target=%.2fms, actual=%.2fms, latency=%.2fms, weight=%.3f, bracket=[%.2fms, %.2fms]",
+                                    presentCount, tTargetMs, actualMs, latencyMs, weight, t0Ms, t1Ms);
+                            }
 
                             // Diagnostics for first 5 presents: kernel output sample, StretchRect, PresentEx
                             if (presentCount < 5) {
@@ -787,6 +812,25 @@ void FrucCaptureMode::Run(
 
                     // Advance to next output target
                     targetPresentTime.QuadPart += targetFrameTime;
+
+                    // Check if we should wait before processing next present
+                    QueryPerformanceCounter(&currentTime);
+                    if (targetPresentTime.QuadPart > currentTime.QuadPart) {
+                        // Next target is in the future, break out to capture more frames
+                        break;
+                    }
+                }
+            }
+
+            // If we're far from next present time, sleep briefly
+            if (targetInitialized) {
+                QueryPerformanceCounter(&currentTime);
+                LONGLONG timeUntilPresent = targetPresentTime.QuadPart - currentTime.QuadPart;
+                DWORD msUntilPresent = timeUntilPresent > 0 ?
+                    (DWORD)((timeUntilPresent * 1000) / m_perfFreq.QuadPart) : 0;
+
+                if (msUntilPresent > 3) {
+                    Sleep(msUntilPresent - 2);  // Wake up 2ms before present time
                 }
             }
         }
