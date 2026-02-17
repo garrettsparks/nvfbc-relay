@@ -5,12 +5,13 @@
 extern "C" void launchInterpolateKernel(
     const uint8_t* frame0,
     const uint8_t* frame1,
-    const int16_t* flowVectors,
+    const uint8_t* flowData,
     uint8_t* output,
     int width,
     int height,
     int flowWidth,
     int flowHeight,
+    int flowStrideBytes,
     int gridSize,
     float weight,
     CUstream stream);
@@ -540,7 +541,7 @@ bool FrucCaptureMode::InterpolateFrame(float weight) {
     }
 
     try {
-        // Get flow vector buffer's device pointer
+        // Get flow vector buffer's device pointer and stride
         NvOFBufferCudaDevicePtr* flowBuffer = dynamic_cast<NvOFBufferCudaDevicePtr*>(m_outputBuffers[0].get());
         if (!flowBuffer) {
             LOGERR("Failed to get flow buffer as CudaDevicePtr");
@@ -548,6 +549,17 @@ bool FrucCaptureMode::InterpolateFrame(float weight) {
         }
 
         CUdeviceptr flowPtr = flowBuffer->getCudaDevicePtr();
+        NV_OF_CUDA_BUFFER_STRIDE_INFO strideInfo = flowBuffer->getStrideInfo();
+        int flowStrideBytes = (int)strideInfo.strideInfo[0].strideXInBytes;
+
+        // Log stride mismatch diagnostic (once)
+        static bool loggedStride = false;
+        if (!loggedStride) {
+            loggedStride = true;
+            int assumedStride = m_flowWidth * sizeof(int16_t) * 2;  // flowWidth * sizeof(FlowVector)
+            LOG("DIAG flow buffer stride: actual=%d bytes, assumed(tight)=%d bytes, mismatch=%d bytes/row",
+                flowStrideBytes, assumedStride, flowStrideBytes - assumedStride);
+        }
 
         // Restore our context before kernel launch (NvOF Execute may have changed it)
         cuCtxSetCurrent(m_cuContext);
@@ -556,12 +568,13 @@ bool FrucCaptureMode::InterpolateFrame(float weight) {
         launchInterpolateKernel(
             (const uint8_t*)m_cudaFrame0,
             (const uint8_t*)m_cudaFrame1,
-            (const int16_t*)flowPtr,
+            (const uint8_t*)flowPtr,
             (uint8_t*)m_cudaOutputFrame,
             m_width,
             m_height,
             m_flowWidth,
             m_flowHeight,
+            flowStrideBytes,
             m_gridSize,
             weight,
             m_cudaStream
@@ -663,6 +676,12 @@ void FrucCaptureMode::Run(
     bool targetInitialized = false;
     bool flowComputedForCurrentPair = false;
 
+    // DIAGNOSTIC: set to true to bypass optical flow and just pass frames through
+    bool bypassFlow = false;
+    if (bypassFlow) {
+        LOG("*** BYPASS MODE: optical flow disabled, passing captured frames through ***");
+    }
+
     int framesSinceLog = 0;
     const int LOG_INTERVAL = 300;  // Log every 300 frames (5 seconds at 60fps)
 
@@ -729,33 +748,44 @@ void FrucCaptureMode::Run(
                     }
 
                     // Compute optical flow once per frame pair
-                    if (!flowComputedForCurrentPair) {
-                        if (!ComputeOpticalFlow()) {
-                            break;
-                        }
-                        flowComputedForCurrentPair = true;
-                    }
-
-                    // Calculate interpolation weight
-                    // weight = (target - t0) / (t1 - t0)
                     float weight = 0.5f;
-                    if (t1 > t0) {
-                        double rawWeight = (double)(targetPresentTime.QuadPart - t0) / (double)(t1 - t0);
-                        weight = (float)(rawWeight < 0.0 ? 0.0 : (rawWeight > 1.0 ? 1.0 : rawWeight));
+                    if (!bypassFlow) {
+                        if (!flowComputedForCurrentPair) {
+                            if (!ComputeOpticalFlow()) {
+                                break;
+                            }
+                            flowComputedForCurrentPair = true;
+                        }
+
+                        // Calculate interpolation weight
+                        // weight = (target - t0) / (t1 - t0)
+                        if (t1 > t0) {
+                            double rawWeight = (double)(targetPresentTime.QuadPart - t0) / (double)(t1 - t0);
+                            weight = (float)(rawWeight < 0.0 ? 0.0 : (rawWeight > 1.0 ? 1.0 : rawWeight));
+                        }
                     }
 
-                    // Interpolate and present
-                    if (InterpolateFrame(weight)) {
+                    // Choose data source: interpolated frame or raw captured frame
+                    bool frameReady = false;
+                    if (bypassFlow) {
+                        // Bypass: copy most recent captured frame's host buffer directly
+                        // (already in RGBA format from CopyFrameToHost)
+                        memcpy(m_hostOutputBuffer, frame1->hostBuffer, m_width * m_height * 4);
+                        frameReady = true;
+                    } else {
+                        frameReady = InterpolateFrame(weight);
+                    }
+
+                    // Present
+                    if (frameReady) {
                         D3DLOCKED_RECT lockedRect;
                         HRESULT hr = m_outputSurface->LockRect(&lockedRect, NULL, 0);
                         if (SUCCEEDED(hr)) {
-                            // Convert from NvOF ABGR8 (R,G,B,A in memory) back to D3D9 A8R8G8B8 (B,G,R,A in memory)
+                            // Convert from RGBA (R,G,B,A in memory) back to D3D9 A8R8G8B8 (B,G,R,A in memory)
                             for (int y = 0; y < m_height; y++) {
                                 const uint8_t* src = m_hostOutputBuffer + y * m_width * 4;
                                 uint8_t* dst = (uint8_t*)lockedRect.pBits + y * lockedRect.Pitch;
                                 for (int x = 0; x < m_width; x++) {
-                                    // NvOF ABGR8 memory: R, G, B, A
-                                    // D3D9 A8R8G8B8 memory: B, G, R, A
                                     dst[x * 4 + 0] = src[x * 4 + 2];  // B <- B
                                     dst[x * 4 + 1] = src[x * 4 + 1];  // G <- G
                                     dst[x * 4 + 2] = src[x * 4 + 0];  // R <- R
@@ -778,21 +808,22 @@ void FrucCaptureMode::Run(
                                 double tTargetMs = (double)targetPresentTime.QuadPart * 1000.0 / m_perfFreq.QuadPart;
                                 double actualMs = (double)actualPresentTime.QuadPart * 1000.0 / m_perfFreq.QuadPart;
                                 double latencyMs = actualMs - tTargetMs;
-                                LOG("Present[%d]: target=%.2fms, actual=%.2fms, latency=%.2fms, weight=%.3f, bracket=[%.2fms, %.2fms]",
-                                    presentCount, tTargetMs, actualMs, latencyMs, weight, t0Ms, t1Ms);
+                                LOG("Present[%d]: target=%.2fms, actual=%.2fms, latency=%.2fms, weight=%.3f, bracket=[%.2fms, %.2fms]%s",
+                                    presentCount, tTargetMs, actualMs, latencyMs, weight, t0Ms, t1Ms,
+                                    bypassFlow ? " [BYPASS]" : "");
                             }
 
-                            // Diagnostics for first 5 presents: kernel output sample, StretchRect, PresentEx
+                            // Diagnostics for first 5 presents
                             if (presentCount < 5) {
-                                // Sample pixel from middle of frame (not corner which might be static)
                                 int midOffset = (m_height / 2) * m_width * 4 + (m_width / 2) * 4;
+                                int botOffset = (m_height - 10) * m_width * 4 + (m_width / 2) * 4;
                                 LOG("DIAG present[%d]: weight=%.3f, LockRect=0x%08x, StretchRect=0x%08x, PresentEx=0x%08x, "
-                                    "mid-pixel: %02x %02x %02x %02x, corner-pixel: %02x %02x %02x %02x",
+                                    "mid-pixel: %02x %02x %02x %02x, bottom-pixel: %02x %02x %02x %02x",
                                     presentCount, weight, hr, stretchHr, presentHr,
                                     m_hostOutputBuffer[midOffset], m_hostOutputBuffer[midOffset+1],
                                     m_hostOutputBuffer[midOffset+2], m_hostOutputBuffer[midOffset+3],
-                                    m_hostOutputBuffer[0], m_hostOutputBuffer[1],
-                                    m_hostOutputBuffer[2], m_hostOutputBuffer[3]);
+                                    m_hostOutputBuffer[botOffset], m_hostOutputBuffer[botOffset+1],
+                                    m_hostOutputBuffer[botOffset+2], m_hostOutputBuffer[botOffset+3]);
                             }
                         } else {
                             if (presentCount < 5) {

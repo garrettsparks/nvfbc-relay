@@ -59,9 +59,21 @@ __device__ __forceinline__ void bilinearSample(
     }
 }
 
+// Access flow vector by row using byte stride (NvOF buffers may be padded)
+__device__ __forceinline__ FlowVector getFlowVector(
+    const uint8_t* flowData,
+    int flowStrideBytes,
+    int x,
+    int y)
+{
+    const FlowVector* row = (const FlowVector*)(flowData + y * flowStrideBytes);
+    return row[x];
+}
+
 // Bilinear interpolate flow vector at sub-grid position
 __device__ __forceinline__ void bilinearFlowSample(
-    const FlowVector* flowVectors,
+    const uint8_t* flowData,
+    int flowStrideBytes,
     int flowWidth,
     int flowHeight,
     float fx,
@@ -81,11 +93,11 @@ __device__ __forceinline__ void bilinearFlowSample(
     float fracX = fx - (float)x0;
     float fracY = fy - (float)y0;
 
-    // Get flow vectors at corners
-    FlowVector f00 = flowVectors[y0 * flowWidth + x0];
-    FlowVector f10 = flowVectors[y0 * flowWidth + x1];
-    FlowVector f01 = flowVectors[y1 * flowWidth + x0];
-    FlowVector f11 = flowVectors[y1 * flowWidth + x1];
+    // Get flow vectors at corners (using byte stride for correct row access)
+    FlowVector f00 = getFlowVector(flowData, flowStrideBytes, x0, y0);
+    FlowVector f10 = getFlowVector(flowData, flowStrideBytes, x1, y0);
+    FlowVector f01 = getFlowVector(flowData, flowStrideBytes, x0, y1);
+    FlowVector f11 = getFlowVector(flowData, flowStrideBytes, x1, y1);
 
     // Bilinear weights
     float w00 = (1.0f - fracX) * (1.0f - fracY);
@@ -105,12 +117,13 @@ __device__ __forceinline__ void bilinearFlowSample(
 __global__ void interpolateKernel(
     const uint8_t* frame0,      // Previous frame (ABGR8)
     const uint8_t* frame1,      // Current frame (ABGR8)
-    const FlowVector* flowVectors,  // Flow from frame0 to frame1
+    const uint8_t* flowData,    // Flow from frame0 to frame1 (raw buffer with stride)
     uint8_t* output,            // Interpolated output (ABGR8)
     int width,
     int height,
     int flowWidth,
     int flowHeight,
+    int flowStrideBytes,        // Actual byte stride of flow buffer rows
     int gridSize,
     float weight)               // 0.0 = frame0, 1.0 = frame1, 0.5 = midpoint
 {
@@ -128,7 +141,7 @@ __global__ void interpolateKernel(
 
     // Get interpolated flow vector at this pixel position
     float fx, fy;
-    bilinearFlowSample(flowVectors, flowWidth, flowHeight, flowX, flowY, &fx, &fy);
+    bilinearFlowSample(flowData, flowStrideBytes, flowWidth, flowHeight, flowX, flowY, &fx, &fy);
 
     // Calculate source positions using backward warping
     // The flow represents motion from frame0 to frame1
@@ -160,12 +173,13 @@ __global__ void interpolateKernel(
 extern "C" void launchInterpolateKernel(
     const uint8_t* frame0,
     const uint8_t* frame1,
-    const int16_t* flowVectors,
+    const uint8_t* flowData,
     uint8_t* output,
     int width,
     int height,
     int flowWidth,
     int flowHeight,
+    int flowStrideBytes,
     int gridSize,
     float weight,
     CUstream stream)
@@ -181,12 +195,13 @@ extern "C" void launchInterpolateKernel(
     interpolateKernel<<<gridDim, blockDim, 0, stream>>>(
         frame0,
         frame1,
-        (const FlowVector*)flowVectors,
+        flowData,
         output,
         width,
         height,
         flowWidth,
         flowHeight,
+        flowStrideBytes,
         gridSize,
         weight
     );
