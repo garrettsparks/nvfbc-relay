@@ -3,6 +3,7 @@
 #include "IFrameCaptureMode.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cudaD3D9.h>
 
 // NvOF SDK headers for optical flow
 #include "NvOFSDK/NvOFCuda.h"
@@ -15,15 +16,12 @@ extern int BUF_WIDTH;
 extern int BUF_HEIGHT;
 
 // Optical Flow based frame interpolation mode
-// Phase 4: Uses NvOFA for motion vectors + custom CUDA kernel for interpolation
+// GPU-resident pipeline: NvFBC → CUDA → NvOF → interpolation → D3D9, zero PCIe crossings
 class FrucCaptureMode : public IFrameCaptureMode {
 private:
-    // Frame history entry - stores captured frame with timestamp
+    // Frame history entry - timestamp and validity for ring buffer slots
     static const int FRAME_HISTORY_SIZE = 2;  // Need 2 frames for interpolation
     struct FrameHistoryEntry {
-        IDirect3DSurface9* d3dSurface;           // Owned D3D9 surface for this frame history slot
-        uint8_t* hostBuffer;                      // Host-side staging buffer for D3D9 Lock data
-        size_t hostBufferSize;                    // Size of host buffer in bytes
         LARGE_INTEGER timestamp;                  // High-precision capture timestamp
         bool valid;                               // Whether entry contains valid data
     };
@@ -42,6 +40,11 @@ private:
     CUstream m_cudaStream;
     bool m_cudaInitialized;
 
+    // ===== CUDA-D3D9 Interop =====
+    IDirect3DSurface9* m_interopCaptureSurface; // Separate surface for CUDA interop (StretchRect target)
+    CUgraphicsResource m_cudaCaptureResource;   // Registered interop capture surface
+    CUgraphicsResource m_cudaOutputResource;    // Registered output surface
+
     // ===== NvOF (Optical Flow) =====
     NvOFObj m_nvOF;                              // NvOF CUDA object
     std::vector<NvOFBufferObj> m_inputBuffers;  // 2 input frame buffers for NvOF
@@ -54,11 +57,10 @@ private:
     int m_currentHistoryIndex;                  // Write index for ring buffer
     int m_capturedFrameCount;                   // Total frames captured
 
-    // ===== Output Buffers =====
-    CUdeviceptr m_cudaFrame0;                   // GPU copy of frame 0 (for warp kernel)
-    CUdeviceptr m_cudaFrame1;                   // GPU copy of frame 1 (for warp kernel)
+    // ===== GPU Buffers (all GPU-resident, no host staging) =====
+    CUdeviceptr m_cudaFrame0;                   // CUDA ring buffer slot 0
+    CUdeviceptr m_cudaFrame1;                   // CUDA ring buffer slot 1
     CUdeviceptr m_cudaOutputFrame;              // GPU interpolated output frame
-    uint8_t* m_hostOutputBuffer;                // Host-side output for D3D9 copy
     IDirect3DSurface9* m_outputSurface;         // D3D9 surface for final output
 
     // ===== D3D9 Resources =====
@@ -91,12 +93,16 @@ private:
 
     // ===== Frame Management =====
     bool CaptureFrame(NvFBCToDx9Vid* nvfbcDx9, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
-    bool CopyFrameToHost(int historyIndex);
     FrameHistoryEntry* GetFrame(int offset);  // 0 = most recent, 1 = previous
+    int GetFrameRingIndex(int offset);        // Ring buffer index for offset
+    CUdeviceptr GetFrameCudaPtr(int offset);  // CUDA device pointer for frame at offset
 
     // ===== Optical Flow & Interpolation =====
     bool ComputeOpticalFlow();
-    bool InterpolateFrame(float weight);
+    bool InterpolateFrame(float weight, CUdeviceptr framePrev, CUdeviceptr frameCurr);
+
+    // ===== GPU-Resident Present =====
+    bool PresentFromGPU(IDirect3DDevice9Ex* device);
 
     // ===== Utility =====
     void LogCudaError(const char* operation, CUresult result);

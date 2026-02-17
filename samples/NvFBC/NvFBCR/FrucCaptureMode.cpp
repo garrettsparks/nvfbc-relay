@@ -27,28 +27,27 @@ FrucCaptureMode::FrucCaptureMode(float framerate)
     , m_cuDevice(0)
     , m_cudaStream(nullptr)
     , m_cudaInitialized(false)
+    , m_interopCaptureSurface(nullptr)
+    , m_cudaCaptureResource(nullptr)
+    , m_cudaOutputResource(nullptr)
     , m_nvofInitialized(false)
-    , m_gridSize(4)  // 4x4 pixel blocks per motion vector
+    , m_gridSize(4)  // 4x4 pixel blocks per motion vector (max supported by NvOF)
     , m_currentHistoryIndex(0)
     , m_capturedFrameCount(0)
     , m_cudaFrame0(0)
     , m_cudaFrame1(0)
     , m_cudaOutputFrame(0)
-    , m_hostOutputBuffer(nullptr)
     , m_outputSurface(nullptr)
     , m_device(nullptr)
     , m_captureTarget(nullptr)
 {
-    LOG("=== FrucCaptureMode Phase 4 (NvOFA) ===");
+    LOG("=== FrucCaptureMode GPU-Resident Pipeline ===");
     LOG("Target framerate: %.2f fps", m_targetFramerate);
     LOG("VSync mode: %s", m_isVsyncMode ? "yes" : "no");
     LOG("Flow grid size: %d", m_gridSize);
 
     // Initialize frame history
     for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        m_frameHistory[i].d3dSurface = nullptr;
-        m_frameHistory[i].hostBuffer = nullptr;
-        m_frameHistory[i].hostBufferSize = 0;
         m_frameHistory[i].timestamp.QuadPart = 0;
         m_frameHistory[i].valid = false;
     }
@@ -70,6 +69,16 @@ void FrucCaptureMode::Cleanup() {
     m_nvOF.reset();
     m_nvofInitialized = false;
 
+    // Unregister CUDA-D3D9 interop resources (before freeing CUDA memory)
+    if (m_cudaCaptureResource) {
+        cuGraphicsUnregisterResource(m_cudaCaptureResource);
+        m_cudaCaptureResource = nullptr;
+    }
+    if (m_cudaOutputResource) {
+        cuGraphicsUnregisterResource(m_cudaOutputResource);
+        m_cudaOutputResource = nullptr;
+    }
+
     // Free CUDA device memory
     if (m_cudaFrame0) {
         cuMemFree(m_cudaFrame0);
@@ -84,27 +93,14 @@ void FrucCaptureMode::Cleanup() {
         m_cudaOutputFrame = 0;
     }
 
-    // Free host buffers and release D3D9 surfaces
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        if (m_frameHistory[i].hostBuffer) {
-            delete[] m_frameHistory[i].hostBuffer;
-            m_frameHistory[i].hostBuffer = nullptr;
-        }
-        if (m_frameHistory[i].d3dSurface) {
-            m_frameHistory[i].d3dSurface->Release();
-            m_frameHistory[i].d3dSurface = nullptr;
-        }
-    }
-
-    if (m_hostOutputBuffer) {
-        delete[] m_hostOutputBuffer;
-        m_hostOutputBuffer = nullptr;
-    }
-
     // Release D3D9 surfaces
     if (m_outputSurface) {
         m_outputSurface->Release();
         m_outputSurface = nullptr;
+    }
+    if (m_interopCaptureSurface) {
+        m_interopCaptureSurface->Release();
+        m_interopCaptureSurface = nullptr;
     }
     if (m_captureTarget) {
         m_captureTarget->Release();
@@ -117,9 +113,9 @@ void FrucCaptureMode::Cleanup() {
         m_cudaStream = nullptr;
     }
 
-    // Release primary context
+    // Destroy D3D9 interop context
     if (m_cuContext) {
-        cuDevicePrimaryCtxRelease(m_cuDevice);
+        cuCtxDestroy(m_cuContext);
         m_cuContext = nullptr;
     }
 
@@ -131,7 +127,7 @@ UINT FrucCaptureMode::GetPresentationInterval() const {
 }
 
 bool FrucCaptureMode::InitCuda() {
-    LOG("Initializing CUDA...");
+    LOG("Initializing CUDA with D3D9 interop...");
 
     // Initialize CUDA driver API
     CUresult result = cuInit(0);
@@ -140,19 +136,12 @@ bool FrucCaptureMode::InitCuda() {
         return false;
     }
 
-    // Get CUDA device count
-    int deviceCount = 0;
-    result = cuDeviceGetCount(&deviceCount);
-    if (result != CUDA_SUCCESS || deviceCount == 0) {
-        LogCudaError("cuDeviceGetCount", result);
-        LOGERR("No CUDA devices found");
-        return false;
-    }
-
-    // Get first CUDA device
-    result = cuDeviceGet(&m_cuDevice, 0);
+    // Create CUDA context with D3D9 interop enabled.
+    // This auto-selects the CUDA device matching the D3D9 adapter and enables
+    // cuGraphicsD3D9RegisterResource on this context.
+    result = cuD3D9CtxCreate(&m_cuContext, &m_cuDevice, 0, m_device);
     if (result != CUDA_SUCCESS) {
-        LogCudaError("cuDeviceGet", result);
+        LogCudaError("cuD3D9CtxCreate", result);
         return false;
     }
 
@@ -164,19 +153,6 @@ bool FrucCaptureMode::InitCuda() {
     cuDeviceGetAttribute(&ccMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, m_cuDevice);
     LOG("CUDA device: %s (compute capability %d.%d, sm_%d%d)", deviceName, ccMajor, ccMinor, ccMajor, ccMinor);
 
-    // Use the primary context so that <<<>>> kernel launches (runtime API) share the same context
-    // as our driver API allocations and NvOF
-    result = cuDevicePrimaryCtxRetain(&m_cuContext, m_cuDevice);
-    if (result != CUDA_SUCCESS) {
-        LogCudaError("cuDevicePrimaryCtxRetain", result);
-        return false;
-    }
-    result = cuCtxSetCurrent(m_cuContext);
-    if (result != CUDA_SUCCESS) {
-        LogCudaError("cuCtxSetCurrent", result);
-        return false;
-    }
-
     // Create CUDA stream
     result = cuStreamCreate(&m_cudaStream, CU_STREAM_DEFAULT);
     if (result != CUDA_SUCCESS) {
@@ -184,7 +160,7 @@ bool FrucCaptureMode::InitCuda() {
         return false;
     }
 
-    LOG("CUDA initialized successfully");
+    LOG("CUDA initialized with D3D9 interop");
     m_cudaInitialized = true;
     return true;
 }
@@ -204,8 +180,8 @@ bool FrucCaptureMode::InitNvOF() {
 
     try {
         // Create NvOF CUDA instance
-        // Using ABGR8 format (8-bit per channel, what we'll convert to from ARGB10)
-        // Using CUdeviceptr buffer type for direct GPU memory access
+        // Declared as ABGR8 but fed BGRA data — NvOF only cares about consistent
+        // byte order between frames for motion vector computation
         m_nvOF = NvOFCuda::Create(
             m_cuContext,
             m_width,
@@ -214,7 +190,7 @@ bool FrucCaptureMode::InitNvOF() {
             NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
             NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
             NV_OF_MODE_OPTICALFLOW,
-            NV_OF_PERF_LEVEL_FAST,  // Use FAST for real-time
+            NV_OF_PERF_LEVEL_FAST,
             m_cudaStream,
             m_cudaStream
         );
@@ -257,44 +233,11 @@ bool FrucCaptureMode::InitNvOF() {
 }
 
 bool FrucCaptureMode::AllocateBuffers() {
-    LOG("Allocating buffers...");
+    LOG("Allocating GPU-resident buffers...");
 
-    // Frame size in bytes (ARGB8 = 4 bytes per pixel)
     size_t frameSize = m_width * m_height * 4;
 
-    // Create frame history surfaces and host buffers
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        // Create D3D9 surface for this history slot
-        HRESULT hr = m_device->CreateOffscreenPlainSurface(
-            m_width, m_height,
-            D3DFMT_A8R8G8B8,
-            D3DPOOL_DEFAULT,
-            &m_frameHistory[i].d3dSurface,
-            NULL
-        );
-        if (FAILED(hr)) {
-            LOGERR("Failed to create frame history surface %d (HRESULT: 0x%08x)", i, hr);
-            return false;
-        }
-
-        // Allocate host staging buffer
-        m_frameHistory[i].hostBuffer = new uint8_t[frameSize];
-        m_frameHistory[i].hostBufferSize = frameSize;
-        if (!m_frameHistory[i].hostBuffer) {
-            LOGERR("Failed to allocate host buffer %d", i);
-            return false;
-        }
-    }
-    LOG("Allocated %d frame history surfaces with host staging buffers (%zu bytes each)", FRAME_HISTORY_SIZE, frameSize);
-
-    // Allocate host output buffer
-    m_hostOutputBuffer = new uint8_t[frameSize];
-    if (!m_hostOutputBuffer) {
-        LOGERR("Failed to allocate host output buffer");
-        return false;
-    }
-
-    // Allocate CUDA device memory for frame copies (for warp kernel)
+    // Allocate CUDA device memory ring buffer (2 slots for frame pairs)
     CUresult result = cuMemAlloc(&m_cudaFrame0, frameSize);
     if (result != CUDA_SUCCESS) {
         LogCudaError("cuMemAlloc frame0", result);
@@ -312,12 +255,12 @@ bool FrucCaptureMode::AllocateBuffers() {
         LogCudaError("cuMemAlloc output", result);
         return false;
     }
-    LOG("Allocated CUDA device memory for frames");
+    LOG("Allocated CUDA device memory: 2 ring slots + 1 output (%zu bytes each)", frameSize);
 
     // Create D3D9 output surface for final presentation
     HRESULT hr = m_device->CreateOffscreenPlainSurface(
         m_width, m_height,
-        D3DFMT_A8R8G8B8,  // 8-bit ARGB for output
+        D3DFMT_A8R8G8B8,
         D3DPOOL_DEFAULT,
         &m_outputSurface,
         NULL
@@ -326,21 +269,53 @@ bool FrucCaptureMode::AllocateBuffers() {
         LOGERR("Failed to create output surface (HRESULT: 0x%08x)", hr);
         return false;
     }
-    LOG("Created D3D9 output surface");
 
-    LOG("Buffer allocation complete");
+    // Create a separate interop surface for capture (NvFBC target can't be directly
+    // mapped — NvFBC writes may not synchronize through D3D9's pipeline, so we
+    // StretchRect to this surface first, which is a proper D3D9 call that syncs)
+    hr = m_device->CreateOffscreenPlainSurface(
+        m_width, m_height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+        &m_interopCaptureSurface,
+        NULL
+    );
+    if (FAILED(hr)) {
+        LOGERR("Failed to create interop capture surface (HRESULT: 0x%08x)", hr);
+        return false;
+    }
+
+    // Register D3D9 surfaces for CUDA interop
+    // D3D9 interop only supports NONE, SURFACE_LDST, TEXTURE_GATHER flags
+    result = cuGraphicsD3D9RegisterResource(&m_cudaCaptureResource, m_interopCaptureSurface,
+                                             CU_GRAPHICS_REGISTER_FLAGS_NONE);
+    if (result != CUDA_SUCCESS) {
+        LogCudaError("cuGraphicsD3D9RegisterResource(interopCaptureSurface)", result);
+        return false;
+    }
+    LOG("Registered interop capture surface for CUDA");
+
+    result = cuGraphicsD3D9RegisterResource(&m_cudaOutputResource, m_outputSurface,
+                                             CU_GRAPHICS_REGISTER_FLAGS_NONE);
+    if (result != CUDA_SUCCESS) {
+        LogCudaError("cuGraphicsD3D9RegisterResource(outputSurface)", result);
+        return false;
+    }
+    LOG("Registered output surface for CUDA interop");
+
+    LOG("GPU-resident buffer allocation complete (zero host staging buffers)");
     return true;
 }
 
 bool FrucCaptureMode::Setup() {
-    LOG("FrucCaptureMode::Setup() - Phase 4 NvOFA implementation");
+    LOG("FrucCaptureMode::Setup() - GPU-resident pipeline");
 
-    // Store device pointer
+    // Store device pointer (needed by InitCuda for cuD3D9CtxCreate)
     m_device = g_pD3D9Device;
 
-    // Initialize CUDA (dimensions not needed yet)
+    // Initialize CUDA with D3D9 interop
     if (!InitCuda()) {
-        LOGERR("Failed to initialize CUDA");
+        LOGERR("Failed to initialize CUDA with D3D9 interop");
         return false;
     }
 
@@ -362,33 +337,60 @@ bool FrucCaptureMode::CaptureFrame(NvFBCToDx9Vid* nvfbcDx9, NVFBC_TODX9VID_GRAB_
         return true;
     }
 
-    // Get current frame history entry
-    FrameHistoryEntry* entry = &m_frameHistory[m_currentHistoryIndex];
-
-    // Copy from NvFBC capture target to current ring buffer slot
+    // StretchRect from NvFBC capture target to interop surface.
+    // This is a D3D9 call that properly synchronizes with NvFBC's writes,
+    // ensuring the data is visible when we map the interop surface for CUDA.
     RECT srcRect = { 0, 0, (LONG)m_width, (LONG)m_height };
-    HRESULT hr = m_device->StretchRect(
-        m_captureTarget,
-        &srcRect,
-        entry->d3dSurface,
-        &srcRect,
-        D3DTEXF_NONE
-    );
+    HRESULT hr = m_device->StretchRect(m_captureTarget, &srcRect,
+                                        m_interopCaptureSurface, &srcRect, D3DTEXF_NONE);
     if (FAILED(hr)) {
-        LOGERR("Failed to copy captured frame to ring buffer (HRESULT: 0x%08x)", hr);
+        LOGERR("Failed to StretchRect capture→interop (HRESULT: 0x%08x)", hr);
         return false;
     }
 
-    // Capture timestamp
-    QueryPerformanceCounter(&entry->timestamp);
+    // Map interop surface for CUDA access
+    CUresult result = cuGraphicsMapResources(1, &m_cudaCaptureResource, m_cudaStream);
+    if (result != CUDA_SUCCESS) {
+        LogCudaError("cuGraphicsMapResources(capture)", result);
+        return false;
+    }
 
-    // Mark entry as valid
+    CUarray mappedArray;
+    result = cuGraphicsSubResourceGetMappedArray(&mappedArray, m_cudaCaptureResource, 0, 0);
+    if (result != CUDA_SUCCESS) {
+        LogCudaError("cuGraphicsSubResourceGetMappedArray(capture)", result);
+        cuGraphicsUnmapResources(1, &m_cudaCaptureResource, m_cudaStream);
+        return false;
+    }
+
+    // Copy from mapped D3D9 array to CUDA ring buffer slot (GPU→GPU, no PCIe)
+    CUdeviceptr targetFrame = (m_currentHistoryIndex == 0) ? m_cudaFrame0 : m_cudaFrame1;
+    CUDA_MEMCPY2D cp = {};
+    cp.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+    cp.srcArray = mappedArray;
+    cp.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    cp.dstDevice = targetFrame;
+    cp.dstPitch = m_width * 4;
+    cp.WidthInBytes = m_width * 4;
+    cp.Height = m_height;
+    result = cuMemcpy2DAsync(&cp, m_cudaStream);
+    if (result != CUDA_SUCCESS) {
+        LogCudaError("cuMemcpy2DAsync(capture→ring)", result);
+        cuGraphicsUnmapResources(1, &m_cudaCaptureResource, m_cudaStream);
+        return false;
+    }
+
+    // Unmap: waits for async copy on m_cudaStream, then releases D3D9 access
+    cuGraphicsUnmapResources(1, &m_cudaCaptureResource, m_cudaStream);
+
+    // Get current frame history entry and record timestamp
+    FrameHistoryEntry* entry = &m_frameHistory[m_currentHistoryIndex];
+    QueryPerformanceCounter(&entry->timestamp);
     entry->valid = true;
     m_capturedFrameCount++;
 
-    // Debug first few captures
     if (m_capturedFrameCount <= 5) {
-        LOG("Captured frame %d to ring buffer slot %d", m_capturedFrameCount, m_currentHistoryIndex);
+        LOG("Captured frame %d to CUDA ring slot %d (GPU-resident)", m_capturedFrameCount, m_currentHistoryIndex);
     }
 
     // Advance ring buffer index
@@ -397,58 +399,20 @@ bool FrucCaptureMode::CaptureFrame(NvFBCToDx9Vid* nvfbcDx9, NVFBC_TODX9VID_GRAB_
     return true;
 }
 
-bool FrucCaptureMode::CopyFrameToHost(int historyIndex) {
-    FrameHistoryEntry* entry = &m_frameHistory[historyIndex];
-
-    if (!entry->valid || !entry->d3dSurface || !entry->hostBuffer) {
-        return false;
-    }
-
-    // Lock the D3D9 surface to get CPU access
-    D3DLOCKED_RECT lockedRect;
-    HRESULT hr = entry->d3dSurface->LockRect(&lockedRect, NULL, D3DLOCK_READONLY);
-    if (FAILED(hr)) {
-        LOGERR("Failed to lock D3D9 surface (HRESULT: 0x%08x)", hr);
-        return false;
-    }
-
-    // Copy data to host buffer - straight memcpy, no channel swap needed.
-    // D3D9 A8R8G8B8 is stored as BGRA in memory. NvOF is declared ABGR8 but only
-    // cares about consistent byte order between frames, not channel semantics.
-    // The interpolation kernel blends bytes at each position regardless of meaning.
-    uint8_t* dst = entry->hostBuffer;
-    const uint8_t* src = (const uint8_t*)lockedRect.pBits;
-
-    for (int y = 0; y < m_height; y++) {
-        memcpy(dst + y * m_width * 4,
-               src + y * lockedRect.Pitch,
-               m_width * 4);
-    }
-
-    entry->d3dSurface->UnlockRect();
-
-    // Diagnostic: check if captured frame has actual pixel data (first time only)
-    static bool checkedInput = false;
-    if (!checkedInput) {
-        checkedInput = true;
-        uint32_t nonZeroCount = 0;
-        for (int i = 0; i < m_width * 4 && i < 256; i++) {
-            if (dst[i] != 0) nonZeroCount++;
-        }
-        LOG("DIAG CopyFrameToHost: first 256 bytes, %d non-zero", nonZeroCount);
-        LOG("DIAG CopyFrameToHost: first 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-            dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7],
-            dst[8], dst[9], dst[10], dst[11], dst[12], dst[13], dst[14], dst[15]);
-    }
-
-    return true;
-}
-
 FrucCaptureMode::FrameHistoryEntry* FrucCaptureMode::GetFrame(int offset) {
     // offset 0 = most recent, 1 = previous
-    int index = (m_currentHistoryIndex + FRAME_HISTORY_SIZE - 1 - offset) % FRAME_HISTORY_SIZE;
+    int index = GetFrameRingIndex(offset);
     FrameHistoryEntry* entry = &m_frameHistory[index];
     return entry->valid ? entry : nullptr;
+}
+
+int FrucCaptureMode::GetFrameRingIndex(int offset) {
+    return (m_currentHistoryIndex + FRAME_HISTORY_SIZE - 1 - offset) % FRAME_HISTORY_SIZE;
+}
+
+CUdeviceptr FrucCaptureMode::GetFrameCudaPtr(int offset) {
+    int idx = GetFrameRingIndex(offset);
+    return (idx == 0) ? m_cudaFrame0 : m_cudaFrame1;
 }
 
 bool FrucCaptureMode::ComputeOpticalFlow() {
@@ -456,53 +420,59 @@ bool FrucCaptureMode::ComputeOpticalFlow() {
         return false;
     }
 
-    // Get the two most recent frames
-    FrameHistoryEntry* frame0 = GetFrame(1);  // Previous frame
-    FrameHistoryEntry* frame1 = GetFrame(0);  // Current frame
-
+    // Verify frame pair is valid
+    FrameHistoryEntry* frame0 = GetFrame(1);
+    FrameHistoryEntry* frame1 = GetFrame(0);
     if (!frame0 || !frame1) {
         return false;
     }
 
     try {
-        // Upload frame data to NvOF input buffers
-        m_inputBuffers[0]->UploadData(frame0->hostBuffer);
-        m_inputBuffers[1]->UploadData(frame1->hostBuffer);
+        // Ensure our context is current
+        cuCtxSetCurrent(m_cuContext);
 
-        // Restore our context before CUDA operations (NvOF UploadData may have changed it)
-        CUresult ctxRes = cuCtxSetCurrent(m_cuContext);
+        // Get CUDA pointers for the current frame pair
+        CUdeviceptr prevFrame = GetFrameCudaPtr(1);  // previous
+        CUdeviceptr currFrame = GetFrameCudaPtr(0);  // current
 
-        // Also copy to our CUDA buffers for the warp kernel
-        size_t frameSize = m_width * m_height * 4;
-        CUresult cpy0 = cuMemcpyHtoDAsync(m_cudaFrame0, frame0->hostBuffer, frameSize, m_cudaStream);
-        CUresult cpy1 = cuMemcpyHtoDAsync(m_cudaFrame1, frame1->hostBuffer, frameSize, m_cudaStream);
+        // Device-to-device copy to NvOF input buffers (respecting NvOF stride)
+        NvOFBufferCudaDevicePtr* nvofInput0 = dynamic_cast<NvOFBufferCudaDevicePtr*>(m_inputBuffers[0].get());
+        NvOFBufferCudaDevicePtr* nvofInput1 = dynamic_cast<NvOFBufferCudaDevicePtr*>(m_inputBuffers[1].get());
+        if (!nvofInput0 || !nvofInput1) {
+            LOGERR("Failed to get NvOF input buffers as CudaDevicePtr");
+            return false;
+        }
+
+        CUDA_MEMCPY2D cp = {};
+        cp.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        cp.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        cp.WidthInBytes = m_width * 4;
+        cp.Height = m_height;
+        cp.srcPitch = m_width * 4;
+
+        // Copy previous frame → NvOF input 0
+        cp.srcDevice = prevFrame;
+        cp.dstDevice = nvofInput0->getCudaDevicePtr();
+        cp.dstPitch = nvofInput0->getStrideInfo().strideInfo[0].strideXInBytes;
+        CUresult r0 = cuMemcpy2DAsync(&cp, m_cudaStream);
+
+        // Copy current frame → NvOF input 1
+        cp.srcDevice = currFrame;
+        cp.dstDevice = nvofInput1->getCudaDevicePtr();
+        cp.dstPitch = nvofInput1->getStrideInfo().strideInfo[0].strideXInBytes;
+        CUresult r1 = cuMemcpy2DAsync(&cp, m_cudaStream);
+
         cuStreamSynchronize(m_cudaStream);
 
-        // Diagnostic: check host buffers and GPU round-trip for first 5 calls
         static int flowDiagCount = 0;
         if (flowDiagCount < 5) {
-            // Sample from middle of frame (not corner)
-            int midOffset = (m_height / 2) * m_width * 4 + (m_width / 2) * 4;
-            LOG("DIAG flow[%d]: cuCtxSet=%d cpy0=%d cpy1=%d | "
-                "host frame0 mid: %02x %02x %02x %02x | "
-                "host frame1 mid: %02x %02x %02x %02x | "
-                "frame0==frame1 mid: %s",
-                flowDiagCount, ctxRes, cpy0, cpy1,
-                frame0->hostBuffer[midOffset], frame0->hostBuffer[midOffset+1],
-                frame0->hostBuffer[midOffset+2], frame0->hostBuffer[midOffset+3],
-                frame1->hostBuffer[midOffset], frame1->hostBuffer[midOffset+1],
-                frame1->hostBuffer[midOffset+2], frame1->hostBuffer[midOffset+3],
-                (memcmp(frame0->hostBuffer, frame1->hostBuffer, frameSize) == 0) ? "YES" : "NO");
-
-            // GPU round-trip: read back mid-pixel from both GPU buffers
-            uint8_t gpu0[4] = {}, gpu1[4] = {};
-            cuMemcpyDtoH(gpu0, m_cudaFrame0 + midOffset, 4);
-            cuMemcpyDtoH(gpu1, m_cudaFrame1 + midOffset, 4);
-            LOG("DIAG flow[%d]: GPU frame0 mid: %02x %02x %02x %02x | GPU frame1 mid: %02x %02x %02x %02x",
+            LOG("DIAG flow[%d]: D2D copy prev(slot %d)→nvof0=%d, curr(slot %d)→nvof1=%d, "
+                "nvof0 stride=%d, nvof1 stride=%d",
                 flowDiagCount,
-                gpu0[0], gpu0[1], gpu0[2], gpu0[3],
-                gpu1[0], gpu1[1], gpu1[2], gpu1[3]);
-
+                GetFrameRingIndex(1), r0,
+                GetFrameRingIndex(0), r1,
+                (int)nvofInput0->getStrideInfo().strideInfo[0].strideXInBytes,
+                (int)nvofInput1->getStrideInfo().strideInfo[0].strideXInBytes);
             flowDiagCount++;
         }
 
@@ -521,7 +491,7 @@ bool FrucCaptureMode::ComputeOpticalFlow() {
     }
 }
 
-bool FrucCaptureMode::InterpolateFrame(float weight) {
+bool FrucCaptureMode::InterpolateFrame(float weight, CUdeviceptr framePrev, CUdeviceptr frameCurr) {
     if (!m_nvofInitialized) {
         return false;
     }
@@ -538,11 +508,11 @@ bool FrucCaptureMode::InterpolateFrame(float weight) {
         NV_OF_CUDA_BUFFER_STRIDE_INFO strideInfo = flowBuffer->getStrideInfo();
         int flowStrideBytes = (int)strideInfo.strideInfo[0].strideXInBytes;
 
-        // Log stride mismatch diagnostic (once)
+        // Log stride info once
         static bool loggedStride = false;
         if (!loggedStride) {
             loggedStride = true;
-            int assumedStride = m_flowWidth * sizeof(int16_t) * 2;  // flowWidth * sizeof(FlowVector)
+            int assumedStride = m_flowWidth * sizeof(int16_t) * 2;
             LOG("DIAG flow buffer stride: actual=%d bytes, assumed(tight)=%d bytes, mismatch=%d bytes/row",
                 flowStrideBytes, assumedStride, flowStrideBytes - assumedStride);
         }
@@ -550,10 +520,10 @@ bool FrucCaptureMode::InterpolateFrame(float weight) {
         // Restore our context before kernel launch (NvOF Execute may have changed it)
         cuCtxSetCurrent(m_cuContext);
 
-        // Launch the interpolation kernel
+        // Launch the interpolation kernel (all data GPU-resident)
         launchInterpolateKernel(
-            (const uint8_t*)m_cudaFrame0,
-            (const uint8_t*)m_cudaFrame1,
+            (const uint8_t*)framePrev,
+            (const uint8_t*)frameCurr,
             (const uint8_t*)flowPtr,
             (uint8_t*)m_cudaOutputFrame,
             m_width,
@@ -566,21 +536,16 @@ bool FrucCaptureMode::InterpolateFrame(float weight) {
             m_cudaStream
         );
 
-        // Diagnostic: check kernel launch error (first time only)
+        // Check kernel launch error (first time only)
         static bool checkedLaunch = false;
         if (!checkedLaunch) {
             checkedLaunch = true;
+            cuStreamSynchronize(m_cudaStream);
             cudaError_t launchErr = cudaGetLastError();
             LOG("DIAG kernel launch: cudaGetLastError=%d (%s)", launchErr, cudaGetErrorString(launchErr));
         }
 
-        // Download result to host
-        size_t frameSize = m_width * m_height * 4;
-        cuMemcpyDtoHAsync(m_hostOutputBuffer, m_cudaOutputFrame, frameSize, m_cudaStream);
-
-        // Synchronize to ensure download is complete
-        cuStreamSynchronize(m_cudaStream);
-
+        // No host download — output stays on GPU for PresentFromGPU
         return true;
     }
     catch (const std::exception& e) {
@@ -589,13 +554,58 @@ bool FrucCaptureMode::InterpolateFrame(float weight) {
     }
 }
 
+bool FrucCaptureMode::PresentFromGPU(IDirect3DDevice9Ex* device) {
+    // Map D3D9 output surface for CUDA access
+    CUresult result = cuGraphicsMapResources(1, &m_cudaOutputResource, m_cudaStream);
+    if (result != CUDA_SUCCESS) {
+        LogCudaError("cuGraphicsMapResources(output)", result);
+        return false;
+    }
+
+    CUarray outputArray;
+    result = cuGraphicsSubResourceGetMappedArray(&outputArray, m_cudaOutputResource, 0, 0);
+    if (result != CUDA_SUCCESS) {
+        LogCudaError("cuGraphicsSubResourceGetMappedArray(output)", result);
+        cuGraphicsUnmapResources(1, &m_cudaOutputResource, m_cudaStream);
+        return false;
+    }
+
+    // Copy interpolated output from CUDA linear memory to D3D9 array (GPU→GPU)
+    CUDA_MEMCPY2D cp = {};
+    cp.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+    cp.srcDevice = m_cudaOutputFrame;
+    cp.srcPitch = m_width * 4;
+    cp.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+    cp.dstArray = outputArray;
+    cp.WidthInBytes = m_width * 4;
+    cp.Height = m_height;
+    cuMemcpy2DAsync(&cp, m_cudaStream);
+
+    // Sync stream and unmap so D3D9 can access the surface
+    cuStreamSynchronize(m_cudaStream);
+    cuGraphicsUnmapResources(1, &m_cudaOutputResource, m_cudaStream);
+
+    // Present via D3D9
+    HRESULT stretchHr = device->StretchRect(m_outputSurface, NULL, g_backbuffer, NULL, D3DTEXF_NONE);
+    HRESULT presentHr = device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
+
+    static int presentDiagCount = 0;
+    if (presentDiagCount < 5) {
+        LOG("DIAG PresentFromGPU[%d]: StretchRect=0x%08x, PresentEx=0x%08x",
+            presentDiagCount, stretchHr, presentHr);
+        presentDiagCount++;
+    }
+
+    return true;
+}
+
 void FrucCaptureMode::Run(
     NvFBCToDx9Vid* nvfbcDx9,
     NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
     IDirect3DDevice9Ex* device,
     HWND hwnd)
 {
-    LOG("FrucCaptureMode::Run() - Phase 4: NvOFA optical flow interpolation");
+    LOG("FrucCaptureMode::Run() - GPU-resident optical flow interpolation");
     LOG("Presentation: %s", m_isVsyncMode ? "VSync" : "Timed");
 
     // Get dimensions from globals (now initialized)
@@ -617,7 +627,7 @@ void FrucCaptureMode::Run(
     }
     LOG("Created NvFBC capture target surface");
 
-    // Configure NvFBC with single buffer (following FrameTemporalCaptureMode pattern)
+    // Configure NvFBC with single buffer
     NVFBC_TODX9VID_OUT_BUF outBuf[1];
     outBuf[0].pPrimary = m_captureTarget;
     outBuf[0].pSecondary = nullptr;
@@ -632,7 +642,7 @@ void FrucCaptureMode::Run(
     setupParams.ppDiffMap = nullptr;
     setupParams.ppClassificationMap = nullptr;
     setupParams.eMode = NVFBC_TODX9VID_ARGB;
-    setupParams.dwNumBuffers = 1;  // Single buffer - we manage ring buffer manually
+    setupParams.dwNumBuffers = 1;
     setupParams.bHDRRequest = FALSE;
 
     NVFBCRESULT setupResult = nvfbcDx9->NvFBCToDx9VidSetUp(&setupParams);
@@ -640,7 +650,7 @@ void FrucCaptureMode::Run(
         LOGERR("Failed to configure NvFBC (error code: 0x%08x)", setupResult);
         return;
     }
-    LOG("NvFBC configured with single capture buffer (manual ring buffer management)");
+    LOG("NvFBC configured with single capture buffer");
 
     // Initialize NvOF now that we have dimensions
     if (!InitNvOF()) {
@@ -648,7 +658,7 @@ void FrucCaptureMode::Run(
         return;
     }
 
-    // Allocate buffers
+    // Allocate buffers and register D3D9 surfaces for CUDA interop
     if (!AllocateBuffers()) {
         LOGERR("Failed to allocate buffers");
         return;
@@ -662,34 +672,33 @@ void FrucCaptureMode::Run(
     bool targetInitialized = false;
     bool flowComputedForCurrentPair = false;
 
-    // DIAGNOSTIC: set to true to bypass optical flow and just pass frames through
-    bool bypassFlow = false;
-    if (bypassFlow) {
-        LOG("*** BYPASS MODE: optical flow disabled, passing captured frames through ***");
-    }
-
     int framesSinceLog = 0;
-    const int LOG_INTERVAL = 300;  // Log every 300 frames (5 seconds at 60fps)
+    const int LOG_INTERVAL = 300;
 
     int presentCount = 0;
 
+    // Phase 2: Timing instrumentation — accumulate per stage, log every LOG_INTERVAL presents
+    double accumCaptureUs = 0, accumFlowUs = 0, accumInterpUs = 0, accumPresentUs = 0, accumSleepUs = 0;
+    int timingCaptureCount = 0, timingPresentCount = 0, timingDropCount = 0;
+    double usPerTick = 1000000.0 / (double)m_perfFreq.QuadPart;
+
     while (TRUE) {
-        LARGE_INTEGER currentTime;
+        LARGE_INTEGER currentTime, tStart, tEnd;
         QueryPerformanceCounter(&currentTime);
 
-        // Continuously capture frames to keep ring buffer fresh (non-blocking)
+        // [TIMING] Capture: NvFBC grab + StretchRect + CUDA interop map/copy/unmap
         int capturedBefore = m_capturedFrameCount;
+        QueryPerformanceCounter(&tStart);
         if (!CaptureFrame(nvfbcDx9, grabParams)) {
             LOGERR("Fatal error during frame capture");
             break;
         }
+        QueryPerformanceCounter(&tEnd);
+        accumCaptureUs += (double)(tEnd.QuadPart - tStart.QuadPart) * usPerTick;
+        timingCaptureCount++;
         bool newFrame = (m_capturedFrameCount > capturedBefore);
 
         if (newFrame) {
-            // Copy newly captured frame to host buffer (for NvOF upload)
-            int prevIndex = (m_currentHistoryIndex + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE;
-            CopyFrameToHost(prevIndex);
-
             // Get frame pair: frame0 = previous, frame1 = just captured
             FrameHistoryEntry* frame0 = GetFrame(1);
             FrameHistoryEntry* frame1 = GetFrame(0);
@@ -700,7 +709,6 @@ void FrucCaptureMode::Run(
 
                 // Initialize target time from first frame pair
                 if (!targetInitialized) {
-                    // First target is one output frame period after frame0
                     targetPresentTime.QuadPart = t0 + targetFrameTime;
                     targetInitialized = true;
                     LOG("Target initialized: first target at %.2fms after first capture",
@@ -712,12 +720,10 @@ void FrucCaptureMode::Run(
             }
         }
 
-        // Check if it's time to present
-        // Only do expensive work (optical flow, interpolation, present) when we're at target time
+        // Present at target times
         if (targetInitialized) {
             QueryPerformanceCounter(&currentTime);
 
-            // Get current frame pair for presentation
             FrameHistoryEntry* frame0 = GetFrame(1);
             FrameHistoryEntry* frame1 = GetFrame(0);
 
@@ -725,99 +731,73 @@ void FrucCaptureMode::Run(
                 LONGLONG t0 = frame0->timestamp.QuadPart;
                 LONGLONG t1 = frame1->timestamp.QuadPart;
 
-                // Present all target times that fall between frame0 and frame1 AND are ready now
                 while (targetPresentTime.QuadPart <= t1 && currentTime.QuadPart >= targetPresentTime.QuadPart) {
-                    // Skip any targets that fell before frame0 (catch-up after hiccup)
+                    // Skip targets before frame0 (catch-up after hiccup)
                     if (targetPresentTime.QuadPart < t0) {
                         targetPresentTime.QuadPart += targetFrameTime;
+                        timingDropCount++;
                         continue;
                     }
 
-                    // Compute optical flow once per frame pair
+                    // [TIMING] Flow: D2D copies to NvOF inputs + NvOF Execute
                     float weight = 0.5f;
-                    if (!bypassFlow) {
-                        if (!flowComputedForCurrentPair) {
-                            if (!ComputeOpticalFlow()) {
-                                break;
-                            }
-                            flowComputedForCurrentPair = true;
+                    if (!flowComputedForCurrentPair) {
+                        QueryPerformanceCounter(&tStart);
+                        if (!ComputeOpticalFlow()) {
+                            break;
                         }
-
-                        // Calculate interpolation weight
-                        // weight = (target - t0) / (t1 - t0)
-                        if (t1 > t0) {
-                            double rawWeight = (double)(targetPresentTime.QuadPart - t0) / (double)(t1 - t0);
-                            weight = (float)(rawWeight < 0.0 ? 0.0 : (rawWeight > 1.0 ? 1.0 : rawWeight));
-                        }
+                        QueryPerformanceCounter(&tEnd);
+                        accumFlowUs += (double)(tEnd.QuadPart - tStart.QuadPart) * usPerTick;
+                        flowComputedForCurrentPair = true;
                     }
 
-                    // Choose data source: interpolated frame or raw captured frame
-                    bool frameReady = false;
-                    if (bypassFlow) {
-                        // Bypass: copy most recent captured frame's host buffer directly
-                        // (native BGRA from CopyFrameToHost, matches D3D9 output)
-                        memcpy(m_hostOutputBuffer, frame1->hostBuffer, m_width * m_height * 4);
-                        frameReady = true;
-                    } else {
-                        frameReady = InterpolateFrame(weight);
+                    // Calculate interpolation weight: where does the target fall between frames?
+                    if (t1 > t0) {
+                        double rawWeight = (double)(targetPresentTime.QuadPart - t0) / (double)(t1 - t0);
+                        weight = (float)(rawWeight < 0.0 ? 0.0 : (rawWeight > 1.0 ? 1.0 : rawWeight));
                     }
 
-                    // Present
-                    if (frameReady) {
-                        D3DLOCKED_RECT lockedRect;
-                        HRESULT hr = m_outputSurface->LockRect(&lockedRect, NULL, 0);
-                        if (SUCCEEDED(hr)) {
-                            // Copy BGRA output directly to D3D9 surface (no channel swap needed)
-                            for (int y = 0; y < m_height; y++) {
-                                memcpy((uint8_t*)lockedRect.pBits + y * lockedRect.Pitch,
-                                       m_hostOutputBuffer + y * m_width * 4,
-                                       m_width * 4);
-                            }
-                            m_outputSurface->UnlockRect();
+                    // [TIMING] Interp: kernel launch (async) + Present: sync + CUDA→D3D9 + PresentEx
+                    CUdeviceptr prevFrame = GetFrameCudaPtr(1);
+                    CUdeviceptr currFrame = GetFrameCudaPtr(0);
 
-                            HRESULT stretchHr = device->StretchRect(m_outputSurface, NULL, g_backbuffer, NULL, D3DTEXF_NONE);
-                            HRESULT presentHr = device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
+                    LARGE_INTEGER tInterp, tPresent, tAfterPresent;
+                    QueryPerformanceCounter(&tInterp);
+                    if (InterpolateFrame(weight, prevFrame, currFrame)) {
+                        QueryPerformanceCounter(&tPresent);
+                        PresentFromGPU(device);
+                        QueryPerformanceCounter(&tAfterPresent);
 
-                            // Measure actual present time (after PresentEx completes)
-                            LARGE_INTEGER actualPresentTime;
-                            QueryPerformanceCounter(&actualPresentTime);
+                        accumInterpUs += (double)(tPresent.QuadPart - tInterp.QuadPart) * usPerTick;
+                        accumPresentUs += (double)(tAfterPresent.QuadPart - tPresent.QuadPart) * usPerTick;
 
-                            // Debug logging for first 120 presents (2 seconds at 60fps)
-                            if (presentCount < 120) {
-                                double t0Ms = (double)t0 * 1000.0 / m_perfFreq.QuadPart;
-                                double t1Ms = (double)t1 * 1000.0 / m_perfFreq.QuadPart;
-                                double tTargetMs = (double)targetPresentTime.QuadPart * 1000.0 / m_perfFreq.QuadPart;
-                                double actualMs = (double)actualPresentTime.QuadPart * 1000.0 / m_perfFreq.QuadPart;
-                                double latencyMs = actualMs - tTargetMs;
-                                LOG("Present[%d]: target=%.2fms, actual=%.2fms, latency=%.2fms, weight=%.3f, bracket=[%.2fms, %.2fms]%s",
-                                    presentCount, tTargetMs, actualMs, latencyMs, weight, t0Ms, t1Ms,
-                                    bypassFlow ? " [BYPASS]" : "");
-                            }
-
-                            // Diagnostics for first 5 presents
-                            if (presentCount < 5) {
-                                int midOffset = (m_height / 2) * m_width * 4 + (m_width / 2) * 4;
-                                int botOffset = (m_height - 10) * m_width * 4 + (m_width / 2) * 4;
-                                LOG("DIAG present[%d]: weight=%.3f, LockRect=0x%08x, StretchRect=0x%08x, PresentEx=0x%08x, "
-                                    "mid-pixel: %02x %02x %02x %02x, bottom-pixel: %02x %02x %02x %02x",
-                                    presentCount, weight, hr, stretchHr, presentHr,
-                                    m_hostOutputBuffer[midOffset], m_hostOutputBuffer[midOffset+1],
-                                    m_hostOutputBuffer[midOffset+2], m_hostOutputBuffer[midOffset+3],
-                                    m_hostOutputBuffer[botOffset], m_hostOutputBuffer[botOffset+1],
-                                    m_hostOutputBuffer[botOffset+2], m_hostOutputBuffer[botOffset+3]);
-                            }
-                        } else {
-                            if (presentCount < 5) {
-                                LOG("DIAG present[%d]: LockRect FAILED 0x%08x", presentCount, hr);
-                            }
-                            device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
+                        if (presentCount < 10) {
+                            double tTargetMs = (double)targetPresentTime.QuadPart * 1000.0 / m_perfFreq.QuadPart;
+                            double actualMs = (double)tAfterPresent.QuadPart * 1000.0 / m_perfFreq.QuadPart;
+                            LOG("Present[%d]: latency=%.2fms, weight=%.3f",
+                                presentCount, actualMs - tTargetMs, weight);
                         }
 
                         presentCount++;
+                        timingPresentCount++;
                         framesSinceLog++;
                         if (framesSinceLog >= LOG_INTERVAL) {
-                            LOG("Phase 4 running - captured %d frames, presented %d interpolated frames",
-                                m_capturedFrameCount, presentCount);
+                            double np = (double)timingPresentCount;
+                            double nc = (double)timingCaptureCount;
+                            double workMs = (accumFlowUs + accumInterpUs + accumPresentUs) / np / 1000.0;
+                            double budgetMs = 1000.0 / m_targetFramerate;
+                            LOG("TIMING(ms): flow=%.2f interp=%.2f present=%.2f work=%.2f headroom=%.2f "
+                                "| capture=%.2f/grab sleep=%.2f | %d presents, %d captures, %d dropped",
+                                accumFlowUs / np / 1000.0,
+                                accumInterpUs / np / 1000.0,
+                                accumPresentUs / np / 1000.0,
+                                workMs,
+                                budgetMs - workMs,
+                                accumCaptureUs / nc / 1000.0,
+                                accumSleepUs / np / 1000.0,
+                                timingPresentCount, timingCaptureCount, timingDropCount);
+                            accumCaptureUs = accumFlowUs = accumInterpUs = accumPresentUs = accumSleepUs = 0;
+                            timingPresentCount = timingCaptureCount = timingDropCount = 0;
                             framesSinceLog = 0;
                         }
                     }
@@ -825,16 +805,14 @@ void FrucCaptureMode::Run(
                     // Advance to next output target
                     targetPresentTime.QuadPart += targetFrameTime;
 
-                    // Check if we should wait before processing next present
                     QueryPerformanceCounter(&currentTime);
                     if (targetPresentTime.QuadPart > currentTime.QuadPart) {
-                        // Next target is in the future, break out to capture more frames
                         break;
                     }
                 }
             }
 
-            // If we're far from next present time, sleep briefly
+            // [TIMING] Sleep: idle time until next present target
             if (targetInitialized) {
                 QueryPerformanceCounter(&currentTime);
                 LONGLONG timeUntilPresent = targetPresentTime.QuadPart - currentTime.QuadPart;
@@ -842,7 +820,10 @@ void FrucCaptureMode::Run(
                     (DWORD)((timeUntilPresent * 1000) / m_perfFreq.QuadPart) : 0;
 
                 if (msUntilPresent > 3) {
-                    Sleep(msUntilPresent - 2);  // Wake up 2ms before present time
+                    QueryPerformanceCounter(&tStart);
+                    Sleep(msUntilPresent - 2);
+                    QueryPerformanceCounter(&tEnd);
+                    accumSleepUs += (double)(tEnd.QuadPart - tStart.QuadPart) * usPerTick;
                 }
             }
         }
@@ -859,13 +840,11 @@ void FrucCaptureMode::Run(
 
     LOG("FrucCaptureMode::Run() exiting - captured %d frames, presented %d interpolated",
         m_capturedFrameCount, presentCount);
-
-    // Surfaces will be released in Cleanup()
 }
 
 const char* FrucCaptureMode::GetModeName() const {
     static char modeName[64];
-    sprintf_s(modeName, sizeof(modeName), "OptFlow-Phase4-%.2f", m_targetFramerate);
+    sprintf_s(modeName, sizeof(modeName), "OptFlow-GPUResident-%.2f", m_targetFramerate);
     return modeName;
 }
 
