@@ -412,31 +412,17 @@ bool FrucCaptureMode::CopyFrameToHost(int historyIndex) {
         return false;
     }
 
-    // Copy data to host buffer
-    // NvFBC is set to ARGB8 mode, NvOF expects ABGR8
-    // D3D9 A8R8G8B8 is stored as BGRA in memory (little endian)
-    // NvOF ABGR8 expects RGBA in memory
-    // So we need to swap R and B channels
+    // Copy data to host buffer - straight memcpy, no channel swap needed.
+    // D3D9 A8R8G8B8 is stored as BGRA in memory. NvOF is declared ABGR8 but only
+    // cares about consistent byte order between frames, not channel semantics.
+    // The interpolation kernel blends bytes at each position regardless of meaning.
     uint8_t* dst = entry->hostBuffer;
     const uint8_t* src = (const uint8_t*)lockedRect.pBits;
 
     for (int y = 0; y < m_height; y++) {
-        const uint8_t* srcRow = src + y * lockedRect.Pitch;
-        uint8_t* dstRow = dst + y * m_width * 4;
-
-        for (int x = 0; x < m_width; x++) {
-            // D3D9 A8R8G8B8 in memory (little endian): B, G, R, A
-            uint8_t b = srcRow[x * 4 + 0];
-            uint8_t g = srcRow[x * 4 + 1];
-            uint8_t r = srcRow[x * 4 + 2];
-            uint8_t a = srcRow[x * 4 + 3];
-
-            // NvOF ABGR8 in memory: R, G, B, A
-            dstRow[x * 4 + 0] = r;
-            dstRow[x * 4 + 1] = g;
-            dstRow[x * 4 + 2] = b;
-            dstRow[x * 4 + 3] = a;
-        }
+        memcpy(dst + y * m_width * 4,
+               src + y * lockedRect.Pitch,
+               m_width * 4);
     }
 
     entry->d3dSurface->UnlockRect();
@@ -769,7 +755,7 @@ void FrucCaptureMode::Run(
                     bool frameReady = false;
                     if (bypassFlow) {
                         // Bypass: copy most recent captured frame's host buffer directly
-                        // (already in RGBA format from CopyFrameToHost)
+                        // (native BGRA from CopyFrameToHost, matches D3D9 output)
                         memcpy(m_hostOutputBuffer, frame1->hostBuffer, m_width * m_height * 4);
                         frameReady = true;
                     } else {
@@ -781,16 +767,11 @@ void FrucCaptureMode::Run(
                         D3DLOCKED_RECT lockedRect;
                         HRESULT hr = m_outputSurface->LockRect(&lockedRect, NULL, 0);
                         if (SUCCEEDED(hr)) {
-                            // Convert from RGBA (R,G,B,A in memory) back to D3D9 A8R8G8B8 (B,G,R,A in memory)
+                            // Copy BGRA output directly to D3D9 surface (no channel swap needed)
                             for (int y = 0; y < m_height; y++) {
-                                const uint8_t* src = m_hostOutputBuffer + y * m_width * 4;
-                                uint8_t* dst = (uint8_t*)lockedRect.pBits + y * lockedRect.Pitch;
-                                for (int x = 0; x < m_width; x++) {
-                                    dst[x * 4 + 0] = src[x * 4 + 2];  // B <- B
-                                    dst[x * 4 + 1] = src[x * 4 + 1];  // G <- G
-                                    dst[x * 4 + 2] = src[x * 4 + 0];  // R <- R
-                                    dst[x * 4 + 3] = src[x * 4 + 3];  // A <- A
-                                }
+                                memcpy((uint8_t*)lockedRect.pBits + y * lockedRect.Pitch,
+                                       m_hostOutputBuffer + y * m_width * 4,
+                                       m_width * 4);
                             }
                             m_outputSurface->UnlockRect();
 
