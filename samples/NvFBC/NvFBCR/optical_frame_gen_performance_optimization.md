@@ -606,20 +606,69 @@ The `NV_OF_OUTPUT_VECTOR_GRID_SIZE` enum in `nvOpticalFlowCommon.h` defines only
 `UNDEFINED`, `1`, `2`, `4`, `MAX`. Grid size 4 is already the coarsest available.
 This means we cannot reduce NvOF execution time by using a coarser grid.
 
-## Phase 4: Reduce NvOF Bottleneck — NOT YET STARTED
+#### Big Buck Bunny baseline (consistent test data, no game GPU load)
+Tested with Big Buck Bunny 4K 60fps video on source display. Stable, repeatable results.
+```
+flow=8.40-10.24  present=1.16-1.58  work=9.66-11.53  headroom=5.14-7.00
+capture=0.15-0.21/grab  sleep=3.19-5.15  dropped=0  captures=2737-3550 per 300 presents
+```
+**Averages:** flow=9.4ms, present=1.3ms, work=10.8ms, headroom=5.7ms, capture=0.17ms/grab
+
+**Critical finding: 0 dropped frames with ~5.7ms headroom, yet user sees repeated frames.**
+This means the stutter is NOT a budget issue — the pipeline has plenty of room. The
+duplicate frames are caused by the ring buffer architecture: with ~3100 captures per 300
+presents (~10 captures per output frame), NvFBC grabs the same source frame many times
+before the source updates. Both ring buffer slots end up with identical data, so flow
+computes zero vectors and interpolation just copies the same frame.
+
+**Root cause:** No source frame change detection. The 2-slot ring buffer gets overwritten
+with duplicates of the current source frame. When the source frame changes, one slot
+briefly holds the old frame and one the new frame — but this window is small relative to
+the capture rate. Need to detect actual source frame transitions and only advance the
+ring buffer when the captured frame is genuinely new.
+
+**Possible fixes (to investigate after Option A):**
+- NvFBC grab params may have flags to detect/wait for new frames
+- Compare a few pixels between consecutive captures to detect changes
+- Use NvFBC's diffmap feature to detect changed regions
+- Rate-limit captures to closer to source framerate
+
+## Phase 4: Reduce NvOF Bottleneck — OPTION A IMPLEMENTED, NOT YET TESTED
 
 NvOF Execute at ~9.5ms/frame is the dominant bottleneck. Grid size 4 is already the
 coarsest available. The following options could reduce the effective flow cost:
 
-### Option A: Downscale input for flow computation
-Feed NvOF a lower-resolution version of the frames (e.g. 640x360 instead of 1280x720).
+### Option A: Downscale input for flow computation — IMPLEMENTED, TESTED, INEFFECTIVE
+Feed NvOF a lower-resolution version of the frames (640x360 instead of 1280x720).
 Use the full-resolution frames for the interpolation kernel, scaling up the flow vectors.
 
-**Pros:** NvOF time scales roughly with pixel count — 4x fewer pixels ≈ 4x faster (~2.5ms).
-**Cons:** Coarser flow vectors, especially at edges. Needs a GPU downscale step (cheap
-via StretchRect or CUDA kernel) and flow vector upscaling in the interpolation kernel.
-**Complexity:** Medium. New downscale surface + NvOF at half res + kernel changes to
-scale flow vectors by 2x. Flow grid would be 160x90 at grid size 4, half-res input.
+**Expected:** NvOF time scales roughly with pixel count — 4x fewer pixels ≈ ~2.5ms (was ~9.5ms).
+**Actual:** flow=9.0ms (was 9.4ms). Only ~4% improvement. **NvOF does NOT scale linearly
+with pixel count on RTX 5080.** The hardware has significant fixed overhead that dominates
+execution time regardless of input resolution.
+
+Results (Big Buck Bunny 4K60, half-res flow 640x360, grid size 4):
+```
+flow=7.52-9.63  present=0.79-1.26  work=8.39-10.71  headroom=5.95-8.27
+capture=0.16-0.22/grab  dropped=0  captures=2713-3406 per 300 presents
+```
+
+**Implementation (still in working tree — may revert or keep for minor savings):**
+- `InterpolateKernel.cu`: Added `downscale2xKernel` (2x2 box filter, writes directly to
+  NvOF input buffer respecting stride). Added `flowScale` param to `interpolateKernel` —
+  scales flow grid lookup (`x / (gridSize * flowScale)`) and flow vector magnitudes
+  (`fx * flowScale`, `fy * flowScale`).
+- `FrucCaptureMode.h`: Added `m_flowScale` member (int, default 2).
+- `FrucCaptureMode.cpp`:
+  - `InitNvOF()`: Creates NvOF at `m_width/m_flowScale × m_height/m_flowScale` (640×360).
+    Flow grid becomes 160×90 (was 320×180).
+  - `ComputeOpticalFlow()`: Replaced `cuMemcpy2D` (full-res D2D copy) with
+    `launchDownscaleKernel` (full-res → half-res, writes directly to NvOF input with stride).
+  - `InterpolateFrame()`: Passes `(float)m_flowScale` to `launchInterpolateKernel`.
+
+**Key learning: NvOF Execute has ~8-9ms fixed cost on RTX 5080 regardless of input
+resolution.** This means Options B (skip similar frames) and C (async pipeline) are
+the only viable paths for reducing effective NvOF cost per frame.
 
 ### Option B: Skip flow on similar frames
 If consecutive frames are nearly identical (static scene, pause menu), reuse the
@@ -714,7 +763,12 @@ complex and risky. Save it for if Option A isn't enough.
 1. **Phase 1** (eliminate channel swap) — DONE
 2. **Phase 3** (CUDA-D3D9 interop) — DONE
 3. **Phase 2** (instrument timing) — DONE
-4. **Phase 4** (reduce NvOF bottleneck) — next, see options above
+4. **Phase 4 Option A** (downscale for flow) — DONE, ineffective (~4% improvement)
+5. **Phase 5: Fix duplicate frames** — NEXT PRIORITY
+   Root cause identified: ring buffer overwrites with identical captures.
+   See "Big Buck Bunny baseline" section above for full analysis.
+   This is the most impactful remaining issue — all the optimization in the world
+   doesn't matter if the output has visible duplicate frames.
 
 ## Test Screenshots
 

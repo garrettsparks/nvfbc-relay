@@ -123,7 +123,8 @@ void FrucCaptureMode::Cleanup() {
 }
 
 UINT FrucCaptureMode::GetPresentationInterval() const {
-    return m_isVsyncMode ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
+    // FRUC always uses VSync-driven presentation for hardware-timed cadence
+    return D3DPRESENT_INTERVAL_ONE;
 }
 
 bool FrucCaptureMode::InitCuda() {
@@ -585,9 +586,9 @@ bool FrucCaptureMode::PresentFromGPU(IDirect3DDevice9Ex* device) {
     cuStreamSynchronize(m_cudaStream);
     cuGraphicsUnmapResources(1, &m_cudaOutputResource, m_cudaStream);
 
-    // Present via D3D9
+    // Present via D3D9 (VSync: blocks until VBlank for hardware-timed cadence)
     HRESULT stretchHr = device->StretchRect(m_outputSurface, NULL, g_backbuffer, NULL, D3DTEXF_NONE);
-    HRESULT presentHr = device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
+    HRESULT presentHr = device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_ONE);
 
     static int presentDiagCount = 0;
     if (presentDiagCount < 5) {
@@ -664,29 +665,28 @@ void FrucCaptureMode::Run(
         return;
     }
 
-    // ===== Main capture/interpolation loop =====
-    MSG msg;
-    LARGE_INTEGER targetPresentTime;
-    LONGLONG targetFrameTime = (LONGLONG)(m_perfFreq.QuadPart / m_targetFramerate);
-
-    bool targetInitialized = false;
+    // ===== Main capture/interpolation loop (VSync-driven) =====
+    // PresentEx(D3DPRESENT_INTERVAL_ONE) blocks until VBlank — this is the timing
+    // mechanism. No Sleep(), no manual target time tracking, no drift.
+    MSG msg = {};
     bool flowComputedForCurrentPair = false;
-
+    int presentCount = 0;
     int framesSinceLog = 0;
     const int LOG_INTERVAL = 300;
 
-    int presentCount = 0;
-
-    // Phase 2: Timing instrumentation — accumulate per stage, log every LOG_INTERVAL presents
-    double accumCaptureUs = 0, accumFlowUs = 0, accumInterpUs = 0, accumPresentUs = 0, accumSleepUs = 0;
-    int timingCaptureCount = 0, timingPresentCount = 0, timingDropCount = 0;
+    // Timing instrumentation
+    double accumCaptureUs = 0, accumFlowUs = 0, accumInterpUs = 0, accumPresentUs = 0;
+    int timingCaptureCount = 0, timingPresentCount = 0;
     double usPerTick = 1000000.0 / (double)m_perfFreq.QuadPart;
 
-    while (TRUE) {
-        LARGE_INTEGER currentTime, tStart, tEnd;
-        QueryPerformanceCounter(&currentTime);
+    LOG("Entering VSync-driven main loop (present blocks until VBlank)");
 
-        // [TIMING] Capture: NvFBC grab + StretchRect + CUDA interop map/copy/unmap
+    while (TRUE) {
+        LARGE_INTEGER tStart, tEnd;
+
+        // === CAPTURE ===
+        // WAIT_WITH_TIMEOUT grab: blocks briefly until new source frame or timeout.
+        // After VSync present blocks ~14ms, there's usually a new source frame ready.
         int capturedBefore = m_capturedFrameCount;
         QueryPerformanceCounter(&tStart);
         if (!CaptureFrame(nvfbcDx9, grabParams)) {
@@ -696,134 +696,80 @@ void FrucCaptureMode::Run(
         QueryPerformanceCounter(&tEnd);
         accumCaptureUs += (double)(tEnd.QuadPart - tStart.QuadPart) * usPerTick;
         timingCaptureCount++;
+
         bool newFrame = (m_capturedFrameCount > capturedBefore);
-
         if (newFrame) {
-            // Get frame pair: frame0 = previous, frame1 = just captured
-            FrameHistoryEntry* frame0 = GetFrame(1);
-            FrameHistoryEntry* frame1 = GetFrame(0);
-
-            if (frame0 && frame1 && frame0->valid && frame1->valid) {
-                LONGLONG t0 = frame0->timestamp.QuadPart;
-                LONGLONG t1 = frame1->timestamp.QuadPart;
-
-                // Initialize target time from first frame pair
-                if (!targetInitialized) {
-                    targetPresentTime.QuadPart = t0 + targetFrameTime;
-                    targetInitialized = true;
-                    LOG("Target initialized: first target at %.2fms after first capture",
-                        (double)targetFrameTime * 1000.0 / m_perfFreq.QuadPart);
-                }
-
-                // New frame pair means flow needs recomputation
-                flowComputedForCurrentPair = false;
-            }
+            flowComputedForCurrentPair = false;
         }
 
-        // Present at target times
-        if (targetInitialized) {
-            QueryPerformanceCounter(&currentTime);
+        // === FLOW + INTERPOLATION + VSYNC PRESENT ===
+        FrameHistoryEntry* frame0 = GetFrame(1);
+        FrameHistoryEntry* frame1 = GetFrame(0);
 
-            FrameHistoryEntry* frame0 = GetFrame(1);
-            FrameHistoryEntry* frame1 = GetFrame(0);
+        if (frame0 && frame1 && frame0->valid && frame1->valid) {
+            LONGLONG t0 = frame0->timestamp.QuadPart;
+            LONGLONG t1 = frame1->timestamp.QuadPart;
 
-            if (frame0 && frame1 && frame0->valid && frame1->valid) {
-                LONGLONG t0 = frame0->timestamp.QuadPart;
-                LONGLONG t1 = frame1->timestamp.QuadPart;
-
-                while (targetPresentTime.QuadPart <= t1 && currentTime.QuadPart >= targetPresentTime.QuadPart) {
-                    // Skip targets before frame0 (catch-up after hiccup)
-                    if (targetPresentTime.QuadPart < t0) {
-                        targetPresentTime.QuadPart += targetFrameTime;
-                        timingDropCount++;
-                        continue;
-                    }
-
-                    // [TIMING] Flow: D2D copies to NvOF inputs + NvOF Execute
-                    float weight = 0.5f;
-                    if (!flowComputedForCurrentPair) {
-                        QueryPerformanceCounter(&tStart);
-                        if (!ComputeOpticalFlow()) {
-                            break;
-                        }
-                        QueryPerformanceCounter(&tEnd);
-                        accumFlowUs += (double)(tEnd.QuadPart - tStart.QuadPart) * usPerTick;
-                        flowComputedForCurrentPair = true;
-                    }
-
-                    // Calculate interpolation weight: where does the target fall between frames?
-                    if (t1 > t0) {
-                        double rawWeight = (double)(targetPresentTime.QuadPart - t0) / (double)(t1 - t0);
-                        weight = (float)(rawWeight < 0.0 ? 0.0 : (rawWeight > 1.0 ? 1.0 : rawWeight));
-                    }
-
-                    // [TIMING] Interp: kernel launch (async) + Present: sync + CUDA→D3D9 + PresentEx
-                    CUdeviceptr prevFrame = GetFrameCudaPtr(1);
-                    CUdeviceptr currFrame = GetFrameCudaPtr(0);
-
-                    LARGE_INTEGER tInterp, tPresent, tAfterPresent;
-                    QueryPerformanceCounter(&tInterp);
-                    if (InterpolateFrame(weight, prevFrame, currFrame)) {
-                        QueryPerformanceCounter(&tPresent);
-                        PresentFromGPU(device);
-                        QueryPerformanceCounter(&tAfterPresent);
-
-                        accumInterpUs += (double)(tPresent.QuadPart - tInterp.QuadPart) * usPerTick;
-                        accumPresentUs += (double)(tAfterPresent.QuadPart - tPresent.QuadPart) * usPerTick;
-
-                        if (presentCount < 10) {
-                            double tTargetMs = (double)targetPresentTime.QuadPart * 1000.0 / m_perfFreq.QuadPart;
-                            double actualMs = (double)tAfterPresent.QuadPart * 1000.0 / m_perfFreq.QuadPart;
-                            LOG("Present[%d]: latency=%.2fms, weight=%.3f",
-                                presentCount, actualMs - tTargetMs, weight);
-                        }
-
-                        presentCount++;
-                        timingPresentCount++;
-                        framesSinceLog++;
-                        if (framesSinceLog >= LOG_INTERVAL) {
-                            double np = (double)timingPresentCount;
-                            double nc = (double)timingCaptureCount;
-                            double workMs = (accumFlowUs + accumInterpUs + accumPresentUs) / np / 1000.0;
-                            double budgetMs = 1000.0 / m_targetFramerate;
-                            LOG("TIMING(ms): flow=%.2f interp=%.2f present=%.2f work=%.2f headroom=%.2f "
-                                "| capture=%.2f/grab sleep=%.2f | %d presents, %d captures, %d dropped",
-                                accumFlowUs / np / 1000.0,
-                                accumInterpUs / np / 1000.0,
-                                accumPresentUs / np / 1000.0,
-                                workMs,
-                                budgetMs - workMs,
-                                accumCaptureUs / nc / 1000.0,
-                                accumSleepUs / np / 1000.0,
-                                timingPresentCount, timingCaptureCount, timingDropCount);
-                            accumCaptureUs = accumFlowUs = accumInterpUs = accumPresentUs = accumSleepUs = 0;
-                            timingPresentCount = timingCaptureCount = timingDropCount = 0;
-                            framesSinceLog = 0;
-                        }
-                    }
-
-                    // Advance to next output target
-                    targetPresentTime.QuadPart += targetFrameTime;
-
-                    QueryPerformanceCounter(&currentTime);
-                    if (targetPresentTime.QuadPart > currentTime.QuadPart) {
-                        break;
-                    }
+            // Compute flow once per frame pair
+            if (!flowComputedForCurrentPair) {
+                QueryPerformanceCounter(&tStart);
+                if (!ComputeOpticalFlow()) {
+                    LOGERR("Optical flow computation failed");
+                    break;
                 }
+                QueryPerformanceCounter(&tEnd);
+                accumFlowUs += (double)(tEnd.QuadPart - tStart.QuadPart) * usPerTick;
+                flowComputedForCurrentPair = true;
             }
 
-            // [TIMING] Sleep: idle time until next present target
-            if (targetInitialized) {
-                QueryPerformanceCounter(&currentTime);
-                LONGLONG timeUntilPresent = targetPresentTime.QuadPart - currentTime.QuadPart;
-                DWORD msUntilPresent = timeUntilPresent > 0 ?
-                    (DWORD)((timeUntilPresent * 1000) / m_perfFreq.QuadPart) : 0;
+            // Weight: where does "now" fall between the two source frame timestamps?
+            // In single-threaded VSync mode this will be near 1.0 (we just captured frame1).
+            // Multithreaded mode will give more meaningful interpolation positions.
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            float weight = 0.5f;
+            if (t1 > t0) {
+                double rawWeight = (double)(now.QuadPart - t0) / (double)(t1 - t0);
+                weight = (float)(rawWeight < 0.0 ? 0.0 : (rawWeight > 1.0 ? 1.0 : rawWeight));
+            }
 
-                if (msUntilPresent > 3) {
-                    QueryPerformanceCounter(&tStart);
-                    Sleep(msUntilPresent - 2);
-                    QueryPerformanceCounter(&tEnd);
-                    accumSleepUs += (double)(tEnd.QuadPart - tStart.QuadPart) * usPerTick;
+            CUdeviceptr prevFrame = GetFrameCudaPtr(1);
+            CUdeviceptr currFrame = GetFrameCudaPtr(0);
+
+            LARGE_INTEGER tInterp, tPresent, tAfterPresent;
+            QueryPerformanceCounter(&tInterp);
+            if (InterpolateFrame(weight, prevFrame, currFrame)) {
+                QueryPerformanceCounter(&tPresent);
+                // PresentFromGPU calls PresentEx(INTERVAL_ONE) which blocks until VBlank.
+                // This is the frame pacer — no Sleep needed.
+                PresentFromGPU(device);
+                QueryPerformanceCounter(&tAfterPresent);
+
+                accumInterpUs += (double)(tPresent.QuadPart - tInterp.QuadPart) * usPerTick;
+                accumPresentUs += (double)(tAfterPresent.QuadPart - tPresent.QuadPart) * usPerTick;
+
+                if (presentCount < 10) {
+                    LOG("Present[%d]: weight=%.3f", presentCount, weight);
+                }
+
+                presentCount++;
+                timingPresentCount++;
+                framesSinceLog++;
+                if (framesSinceLog >= LOG_INTERVAL) {
+                    double np = (double)timingPresentCount;
+                    double nc = (double)timingCaptureCount;
+                    double workMs = (accumFlowUs + accumInterpUs) / np / 1000.0;
+                    LOG("TIMING(ms): flow=%.2f interp=%.2f present=%.2f work=%.2f "
+                        "| capture=%.2f/grab | %d presents, %d captures",
+                        accumFlowUs / np / 1000.0,
+                        accumInterpUs / np / 1000.0,
+                        accumPresentUs / np / 1000.0,
+                        workMs,
+                        accumCaptureUs / nc / 1000.0,
+                        timingPresentCount, timingCaptureCount);
+                    accumCaptureUs = accumFlowUs = accumInterpUs = accumPresentUs = 0;
+                    timingPresentCount = timingCaptureCount = 0;
+                    framesSinceLog = 0;
                 }
             }
         }
@@ -838,7 +784,7 @@ void FrucCaptureMode::Run(
             break;
     }
 
-    LOG("FrucCaptureMode::Run() exiting - captured %d frames, presented %d interpolated",
+    LOG("FrucCaptureMode::Run() exiting - captured %d frames, presented %d",
         m_capturedFrameCount, presentCount);
 }
 
