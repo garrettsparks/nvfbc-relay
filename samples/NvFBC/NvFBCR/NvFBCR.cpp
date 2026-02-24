@@ -737,7 +737,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     NVFBC_TODX9VID_GRAB_FRAME_PARAMS fbcDX9GrabParams = { 0 };
     {
         fbcDX9GrabParams.dwVersion = NVFBC_TODX9VID_GRAB_FRAME_PARAMS_V1_VER;
-        fbcDX9GrabParams.dwFlags = NVFBC_TODX9VID_NOWAIT;
+        fbcDX9GrabParams.dwFlags = NVFBC_TODX9VID_WAIT_WITH_TIMEOUT;
+        fbcDX9GrabParams.dwWaitTime = 2;
         fbcDX9GrabParams.eGMode = NVFBC_TODX9VID_SOURCEMODE_SCALE;
         fbcDX9GrabParams.dwTargetWidth = BUF_WIDTH;
         fbcDX9GrabParams.dwTargetHeight = BUF_HEIGHT;
