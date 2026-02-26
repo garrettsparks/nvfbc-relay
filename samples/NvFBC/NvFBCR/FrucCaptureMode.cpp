@@ -607,7 +607,9 @@ void FrucCaptureMode::Run(
     HWND hwnd)
 {
     LOG("FrucCaptureMode::Run() - GPU-resident optical flow interpolation");
-    LOG("Presentation: %s", m_isVsyncMode ? "VSync" : "Timed");
+    LOG("Presentation: %s (PresentationInterval=%d, INTERVAL_ONE=%d)",
+        m_isVsyncMode ? "VSync" : "Timed",
+        GetPresentationInterval(), D3DPRESENT_INTERVAL_ONE);
 
     // Get dimensions from globals (now initialized)
     m_width = BUF_WIDTH;
@@ -679,6 +681,29 @@ void FrucCaptureMode::Run(
     int timingCaptureCount = 0, timingPresentCount = 0;
     double usPerTick = 1000000.0 / (double)m_perfFreq.QuadPart;
 
+    // Weight statistics
+    double accumWeight = 0;
+    float minWeight = 1.0f, maxWeight = 0.0f;
+
+    // Frame pair delta statistics (how far apart the two ring buffer frames are)
+    double accumPairDeltaMs = 0;
+    double minPairDeltaMs = 1e9, maxPairDeltaMs = 0;
+
+    // VBlank time tracking for interpolation weight.
+    // After PresentEx returns (VBlank), we record the time. Next iteration uses
+    // that time as the interpolation target — it falls between frame0 (captured
+    // after previous VBlank) and frame1 (captured after this VBlank).
+    LARGE_INTEGER lastVBlankTime = {};
+    bool hasVBlankTime = false;
+
+    // Per-frame outlier detection: log any frame-to-frame interval that deviates
+    // significantly from the running average (catches hitches regardless of actual fps)
+    LARGE_INTEGER lastFrameTime = {};
+    bool hasLastFrameTime = false;
+    int outlierCount = 0;
+    double avgIntervalMs = 0.0;
+    int intervalSampleCount = 0;
+
     LOG("Entering VSync-driven main loop (present blocks until VBlank)");
 
     while (TRUE) {
@@ -722,31 +747,74 @@ void FrucCaptureMode::Run(
                 flowComputedForCurrentPair = true;
             }
 
-            // Weight: where does "now" fall between the two source frame timestamps?
-            // In single-threaded VSync mode this will be near 1.0 (we just captured frame1).
-            // Multithreaded mode will give more meaningful interpolation positions.
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
+            // Weight: where does the last VBlank fall between the two source frames?
+            // frame0 was captured after the previous VBlank, frame1 after this one.
+            // The VBlank moment (recorded after PresentEx returned last iteration)
+            // sits between t0 and t1, giving a meaningful interpolation position.
+            // First frame uses 0.5 as default until we have a VBlank timestamp.
             float weight = 0.5f;
-            if (t1 > t0) {
-                double rawWeight = (double)(now.QuadPart - t0) / (double)(t1 - t0);
+            if (hasVBlankTime && t1 > t0) {
+                double rawWeight = (double)(lastVBlankTime.QuadPart - t0) / (double)(t1 - t0);
                 weight = (float)(rawWeight < 0.0 ? 0.0 : (rawWeight > 1.0 ? 1.0 : rawWeight));
             }
 
             CUdeviceptr prevFrame = GetFrameCudaPtr(1);
             CUdeviceptr currFrame = GetFrameCudaPtr(0);
 
-            LARGE_INTEGER tInterp, tPresent, tAfterPresent;
+            LARGE_INTEGER tInterp, tPresent;
             QueryPerformanceCounter(&tInterp);
             if (InterpolateFrame(weight, prevFrame, currFrame)) {
                 QueryPerformanceCounter(&tPresent);
                 // PresentFromGPU calls PresentEx(INTERVAL_ONE) which blocks until VBlank.
                 // This is the frame pacer — no Sleep needed.
                 PresentFromGPU(device);
-                QueryPerformanceCounter(&tAfterPresent);
+                // Record VBlank time immediately after PresentEx returns.
+                // Next iteration's weight calculation uses this as the interpolation target.
+                QueryPerformanceCounter(&lastVBlankTime);
+                hasVBlankTime = true;
 
                 accumInterpUs += (double)(tPresent.QuadPart - tInterp.QuadPart) * usPerTick;
-                accumPresentUs += (double)(tAfterPresent.QuadPart - tPresent.QuadPart) * usPerTick;
+                accumPresentUs += (double)(lastVBlankTime.QuadPart - tPresent.QuadPart) * usPerTick;
+
+                // Frame pair delta: how far apart the two source frames are
+                double pairDeltaMs = (double)(t1 - t0) * usPerTick / 1000.0;
+                accumPairDeltaMs += pairDeltaMs;
+                if (pairDeltaMs < minPairDeltaMs) minPairDeltaMs = pairDeltaMs;
+                if (pairDeltaMs > maxPairDeltaMs) maxPairDeltaMs = pairDeltaMs;
+
+                // Per-frame outlier detection (relative to running average)
+                if (hasLastFrameTime) {
+                    double intervalMs = (double)(lastVBlankTime.QuadPart - lastFrameTime.QuadPart) * usPerTick / 1000.0;
+
+                    // Update running average (exponential moving average after warmup)
+                    if (intervalSampleCount < 30) {
+                        // Warmup: simple cumulative average
+                        avgIntervalMs = (avgIntervalMs * intervalSampleCount + intervalMs) / (intervalSampleCount + 1);
+                        intervalSampleCount++;
+                    } else {
+                        // Check for outlier: >50% deviation from running average
+                        double ratio = intervalMs / avgIntervalMs;
+                        if (ratio > 1.5 || ratio < 0.5) {
+                            double captureMs = (double)(tEnd.QuadPart - tStart.QuadPart) * usPerTick / 1000.0;
+                            double presentMs = (double)(lastVBlankTime.QuadPart - tPresent.QuadPart) * usPerTick / 1000.0;
+                            LOG("OUTLIER[%d] #%d: interval=%.2fms (avg=%.2f, ratio=%.2fx) "
+                                "weight=%.3f capture=%.2fms present=%.2fms newFrame=%d",
+                                presentCount, outlierCount,
+                                intervalMs, avgIntervalMs, ratio,
+                                weight, captureMs, presentMs, newFrame ? 1 : 0);
+                            outlierCount++;
+                        }
+                        // Update average (slow EMA, alpha=0.02 so outliers don't skew it)
+                        avgIntervalMs = avgIntervalMs * 0.98 + intervalMs * 0.02;
+                    }
+                }
+                lastFrameTime = lastVBlankTime;
+                hasLastFrameTime = true;
+
+                // Accumulate weight statistics
+                accumWeight += weight;
+                if (weight < minWeight) minWeight = weight;
+                if (weight > maxWeight) maxWeight = weight;
 
                 if (presentCount < 10) {
                     LOG("Present[%d]: weight=%.3f", presentCount, weight);
@@ -760,15 +828,26 @@ void FrucCaptureMode::Run(
                     double nc = (double)timingCaptureCount;
                     double workMs = (accumFlowUs + accumInterpUs) / np / 1000.0;
                     LOG("TIMING(ms): flow=%.2f interp=%.2f present=%.2f work=%.2f "
-                        "| capture=%.2f/grab | %d presents, %d captures",
+                        "| capture=%.2f/grab | weight avg=%.3f min=%.3f max=%.3f "
+                        "| pair_delta avg=%.1f min=%.1f max=%.1f "
+                        "| %d presents, %d captures, %d outliers",
                         accumFlowUs / np / 1000.0,
                         accumInterpUs / np / 1000.0,
                         accumPresentUs / np / 1000.0,
                         workMs,
                         accumCaptureUs / nc / 1000.0,
-                        timingPresentCount, timingCaptureCount);
+                        accumWeight / np, minWeight, maxWeight,
+                        accumPairDeltaMs / np, minPairDeltaMs, maxPairDeltaMs,
+                        timingPresentCount, timingCaptureCount, outlierCount);
                     accumCaptureUs = accumFlowUs = accumInterpUs = accumPresentUs = 0;
                     timingPresentCount = timingCaptureCount = 0;
+                    accumWeight = 0;
+                    minWeight = 1.0f;
+                    maxWeight = 0.0f;
+                    accumPairDeltaMs = 0;
+                    minPairDeltaMs = 1e9;
+                    maxPairDeltaMs = 0;
+                    outlierCount = 0;
                     framesSinceLog = 0;
                 }
             }

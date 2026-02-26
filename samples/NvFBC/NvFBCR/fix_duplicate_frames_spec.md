@@ -46,45 +46,111 @@ Massive improvement. Duplicate frames largely eliminated. Output is mostly smoot
 FrameTemporalCaptureMode, which was fixed by switching to VSync-driven presentation.
 Cause: `Sleep()` on Windows has ~1-2ms jitter that accumulates into a periodic stutter.
 
-## Phase A: VSync-Driven Presentation (next step)
+## Phase A: VSync-Driven Presentation — DONE, WEIGHT FIX NEEDED
 
 Switch from `D3DPRESENT_INTERVAL_IMMEDIATE` + Sleep-based timing to
 `D3DPRESENT_INTERVAL_ONE` (VSync). PresentEx blocks until VBlank, which is
 hardware-timed with zero drift.
 
-**File:** `FrucCaptureMode.cpp` `Run()` main loop
+### Critical: VBlank Time as Interpolation Target
 
-The loop structure changes from timer-driven to VSync-driven:
+**The key invariant:** We always have two source frames in the ring buffer. When VBlank
+fires, we interpolate between them at the point corresponding to the VBlank moment. This
+produces smooth output regardless of source framerate.
+
+**The bug in the initial VSync implementation:** Weight was calculated using "now" (after
+capture), which is always past frame1's timestamp → weight ≈ 1.0 → no actual interpolation,
+just showing the latest frame. Confirmed by logs: every frame had `weight=1.000`.
+
+**The fix:** Use the VBlank time as the interpolation target, not "now". The VBlank time
+naturally falls between the two ring buffer frames:
+
 ```
-// BEFORE (timer-driven):
-while (TRUE) {
-    CaptureFrame(WAIT_WITH_TIMEOUT=2ms)
-    PresentAtTargetTimes()      // manual timer + Sleep
-    Sleep(untilNextTarget)
-}
+Iteration N:
+  1. Capture frame1 → ring buffer has [frame0, frame1]
+  2. Compute flow (frame0 → frame1)
+  3. Interpolate at weight = (lastVBlankTime - t0) / (t1 - t0)
+  4. PresentEx(INTERVAL_ONE) — blocks until VBlank
+  5. Record VBlank time: QueryPerformanceCounter(&lastVBlankTime)
+  6. → Go to step 1 (next iteration)
+```
 
-// AFTER (VSync-driven):
+**Why this works:** frame0 was captured right after the PREVIOUS VBlank. frame1 was
+captured right after THIS VBlank (step 1). The VBlank moment (step 5 of the previous
+iteration) sits between frame0's timestamp and frame1's timestamp:
+
+```
+prev VBlank          this VBlank
+    |                    |
+    V                    V
+----+--------------------+--------------------
+    |  frame0            |  frame1
+    |  captured          |  captured
+    t0                   t1
+
+    lastVBlankTime is HERE ↑
+    (recorded at prev iteration's step 5)
+
+    weight = (lastVBlankTime - t0) / (t1 - t0)
+           ≈ 0.95 for 60fps/60Hz (VBlank slightly before t1)
+           varies for non-matching rates
+```
+
+**For non-matching rates (e.g., 90fps source on 60Hz output):**
+The source frames arrive at ~11ms intervals. We capture once per VBlank (~16.67ms).
+Some VBlanks we get 1 new source frame, some we get 2. The ring buffer pair timestamps
+vary, and the VBlank time falls at different positions within each pair. This is correct
+behavior — the weight adapts to wherever the VBlank actually falls between the two most
+recent source frames.
+
+**For the first frame:** No lastVBlankTime exists yet. Use weight=0.5 as default until
+the first PresentEx returns and we have a VBlank timestamp.
+
+### Loop Structure
+
+```cpp
+LARGE_INTEGER lastVBlankTime = {};
+bool hasVBlankTime = false;
+
 while (TRUE) {
-    CaptureFrame(WAIT_WITH_TIMEOUT=2ms)
-    if (newPair) ComputeOpticalFlow()
-    InterpolateFrame(weight)    // weight from current time vs frame pair timestamps
-    PresentFromGPU()            // PresentEx(D3DPRESENT_INTERVAL_ONE) — blocks until VBlank
+    // 1. Capture new source frame
+    CaptureFrame()
+
+    // 2. If we have a valid frame pair:
+    if (frame0 && frame1) {
+        // Compute flow once per new pair
+        if (newPair) ComputeOpticalFlow()
+
+        // Weight from VBlank time (falls between frame0 and frame1)
+        float weight = 0.5f;
+        if (hasVBlankTime && t1 > t0) {
+            weight = clamp((lastVBlankTime - t0) / (t1 - t0), 0, 1);
+        }
+
+        InterpolateFrame(weight)
+
+        // VSync present — blocks until VBlank (this IS the timing mechanism)
+        PresentFromGPU()  // PresentEx(D3DPRESENT_INTERVAL_ONE)
+
+        // Record VBlank time for next iteration's weight calculation
+        QueryPerformanceCounter(&lastVBlankTime)
+        hasVBlankTime = true;
+    }
+
+    ProcessMessages()
 }
 ```
 
-VSync present replaces Sleep as the timing mechanism. No manual timer, no drift.
+### Results: VSync Mode (before weight fix)
 
-**Concern:** With VSync blocking ~14ms per frame, CaptureFrame only runs once per
-VBlank (~60 times/sec on 60Hz output). For source rates >> 60fps, we only see the
-latest source frame each VBlank — we miss intermediate source frames. This is fine for
-the interpolation (we always get the freshest pair), but the time gap between ring buffer
-frames equals the VBlank interval rather than the source frame interval.
+```
+300 presents, 300 captures (perfect 1:1)
+flow=1.2ms, work=1.2ms, present=3.5ms (includes VSync wait)
+weight avg=1.000 min=1.000 max=1.000  ← BUG: no actual interpolation
+```
 
-**Bigger concern for non-60fps sources:** If source is 90fps on a 60Hz output, the
-timing relationship between source frames and VBlanks drifts. Some VBlanks will see 1
-new source frame, others 2. The ring buffer pair timestamps will be uneven. This should
-still work — the interpolation weight adjusts based on actual timestamps — but it's not
-ideal. The multithreaded approach (Phase B) handles this properly.
+No 1-second hitch (VSync provides hardware-timed cadence). But weight=1.0 means we're
+just frame-selecting, not interpolating. The VBlank weight fix addresses this.
 
 ## Phase B: Multithreaded Capture + VSync Present (future)
 
@@ -92,6 +158,13 @@ See: `multithreaded_fruc_spec.md`
 
 Separates capture (event-driven, source frame rate) from presentation (VSync-driven,
 output display rate). Each runs on its own schedule without blocking the other.
+
+**When this becomes necessary:** Single-threaded VSync captures once per VBlank, so the
+ring buffer pair always spans roughly one VBlank interval. At 90fps source, we miss
+intermediate source frames — the pair spans ~16.67ms instead of ~11ms (one source frame).
+Multithreaded capture keeps the ring buffer at source rate for tighter frame pairs and
+better flow vectors. But single-threaded with the VBlank weight fix should produce correct
+interpolation for any source rate — just with coarser frame pairs for high source rates.
 
 ## Notes
 
