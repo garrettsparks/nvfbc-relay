@@ -327,7 +327,7 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
     d3dpp.PresentationInterval = presentationInterval;
     //d3dpp.Flags = D3DPRESENTFLAG_VIDEO;
     d3dpp.hDeviceWindow = hwnd;
-    DWORD dwBehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING;
+    DWORD dwBehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED;
 
     hr = g_pD3DEx->CreateDeviceEx(
         deviceID,
@@ -712,51 +712,65 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 
     LOG("NvFBCToDX9Vid instance created successfully");
 
-    NvFBC_OutBuf[0].pPrimary = g_backbuffer;
+    // If capture mode manages its own NvFBC instance (e.g. NvFBCCuda),
+    // release the canary NvFBCToDx9Vid — it was only used to verify NvFBC is enabled.
+    if (captureMode->ManagesOwnCapture()) {
+        LOG("Capture mode manages own NvFBC instance — releasing NvFBCToDx9Vid canary");
+        NvFBCDX9->NvFBCToDx9VidRelease();
+        NvFBCDX9 = NULL;
 
+        if (!captureMode->Setup()) {
+            LOGERR("Failed to setup capture mode");
+            delete captureMode;
+            Cleanup();
+            return -1;
+        }
 
-    NVFBC_TODX9VID_SETUP_PARAMS DX9SetupParams = {};
-    DX9SetupParams.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
-    DX9SetupParams.bWithHWCursor = 1;
-    DX9SetupParams.bStereoGrab = 0;
-    DX9SetupParams.bDiffMap = 0;
-    DX9SetupParams.ppBuffer = NvFBC_OutBuf;
-    DX9SetupParams.eMode = NVFBC_TODX9VID_ARGB10; //NVFBC_TODX9VID_ARGB10; //NVFBC_TODX9VID_ARGB;
-    DX9SetupParams.dwNumBuffers = 1;
-    DX9SetupParams.bHDRRequest = TRUE;
-
-
-    if (NVFBC_SUCCESS != NvFBCDX9->NvFBCToDx9VidSetUp(&DX9SetupParams))
-    {
-        LOGERR("Failed calling NvFBCToDx9VidSetUp()");
-        Cleanup();
-        return -1;
+        LOG("Entering capture loop - mode: %s", captureMode->GetModeName());
+        captureMode->Run(nullptr, nullptr, g_pD3D9Device, hWnd);
     }
+    else {
+        NvFBC_OutBuf[0].pPrimary = g_backbuffer;
 
-    //! Setup NvFBC Grab Parameters
-    NVFBC_TODX9VID_GRAB_FRAME_PARAMS fbcDX9GrabParams = { 0 };
-    {
-        fbcDX9GrabParams.dwVersion = NVFBC_TODX9VID_GRAB_FRAME_PARAMS_V1_VER;
-        fbcDX9GrabParams.dwFlags = NVFBC_TODX9VID_WAIT_WITH_TIMEOUT;
-        fbcDX9GrabParams.dwWaitTime = 2;
-        fbcDX9GrabParams.eGMode = NVFBC_TODX9VID_SOURCEMODE_SCALE;
-        fbcDX9GrabParams.dwTargetWidth = BUF_WIDTH;
-        fbcDX9GrabParams.dwTargetHeight = BUF_HEIGHT;
-        fbcDX9GrabParams.pNvFBCFrameGrabInfo = &frameGrabInfo;
+        NVFBC_TODX9VID_SETUP_PARAMS DX9SetupParams = {};
+        DX9SetupParams.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
+        DX9SetupParams.bWithHWCursor = 1;
+        DX9SetupParams.bStereoGrab = 0;
+        DX9SetupParams.bDiffMap = 0;
+        DX9SetupParams.ppBuffer = NvFBC_OutBuf;
+        DX9SetupParams.eMode = NVFBC_TODX9VID_ARGB10;
+        DX9SetupParams.dwNumBuffers = 1;
+        DX9SetupParams.bHDRRequest = TRUE;
+
+        if (NVFBC_SUCCESS != NvFBCDX9->NvFBCToDx9VidSetUp(&DX9SetupParams))
+        {
+            LOGERR("Failed calling NvFBCToDx9VidSetUp()");
+            Cleanup();
+            return -1;
+        }
+
+        //! Setup NvFBC Grab Parameters
+        NVFBC_TODX9VID_GRAB_FRAME_PARAMS fbcDX9GrabParams = { 0 };
+        {
+            fbcDX9GrabParams.dwVersion = NVFBC_TODX9VID_GRAB_FRAME_PARAMS_V1_VER;
+            fbcDX9GrabParams.dwFlags = NVFBC_TODX9VID_WAIT_WITH_TIMEOUT;
+            fbcDX9GrabParams.dwWaitTime = 2;
+            fbcDX9GrabParams.eGMode = NVFBC_TODX9VID_SOURCEMODE_SCALE;
+            fbcDX9GrabParams.dwTargetWidth = BUF_WIDTH;
+            fbcDX9GrabParams.dwTargetHeight = BUF_HEIGHT;
+            fbcDX9GrabParams.pNvFBCFrameGrabInfo = &frameGrabInfo;
+        }
+
+        if (!captureMode->Setup()) {
+            LOGERR("Failed to setup capture mode");
+            delete captureMode;
+            Cleanup();
+            return -1;
+        }
+
+        LOG("Entering capture loop - mode: %s", captureMode->GetModeName());
+        captureMode->Run(NvFBCDX9, &fbcDX9GrabParams, g_pD3D9Device, hWnd);
     }
-
-    // Setup and run capture mode
-    if (!captureMode->Setup()) {
-        LOGERR("Failed to setup capture mode");
-        delete captureMode;
-        Cleanup();
-        return -1;
-    }
-
-    LOG("Entering capture loop - mode: %s", captureMode->GetModeName());
-
-    // Run the mode's capture loop (contains entire loop logic including message processing)
-    captureMode->Run(NvFBCDX9, &fbcDX9GrabParams, g_pD3D9Device, hWnd);
 
     // Clean up capture mode
     delete captureMode;

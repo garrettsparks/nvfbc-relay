@@ -25,4 +25,8 @@ public:
 
     // Get descriptive name for logging
     virtual const char* GetModeName() const = 0;
+
+    // Return true if the mode creates its own NvFBC capture instance
+    // (e.g. NvFBCCuda instead of NvFBCToDx9Vid)
+    virtual bool ManagesOwnCapture() const { return false; }
 };
