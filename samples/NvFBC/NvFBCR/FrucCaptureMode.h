@@ -21,10 +21,12 @@ extern NvFBCLibrary* pNVFBCLib;
 // Optical Flow based frame interpolation mode
 // GPU-resident pipeline: NvFBC → CUDA → NvOF → interpolation → D3D9, zero PCIe crossings
 //
-// V4 architecture: NvFBCCuda grabs directly to CUDA ring buffer slots — no D3D9
-// on capture thread at all. Eliminates D3DCREATE_MULTITHREADED lock contention.
-// Present thread reads ring metadata via atomics, selects bracket pair straddling
-// prevVBlankTime, then reads ring slots directly for flow/interp.
+// V7 architecture: Direct-to-backbuffer at native resolution. Three threads:
+//   Capture thread: NvFBCCuda grab → downscale to backbuffer res → ring buffer
+//   Flow thread: ring → NvOF input copy → NvOF Execute (blocking) → double-buffered output
+//   Present thread: interp kernel → CUDA→backbuffer copy → PresentEx (VSync)
+// Working resolution = backbuffer resolution (no StretchRect needed).
+// Flow(N+1) runs concurrently with Present(N), so budget = max(flow, present).
 class FrucCaptureMode : public IFrameCaptureMode {
 private:
     // Frame history entry - timestamp and validity for ring buffer slots
@@ -37,24 +39,28 @@ private:
     // ===== Configuration =====
     float m_targetFramerate;
     bool m_isVsyncMode;
-    int m_width;
+    int m_width;                                // Working resolution (= backbuffer res)
     int m_height;
+    int m_captureWidth;                         // Full NvFBCCuda capture resolution
+    int m_captureHeight;
     int m_flowWidth;                            // Width of flow vector grid
     int m_flowHeight;                           // Height of flow vector grid
 
     // ===== CUDA Resources =====
     CUcontext m_cuContext;
     CUdevice m_cuDevice;
-    CUstream m_cudaStream;                      // Present thread stream (flow/interp/output)
+    CUstream m_cudaStream;                      // Present thread stream (interp/output)
+    CUstream m_captureStream;                   // Capture thread stream (downscale kernel)
+    CUstream m_flowStream;                      // Flow thread stream (ring→NvOF memcpy)
     bool m_cudaInitialized;
 
     // ===== CUDA-D3D9 Interop (output only) =====
-    CUgraphicsResource m_cudaOutputResource;    // Registered output surface
+    CUgraphicsResource m_cudaOutputResource;    // Registered backbuffer for direct output
 
     // ===== NvOF (Optical Flow) =====
     NvOFObj m_nvOF;                              // NvOF CUDA object
     std::vector<NvOFBufferObj> m_inputBuffers;  // 2 input frame buffers for NvOF
-    std::vector<NvOFBufferObj> m_outputBuffers; // 1 output flow vector buffer
+    std::vector<NvOFBufferObj> m_outputBuffers; // 2 output flow vector buffers (double-buffered)
     bool m_nvofInitialized;
     uint32_t m_gridSize;                        // Flow vector grid size (e.g., 4 = 4x4 pixel blocks)
 
@@ -66,7 +72,8 @@ private:
 
     // ===== GPU Buffers =====
     CUdeviceptr m_cudaOutputFrame;              // GPU interpolated output frame
-    IDirect3DSurface9* m_outputSurface;         // D3D9 surface for final output
+    CUdeviceptr m_fullResGrabBuffer;            // Single full-res buffer for NvFBCCuda grabs
+    IDirect3DSurface9* m_outputSurface;         // D3D9 surface for CUDA interop output
 
     // ===== D3D9 Resources =====
     IDirect3DDevice9Ex* m_device;
@@ -74,11 +81,23 @@ private:
     // ===== Timing =====
     LARGE_INTEGER m_perfFreq;                   // Performance counter frequency
 
-    // ===== Threading =====
+    // ===== Threading: Capture =====
     HANDLE m_captureThread;                     // Capture thread handle
     std::atomic<bool> m_captureRunning;         // Shutdown signal for capture thread
     std::atomic<bool> m_sessionInvalidated;     // Fatal error from capture thread
     std::atomic<int> m_captureGrabCount;        // For capture rate metric
+
+    // ===== Threading: Flow Worker (pipelining) =====
+    HANDLE m_flowThread;                        // Flow worker thread handle
+    HANDLE m_flowRequestEvent;                  // Auto-reset: present→flow "start computing"
+    HANDLE m_flowDoneEvent;                     // Auto-reset: flow→present "result ready"
+    std::atomic<bool> m_flowShutdown;           // Shutdown signal for flow thread
+
+    // Flow thread shared state (written by present thread before signaling, read by flow thread)
+    int m_flowPrevSlot;                         // Ring slot index for previous frame
+    int m_flowNextSlot;                         // Ring slot index for next frame
+    int m_flowOutputIdx;                        // Which NvOF output buffer to write (0 or 1)
+    std::atomic<double> m_lastFlowTimeUs;       // Flow thread timing (for present thread logging)
 
     // ===== NvFBCCuda =====
     NvFBCCuda* m_nvfbcCuda;                     // NvFBCCuda instance (used by capture thread)
@@ -115,10 +134,10 @@ private:
 
     // ===== Threading =====
     static DWORD WINAPI CaptureThreadProc(LPVOID param);
+    static DWORD WINAPI FlowWorkerThreadProc(LPVOID param);
 
     // ===== Optical Flow & Interpolation =====
-    bool ComputeOpticalFlow(CUdeviceptr framePrev, CUdeviceptr frameCurr);
-    bool InterpolateFrame(float weight, CUdeviceptr framePrev, CUdeviceptr frameCurr);
+    bool InterpolateFrame(float weight, CUdeviceptr framePrev, CUdeviceptr frameCurr, int flowOutputIdx);
 
     // ===== GPU-Resident Present =====
     bool PresentFromGPU(IDirect3DDevice9Ex* device, LARGE_INTEGER* pPresentExStart);

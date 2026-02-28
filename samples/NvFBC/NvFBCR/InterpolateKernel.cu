@@ -169,6 +169,58 @@ __global__ void interpolateKernel(
     }
 }
 
+// Bilinear downscale kernel
+// For each output pixel, samples the corresponding position in the source using bilinear filtering
+__global__ void downscaleKernel(
+    const uint8_t* src,
+    uint8_t* dst,
+    int srcWidth,
+    int srcHeight,
+    int dstWidth,
+    int dstHeight)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= dstWidth || y >= dstHeight) {
+        return;
+    }
+
+    // Map output pixel to source position (center of corresponding source region)
+    float srcX = ((float)x + 0.5f) * (float)srcWidth / (float)dstWidth - 0.5f;
+    float srcY = ((float)y + 0.5f) * (float)srcHeight / (float)dstHeight - 0.5f;
+
+    uint8_t pixel[4];
+    bilinearSample(src, srcWidth, srcHeight, srcX, srcY, pixel);
+
+    uint8_t* outPixel = dst + (y * dstWidth + x) * 4;
+    outPixel[0] = pixel[0];
+    outPixel[1] = pixel[1];
+    outPixel[2] = pixel[2];
+    outPixel[3] = pixel[3];
+}
+
+// Host-callable function to launch the downscale kernel
+extern "C" void launchDownscaleKernel(
+    const uint8_t* src,
+    int srcWidth,
+    int srcHeight,
+    uint8_t* dst,
+    int dstWidth,
+    int dstHeight,
+    CUstream stream)
+{
+    dim3 blockDim(16, 16);
+    dim3 gridDim(
+        (dstWidth + blockDim.x - 1) / blockDim.x,
+        (dstHeight + blockDim.y - 1) / blockDim.y
+    );
+
+    downscaleKernel<<<gridDim, blockDim, 0, stream>>>(
+        src, dst, srcWidth, srcHeight, dstWidth, dstHeight
+    );
+}
+
 // Host-callable function to launch the kernel
 extern "C" void launchInterpolateKernel(
     const uint8_t* frame0,

@@ -1154,3 +1154,97 @@ All options assume 60Hz locked output as a hard requirement.
 and may be sufficient on its own. If NvOF's 8ms fixed cost still causes issues, add
 predictive timing (Option 2) to reclaim VSync headroom. Pipelining (Option 3/4) is the
 nuclear option if the simpler approaches fail.
+
+## V5: Downscale After Capture (IMPLEMENTED, TESTED)
+
+### Implementation
+V5 = Option 1 from planning above. Added CUDA downscale kernel in capture thread:
+- NvFBCCuda grab → `m_fullResGrabBuffer` (2560×1440)
+- `launchDownscaleKernel` → ring slot (1920×1080, target display resolution)
+- All downstream work (NvOF, interp, present) at 1920×1080
+
+### V5 Gameplay Results (Avatar @ 90fps)
+
+| Phase | flow (ms) | work (ms) | Stalls/300 |
+|-------|-----------|-----------|------------|
+| Desktop | 0.3-0.5 | 1.4-1.9 | 0 |
+| Medium gameplay | 4.7-5.5 | 4.3-5.7 | 0 |
+| Heavy gameplay | 7.8-10.1 | 8.4-11.7 | 12-108 |
+
+**Total: ~424 stalls** (73% reduction from V4's 1578).
+
+### Analysis
+NvOF is still 8-10ms under heavy GPU load. flow+work = 16-22ms exceeds 16.7ms budget.
+Downscale helped but wasn't sufficient alone. Need Option 3 (pipelining).
+
+## V6: Pipelined Flow + Present (IMPLEMENTED, TESTED)
+
+### Implementation
+V6 = Option 1 + Option 3. Dedicated flow worker thread:
+- Flow thread: waits for signal → copies ring→NvOF inputs → NvOF Execute → signals done
+- Present thread: waits for flow done → interp → present → dispatches next flow
+- Double-buffered NvOF outputs prevent read/write conflict
+- Windows auto-reset events for synchronization
+- Budget = max(flow, present) instead of flow + present
+
+### V6 Gameplay Results (Avatar @ 90fps)
+
+| Phase | flow (ms) | fwait (ms) | work (ms) | Stalls/300 |
+|-------|-----------|------------|-----------|------------|
+| Desktop | 4.1-4.8 | 0.03-0.10 | 1.7-1.8 | 0 |
+| Medium gameplay | 13.0-14.3 | 0.06-0.20 | 3.2-7.6 | 0-2 |
+| Heavy gameplay | 14.3-16.0 | 0.10-0.17 | 7.6-13.8 | 10-74 |
+
+**Total: 311 stalls** (27% reduction from V5's 424).
+
+### Analysis
+Pipelining works — fwait≈0 in most stalls (flow finishes before present needs it).
+But `work` alone reaches 20-52ms during heavy GPU contention. The problem shifted from
+flow+work budget to work-only GPU contention. Need to reduce work volume.
+
+## V7: Direct-to-Backbuffer Resolution (IMPLEMENTED, TESTED — CURRENT)
+
+### Implementation
+Two changes combined:
+1. **Working resolution → backbuffer (1280×720)** instead of target display (1920×1080)
+   - Ring buffers, NvOF inputs, interp, memcpy all 2.25× smaller
+   - NvOF cost unchanged (8-9ms fixed regardless of resolution)
+2. **Backbuffer-native output** — interop surface at 1280×720, StretchRect is 1:1 copy
+   - Attempted to register backbuffer directly for CUDA interop → CUDA_ERROR_INVALID_VALUE
+   - D3D9 swap chain surfaces can't be CUDA-registered
+   - Kept intermediate surface but at backbuffer resolution (1:1 copy instead of scaling)
+
+### V7 Gameplay Results (Avatar @ 90fps)
+
+| Phase | flow (ms) | work (ms) | Stalls/300 |
+|-------|-----------|-----------|------------|
+| Desktop | 3.9-4.4 | 1.1-1.3 | 0 |
+| Medium gameplay | 12.7-13.5 | 4.5-6.0 | 0 |
+| Heavy gameplay | 13.3-16.1 | 3.7-7.2 | 0-6 |
+
+**Total: 22 stalls / 12,900 presents (0.17%).**
+**98.6% reduction from V4 baseline (1578 → 22).**
+
+### Remaining Stall Analysis
+All 22 stalls are isolated GPU contention spikes (work=15-30ms) during peak game load.
+The actual data copies total ~0.3ms — stalls are from cuGraphicsMapResources and
+cuStreamSynchronize waiting for GPU availability behind the game's rendering.
+
+## Future Optimization Notes
+
+Pipeline is near-optimal for single-GPU. Remaining 22 stalls are fundamental GPU
+scheduling contention. Marginal optimizations (~0.3ms total):
+
+1. **NvOF RegisterPreAllocBuffers** — register ring slots as NvOF inputs, skip
+   ring→NvOF memcpy (~0.1ms/flow). Complex: 6 rotating slots.
+2. **CUDA surface objects** — interp kernel writes directly to D3D9 CUarray via
+   surf2Dwrite, eliminating cudaOutputFrame + memcpy (~0.05ms). Requires .cu changes.
+3. **CUDA stream priorities** — cuStreamCreateWithPriority for present/flow streams.
+4. **D3D9Ex swap chain tuning** — BackBufferCount, swap effect experiments.
+
+None expected to significantly reduce the 22 stalls.
+
+## Pending Testing
+
+1. **Performance impact** — measure game FPS delta with/without NvFBCR running
+2. **Visual quality** — interpolation artifacts, motion smoothness on relay display
