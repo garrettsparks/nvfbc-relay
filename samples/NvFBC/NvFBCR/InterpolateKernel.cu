@@ -19,11 +19,12 @@ __device__ __forceinline__ float s10_5_to_float(int16_t val) {
     return (float)val / 32.0f;  // Divide by 2^5
 }
 
-// Bilinear sample from ABGR8 frame
+// Bilinear sample from ABGR8 frame (stride-aware)
 __device__ __forceinline__ void bilinearSample(
     const uint8_t* frame,
     int width,
     int height,
+    int strideBytes,    // Byte stride per row (may differ from width*4 for NvOF buffers)
     float x,
     float y,
     uint8_t* outPixel)
@@ -40,11 +41,11 @@ __device__ __forceinline__ void bilinearSample(
     float fx = x - (float)x0;
     float fy = y - (float)y0;
 
-    // Get pixel pointers (4 bytes per pixel for ABGR8)
-    const uint8_t* p00 = frame + (y0 * width + x0) * 4;
-    const uint8_t* p10 = frame + (y0 * width + x1) * 4;
-    const uint8_t* p01 = frame + (y1 * width + x0) * 4;
-    const uint8_t* p11 = frame + (y1 * width + x1) * 4;
+    // Get pixel pointers (4 bytes per pixel for ABGR8, using byte stride for rows)
+    const uint8_t* p00 = frame + y0 * strideBytes + x0 * 4;
+    const uint8_t* p10 = frame + y0 * strideBytes + x1 * 4;
+    const uint8_t* p01 = frame + y1 * strideBytes + x0 * 4;
+    const uint8_t* p11 = frame + y1 * strideBytes + x1 * 4;
 
     // Bilinear weights
     float w00 = (1.0f - fx) * (1.0f - fy);
@@ -124,6 +125,7 @@ __global__ void interpolateKernel(
     int flowWidth,
     int flowHeight,
     int flowStrideBytes,        // Actual byte stride of flow buffer rows
+    int srcStrideBytes,         // Byte stride of frame0/frame1 rows
     int gridSize,
     float weight)               // 0.0 = frame0, 1.0 = frame1, 0.5 = midpoint
 {
@@ -157,8 +159,8 @@ __global__ void interpolateKernel(
 
     // Sample from both frames
     uint8_t pixel0[4], pixel1[4];
-    bilinearSample(frame0, width, height, srcX0, srcY0, pixel0);
-    bilinearSample(frame1, width, height, srcX1, srcY1, pixel1);
+    bilinearSample(frame0, width, height, srcStrideBytes, srcX0, srcY0, pixel0);
+    bilinearSample(frame1, width, height, srcStrideBytes, srcX1, srcY1, pixel1);
 
     // Blend the two samples based on weight
     // weight=0 -> all frame0, weight=1 -> all frame1
@@ -177,7 +179,8 @@ __global__ void downscaleKernel(
     int srcWidth,
     int srcHeight,
     int dstWidth,
-    int dstHeight)
+    int dstHeight,
+    int dstStrideBytes)         // Byte stride of dst rows (NvOF buffer may have padding)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -191,9 +194,9 @@ __global__ void downscaleKernel(
     float srcY = ((float)y + 0.5f) * (float)srcHeight / (float)dstHeight - 0.5f;
 
     uint8_t pixel[4];
-    bilinearSample(src, srcWidth, srcHeight, srcX, srcY, pixel);
+    bilinearSample(src, srcWidth, srcHeight, srcWidth * 4, srcX, srcY, pixel);
 
-    uint8_t* outPixel = dst + (y * dstWidth + x) * 4;
+    uint8_t* outPixel = dst + y * dstStrideBytes + x * 4;
     outPixel[0] = pixel[0];
     outPixel[1] = pixel[1];
     outPixel[2] = pixel[2];
@@ -208,6 +211,7 @@ extern "C" void launchDownscaleKernel(
     uint8_t* dst,
     int dstWidth,
     int dstHeight,
+    int dstStrideBytes,
     CUstream stream)
 {
     dim3 blockDim(16, 16);
@@ -217,7 +221,7 @@ extern "C" void launchDownscaleKernel(
     );
 
     downscaleKernel<<<gridDim, blockDim, 0, stream>>>(
-        src, dst, srcWidth, srcHeight, dstWidth, dstHeight
+        src, dst, srcWidth, srcHeight, dstWidth, dstHeight, dstStrideBytes
     );
 }
 
@@ -232,6 +236,7 @@ extern "C" void launchInterpolateKernel(
     int flowWidth,
     int flowHeight,
     int flowStrideBytes,
+    int srcStrideBytes,
     int gridSize,
     float weight,
     CUstream stream)
@@ -254,7 +259,83 @@ extern "C" void launchInterpolateKernel(
         flowWidth,
         flowHeight,
         flowStrideBytes,
+        srcStrideBytes,
         gridSize,
         weight
+    );
+}
+
+// Surface-output variant: writes directly to a mapped D3D9 CUarray via surf2Dwrite
+// Eliminates the intermediate m_cudaOutputFrame buffer and its cuMemcpy2D copy
+__global__ void interpolateKernelSurf(
+    const uint8_t* frame0,
+    const uint8_t* frame1,
+    const uint8_t* flowData,
+    cudaSurfaceObject_t output,
+    int width,
+    int height,
+    int flowWidth,
+    int flowHeight,
+    int flowStrideBytes,
+    int srcStrideBytes,
+    int gridSize,
+    float weight)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    float flowX = (float)x / (float)gridSize;
+    float flowY = (float)y / (float)gridSize;
+
+    float fx, fy;
+    bilinearFlowSample(flowData, flowStrideBytes, flowWidth, flowHeight, flowX, flowY, &fx, &fy);
+
+    float srcX0 = (float)x - weight * fx;
+    float srcY0 = (float)y - weight * fy;
+    float srcX1 = (float)x + (1.0f - weight) * fx;
+    float srcY1 = (float)y + (1.0f - weight) * fy;
+
+    uint8_t pixel0[4], pixel1[4];
+    bilinearSample(frame0, width, height, srcStrideBytes, srcX0, srcY0, pixel0);
+    bilinearSample(frame1, width, height, srcStrideBytes, srcX1, srcY1, pixel1);
+
+    uchar4 result;
+    result.x = (uint8_t)fminf(255.0f, fmaxf(0.0f, (1.0f - weight) * pixel0[0] + weight * pixel1[0] + 0.5f));
+    result.y = (uint8_t)fminf(255.0f, fmaxf(0.0f, (1.0f - weight) * pixel0[1] + weight * pixel1[1] + 0.5f));
+    result.z = (uint8_t)fminf(255.0f, fmaxf(0.0f, (1.0f - weight) * pixel0[2] + weight * pixel1[2] + 0.5f));
+    result.w = (uint8_t)fminf(255.0f, fmaxf(0.0f, (1.0f - weight) * pixel0[3] + weight * pixel1[3] + 0.5f));
+    surf2Dwrite(result, output, x * (int)sizeof(uchar4), y);
+}
+
+// Host-callable launcher for surface-output variant
+extern "C" void launchInterpolateKernelToSurface(
+    const uint8_t* frame0,
+    const uint8_t* frame1,
+    const uint8_t* flowData,
+    cudaSurfaceObject_t output,
+    int width,
+    int height,
+    int flowWidth,
+    int flowHeight,
+    int flowStrideBytes,
+    int srcStrideBytes,
+    int gridSize,
+    float weight,
+    CUstream stream)
+{
+    dim3 blockDim(16, 16);
+    dim3 gridDim(
+        (width + blockDim.x - 1) / blockDim.x,
+        (height + blockDim.y - 1) / blockDim.y
+    );
+
+    interpolateKernelSurf<<<gridDim, blockDim, 0, stream>>>(
+        frame0, frame1, flowData, output,
+        width, height, flowWidth, flowHeight,
+        flowStrideBytes, srcStrideBytes, gridSize, weight
     );
 }

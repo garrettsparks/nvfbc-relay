@@ -509,6 +509,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     int nCmdShow)
 {
 
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     if (!InitDisplays()) {
         LOGERR("Unable to enumerate display adapters");
         return -1;
