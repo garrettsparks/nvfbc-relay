@@ -9,7 +9,7 @@ jobs:
 
     steps:
     - name: Checkout code with submodules
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         submodules: recursive
 
@@ -20,7 +20,7 @@ jobs:
       run: msbuild samples/NvFBC/NvFBCR/NvFBCR_2013.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
 
     - name: Upload build artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: nvfbc-relay-dev-build
         path: samples/Release/x64/*.exe
