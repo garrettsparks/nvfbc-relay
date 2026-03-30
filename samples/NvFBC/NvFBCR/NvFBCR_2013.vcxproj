@@ -191,6 +191,7 @@
   <ItemGroup>
     <ClCompile Include="FrameBlendCaptureMode.cpp" />
     <ClCompile Include="FrameTemporalCaptureMode.cpp" />
+    <ClCompile Include="GPUSleepCaptureMode.cpp" />
     <ClCompile Include="NvFBCR.cpp" />
     <ClCompile Include="TimerCaptureMode.cpp" />
     <ClCompile Include="VsyncBlendCaptureMode.cpp" />
@@ -201,6 +202,7 @@
     <ClInclude Include="..\..\..\inc\NvFBC\NvFBCToDx9vid.h" />
     <ClInclude Include="FrameBlendCaptureMode.h" />
     <ClInclude Include="FrameTemporalCaptureMode.h" />
+    <ClInclude Include="GPUSleepCaptureMode.h" />
     <ClInclude Include="IFrameCaptureMode.h" />
     <ClInclude Include="TimerCaptureMode.h" />
     <ClInclude Include="VsyncBlendCaptureMode.h" />

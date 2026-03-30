@@ -59,6 +59,7 @@
 #include "FrameBlendCaptureMode.h"
 #include "VsyncBlendCaptureMode.h"
 #include "VsyncTemporalCaptureMode.h"
+#include "GPUSleepCaptureMode.h"
 
 using namespace std;
 
@@ -116,6 +117,19 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         }
     }
 
+    // Check for GPU sleep mode (g:60 format)
+    if (modeStr.length() > 2 && modeStr[0] == 'g' && modeStr[1] == ':') {
+        try {
+            float framerate = stof(modeStr.substr(2));
+            if (framerate > 0.0f && framerate <= 1000.0f) {
+                return new GPUSleepCaptureMode(framerate);
+            }
+        }
+        catch (...) {
+            // Invalid number after g:
+        }
+    }
+
     // Try to parse as numeric framerate
     try {
         float framerate = stof(modeStr);
@@ -134,6 +148,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  t:59.94        - Timed temporal (frame selection, manual framerate)");
     LOGERR("  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)");
     LOGERR("  b:59.94        - Timed blend (GPU shader blending, manual framerate)");
+    LOGERR("  g:60           - GPU sleep mode (sub-ms precision timer at specified fps)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
     return NULL;
 }
@@ -454,6 +469,8 @@ void ConsoleUserInput(string* framerateStr) {
     cout << endl;
     cout << "  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)" << endl;
     cout << "  b:59.94        - Timed blend (GPU shader blending, manual framerate)" << endl;
+    cout << endl;
+    cout << "  g:60           - GPU sleep mode (sub-ms precision timer at specified fps)" << endl;
     cout << endl;
     cout << "  60             - Timer mode (simple timer-driven at specified fps)" << endl;
     cout << endl;
