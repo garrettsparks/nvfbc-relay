@@ -20,10 +20,10 @@ UINT TimerCaptureMode::GetPresentationInterval() const {
 }
 
 bool TimerCaptureMode::Setup() {
-    m_timer = CreateWaitableTimer(NULL, TRUE, NULL);
+    m_timer = CreateWaitableTimerEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION | CREATE_WAITABLE_TIMER_MANUAL_RESET, TIMER_ALL_ACCESS);
 
     if (NULL == m_timer) {
-        LOGERR("CreateWaitableTimer failed (error: %d)", GetLastError());
+        LOGERR("CreateWaitableTimerEx failed (error: %d)", GetLastError());
         return false;
     }
 
