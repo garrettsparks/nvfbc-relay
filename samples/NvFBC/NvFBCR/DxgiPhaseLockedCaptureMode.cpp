@@ -212,7 +212,10 @@ void DxgiPhaseLockedCaptureMode::Run(
                 LONGLONG delta = m_nextPresentQpc + m_marginQpc - ref;
                 LONGLONG nVblanks = (delta + period / 2) / period;  // round to nearest
                 if (nVblanks < 0) nVblanks = 0;
-                m_nextPresentQpc = ref + nVblanks * period - m_marginQpc;
+                // EXPERIMENT: resync snap disabled to confirm drift returns without
+                // the phase reference (schedule then free-runs like plain TimerCaptureMode).
+                // Re-enable this line to restore phase-locking.
+                // m_nextPresentQpc = ref + nVblanks * period - m_marginQpc;
             }
             m_framesSinceResync = 0;
         }
