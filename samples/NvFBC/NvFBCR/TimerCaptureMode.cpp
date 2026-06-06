@@ -78,6 +78,17 @@ void TimerCaptureMode::Run(
         // so wake-latency jitter does not accumulate into drift.
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
+
+        // If a transient stall (e.g. a load spike) leaves the schedule more than one
+        // full period behind real time, re-anchor to now instead of catching up
+        // frame-by-frame. Without this, the loop would present back-to-back with no
+        // wait until it caught up, fanning a single stall out into a burst of duplicate
+        // frames. Normal sub-period overruns don't trip this and self-correct on the fixed timeline.
+        if (m_nextPresent.QuadPart < now.QuadPart - m_periodQpc)
+        {
+            m_nextPresent.QuadPart = now.QuadPart;
+        }
+
         LONGLONG ticksUntilPresent = m_nextPresent.QuadPart - now.QuadPart;
         if (ticksUntilPresent > 0)
         {
