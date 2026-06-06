@@ -6,7 +6,13 @@
 class TimerCaptureMode : public IFrameCaptureMode {
 private:
     HANDLE m_timer;
-    LARGE_INTEGER m_interval;
+    // EXPERIMENT: absolute QPC scheduling instead of a per-iteration relative timer.
+    // Tests whether the drift in this mode came from relative-timer wake-latency
+    // accumulation (not display-clock drift). Revert this commit to restore the
+    // original relative-interval behavior.
+    LARGE_INTEGER m_freq;          // QPC frequency (ticks/sec)
+    LONGLONG m_periodQpc;          // target frame interval in QPC ticks
+    LARGE_INTEGER m_nextPresent;   // absolute QPC deadline for the next present
     float m_framerate;
 
 public:

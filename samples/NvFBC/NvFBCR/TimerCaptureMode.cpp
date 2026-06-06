@@ -3,9 +3,11 @@
 
 TimerCaptureMode::TimerCaptureMode(float framerate)
     : m_timer(NULL)
+    , m_periodQpc(0)
     , m_framerate(framerate)
 {
-    m_interval.QuadPart = -(LONGLONG)(10000000.0f / framerate);
+    m_freq.QuadPart = 0;
+    m_nextPresent.QuadPart = 0;
 }
 
 TimerCaptureMode::~TimerCaptureMode() {
@@ -27,7 +29,11 @@ bool TimerCaptureMode::Setup() {
         return false;
     }
 
-    LOG("Timer mode initialized - target framerate: %.2f fps", m_framerate);
+    QueryPerformanceFrequency(&m_freq);
+    // Round to nearest tick to minimize accumulated rounding error over many frames.
+    m_periodQpc = (LONGLONG)((double)m_freq.QuadPart / m_framerate + 0.5);
+
+    LOG("Timer mode initialized (absolute QPC schedule) - target framerate: %.2f fps (period: %lld ticks)", m_framerate, m_periodQpc);
     return true;
 }
 
@@ -39,11 +45,12 @@ void TimerCaptureMode::Run(
 {
     MSG msg;
 
+    // Seed the absolute schedule one period out from now.
+    QueryPerformanceCounter(&m_nextPresent);
+    m_nextPresent.QuadPart += m_periodQpc;
+
     while (TRUE)
     {
-        // Set timer for this frame
-        SetWaitableTimer(m_timer, &m_interval, 0, NULL, NULL, FALSE);
-
         // Grab frame
         NVFBCRESULT fbcRes = nvfbcDx9->NvFBCToDx9VidGrabFrame(grabParams);
 
@@ -66,8 +73,20 @@ void TimerCaptureMode::Run(
         if (msg.message == WM_QUIT)
             break;
 
-        // Wait for timer to maintain target framerate
-        WaitForSingleObject(m_timer, INFINITE);
+        // Wait until the absolute scheduled deadline (fixed timeline: seed + N*period).
+        // Unlike a relative timer re-armed each iteration, wake-latency jitter cannot
+        // accumulate here.
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        LONGLONG ticksUntilPresent = m_nextPresent.QuadPart - now.QuadPart;
+        if (ticksUntilPresent > 0)
+        {
+            LARGE_INTEGER due;
+            due.QuadPart = -(ticksUntilPresent * 10000000 / m_freq.QuadPart);  // 100ns units, relative
+            SetWaitableTimer(m_timer, &due, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(m_timer, INFINITE);
+        }
+        m_nextPresent.QuadPart += m_periodQpc;
     }
 }
 
