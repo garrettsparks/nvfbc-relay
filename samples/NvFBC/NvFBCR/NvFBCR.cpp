@@ -59,6 +59,7 @@
 #include "FrameBlendCaptureMode.h"
 #include "VsyncBlendCaptureMode.h"
 #include "VsyncTemporalCaptureMode.h"
+#include "DxgiPhaseLockedCaptureMode.h"
 
 using namespace std;
 
@@ -116,6 +117,19 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         }
     }
 
+    // Check for DXGI phase-locked timer mode (p:60 format)
+    if (modeStr.length() > 2 && modeStr[0] == 'p' && modeStr[1] == ':') {
+        try {
+            float framerate = stof(modeStr.substr(2));
+            if (framerate > 0.0f && framerate <= 1000.0f) {
+                return new DxgiPhaseLockedCaptureMode(framerate);
+            }
+        }
+        catch (...) {
+            // Invalid number after p:
+        }
+    }
+
     // Try to parse as numeric framerate
     try {
         float framerate = stof(modeStr);
@@ -135,6 +149,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)");
     LOGERR("  b:59.94        - Timed blend (GPU shader blending, manual framerate)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
+    LOGERR("  p:60           - DXGI phase-locked timer (drift-corrected, vsync-smooth at specified fps)");
     return NULL;
 }
 
@@ -456,6 +471,7 @@ void ConsoleUserInput(string* framerateStr) {
     cout << "  b:59.94        - Timed blend (GPU shader blending, manual framerate)" << endl;
     cout << endl;
     cout << "  60             - Timer mode (simple timer-driven at specified fps)" << endl;
+    cout << "  p:60           - DXGI phase-locked timer (drift-corrected, vsync-smooth at fps)" << endl;
     cout << endl;
     cout << "Capture/Present framerate (blank for vsync) ? ";
     string cinString;
