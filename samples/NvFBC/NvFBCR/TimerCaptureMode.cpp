@@ -3,9 +3,11 @@
 
 TimerCaptureMode::TimerCaptureMode(float framerate)
     : m_timer(NULL)
+    , m_periodQpc(0)
     , m_framerate(framerate)
 {
-    m_interval.QuadPart = -(LONGLONG)(10000000.0f / framerate);
+    m_freq.QuadPart = 0;
+    m_nextPresent.QuadPart = 0;
 }
 
 TimerCaptureMode::~TimerCaptureMode() {
@@ -20,14 +22,18 @@ UINT TimerCaptureMode::GetPresentationInterval() const {
 }
 
 bool TimerCaptureMode::Setup() {
-    m_timer = CreateWaitableTimer(NULL, TRUE, NULL);
+    m_timer = CreateWaitableTimerEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION | CREATE_WAITABLE_TIMER_MANUAL_RESET, TIMER_ALL_ACCESS);
 
     if (NULL == m_timer) {
-        LOGERR("CreateWaitableTimer failed (error: %d)", GetLastError());
+        LOGERR("CreateWaitableTimerEx failed (error: %d)", GetLastError());
         return false;
     }
 
-    LOG("Timer mode initialized - target framerate: %.2f fps", m_framerate);
+    QueryPerformanceFrequency(&m_freq);
+    // Round to nearest tick to minimize accumulated rounding error over many frames.
+    m_periodQpc = (LONGLONG)((double)m_freq.QuadPart / m_framerate + 0.5);
+
+    LOG("Timer mode initialized - target framerate: %.2f fps (period: %lld ticks)", m_framerate, m_periodQpc);
     return true;
 }
 
@@ -39,11 +45,12 @@ void TimerCaptureMode::Run(
 {
     MSG msg;
 
+    // Initiate the absolute schedule one period out from now.
+    QueryPerformanceCounter(&m_nextPresent);
+    m_nextPresent.QuadPart += m_periodQpc;
+
     while (TRUE)
     {
-        // Set timer for this frame
-        SetWaitableTimer(m_timer, &m_interval, 0, NULL, NULL, FALSE);
-
         // Grab frame
         NVFBCRESULT fbcRes = nvfbcDx9->NvFBCToDx9VidGrabFrame(grabParams);
 
@@ -66,8 +73,31 @@ void TimerCaptureMode::Run(
         if (msg.message == WM_QUIT)
             break;
 
-        // Wait for timer to maintain target framerate
-        WaitForSingleObject(m_timer, INFINITE);
+        // Wait until the absolute scheduled deadline. Advancing the deadline by a fixed
+        // period each frame keeps the average rate pinned to the target period,
+        // so wake-latency jitter does not accumulate into drift.
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+
+        // If a transient stall (e.g. a load spike) leaves the schedule more than one
+        // full period behind real time, re-anchor to now instead of catching up
+        // frame-by-frame. Without this, the loop would present back-to-back with no
+        // wait until it caught up, fanning a single stall out into a burst of duplicate
+        // frames. Normal sub-period overruns don't trip this and self-correct on the fixed timeline.
+        if (m_nextPresent.QuadPart < now.QuadPart - m_periodQpc)
+        {
+            m_nextPresent.QuadPart = now.QuadPart;
+        }
+
+        LONGLONG ticksUntilPresent = m_nextPresent.QuadPart - now.QuadPart;
+        if (ticksUntilPresent > 0)
+        {
+            LARGE_INTEGER due;
+            due.QuadPart = -(ticksUntilPresent * 10000000 / m_freq.QuadPart);  // 100ns units, relative
+            SetWaitableTimer(m_timer, &due, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(m_timer, INFINITE);
+        }
+        m_nextPresent.QuadPart += m_periodQpc;
     }
 }
 
