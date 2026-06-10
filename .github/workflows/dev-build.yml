@@ -14,7 +14,7 @@ jobs:
         submodules: recursive
 
     - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v2
+      uses: microsoft/setup-msbuild@v3
 
     - name: Build Solution
       run: msbuild samples/NvFBC/NvFBCR/NvFBCR_2013.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
