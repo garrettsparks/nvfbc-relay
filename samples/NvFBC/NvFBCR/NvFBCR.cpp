@@ -306,7 +306,11 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
     d3dpp.PresentationInterval = presentationInterval;
     //d3dpp.Flags = D3DPRESENTFLAG_VIDEO;
     d3dpp.hDeviceWindow = hwnd;
-    DWORD dwBehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING;
+    // D3DCREATE_MULTITHREADED: the temporal/blend modes drive capture on a separate thread
+    // from present, so D3D9 device calls (StretchRect/Present) come from two threads. This
+    // flag makes the D3D9 runtime serialize them safely. It only affects this process's own
+    // device, not the captured game's rendering.
+    DWORD dwBehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED;
 
     hr = g_pD3DEx->CreateDeviceEx(
         deviceID,
