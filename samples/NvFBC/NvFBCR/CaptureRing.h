@@ -8,13 +8,14 @@
 #include <thread>
 
 // Result of a bracketing query: the captured frames immediately before and after a target
-// time, plus the interpolation weight a blending consumer would use.
+// time, plus the interpolation weight a blending consumer would use. Surfaces/textures are
+// the PRESENT-device aliases of the shared ring slots (borrowed; do not Release).
 struct FrameBracket {
     bool hasBefore;
     bool hasAfter;
-    IDirect3DSurface9* beforeSurface;  // borrowed from the ring slot (do not Release)
+    IDirect3DSurface9* beforeSurface;
     IDirect3DSurface9* afterSurface;
-    IDirect3DTexture9* beforeTexture;  // same slots as textures, for shader sampling
+    IDirect3DTexture9* beforeTexture;
     IDirect3DTexture9* afterTexture;
     LONGLONG beforeTs;                 // QPC of the before frame's arrival
     LONGLONG afterTs;
@@ -24,20 +25,21 @@ struct FrameBracket {
     double weight;                     // beforeDiff / (beforeDiff + afterDiff); 1.0 if no after
 };
 
-// Source-paced capture ring shared by the temporal/blend (and future optical-flow) modes.
+// Source-paced capture ring on its OWN D3D9Ex device (branch B: two devices).
 //
-// Owns the capture side of the two-thread flow: a capture thread loops a *blocking* NvFBC grab
-// (NVFBC_TODX9VID_WAIT_WITH_TIMEOUT), which returns once per real source frame, so each frame
-// is QPC-stamped at arrival (≈ its true source time) and copied into a fixed ring slot. A
-// monotonic count is published via an atomic after each slot is fully written — the only state
-// shared with the consumer, who reads published slots and never signals back (strictly one-way
-// producer -> consumer; the ring overwrites oldest slots naturally, no purging).
+// The two-thread design failed on a shared device because the blocking NvFBC grab holds the
+// device lock for its entire wait (up to a full source period), slaving present timing to
+// capture arrivals (measured: present jitter = capture period / 2). Here the capture side
+// gets a private device: Start() releases the caller's NvFBC session and creates a new one
+// bound to a capture-only device, so the grab's lock holds affect nothing the present thread
+// uses. Grabs go back to long, fully event-driven blocking waits (true arrival timestamps,
+// no polling, no diffmap needed).
 //
-// Slots are render-target textures (with their level-0 surfaces exposed) so consumers can
-// either StretchRect them (temporal) or sample them in a shader (blend).
-//
-// Requires D3DCREATE_MULTITHREADED on the device, since the capture thread issues StretchRect
-// while the present thread issues its own D3D9 calls.
+// Ring slots are SHARED render-target textures: created on the capture device (NvFBC's
+// StretchRect source side) and opened on the present device via D3D9Ex shared handles, so the
+// present thread reads them without touching the capture device. Known risk: D3D9Ex shared
+// surfaces have no cross-device sync primitive; ordering relies on driver behavior. If the
+// output shows tearing/partial frames inside slots, that is the cause.
 class CaptureRing {
 public:
     static const int RING_SIZE = 8;  // generous for validation; shrink later from logged depth
@@ -49,12 +51,14 @@ public:
     CaptureRing(const CaptureRing&) = delete;
     CaptureRing& operator=(const CaptureRing&) = delete;
 
-    // Allocate the capture target and ring slots.
-    bool Setup(IDirect3DDevice9Ex* device, int width, int height);
+    // Stash the present device + dimensions (capture-side resources are created in Start,
+    // which has the HWND needed for the capture device).
+    bool Setup(IDirect3DDevice9Ex* presentDevice, int width, int height);
 
-    // Redirect NvFBC output into the capture target, switch the grab to blocking-with-timeout,
-    // and start the capture thread. baseQpc is the shared logging time origin.
-    bool Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams, LARGE_INTEGER baseQpc);
+    // Create the capture device + shared ring, rebind NvFBC to the capture device (releases
+    // the passed-in session and replaces the global), and start the capture thread.
+    bool Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
+               LARGE_INTEGER baseQpc, HWND hwnd);
 
     // Signal and join the capture thread (idempotent).
     void Stop();
@@ -65,30 +69,33 @@ public:
     // Count of fully-published frames so far.
     long long Published() const { return m_published.load(); }
 
-    // Find the published frames bracketing targetQpc. Fields for a missing side are zeroed and
-    // the corresponding has* flag false.
+    // Find the published frames bracketing targetQpc (present-device aliases).
     void FindBracket(LONGLONG targetQpc, FrameBracket* out) const;
 
 private:
     struct Slot {
-        IDirect3DTexture9* texture;
-        IDirect3DSurface9* surface;   // level 0 of texture
+        IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
+        IDirect3DSurface9* capSurface;
+        IDirect3DTexture9* mainTexture;   // present device alias (opened via shared handle)
+        IDirect3DSurface9* mainSurface;
         LARGE_INTEGER timestamp;
         bool valid;
     };
 
-    void CaptureLoop(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
+    void CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
 
     Slot m_ring[RING_SIZE];
-    IDirect3DSurface9* m_captureTarget;  // NvFBC writes here; capture thread copies into slots
-    IDirect3DDevice9Ex* m_device;
+    IDirect3DSurface9* m_captureTarget;   // on the capture device; NvFBC writes here
+    IDirect3DDevice9Ex* m_presentDevice;
+    IDirect3DDevice9Ex* m_capDevice;      // private capture device
+    NvFBCToDx9Vid* m_nvfbc;               // session bound to the capture device
     int m_width;
     int m_height;
-    LARGE_INTEGER m_baseQpc;             // logging origin
-    LONGLONG m_freqQuad;                 // QPC ticks/sec, for log µs conversion
+    LARGE_INTEGER m_baseQpc;              // logging origin
+    LONGLONG m_freqQuad;                  // QPC ticks/sec
 
     std::thread m_captureThread;
     std::atomic<long long> m_published;
     std::atomic<bool> m_stop;
-    long long m_writeCount;              // capture-thread-local
+    long long m_writeCount;               // capture-thread-local
 };

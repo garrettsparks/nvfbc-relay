@@ -45,7 +45,9 @@ void FrameTemporalCaptureMode::Run(
     QueryPerformanceCounter(&m_baseQpc);
     const double usPerTick = 1000000.0 / (double)m_scheduler.Freq();
 
-    if (!m_ring.Start(nvfbcDx9, grabParams, m_baseQpc)) {
+    // Note: Start releases nvfbcDx9 (the session bound to the present device) and rebinds
+    // NvFBC to the ring's private capture device. nvfbcDx9 must not be used after this call.
+    if (!m_ring.Start(nvfbcDx9, grabParams, m_baseQpc, hwnd)) {
         return;
     }
 

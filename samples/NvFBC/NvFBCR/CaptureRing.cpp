@@ -2,17 +2,22 @@
 #include <SimpleLogger.h>
 #include <limits.h>
 
-// How long one blocking grab call may wait before returning empty-handed. This must be SHORT:
-// the grab holds the D3D9 device lock (D3DCREATE_MULTITHREADED) for its entire wait, stalling
-// the present thread's StretchRect/Present until it returns — measured as present jitter of
-// exactly half the capture period (2.3ms @ 240Hz, 5.2ms @ 100Hz, 8.4ms @ 60Hz) with presents
-// quantized to capture arrivals. A short timeout bounds each lock hold; the grab still returns
-// immediately when a frame arrives, so arrival timestamps are unaffected.
-static const NvU32 kGrabWaitMs = 2;
+// External globals (NvFBCR.cpp). Start() rebinds the NvFBC session to the capture device and
+// must update the global so WinMain's Cleanup releases the right session.
+extern IDirect3D9Ex* g_pD3DEx;
+extern NvFBCLibrary* pNVFBCLib;
+extern NvFBCToDx9Vid* NvFBCDX9;
+
+// With a private capture device the blocking grab can wait as long as it likes — its lock
+// holds affect nothing the present thread uses. The timeout only bounds how quickly the
+// capture thread notices a stop request.
+static const NvU32 kGrabWaitMs = 100;
 
 CaptureRing::CaptureRing()
     : m_captureTarget(NULL)
-    , m_device(NULL)
+    , m_presentDevice(NULL)
+    , m_capDevice(NULL)
+    , m_nvfbc(NULL)
     , m_width(0)
     , m_height(0)
     , m_freqQuad(0)
@@ -21,8 +26,10 @@ CaptureRing::CaptureRing()
     , m_writeCount(0)
 {
     for (int i = 0; i < RING_SIZE; i++) {
-        m_ring[i].texture = NULL;
-        m_ring[i].surface = NULL;
+        m_ring[i].capTexture = NULL;
+        m_ring[i].capSurface = NULL;
+        m_ring[i].mainTexture = NULL;
+        m_ring[i].mainSurface = NULL;
         m_ring[i].valid = false;
         m_ring[i].timestamp.QuadPart = 0;
     }
@@ -33,63 +40,110 @@ CaptureRing::~CaptureRing() {
     Stop();
 
     for (int i = 0; i < RING_SIZE; i++) {
-        if (m_ring[i].surface) {
-            m_ring[i].surface->Release();
-            m_ring[i].surface = NULL;
-        }
-        if (m_ring[i].texture) {
-            m_ring[i].texture->Release();
-            m_ring[i].texture = NULL;
-        }
+        if (m_ring[i].mainSurface) { m_ring[i].mainSurface->Release(); m_ring[i].mainSurface = NULL; }
+        if (m_ring[i].mainTexture) { m_ring[i].mainTexture->Release(); m_ring[i].mainTexture = NULL; }
+        if (m_ring[i].capSurface)  { m_ring[i].capSurface->Release();  m_ring[i].capSurface = NULL; }
+        if (m_ring[i].capTexture)  { m_ring[i].capTexture->Release();  m_ring[i].capTexture = NULL; }
     }
     if (m_captureTarget) {
         m_captureTarget->Release();
         m_captureTarget = NULL;
     }
+    if (m_capDevice) {
+        m_capDevice->Release();
+        m_capDevice = NULL;
+    }
 }
 
-bool CaptureRing::Setup(IDirect3DDevice9Ex* device, int width, int height) {
-    m_device = device;
+bool CaptureRing::Setup(IDirect3DDevice9Ex* presentDevice, int width, int height) {
+    m_presentDevice = presentDevice;
     m_width = width;
     m_height = height;
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
     m_freqQuad = freq.QuadPart;
+    return true;
+}
 
-    // Capture target surface (NvFBC writes each grab here).
-    HRESULT hr = m_device->CreateOffscreenPlainSurface(
-        width, height, D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT, &m_captureTarget, NULL);
+bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
+                        LARGE_INTEGER baseQpc, HWND hwnd) {
+    m_baseQpc = baseQpc;
+
+    // ---- Create the private capture device on the same adapter as the present device. ----
+    D3DDEVICE_CREATION_PARAMETERS cp = {};
+    m_presentDevice->GetCreationParameters(&cp);
+
+    D3DPRESENT_PARAMETERS d3dpp = {};
+    d3dpp.Windowed = TRUE;
+    d3dpp.BackBufferFormat = D3DFMT_A2R10G10B10;
+    d3dpp.BackBufferWidth = m_width;
+    d3dpp.BackBufferHeight = m_height;
+    d3dpp.BackBufferCount = 1;
+    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    d3dpp.hDeviceWindow = hwnd;
+
+    HRESULT hr = g_pD3DEx->CreateDeviceEx(
+        cp.AdapterOrdinal, D3DDEVTYPE_HAL, hwnd,
+        D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+        &d3dpp, NULL, &m_capDevice);
+    if (FAILED(hr)) {
+        LOGERR("CaptureRing: failed to create capture device (error: 0x%08x)", hr);
+        return false;
+    }
+
+    // ---- Capture-side resources. ----
+    hr = m_capDevice->CreateOffscreenPlainSurface(
+        m_width, m_height, D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT, &m_captureTarget, NULL);
     if (FAILED(hr)) {
         LOGERR("CaptureRing: failed to create capture target surface (error: 0x%08x)", hr);
         return false;
     }
 
-    // Ring slots: render-target textures so consumers can StretchRect the surface (temporal)
-    // or sample the texture in a shader (blend).
+    // Shared ring slots: create on the capture device with a shared handle, open the same
+    // resource on the present device. Slots are render-target textures so consumers can
+    // StretchRect the surface (temporal) or sample the texture in a shader (blend).
     for (int i = 0; i < RING_SIZE; i++) {
-        hr = m_device->CreateTexture(
-            width, height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT,
-            &m_ring[i].texture, NULL);
+        HANDLE shared = NULL;
+        hr = m_capDevice->CreateTexture(
+            m_width, m_height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT,
+            &m_ring[i].capTexture, &shared);
         if (FAILED(hr)) {
-            LOGERR("CaptureRing: failed to create ring texture %d (error: 0x%08x)", i, hr);
+            LOGERR("CaptureRing: failed to create shared ring texture %d (error: 0x%08x)", i, hr);
             return false;
         }
-        hr = m_ring[i].texture->GetSurfaceLevel(0, &m_ring[i].surface);
+        hr = m_ring[i].capTexture->GetSurfaceLevel(0, &m_ring[i].capSurface);
         if (FAILED(hr)) {
-            LOGERR("CaptureRing: failed to get ring surface %d (error: 0x%08x)", i, hr);
+            LOGERR("CaptureRing: failed to get capture-side ring surface %d (error: 0x%08x)", i, hr);
+            return false;
+        }
+        hr = m_presentDevice->CreateTexture(
+            m_width, m_height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT,
+            &m_ring[i].mainTexture, &shared);  // open existing shared resource
+        if (FAILED(hr)) {
+            LOGERR("CaptureRing: failed to open shared ring texture %d on present device (error: 0x%08x)", i, hr);
+            return false;
+        }
+        hr = m_ring[i].mainTexture->GetSurfaceLevel(0, &m_ring[i].mainSurface);
+        if (FAILED(hr)) {
+            LOGERR("CaptureRing: failed to get present-side ring surface %d (error: 0x%08x)", i, hr);
             return false;
         }
     }
 
-    LOG("CaptureRing initialized - %dx%d, %d slots", width, height, RING_SIZE);
-    return true;
-}
+    // ---- Rebind NvFBC to the capture device. ----
+    // Release the session WinMain created against the present device, create a new one bound
+    // to the capture device, and update the global so Cleanup releases the right session.
+    nvfbc->NvFBCToDx9VidRelease();
+    DWORD maxW = 0, maxH = 0;
+    m_nvfbc = (NvFBCToDx9Vid*)pNVFBCLib->create(NVFBC_TO_DX9_VID, &maxW, &maxH, 0, (void*)m_capDevice);
+    if (!m_nvfbc) {
+        LOGERR("CaptureRing: failed to create NvFBC session on the capture device");
+        return false;
+    }
+    NvFBCDX9 = m_nvfbc;
 
-bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams, LARGE_INTEGER baseQpc) {
-    m_baseQpc = baseQpc;
-
-    // Redirect NvFBC output into our capture target (instead of the window backbuffer).
     NVFBC_TODX9VID_OUT_BUF outBuf[1];
     outBuf[0].pPrimary = m_captureTarget;
 
@@ -103,19 +157,21 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     setupParams.dwNumBuffers = 1;
     setupParams.bHDRRequest = TRUE;
 
-    if (NVFBC_SUCCESS != nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
-        LOGERR("CaptureRing: failed to reconfigure NvFBC output");
+    if (NVFBC_SUCCESS != m_nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
+        LOGERR("CaptureRing: NvFBCToDx9VidSetUp on capture device failed");
         return false;
     }
 
-    // Blocking grab: wake once per real source frame (or after kGrabWaitMs to re-check stop).
+    // Fully event-driven blocking grab — safe now that the lock it holds is private.
     grabParams->dwFlags = NVFBC_TODX9VID_WAIT_WITH_TIMEOUT;
     grabParams->dwWaitTime = kGrabWaitMs;
+
+    LOG("CaptureRing initialized - %dx%d, %d shared slots, private capture device", m_width, m_height, RING_SIZE);
 
     m_published.store(0);
     m_writeCount = 0;
     m_stop.store(false);
-    m_captureThread = std::thread(&CaptureRing::CaptureLoop, this, nvfbc, grabParams);
+    m_captureThread = std::thread(&CaptureRing::CaptureLoop, this, grabParams);
     return true;
 }
 
@@ -126,13 +182,13 @@ void CaptureRing::Stop() {
     }
 }
 
-void CaptureRing::CaptureLoop(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
+void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     RECT srcRect = { 0, 0, (LONG)m_width, (LONG)m_height };
     const double usPerTick = 1000000.0 / (double)m_freqQuad;
     LONGLONG lastArrival = 0;
 
     while (!m_stop.load()) {
-        NVFBCRESULT res = nvfbc->NvFBCToDx9VidGrabFrame(grabParams);
+        NVFBCRESULT res = m_nvfbc->NvFBCToDx9VidGrabFrame(grabParams);
 
         if (res == NVFBC_ERROR_INVALIDATED_SESSION) {
             LOGERR("CaptureRing: NvFBC session invalidated - stopping capture");
@@ -149,7 +205,7 @@ void CaptureRing::CaptureLoop(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PA
 
         long long count = m_writeCount;
         int slot = (int)(count % RING_SIZE);
-        m_device->StretchRect(m_captureTarget, &srcRect, m_ring[slot].surface, &srcRect, D3DTEXF_NONE);
+        m_capDevice->StretchRect(m_captureTarget, &srcRect, m_ring[slot].capSurface, &srcRect, D3DTEXF_NONE);
         m_ring[slot].timestamp = now;
         m_ring[slot].valid = true;
 
@@ -183,8 +239,8 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, FrameBracket* out) const {
             if (diff < bestBeforeDiff) {
                 bestBeforeDiff = diff;
                 out->hasBefore = true;
-                out->beforeSurface = m_ring[slot].surface;
-                out->beforeTexture = m_ring[slot].texture;
+                out->beforeSurface = m_ring[slot].mainSurface;
+                out->beforeTexture = m_ring[slot].mainTexture;
                 out->beforeTs = ts;
                 out->beforeDiff = diff;
                 out->beforeDepth = (int)(p - 1 - i);
@@ -193,8 +249,8 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, FrameBracket* out) const {
             if (-diff < bestAfterDiff) {
                 bestAfterDiff = -diff;
                 out->hasAfter = true;
-                out->afterSurface = m_ring[slot].surface;
-                out->afterTexture = m_ring[slot].texture;
+                out->afterSurface = m_ring[slot].mainSurface;
+                out->afterTexture = m_ring[slot].mainTexture;
                 out->afterTs = ts;
                 out->afterDiff = -diff;
             }
