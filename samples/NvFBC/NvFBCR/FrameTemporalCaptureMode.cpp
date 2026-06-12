@@ -97,14 +97,15 @@ void FrameTemporalCaptureMode::Run(
                     m_ring.Published());
             }
         } else {
-            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus",
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus pub=%lld skip=%lld",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((bracket.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
                 bracket.hasAfter ? (long long)((bracket.afterTs - m_baseQpc.QuadPart) * usPerTick) : -1LL,
                 bracket.weight, pick,
                 (long long)((beforePresent.QuadPart - deadline) * usPerTick),
-                (long long)(presentDelta * usPerTick));
+                (long long)(presentDelta * usPerTick),
+                m_ring.Published(), m_ring.StaleSkips());
             if (!bracket.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }

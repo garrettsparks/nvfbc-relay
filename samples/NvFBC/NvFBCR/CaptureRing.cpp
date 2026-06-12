@@ -13,6 +13,9 @@ static const NvU32 kGrabWaitMs = 2;
 CaptureRing::CaptureRing()
     : m_captureTarget(NULL)
     , m_device(NULL)
+    , m_diffMap(NULL)
+    , m_diffMapScanBytes(0)
+    , m_staleSkips(0)
     , m_width(0)
     , m_height(0)
     , m_freqQuad(0)
@@ -26,6 +29,7 @@ CaptureRing::CaptureRing()
         m_ring[i].valid = false;
         m_ring[i].timestamp.QuadPart = 0;
     }
+    m_diffMapArray[0] = NULL;
     m_baseQpc.QuadPart = 0;
 }
 
@@ -45,6 +49,10 @@ CaptureRing::~CaptureRing() {
     if (m_captureTarget) {
         m_captureTarget->Release();
         m_captureTarget = NULL;
+    }
+    if (m_diffMap) {
+        VirtualFree(m_diffMap, 0, MEM_RELEASE);
+        m_diffMap = NULL;
     }
 }
 
@@ -82,8 +90,26 @@ bool CaptureRing::Setup(IDirect3DDevice9Ex* device, int width, int height) {
         }
     }
 
-    LOG("CaptureRing initialized - %dx%d, %d slots", width, height, RING_SIZE);
+    // Diffmap buffer (must be VirtualAlloc'd per the NvFBC header). Only the first
+    // ceil(w/128)*ceil(h/128) bytes are meaningful at the 128x128 block size.
+    m_diffMap = VirtualAlloc(NULL, NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!m_diffMap) {
+        LOGERR("CaptureRing: VirtualAlloc for diffmap failed (error: %d)", GetLastError());
+        return false;
+    }
+    m_diffMapArray[0] = m_diffMap;
+    m_diffMapScanBytes = ((width + 127) / 128) * ((height + 127) / 128);
+
+    LOG("CaptureRing initialized - %dx%d, %d slots, diffmap %d scan bytes", width, height, RING_SIZE, m_diffMapScanBytes);
     return true;
+}
+
+bool CaptureRing::DiffMapChanged() const {
+    const unsigned char* p = (const unsigned char*)m_diffMap;
+    for (int i = 0; i < m_diffMapScanBytes; i++) {
+        if (p[i]) return true;
+    }
+    return false;
 }
 
 bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams, LARGE_INTEGER baseQpc) {
@@ -97,7 +123,10 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     setupParams.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
     setupParams.bWithHWCursor = 1;
     setupParams.bStereoGrab = 0;
-    setupParams.bDiffMap = 0;
+    setupParams.bDiffMap = 1;
+    setupParams.eDiffMapBlockSize = NVFBC_TODX9VID_DIFFMAP_BLOCKSIZE_128X128;
+    setupParams.dwDiffMapBuffSize = NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE;
+    setupParams.ppDiffMap = m_diffMapArray;
     setupParams.ppBuffer = outBuf;
     setupParams.eMode = NVFBC_TODX9VID_ARGB10;
     setupParams.dwNumBuffers = 1;
@@ -140,7 +169,16 @@ void CaptureRing::CaptureLoop(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PA
             break;
         }
         if (res != NVFBC_SUCCESS) {
-            // Timed out with no new frame (e.g. static source) — loop and re-check stop.
+            // Unexpected non-fatal result — loop and re-check stop.
+            continue;
+        }
+
+        if (!DiffMapChanged()) {
+            // Stale re-grab (timeout expiry returns the unchanged screen as success) or a
+            // no-content wake (e.g. HW cursor move). Don't publish — and sleep 1 ms so the
+            // device lock has a guaranteed window for the present thread (anti-convoy).
+            m_staleSkips.fetch_add(1);
+            Sleep(1);
             continue;
         }
 
@@ -156,12 +194,14 @@ void CaptureRing::CaptureLoop(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PA
         m_writeCount = count + 1;
         m_published.store(count + 1);  // publish only after the slot is fully written
 
-        // Verbose: the source arrival timeline (dt = inter-arrival gap ≈ source frame period).
+        // Verbose: the source arrival timeline (dt = inter-arrival gap ≈ source frame period;
+        // skip = cumulative stale grabs rejected by the diffmap).
         LONGLONG dt = (lastArrival != 0) ? (now.QuadPart - lastArrival) : 0;
-        LOG("capture #%lld arr=%lldus dt=%lldus",
+        LOG("capture #%lld arr=%lldus dt=%lldus skip=%lld",
             count,
             (long long)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
-            (long long)(dt * usPerTick));
+            (long long)(dt * usPerTick),
+            m_staleSkips.load());
         lastArrival = now.QuadPart;
     }
 }

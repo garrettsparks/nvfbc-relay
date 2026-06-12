@@ -36,6 +36,14 @@ struct FrameBracket {
 // Slots are render-target textures (with their level-0 surfaces exposed) so consumers can
 // either StretchRect them (temporal) or sample them in a shader (blend).
 //
+// Experiment C — short-timeout polling + diffmap dedup: NvFBC's WAIT_WITH_TIMEOUT expiry does
+// not return empty; it re-grabs the unchanged screen and returns success. With the short
+// timeout (which bounds how long each grab holds the shared device lock), most grab calls are
+// therefore stale re-grabs. The NvFBC diffmap detects them by content (all-zero = unchanged)
+// so only content-distinct frames are published, keeping arrival timestamps meaningful. After
+// each stale result the capture thread sleeps 1 ms to hand the device lock to the present
+// thread (guarding against lock-acquisition unfairness/convoy).
+//
 // Requires D3DCREATE_MULTITHREADED on the device, since the capture thread issues StretchRect
 // while the present thread issues its own D3D9 calls.
 class CaptureRing {
@@ -65,6 +73,9 @@ public:
     // Count of fully-published frames so far.
     long long Published() const { return m_published.load(); }
 
+    // Stale grabs skipped via the diffmap (timeout re-grabs / no-content wakes).
+    long long StaleSkips() const { return m_staleSkips.load(); }
+
     // Find the published frames bracketing targetQpc. Fields for a missing side are zeroed and
     // the corresponding has* flag false.
     void FindBracket(LONGLONG targetQpc, FrameBracket* out) const;
@@ -78,10 +89,15 @@ private:
     };
 
     void CaptureLoop(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
+    bool DiffMapChanged() const;
 
     Slot m_ring[RING_SIZE];
     IDirect3DSurface9* m_captureTarget;  // NvFBC writes here; capture thread copies into slots
     IDirect3DDevice9Ex* m_device;
+    void* m_diffMapArray[1];             // ppDiffMap container (dwNumBuffers == 1)
+    void* m_diffMap;                     // VirtualAlloc'd, NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE
+    int m_diffMapScanBytes;              // bytes actually used: ceil(w/128)*ceil(h/128)
+    std::atomic<long long> m_staleSkips;
     int m_width;
     int m_height;
     LARGE_INTEGER m_baseQpc;             // logging origin
