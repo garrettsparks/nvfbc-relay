@@ -7,12 +7,15 @@
 // Frame temporal capture mode — nearest-frame selection for smooth fixed-rate capture of a
 // (possibly variable-rate) source.
 //
-// Composition of the two shared pieces plus a trivial selection step:
-//   PresentScheduler — wakes this mode at each absolute-QPC present deadline.
-//   CaptureRing      — capture thread fills a ring with source frames stamped at arrival.
-//   This mode        — each deadline: select the ring frame nearest to a content target
-//                      lagged one period behind the deadline (so the ring brackets it),
-//                      copy it to the backbuffer, present, log.
+// Single-thread composition (branch A): one loop alternates between pumping the CaptureRing
+// (blocking grabs with a dynamic timeout, diffmap-deduplicated) and presenting on the
+// PresentScheduler's absolute-QPC deadlines. Capture and present never contend for the D3D9
+// device because they share the thread.
+//
+//   PresentScheduler — when to present (absolute-QPC deadlines).
+//   CaptureRing      — pump-driven ring of content-distinct source frames stamped at arrival.
+//   This mode        — each deadline: select the ring frame nearest a content target lagged
+//                      one period behind the deadline, copy to backbuffer, present, log.
 //
 // Blend mode will differ only in the last step (blend the bracketing pair instead of picking
 // one); optical flow later replaces that step again.
@@ -21,6 +24,7 @@ private:
     PresentScheduler m_scheduler;
     CaptureRing m_ring;
     LONGLONG m_bracketingDelayQpc;  // present-target lag (≈ one present period)
+    LONGLONG m_marginQpc;           // stop pumping this long before each deadline
     LARGE_INTEGER m_baseQpc;        // logging time origin
     float m_targetFramerate;
     IDirect3DDevice9Ex* m_device;

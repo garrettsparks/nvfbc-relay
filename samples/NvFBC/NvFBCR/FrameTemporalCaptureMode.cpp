@@ -9,6 +9,7 @@ extern int BUF_HEIGHT;
 
 FrameTemporalCaptureMode::FrameTemporalCaptureMode(float framerate)
     : m_bracketingDelayQpc(0)
+    , m_marginQpc(0)
     , m_targetFramerate(framerate)
     , m_device(NULL)
 {
@@ -31,8 +32,11 @@ bool FrameTemporalCaptureMode::Setup() {
     // Lag the present target by one present period so the ring reliably holds a frame on each
     // side of it (with source rate >= present rate, a frame newer than the target has arrived).
     m_bracketingDelayQpc = m_scheduler.PeriodQpc();
+    // Stop pumping this long before each deadline; the high-res timer covers the final wait.
+    m_marginQpc = (m_scheduler.Freq() * 2) / 1000;  // 2 ms
 
-    LOG("Temporal mode initialized - present %.2f fps, nearest-frame selection", m_targetFramerate);
+    LOG("Temporal mode initialized - present %.2f fps, nearest-frame selection (single-thread pump)",
+        m_targetFramerate);
     return true;
 }
 
@@ -45,7 +49,7 @@ void FrameTemporalCaptureMode::Run(
     QueryPerformanceCounter(&m_baseQpc);
     const double usPerTick = 1000000.0 / (double)m_scheduler.Freq();
 
-    if (!m_ring.Start(nvfbcDx9, grabParams, m_baseQpc)) {
+    if (!m_ring.Attach(nvfbcDx9, grabParams, m_baseQpc)) {
         return;
     }
 
@@ -56,6 +60,11 @@ void FrameTemporalCaptureMode::Run(
 
     while (TRUE)
     {
+        // Absorb source frames until just before the deadline (single thread: capture and
+        // present interleave here, so there is no device-lock contention).
+        m_ring.PumpUntil(m_scheduler.Deadline() - m_marginQpc);
+        if (m_ring.HasFatal()) break;
+
         m_scheduler.WaitUntilDeadline();
         const LONGLONG deadline = m_scheduler.Deadline();
         const LONGLONG target = deadline - m_bracketingDelayQpc;
@@ -88,7 +97,8 @@ void FrameTemporalCaptureMode::Run(
         lastPresentQpc = beforePresent.QuadPart;
 
         // Logging: bracket timestamps double as the source timeline; w is what blend would use;
-        // jit is actual-present vs scheduled deadline; pdt is the actual inter-present gap.
+        // jit is actual-present vs scheduled deadline; pdt is the actual inter-present gap;
+        // pub/skip are cumulative published frames and stale grabs skipped via diffmap.
         if (!bracket.hasBefore) {
             // Benign while the ring is still filling at startup; once it has wrapped at least
             // once it means the target fell off the back of the ring.
@@ -97,14 +107,15 @@ void FrameTemporalCaptureMode::Run(
                     m_ring.Published());
             }
         } else {
-            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus",
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus pub=%lld skip=%lld",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((bracket.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
                 bracket.hasAfter ? (long long)((bracket.afterTs - m_baseQpc.QuadPart) * usPerTick) : -1LL,
                 bracket.weight, pick,
                 (long long)((beforePresent.QuadPart - deadline) * usPerTick),
-                (long long)(presentDelta * usPerTick));
+                (long long)(presentDelta * usPerTick),
+                m_ring.Published(), m_ring.StaleSkips());
             if (!bracket.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }
@@ -117,10 +128,7 @@ void FrameTemporalCaptureMode::Run(
             DispatchMessage(&msg);
         }
         if (msg.message == WM_QUIT) break;
-        if (m_ring.HasStopped()) break;  // capture thread hit a fatal error
     }
-
-    m_ring.Stop();
 }
 
 const char* FrameTemporalCaptureMode::GetModeName() const {

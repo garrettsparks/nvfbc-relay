@@ -2,23 +2,20 @@
 #include <SimpleLogger.h>
 #include <limits.h>
 
-// How long one blocking grab call may wait before returning empty-handed. This must be SHORT:
-// the grab holds the D3D9 device lock (D3DCREATE_MULTITHREADED) for its entire wait, stalling
-// the present thread's StretchRect/Present until it returns — measured as present jitter of
-// exactly half the capture period (2.3ms @ 240Hz, 5.2ms @ 100Hz, 8.4ms @ 60Hz) with presents
-// quantized to capture arrivals. A short timeout bounds each lock hold; the grab still returns
-// immediately when a frame arrives, so arrival timestamps are unaffected.
-static const NvU32 kGrabWaitMs = 2;
-
 CaptureRing::CaptureRing()
     : m_captureTarget(NULL)
     , m_device(NULL)
+    , m_nvfbc(NULL)
+    , m_grabParams(NULL)
+    , m_diffMap(NULL)
+    , m_diffMapScanBytes(0)
     , m_width(0)
     , m_height(0)
     , m_freqQuad(0)
     , m_published(0)
-    , m_stop(true)   // not running until Start()
-    , m_writeCount(0)
+    , m_staleSkips(0)
+    , m_fatal(false)
+    , m_lastArrival(0)
 {
     for (int i = 0; i < RING_SIZE; i++) {
         m_ring[i].texture = NULL;
@@ -26,12 +23,11 @@ CaptureRing::CaptureRing()
         m_ring[i].valid = false;
         m_ring[i].timestamp.QuadPart = 0;
     }
+    m_diffMapArray[0] = NULL;
     m_baseQpc.QuadPart = 0;
 }
 
 CaptureRing::~CaptureRing() {
-    Stop();
-
     for (int i = 0; i < RING_SIZE; i++) {
         if (m_ring[i].surface) {
             m_ring[i].surface->Release();
@@ -45,6 +41,10 @@ CaptureRing::~CaptureRing() {
     if (m_captureTarget) {
         m_captureTarget->Release();
         m_captureTarget = NULL;
+    }
+    if (m_diffMap) {
+        VirtualFree(m_diffMap, 0, MEM_RELEASE);
+        m_diffMap = NULL;
     }
 }
 
@@ -82,14 +82,28 @@ bool CaptureRing::Setup(IDirect3DDevice9Ex* device, int width, int height) {
         }
     }
 
-    LOG("CaptureRing initialized - %dx%d, %d slots", width, height, RING_SIZE);
+    // Diffmap buffer (must be VirtualAlloc'd per the NvFBC header). Only the first
+    // ceil(w/128)*ceil(h/128) bytes are meaningful at the 128x128 block size.
+    m_diffMap = VirtualAlloc(NULL, NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!m_diffMap) {
+        LOGERR("CaptureRing: VirtualAlloc for diffmap failed (error: %d)", GetLastError());
+        return false;
+    }
+    m_diffMapArray[0] = m_diffMap;
+    m_diffMapScanBytes = ((width + 127) / 128) * ((height + 127) / 128);
+
+    LOG("CaptureRing initialized - %dx%d, %d slots, diffmap %d scan bytes (single-thread pump)",
+        width, height, RING_SIZE, m_diffMapScanBytes);
     return true;
 }
 
-bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams, LARGE_INTEGER baseQpc) {
+bool CaptureRing::Attach(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams, LARGE_INTEGER baseQpc) {
+    m_nvfbc = nvfbc;
+    m_grabParams = grabParams;
     m_baseQpc = baseQpc;
 
-    // Redirect NvFBC output into our capture target (instead of the window backbuffer).
+    // Redirect NvFBC output into our capture target, with the diffmap enabled so stale
+    // timeout re-grabs (no content change) can be detected and skipped.
     NVFBC_TODX9VID_OUT_BUF outBuf[1];
     outBuf[0].pPrimary = m_captureTarget;
 
@@ -97,79 +111,89 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     setupParams.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
     setupParams.bWithHWCursor = 1;
     setupParams.bStereoGrab = 0;
-    setupParams.bDiffMap = 0;
+    setupParams.bDiffMap = 1;
+    setupParams.eDiffMapBlockSize = NVFBC_TODX9VID_DIFFMAP_BLOCKSIZE_128X128;
+    setupParams.dwDiffMapBuffSize = NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE;
+    setupParams.ppDiffMap = m_diffMapArray;
     setupParams.ppBuffer = outBuf;
     setupParams.eMode = NVFBC_TODX9VID_ARGB10;
     setupParams.dwNumBuffers = 1;
     setupParams.bHDRRequest = TRUE;
 
     if (NVFBC_SUCCESS != nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
-        LOGERR("CaptureRing: failed to reconfigure NvFBC output");
+        LOGERR("CaptureRing: NvFBCToDx9VidSetUp with diffmap failed");
         return false;
     }
 
-    // Blocking grab: wake once per real source frame (or after kGrabWaitMs to re-check stop).
     grabParams->dwFlags = NVFBC_TODX9VID_WAIT_WITH_TIMEOUT;
-    grabParams->dwWaitTime = kGrabWaitMs;
-
-    m_published.store(0);
-    m_writeCount = 0;
-    m_stop.store(false);
-    m_captureThread = std::thread(&CaptureRing::CaptureLoop, this, nvfbc, grabParams);
     return true;
 }
 
-void CaptureRing::Stop() {
-    m_stop.store(true);
-    if (m_captureThread.joinable()) {
-        m_captureThread.join();
+bool CaptureRing::DiffMapChanged() const {
+    const unsigned char* p = (const unsigned char*)m_diffMap;
+    for (int i = 0; i < m_diffMapScanBytes; i++) {
+        if (p[i]) return true;
     }
+    return false;
 }
 
-void CaptureRing::CaptureLoop(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
+void CaptureRing::PumpUntil(LONGLONG stopQpc) {
     RECT srcRect = { 0, 0, (LONG)m_width, (LONG)m_height };
     const double usPerTick = 1000000.0 / (double)m_freqQuad;
-    LONGLONG lastArrival = 0;
 
-    while (!m_stop.load()) {
-        NVFBCRESULT res = nvfbc->NvFBCToDx9VidGrabFrame(grabParams);
+    while (!m_fatal) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        LONGLONG remainTicks = stopQpc - now.QuadPart;
+        long remainMs = (long)((remainTicks * 1000) / m_freqQuad);
+        if (remainMs < 2) {
+            break;  // too close to the stop time for a meaningful wait
+        }
+
+        // One blocking grab, capped at the remaining window. Early return = a frame event;
+        // expiry = stale re-grab. Either way the diffmap decides whether content changed.
+        m_grabParams->dwWaitTime = (NvU32)remainMs;
+        NVFBCRESULT res = m_nvfbc->NvFBCToDx9VidGrabFrame(m_grabParams);
 
         if (res == NVFBC_ERROR_INVALIDATED_SESSION) {
             LOGERR("CaptureRing: NvFBC session invalidated - stopping capture");
-            m_stop.store(true);
+            m_fatal = true;
             break;
         }
         if (res != NVFBC_SUCCESS) {
-            // Timed out with no new frame (e.g. static source) — loop and re-check stop.
+            continue;  // unexpected non-fatal result; re-check the window and retry
+        }
+
+        if (!DiffMapChanged()) {
+            // Stale re-grab (timeout expiry) or a no-content wake (e.g. HW cursor move).
+            // Don't publish; loop — if the window expired, the time check exits.
+            m_staleSkips++;
             continue;
         }
 
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
+        LARGE_INTEGER arrival;
+        QueryPerformanceCounter(&arrival);
 
-        long long count = m_writeCount;
-        int slot = (int)(count % RING_SIZE);
+        int slot = (int)(m_published % RING_SIZE);
         m_device->StretchRect(m_captureTarget, &srcRect, m_ring[slot].surface, &srcRect, D3DTEXF_NONE);
-        m_ring[slot].timestamp = now;
+        m_ring[slot].timestamp = arrival;
         m_ring[slot].valid = true;
+        m_published++;
 
-        m_writeCount = count + 1;
-        m_published.store(count + 1);  // publish only after the slot is fully written
-
-        // Verbose: the source arrival timeline (dt = inter-arrival gap ≈ source frame period).
-        LONGLONG dt = (lastArrival != 0) ? (now.QuadPart - lastArrival) : 0;
-        LOG("capture #%lld arr=%lldus dt=%lldus",
-            count,
-            (long long)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
-            (long long)(dt * usPerTick));
-        lastArrival = now.QuadPart;
+        LONGLONG dt = (m_lastArrival != 0) ? (arrival.QuadPart - m_lastArrival) : 0;
+        LOG("capture #%lld arr=%lldus dt=%lldus skip=%lld",
+            m_published - 1,
+            (long long)((arrival.QuadPart - m_baseQpc.QuadPart) * usPerTick),
+            (long long)(dt * usPerTick),
+            m_staleSkips);
+        m_lastArrival = arrival.QuadPart;
     }
 }
 
 void CaptureRing::FindBracket(LONGLONG targetQpc, FrameBracket* out) const {
     *out = FrameBracket{};
 
-    const long long p = m_published.load();
+    const long long p = m_published;
     long long oldest = p - (RING_SIZE - 1);
     if (oldest < 0) oldest = 0;
 
