@@ -2,9 +2,13 @@
 #include <SimpleLogger.h>
 #include <limits.h>
 
-// How long the blocking grab waits before returning empty-handed. Only governs how quickly the
-// capture thread notices a stop request / stall — not pacing (the source paces capture).
-static const NvU32 kGrabWaitMs = 100;
+// How long one blocking grab call may wait before returning empty-handed. This must be SHORT:
+// the grab holds the D3D9 device lock (D3DCREATE_MULTITHREADED) for its entire wait, stalling
+// the present thread's StretchRect/Present until it returns — measured as present jitter of
+// exactly half the capture period (2.3ms @ 240Hz, 5.2ms @ 100Hz, 8.4ms @ 60Hz) with presents
+// quantized to capture arrivals. A short timeout bounds each lock hold; the grab still returns
+// immediately when a frame arrives, so arrival timestamps are unaffected.
+static const NvU32 kGrabWaitMs = 2;
 
 CaptureRing::CaptureRing()
     : m_captureTarget(NULL)
