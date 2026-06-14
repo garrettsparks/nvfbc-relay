@@ -66,15 +66,18 @@ void FrameTemporalCaptureMode::Run(
         FrameBracket bracket;
         m_ring.FindBracket(target, &bracket);
 
+        // Always-future selection (experiment): pick the first frame at/after the target,
+        // rather than the nearest of the bracket. A stable monotonic policy avoids the
+        // boundary wobble that, with nearest-pick, holds the same frame for ~6 presents at
+        // each drift slip (~81 dupes vs the ~12 fundamental rate-matching floor). Falls back
+        // to the newest before-frame only when no future frame exists (source slower than
+        // present). Costs up to one extra frame of latency vs nearest — acceptable.
         IDirect3DSurface9* chosen = NULL;
         const char* pick = "none";
-        if (bracket.hasBefore && bracket.hasAfter) {
-            if (bracket.beforeDiff <= bracket.afterDiff) { chosen = bracket.beforeSurface; pick = "before"; }
-            else { chosen = bracket.afterSurface; pick = "after"; }
+        if (bracket.hasAfter) {
+            chosen = bracket.afterSurface; pick = "after";
         } else if (bracket.hasBefore) {
             chosen = bracket.beforeSurface; pick = "before-only";
-        } else if (bracket.hasAfter) {
-            chosen = bracket.afterSurface; pick = "after-only";
         }
 
         if (chosen) {
