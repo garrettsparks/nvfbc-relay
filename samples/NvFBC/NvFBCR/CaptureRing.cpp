@@ -17,6 +17,7 @@ CaptureRing::CaptureRing()
     : m_captureTarget(NULL)
     , m_presentDevice(NULL)
     , m_capDevice(NULL)
+    , m_capSync(NULL)
     , m_nvfbc(NULL)
     , m_width(0)
     , m_height(0)
@@ -48,6 +49,10 @@ CaptureRing::~CaptureRing() {
     if (m_captureTarget) {
         m_captureTarget->Release();
         m_captureTarget = NULL;
+    }
+    if (m_capSync) {
+        m_capSync->Release();
+        m_capSync = NULL;
     }
     if (m_capDevice) {
         m_capDevice->Release();
@@ -90,6 +95,18 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
         &d3dpp, NULL, &m_capDevice);
     if (FAILED(hr)) {
         LOGERR("CaptureRing: failed to create capture device (error: 0x%08x)", hr);
+        return false;
+    }
+
+    // Event query on the capture device. After each StretchRect into a shared slot we issue
+    // and drain this so the capture device's GPU write is COMPLETE before we publish the slot.
+    // Without it the present device can read stale pixels from a freshly-written shared slot
+    // (D3D9Ex shared surfaces have no implicit cross-device coherency) — observed as periodic
+    // "old frame" episodes. The wait lands on the capture thread (off the present path), so it
+    // only adds a near-constant pipeline offset, not present-side jitter.
+    hr = m_capDevice->CreateQuery(D3DQUERYTYPE_EVENT, &m_capSync);
+    if (FAILED(hr)) {
+        LOGERR("CaptureRing: failed to create capture sync query (error: 0x%08x)", hr);
         return false;
     }
 
@@ -206,18 +223,36 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         long long count = m_writeCount;
         int slot = (int)(count % RING_SIZE);
         m_capDevice->StretchRect(m_captureTarget, &srcRect, m_ring[slot].capSurface, &srcRect, D3DTEXF_NONE);
+
+        // Force the StretchRect to complete on the capture GPU before publishing, so the
+        // present device never reads a not-yet-coherent shared slot. D3DGETDATA_FLUSH kicks
+        // the command buffer; GetData returns S_FALSE until the GPU signals the event.
+        m_capSync->Issue(D3DISSUE_END);
+        while (m_capSync->GetData(NULL, 0, D3DGETDATA_FLUSH) == S_FALSE) {
+            if (m_stop.load()) break;
+        }
+
+        // Measure how long the flush blocked: this is the fix's cost. It should be small and
+        // CONSISTENT (a near-constant pipeline offset, off the present path). Spikes here would
+        // mean the flush is stalling capture — watch flush p95 and whether dt grows.
+        LARGE_INTEGER afterFlush;
+        QueryPerformanceCounter(&afterFlush);
+        LONGLONG flushUs = (afterFlush.QuadPart - now.QuadPart) * 1000000 / m_freqQuad;
+
         m_ring[slot].timestamp = now;
         m_ring[slot].valid = true;
 
         m_writeCount = count + 1;
-        m_published.store(count + 1);  // publish only after the slot is fully written
+        m_published.store(count + 1);  // publish only after the slot write is GPU-complete
 
-        // Verbose: the source arrival timeline (dt = inter-arrival gap ≈ source frame period).
+        // Verbose: source arrival timeline (dt = inter-arrival gap ≈ source frame period);
+        // flush = GPU-completion wait added by the cross-device coherency fix.
         LONGLONG dt = (lastArrival != 0) ? (now.QuadPart - lastArrival) : 0;
-        LOG("capture #%lld arr=%lldus dt=%lldus",
+        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus",
             count,
             (long long)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
-            (long long)(dt * usPerTick));
+            (long long)(dt * usPerTick),
+            (long long)flushUs);
         lastArrival = now.QuadPart;
     }
 }

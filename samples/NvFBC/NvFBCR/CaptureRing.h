@@ -88,6 +88,7 @@ private:
     IDirect3DSurface9* m_captureTarget;   // on the capture device; NvFBC writes here
     IDirect3DDevice9Ex* m_presentDevice;
     IDirect3DDevice9Ex* m_capDevice;      // private capture device
+    IDirect3DQuery9* m_capSync;           // event query: flush capture writes before publish
     NvFBCToDx9Vid* m_nvfbc;               // session bound to the capture device
     int m_width;
     int m_height;
