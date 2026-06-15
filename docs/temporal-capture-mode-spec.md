@@ -64,16 +64,20 @@ selection/interpolation step. Vocabulary: the capture side **grabs** (from NvFBC
 side **selects** (from the ring).
 
 - **`CaptureRing`** (`CaptureRing.{h,cpp}`, shared with future blend/optical-flow modes): owns
-  the capture side — the ring slots, their registration as NvFBC output buffers, and the
-  capture thread. All slots are registered with NvFBC up front (`dwNumBuffers = RING_SIZE`)
-  and each blocking grab targets the next slot via `dwBufferIdx`, so **NvFBC writes every
-  frame directly into its ring slot — there is no capture target and no capture-side copy**;
-  the ring fill is pure index rotation. Each grab is QPC-stamped at return (≈ source arrival),
-  then a monotonic count is published via an **atomic**. Nothing is ever signaled *back* to
-  this thread. Slots are render-target **textures** (surface levels exposed) so consumers can
-  `StretchRect` them (temporal) or sample them in a shader (blend). The ring also answers
-  bracketing queries: `FindBracket(targetQpc)` → before/after frames + timestamps + depth +
+  the capture side — a **private D3D9Ex capture device** (separate from the present device), the
+  ring slots, and the capture thread. Each ring slot is a render-target texture **shared across
+  both devices** via a D3D9Ex shared handle (created on the capture device, opened on the present
+  device), so the present thread reads its alias without touching the capture device. Per source
+  frame the capture thread: blocking NvFBC grab into a single capture-target surface (`dwNumBuffers
+  = 1`) → `StretchRect` it into the next ring slot on the capture device → **coherency flush** (an
+  event query issued and drained before publishing, so the capture GPU's write is complete before
+  the present device can read the shared slot — see "B sync fix" below) → QPC-stamp at arrival →
+  publish a monotonic count via an **atomic**. Nothing is signaled *back* to this thread.
+  `FindBracket(targetQpc)` → before/after frames (present-device aliases) + timestamps + depth +
   the interpolation weight a blending consumer would use.
+  *(Direct-write — NvFBC writing each frame straight into a ring slot via `dwBufferIdx`, dropping
+  the capture target and that `StretchRect` — is a future perf optimization, see Future work; it
+  is NOT the current design.)*
 - **`PresentScheduler`** (shared with timer mode): the absolute-QPC present clock — purely
   *when* to act, never *what* to do.
 - **Present thread** (the main thread — owns the HWND, message pump, `PresentEx`): the mode's
@@ -84,8 +88,11 @@ side **selects** (from the ring).
 The **only** shared state between threads is the atomic published index (capture writes,
 present reads). This is the easy kind of concurrency — one-way producer→consumer.
 
-Requires `D3DCREATE_MULTITHREADED` on the D3D9 device (`InitD3D9` in `NvFBCR.cpp`) because both
-threads issue D3D9 calls. That flag affects only our process's device, not the captured game.
+Both D3D9Ex devices are created with `D3DCREATE_MULTITHREADED` (present device in `InitD3D9`,
+capture device in `CaptureRing::Start`). The flag affects only our process's devices, not the
+captured game. (With the two-device split each device is touched by a single thread, so the
+flag is largely defensive — the cross-device hazard is GPU coherency, handled by the flush, not
+CPU-side device-call reentrancy.)
 
 ### Buffer rules (no purging, no backward comms)
 
@@ -174,11 +181,12 @@ Conclusions:
   back-to-back returns) occasionally flushed it past the 16.7 ms-lagged target, so the mode
   presented a too-new frame. Fixes available: VRR/dedup (fewer publishes) and/or a larger
   ring. Revisit after the G-Sync / matched-refresh tests show the realistic wake rate.
-- **`jit` (deadline → Present call) median ≈ 2.3 ms** in both temporal runs — includes the
-  bracket search, the ring→backbuffer StretchRect, and device-lock contention with the
-  capture thread (which in the copy-path build StretchRects ~240×/s). `pdt` held a perfect
-  16,666 µs mean, so pacing was unaffected. The direct-write ring (NvFBC writes slots via
-  `dwBufferIdx`; no capture-side copies) should tighten `jit` — measure in the A/B.
+- **`jit` (deadline → Present call) median ≈ 2.3 ms** in this round's *single-device* build —
+  dominated by device-lock contention with the capture thread (which shared the present device).
+  `pdt` held 16,666 µs mean, so pacing was unaffected. (Superseded: the **two-device B** rework
+  eliminated this contention by giving capture its own device — `jit` on the current B build is
+  ~270 µs at 60→60. Direct-write is a *separate* future perf optimization for the capture-side
+  copy, not the fix for this `jit`.)
 
 ## Validation rounds 2–3 (2026-06-12, matched-refresh) — two NvFBC discoveries, three fix experiments
 
@@ -440,13 +448,25 @@ Blend's role is the POC that validates the bracket/weight pipeline NVOFA later p
 - **Resolve the 240→60 judder mechanism** — run the t:vsync@240 discriminator; if still juddery,
   investigate the target-selection path (uniform selection timestamps + uniform present timing
   but period-2 video judder is currently unexplained).
-- **Direct-write capture (perf optimization, against the clean t:60 baseline)** — register the
-  shared ring slots as NvFBC output buffers (`dwNumBuffers = RING_SIZE`) and rotate `dwBufferIdx`
-  per grab so NvFBC writes each frame *directly* into its ring slot, dropping the capture target
-  and the per-grab capture-side `StretchRect` (one full-res copy/frame, significant at 240fps).
-  Keep the coherency flush. Must produce the *same* result as t:60 hysteresis (0 reversals, ~6
-  dupes/5min) at lower capture cost. NOTE: the earlier stash was for the single-device CaptureRing
-  and won't apply to two-device B — needs re-implementing on the shared-surface ring.
+- **Direct-write capture (perf optimization, against the clean t:60 baseline).** Goal: eliminate
+  the per-grab capture-side `StretchRect` (one full-res copy/frame — significant at 240fps).
+  Change on the two-device B `CaptureRing`:
+  - In `Start`: instead of one capture-target surface + `dwNumBuffers = 1`, register **all
+    RING_SIZE shared slot surfaces** as NvFBC output buffers — `dwNumBuffers = RING_SIZE`,
+    `ppBuffer` = array of `NVFBC_TODX9VID_OUT_BUF` pointing at each slot's capture-device surface.
+  - In `CaptureLoop`: set `grabParams->dwBufferIdx = count % RING_SIZE` before each grab so NvFBC
+    writes the frame **directly** into the next slot; drop `m_captureTarget` and the `StretchRect`.
+  - **Keep the coherency flush, but move it to after the grab** (it currently follows the
+    StretchRect): NvFBC's write must still be GPU-complete before the present device reads the
+    shared slot, so issue+drain the event query between grab and publish.
+  - **Untested wrinkle / main risk:** this points NvFBC's output at a **D3D9Ex shared-handle
+    surface**. NvFBC-ToDx9Vid writing into a cross-device shared surface is unverified — it may
+    reject it or behave oddly. If so, fallbacks: keep a per-slot non-shared capture target and
+    direct-write there then StretchRect (no gain), or revisit. Validate first that NvFBC accepts
+    shared surfaces as outputs.
+  - **Acceptance:** same result as the t:60 hysteresis baseline (0 reversals, ~6 dupes/5min,
+    EXCELLENT) with lower capture-side cost (watch `flush` and capture `dt`).
+  - NOTE: the earlier single-device stash does NOT apply — re-implement on the shared-surface ring.
 
 ## Out of scope
 
