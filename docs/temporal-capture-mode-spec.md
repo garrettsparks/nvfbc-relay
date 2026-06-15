@@ -1,0 +1,453 @@
+# Temporal Capture Mode — spec (nearest-pick foundation for interpolation)
+
+Status: implemented (stage 1). This is the foundation the blend and optical-flow modes build on.
+
+## Purpose
+
+Produce a **smooth, fixed-rate** capture stream from a **variable-rate source** (e.g. a game
+running 80/90/100/144 fps captured at a steady 60). Temporal mode does this with the simplest
+possible content step — **nearest-frame selection** — so that the *timing/buffering* can be
+proven correct before any interpolation is added. The staged roadmap:
+
+1. **Temporal (this mode)** — pick the captured frame nearest the target time. No interpolation.
+2. **Blend** — same flow, linearly blend the two bracketing frames (own spec, later).
+3. **Optical flow (NVOFA)** — replace the blend with motion-compensated interpolation (later).
+
+Each stage changes only the final "what do we do with the bracketing pair" step; the
+scheduling, capture, and buffering below are shared.
+
+## Why the old approach couldn't do this
+
+`NvFBCFrameGrabInfo` exposes **no source-generation timestamp and no new-frame flag**
+(`inc/NvFBC/nvFBC.h:125`). The previous modes grabbed with `NVFBC_TODX9VID_NOWAIT` (return the
+latest frame immediately), so the only time information available was *our polling clock* —
+useless for reconstructing a variable source's true frame timing. You cannot bracket a target
+time against source frames you can't timestamp.
+
+## Capture timing — blocking grab
+
+NvFBC's grab flags (`inc/NvFBC/nvFBCToDx9vid.h:106`) include a **blocking** mode. We use
+`NVFBC_TODX9VID_WAIT_WITH_TIMEOUT`: the grab returns when NvFBC has a new frame, so the QPC
+timestamp at return approximates that frame's arrival time. The timeout (`kGrabWaitMs`, 100 ms)
+governs only how fast the capture thread notices a stop/stall — not pacing.
+
+**Measured semantics (2026-06 validation runs): "new frame" = new display scan-out /
+composition, NOT new content frame.** On a fixed-refresh source display the grab wakes once
+per refresh regardless of the content's framerate — measured `dt` median ≈ 4.2 ms (~240 Hz)
+for *both* a 60 fps and an 80 fps UFO source on a 240 Hz monitor. HW cursor moves also wake
+the grab (`bWithHWCursor = 1`; observed as `dt` ≈ 100 µs spikes). Implications:
+
+- **Fixed refresh:** the ring holds several timestamped copies of each content frame
+  (refresh-rate / content-rate of them), and timestamps are *refresh* times. Nearest-pick
+  selection remains content-correct (the nearest capture to the target holds the content the
+  display showed then — validated EXCELLENT at 60→60), but the bracket **weights** measure
+  position between adjacent *captures*, not between content frames — insufficient for blend.
+- **VRR / G-Sync engaged (the primary use case):** scan-out is driven by frame delivery, so
+  wakes ≈ content frames and timestamps ≈ true content arrival. No dedup needed. Each
+  session's capture log (`dt`) self-verifies which regime is active.
+- **Back-pocket mitigation for fixed-refresh sources (not yet implemented):** NvFBC diffmaps
+  (`bDiffMap` / `ppDiffMap`, per-block change maps documented in the setup params). The
+  capture thread would skip *publishing* unchanged grabs, leaving only content-distinct frames
+  in the ring with timestamps quantized to one refresh — accurate enough — and making weights
+  meaningful for blend. Build this when a no-VRR use case matters (desktop capture, games
+  without VRR support); skip the overhead otherwise. Testing without VRR can instead set the
+  monitor refresh equal to the content rate (content == refresh ⇒ wakes == content frames).
+
+**Assumption: source rate ≥ present rate** (no upconversion yet). If the source runs slower,
+no frame newer than the target exists, so we present the newest-before (a repeat) and log it;
+true upconversion (interpolating to *add* frames) is future work.
+
+## Architecture — two threads, strictly one-way (capture → ring → present)
+
+The shared logic lives in two reusable classes; a mode composes them and adds only its
+selection/interpolation step. Vocabulary: the capture side **grabs** (from NvFBC); the present
+side **selects** (from the ring).
+
+- **`CaptureRing`** (`CaptureRing.{h,cpp}`, shared with future blend/optical-flow modes): owns
+  the capture side — the ring slots, their registration as NvFBC output buffers, and the
+  capture thread. All slots are registered with NvFBC up front (`dwNumBuffers = RING_SIZE`)
+  and each blocking grab targets the next slot via `dwBufferIdx`, so **NvFBC writes every
+  frame directly into its ring slot — there is no capture target and no capture-side copy**;
+  the ring fill is pure index rotation. Each grab is QPC-stamped at return (≈ source arrival),
+  then a monotonic count is published via an **atomic**. Nothing is ever signaled *back* to
+  this thread. Slots are render-target **textures** (surface levels exposed) so consumers can
+  `StretchRect` them (temporal) or sample them in a shader (blend). The ring also answers
+  bracketing queries: `FindBracket(targetQpc)` → before/after frames + timestamps + depth +
+  the interpolation weight a blending consumer would use.
+- **`PresentScheduler`** (shared with timer mode): the absolute-QPC present clock — purely
+  *when* to act, never *what* to do.
+- **Present thread** (the main thread — owns the HWND, message pump, `PresentEx`): the mode's
+  own loop. Each deadline it computes `target = deadline − bracketingDelay`, calls
+  `FindBracket(target)`, selects per the mode's policy (temporal: the nearer frame),
+  `StretchRect`s to the backbuffer, and presents.
+
+The **only** shared state between threads is the atomic published index (capture writes,
+present reads). This is the easy kind of concurrency — one-way producer→consumer.
+
+Requires `D3DCREATE_MULTITHREADED` on the D3D9 device (`InitD3D9` in `NvFBCR.cpp`) because both
+threads issue D3D9 calls. That flag affects only our process's device, not the captured game.
+
+### Buffer rules (no purging, no backward comms)
+
+- **No frame lifetime management.** The fixed ring overwrites the oldest slot as capture
+  advances — the overwrite *is* the eviction. Frames older than the presented one are harmless.
+  This is what keeps the design one-way: present never tells capture which slots to free.
+- **Lock-free safety.** Capture writes a slot fully, *then* publishes its index. Present reads
+  only published slots in `[p−(RING_SIZE−1), p−1]` — never the slot capture is writing — and
+  only touches the newest few (the bracket sits near the lagging target). At `RING_SIZE = 8`,
+  capture cannot wrap onto a slot present is reading during one microsecond-scale `StretchRect`.
+- **Ring size.** Start at 8 to validate; shrink later from the logged "before-frame depth"
+  (how far back the bracket reached). Realistic floor ~3–4 (not 2 — capture leads the lagging
+  target). Size scales with the source/output gap.
+- **`bracketingDelay`** = one present period. Lagging the target by ~one period guarantees a
+  frame newer than the target has arrived (given source ≥ present), so the pair brackets it.
+- If the target falls **older than the whole ring** once warm (`p ≥ RING_SIZE`): logged loudly
+  (ring too small / delay too large), never silent.
+
+### Shared scheduler — `PresentScheduler`
+
+`PresentScheduler.{h,cpp}` holds the timer mode's validated absolute-QPC logic: period =
+`round(freq/framerate)`, a `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` timer, `Seed()`,
+`Deadline()`, `WaitUntilDeadline()` (with the >1-period catch-up clamp), `Advance()`. Both
+`TimerCaptureMode` and `FrameTemporalCaptureMode` use it, so present pacing is identical and
+drift-free across modes.
+
+### Nearest-pick selection
+
+Among the bracketing frames, pick the one whose timestamp is genuinely closest to `target`
+(before *or* after). This fixes the prior bug where selection always preferred the "before"
+frame and so never used a future frame (`FrameTemporalCaptureMode.cpp` old `:213`) — see
+`temporal-blend-future-frame-findings.md`.
+
+## Logging (the correctness instrument)
+
+Verbose by design for now — this is how we validate the scheduler before adding interpolation.
+Logging is enabled only if an empty `NvFBCR.log` exists next to the exe at startup. Two streams
+(the logger is mutex-guarded, so concurrent thread logging is safe):
+
+- **Capture thread**, per frame: `capture #<n> arr=<µs> dt=<µs>` — the source arrival timeline;
+  `dt` (inter-arrival gap) ≈ the source frame period, confirming the blocking grab returns at
+  the true source rate and showing a variable source's real cadence.
+- **Present thread**, per present: `temporal dl=<µs> tgt=<µs> before=<µs>(d<depth>) after=<µs>
+  w=<weight> pick=<side> jit=<µs> pdt=<µs>` — scheduled deadline, target, the bracket's
+  before/after timestamps (all relative to a base QPC) + the before-frame's ring depth, the
+  chosen side, the *would-be* interpolation weight (`beforeDiff/(beforeDiff+afterDiff)` — what
+  blend will use), present **jit**ter (actual present vs scheduled deadline = scheduler health),
+  and **p**resent **d**el**t**a (actual inter-present gap, should hold at the present period).
+
+The bracket timestamps double as the observed source timeline at the present points.
+
+## Verification
+
+- **Timer no-regression**: `60` UFO capture → still 0 dupes, `std(Δ)≈0.43` (matches dev `fb0e6e3`).
+- **Temporal, mismatched source (e.g. 90→60 ⇒ 3:2, or 80→60 ⇒ 4:3 as actually run)**: from
+  the logs, confirm the bracket **straddles** the target (before ≤ target < after) and present
+  pacing is steady (`pdt` ≈ the present period). Output should show the clean, predictable
+  cadence judder for that ratio (`detect.py pacing` period-2/3) — correct for nearest-pick and
+  proof the bracketing/timing is right. Use the logged before-frame depth to pick the shrunk
+  ring size. (Note: on a fixed-refresh display the `w`/`pick` pattern is refresh-quantized —
+  see "Measured semantics"; the clean repeating weight pattern only appears when wakes track
+  content, i.e. VRR or content == refresh.)
+- Capture per `frame-pacing-drift-analysis.md`: CBR ~6 Mbps is fine; verify **0 OBS dropped
+  frames**; compare against a same-session baseline.
+
+## Validation results (2026-06-11, copy-path build, 240 Hz fixed-refresh source display)
+
+Three runs (UFO test, OBS CBR ~6 Mbps): timer `60` 5 min; `t:60` with a 60 fps source ~6 min;
+`t:60` with an 80 fps source ~6 min. Clips/logs: `frame-drop-analysis/bb_temporal_rework_*`.
+
+| Run | detect.py | Key log stats |
+|---|---|---|
+| timer 60→60 | GOOD; 112 dupes all in two environmental bursts, else clean | (no per-frame logging) |
+| t:60, 60 src | **EXCELLENT**, 97% smooth | `pdt` mean 16,666 µs; brackets straddling; 0 no-after |
+| t:60, 80 src | POOR (98% bad) — **expected**: nearest-pick 4:3 cadence | same healthy `pdt`/brackets; **0 dupes** (always a fresh frame) |
+
+Conclusions:
+
+- **Stage 1 validated.** Scheduler extraction unregressed (timer matches baseline); the
+  two-thread ring + bracketing work (60→60 EXCELLENT); the 80→60 period-3 judder is exactly
+  what nearest-pick *should* produce and is the "before" picture that blend must beat.
+- **Discovery:** grab wakes are scan-out-paced, not content-paced (see "Measured semantics"
+  above) — `dt` ≈ 4.2 ms in both temporal runs, independent of content rate.
+- **Known defect (~1%):** `target older than ring window` on ~250 of ~25k presents per run.
+  At ~240 Hz wakes the 8-slot ring spans only ~34 ms, and capture bursts (cursor wakes,
+  back-to-back returns) occasionally flushed it past the 16.7 ms-lagged target, so the mode
+  presented a too-new frame. Fixes available: VRR/dedup (fewer publishes) and/or a larger
+  ring. Revisit after the G-Sync / matched-refresh tests show the realistic wake rate.
+- **`jit` (deadline → Present call) median ≈ 2.3 ms** in both temporal runs — includes the
+  bracket search, the ring→backbuffer StretchRect, and device-lock contention with the
+  capture thread (which in the copy-path build StretchRects ~240×/s). `pdt` held a perfect
+  16,666 µs mean, so pacing was unaffected. The direct-write ring (NvFBC writes slots via
+  `dwBufferIdx`; no capture-side copies) should tighten `jit` — measure in the A/B.
+
+## Validation rounds 2–3 (2026-06-12, matched-refresh) — two NvFBC discoveries, three fix experiments
+
+Round 2 re-ran the tests with the monitor refresh set to the content rate (60/100 Hz), making
+capture wakes ≈ content frames for real. The output got *worse*, and the logs found why; the
+attempted fix then exposed a second API discovery.
+
+### Discovery 1 — the blocking grab holds the device lock for its entire wait
+
+With wakes at the true source rate, present jitter (`jit` = deadline → Present call) measured
+**exactly half the capture period at every rate**: 2.3 ms @ 240 Hz, 5.2 ms @ 100 Hz, 8.4 ms @
+60 Hz. At 100→60, `pdt` (inter-present gap) quantized to the 10/20 ms capture grid instead of
+16.7 ms. Conclusion: with `D3DCREATE_MULTITHREADED`, the blocking grab holds the shared D3D9
+device lock for its whole wait (up to a full source period), so the present thread's
+StretchRect/Present stall until the next source frame arrives — **presents were paced by
+capture arrivals, not by the scheduler**. (The earlier 240 Hz "EXCELLENT" result was partly
+luck: 4 ms max stalls rarely crossed scan-out boundaries.) Result at 60→60: 259 dupes / 2 min
+of visible hitching.
+
+### Discovery 2 — WAIT_WITH_TIMEOUT expiry returns SUCCESS with a stale re-grab
+
+The attempted fix (timeout 100 ms → 2 ms, to bound each lock hold) backfired: NvFBC's timeout
+expiry does **not** return empty — it re-grabs the unchanged screen and returns success. There
+is no empty-return path. The 2 ms timeout therefore turned capture into ~500 Hz polling of
+duplicate content with meaningless timestamps: 162k captures in 5.5 min at a 60 fps source
+(`dt` ≈ 2.3 ms, no 16.7 ms gaps), ring window shrunk below the bracketing lag, 20,882
+"target older than ring window" errors vs 24 successful brackets, 931 dupes.
+
+Corollary: **timing cannot distinguish** a frame arriving within ~1 ms of expiry from a stale
+re-grab (the expiring grab consumes it). At rate-matched sources, drift makes the arrival
+phase *dwell* at any fixed boundary for seconds per sweep cycle, so timing-based stale
+detection would drop frames in multi-second stretches. Stale detection must be by **content**
+— NvFBC's diffmap (`bDiffMap`/`ppDiffMap`; all-zero diff = unchanged).
+
+### Three fix experiments (local branches off `temporal-capture-mode-rework`)
+
+| Branch | Mechanism | Notes |
+|---|---|---|
+| `temporal-a-singlethread` | **One thread**: present loop pumps the ring between deadlines; grab timeout = time-to-deadline (the structural max for a single thread — the same thread must present); diffmap classifies the per-interval boundary expiry (~120 grabs/s) | No lock contention by construction; frames arriving during present work stamp ≤ ~2–3 ms late |
+| `temporal-b-two-devices` | **Two threads, two devices**: NvFBC session rebound to a private capture device; ring slots are D3D9Ex shared textures opened on both devices; long event-driven grabs (100 ms), no polling, no diffmap | Purest timestamps. Risk: D3D9Ex shared surfaces have no cross-device sync — watch for intra-frame tearing |
+| `temporal-c-diffmap` | **Two threads, one device**: keep 2 ms polling (bounds each lock hold), diffmap dedups the ~500 Hz stale flood, Sleep(1) after each stale skip hands the lock to the present thread (anti-convoy) | Smallest delta from current code. The timeout is the present-jitter ceiling (lock hold ≈ timeout, regardless of source rate): 4 ms is a viable trade, 8 ms re-creates the disease. Tune/configure only after validation |
+
+Logging is the referee (upgraded on all three): capture lines fire **only on published,
+content-distinct frames** (`dt` ≈ source period = healthy) and carry cumulative `skip=`;
+present lines add `pub=`/`skip=`. The round-3 failure mode is now directly visible — `dt`
+collapsing to ~2 ms or `skip` staying at ~0 (diffmap not flagging) would expose itself
+immediately. Decision metrics per branch: `dt` ≈ source period, `jit` (predicted A ≈ sub-ms,
+B ≈ sub-ms if sharing behaves, C ≲ 2–3 ms), `pdt` pinned at the present period, 60→60 dupes
+at drift level only, ring-window errors ≈ 0, and (B) no tearing.
+
+Test matrix: per branch, 60-source 5 min (rate-matched stress: drift sweep, dwell, the
+original hitching) + 100-source 2 min (mismatch check: `dt` ≈ 10 ms, 5:3 bracketing,
+un-quantized `pdt`).
+
+## Round-3 experiment results (2026-06-13, 60→60, matched 60 Hz refresh)
+
+All three built; `detect.py` (now with the roughness detector, see below) + log analysis:
+
+| Branch | dupes/5min | jit median | Verdict | Finding |
+|---|---|---|---|---|
+| A (single-thread pump) | 159 (drift-level) | 266 µs | EXCELLENT 98% | Clean. Residual roughness = inherent nearest-pick drift slips (scattered, not periodic) — the artifact blend removes. Cleanest capture timing (dt p95 17.3 ms). |
+| B (two devices) | 1 | 268 µs | "EXCELLENT" but **wrong** | Timing flawless, but **periodic ~25 s visual roughness** the dupe/pacing tools rated 100% smooth. |
+| C (2-thread, 2 ms poll + diffmap) | 764 | 324 µs (p95 2 ms) | GOOD 50% | Roughest. Capture-side jitter (dt p95 28 ms); not chosen. |
+
+### The roughness detector (new in `detect.py`)
+
+Dupe/pacing analysis only sees *near-zero* deltas (duplicates); it is structurally blind to
+*wrong-order / stale* frames, which are different from their neighbours (non-zero delta) but
+from the wrong time. `analyze_roughness()` flags windows whose inter-frame delta-variance
+spikes above the smooth floor and warns when episodes recur periodically (a timing/sync-defect
+tell). It reproduced B's ~25 s episodes at timestamps matching the eyeball report, while
+correctly leaving A unflagged-for-periodicity (A's slips are scattered/inherent). This is the
+only instrument besides the eye that catches B's class of defect.
+
+### B investigation — what the data eliminated, and the surviving diagnosis
+
+B's glitch is "whole old frames," not tearing. Three mechanisms were proposed and **two were
+refuted by data**:
+
+1. *Same-slot write/read collision* — refuted by ring arithmetic: at 60→60 with 8 slots the
+   write head and read position stay ~1–2 slots apart; a slot is re-used only ~8 frames
+   (~133 ms) later. No collision.
+2. *Reading a too-fresh slot before coherency settles* — refuted by age analysis: in rough
+   windows the picked frame is *older* (~21 ms, all depth 1), never fresh.
+3. **Confirmed diagnosis — cross-device pixel coherency.** Two independent measurements:
+   (a) the picked-frame timeline is **100 % monotonic in rough windows** (0 backward jumps in
+   the log's selected timestamps) and capture timing is a clean 60 Hz there — CPU-side
+   selection/bookkeeping is correct; (b) per-frame scroll-direction analysis of the *video*
+   shows **10 backward-scroll jumps in a 4 s rough window vs 0 in a smooth window** — the
+   displayed pixels momentarily move to an earlier scroll position. Selection-forward +
+   pixels-backward proves the present device reads **stale pixels** from a shared slot the
+   capture device wrote: the `m_published` atomic synchronises the CPU side, but nothing
+   synchronises GPU work across the two D3D9Ex devices. B-specific (single-device A cannot have
+   it). The exact reason it concentrates at the ~25 s drift phase isn't modelled, but the
+   stale-pixel mechanism itself is confirmed by the backward-scroll measurement.
+
+**Fix under test (`temporal-b2-sync`):** after each capture-side `StretchRect`, issue a
+`D3DQUERYTYPE_EVENT` and drain it (`D3DGETDATA_FLUSH`) **before** publishing the slot, so the
+write is GPU-complete before the present device can read it. The wait is on the capture thread
+(off the present path) → a near-constant pipeline offset, not present jitter. Validation:
+re-run 60→60; success = the roughness detector reports **no periodic episodes** and `pdt` stays
+pinned. If roughness persists, coherency is eliminated and the "older-pick" timing pattern is
+the next lead.
+
+### Why pursue B over the cleaner-scoring A
+
+A scored better here, but its single thread is a structural ceiling: vsync-blocking present or
+heavy NVOFA flow compute on the present path would **starve capture** (a single frame's work
+exceeding the present period = a stutter — the exact failure mode to avoid). B's independent
+capture thread keeps filling the ring regardless of present-side work, so interpolation/vsync
+cost becomes a *constant pipeline offset* rather than per-frame jitter. B is the better
+foundation for blend → NVOFA; the coherency fix is the price of its two-device split.
+
+### Latency policy (clarified)
+
+Constant pipeline offset (uniformly older presented content) is acceptable without limit, in
+service of pacing. Variable per-frame latency — any single frame's work exceeding the present
+period — is *not*; that is what a stutter is. Every timing decision is judged by pacing
+uniformity (steady `pdt`, no roughness episodes), never by absolute latency.
+
+## B sync fix — validated (2026-06-13, 60→60)
+
+The capture-thread flush before publish (`temporal-b-two-devices` + sync commit) **fixed the
+stale-pixel reads**: `detect.py reverse` went **177 → 0** reversals. The cross-device coherency
+diagnosis is confirmed and resolved.
+
+**Performance (the gating question): capture is light.** `flush=` median **247 µs**, p95 287 µs,
+p99 354 µs, max 743 µs — sub-millisecond and consistent. Capture `dt` held 16661 µs median (no
+stalls). So the flush costs ~1.5% of the capture thread's budget at 60 fps (~6% at a 240 fps
+source), off the present path = constant pipeline offset, not present jitter. Nothing here is
+heavy before blend/NVOFA; the expensive future work (flow compute) lives on the present thread,
+decoupled.
+
+**Residual = inherent nearest-pick drift slip, not a bug.** 86 dupes/5min, classified by
+periodicity: **81 in ~25 s-periodic clusters (drift slips)** + **5 isolated (environmental)**.
+The drift sweep is the source-vs-present clock difference (~0.07%); vsync baseline shows ~0–27
+because it is single-clock (can't drift-slip). The *fundamental* floor for a decoupled mode is
+~12/5min (one rate-matching correction per ~25 s sweep) — so the ~69 excess over that floor is
+selection-policy wobble, not fundamental (see always-future below).
+
+This is the **success criterion for the temporal stage**: zero reversals, zero stale reads,
+sub-ms capture cost, residual = the inherent rate-matching artifact the next stages address.
+
+### Decision: adopt B (two devices) over A (single thread)
+
+A scored cleaner here (159 vs 86 dupes is misleading — A's were also drift slips) but A's single
+thread is a structural ceiling: vsync-blocking present or heavy NVOFA flow compute on the present
+path would **starve capture** (a single frame's work exceeding the present period = a stutter).
+B's independent capture thread keeps filling the ring regardless of present-side cost, so
+interpolation/vsync becomes a constant pipeline offset, not per-frame jitter. B is the foundation
+for blend → NVOFA; the (now-fixed) coherency flush is the price of its two-device split.
+
+### Always-future selection (experiment, in progress)
+
+Nearest-pick holds the same frame for ~6 presents at each slip (81 dupes vs the ~12 floor),
+likely boundary wobble. Experiment: always pick the first frame **at/after** the target (stable,
+monotonic) instead of the nearest. Expected to collapse each slip to a single clean dupe (~81 →
+~17, near baseline). Cannot reach true zero — two drifting clocks force ~12 corrections/5min
+regardless of policy; only frame *generation* removes those. Likely the default selection policy
+for streaming use going forward; hysteresis is a fancier alternative if needed.
+
+## Round 4 (2026-06-14) — hysteresis, always-future, 240→60, and the present-clock question
+
+New `detect.py` instrument added: **`reverse`** subcommand — per-frame scroll-direction via
+column-profile cross-correlation. On directional-motion clips a backward scroll = a stale /
+out-of-order frame; catches what dupe and roughness detection miss. (Also added: the
+`pacing` "Roughness" metric in round 3.)
+
+Selection-policy experiments on the B-sync build (all 60→60 unless noted; reversals 0 / capture
+clean throughout):
+
+| Build | dupes/5min | roughness | note |
+|---|---|---|---|
+| always-future @60 | 66 | ~7 episodes, ~50s period | each slip = ~1s cluster of single dupes (boundary wobble) |
+| always-future @240 | 1 | 9 episodes, ~34s periodic (GOOD) | no dupes (4× oversample); mild period-2 motion judder |
+| **plain vsync @240** | 1 | ~0 (EXCELLENT) | control — source is uniform; vsync downsamples 240→60 cleanly |
+| **t:60 = nearest + hysteresis @60** | **4** | 4 single blips, 0s total (EXCELLENT) | 6 `pick=repeat` logged = the floor |
+| t:vsync = hysteresis + vblank @60 | 7 | 6 episodes, 2s, ~50s periodic (EXCELLENT) | vsync present did NOT help at 60 |
+
+**Hysteresis is the 60→60 fix — confirmed:** nearest *without* hysteresis was 86 dupes; nearest
+*with* hysteresis is **4** (EXCELLENT, roughness ~0, 6 logged repeats = the fundamental floor).
+The improvement is specifically the monotonic constraint.
+
+**Why it's principled, not a patch — it's asynchronous sample-rate conversion (ASRC).** Resampling
+a source onto a drifting present timebase is the same problem audio resamplers solve across
+44.1↔48 kHz clocks. The textbook-correct ASRC is a **phase accumulator** (hold a fractional
+source position, advance by `source_rate/present_rate` each output, pick/interpolate there) —
+which is **inherently monotonic by construction**. Our nearest-timestamp pick was a *memoryless*
+approximation that dropped that monotonicity; "nearest" is genuinely ill-posed at a tie. The
+mechanism is quantified: at 60→60 the phase creeps ~5.6µs/present (near-equal rates), so for ~1s
+per drift sweep the target sits within the **319µs capture-jitter band** of the midpoint between
+two frames, and 319µs ≫ 5.6µs means jitter flip-flops the memoryless pick → predicted flip-flop
+window 319/5.6 ≈ 57 presents ≈ **1.0s, matching the observed ~1s clusters exactly.** Hysteresis
+*restores* the monotonicity proper ASRC always has (and for an unknown/variable source rate,
+timestamp-nearest + monotonic-constraint *is* the variable-rate phase accumulator). It is a
+**no-op at 240→60** (picks already advance), so it doesn't confound the 240 tests — and indeed
+t:vsync@60 (which adds vblank present on top) was no better, slightly worse, since at 60→60 the
+residual is rate-matching that *selection* fixes, not present timing.
+
+### Architecture status (what's solid vs open)
+
+- **Capture / ring population: solid and locked.** Clean capture `dt`, accurate arrival
+  timestamps, 0 reversals everywhere (cross-device coherency fixed by the flush), uniform
+  bracketing at both rates. The hard, concurrency-and-cross-device-heavy layer is done; the ring
+  is now a stable interface ("timestamped, bracketable, coherent frames").
+- **Present side: where the remaining work lives — and that's for the best.** Selection policy,
+  present timing, and (next) blend/NVOFA are all single-threaded, deterministic consumers of the
+  ring interface. 60→60 is solved by hysteresis (selection). The one open item is the 240→60
+  micro-judder: confirmed *not* capture, *not* selection-timestamps, *not* present-timing-by-pdt
+  — yet the video micro-judders period-2. Unexplained; the t:60-vs-t:vsync @240 discriminator
+  localizes it (present clock vs the StretchRect/display path).
+
+**The 240→60 judder — present clock vs selection (open):** vsync@240 is clean, so the source is
+uniform and 240→60 *can* be downsampled cleanly; the judder is in our temporal pipeline. But it
+is **not** simply "QPC-present-vs-vblank drift," because plain `60` (TimerCaptureMode: latest +
+QPC present) was smooth — QPC present is fine with show-latest. The two clean modes (plain 60,
+vsync@240) both show *latest*; the juddery one (temporal@240) does *target-based ring selection*.
+So the judder correlates with target-selection, and its mechanism is not yet confirmed
+(measurements show uniform selection timestamps AND uniform present timing, yet the video
+micro-judders period-2 — unexplained). **`t:vsync` is the discriminator:** it keeps target
+selection but moves present to the vblank. Clean → present clock was it; still juddery → the
+ring/selection path is, independent of present clock. Test pending.
+
+## Mode framework: `<selection>:<present_timing>`
+
+The mode string is two orthogonal axes (already reflected in `t:60` vs `t:vsync` parsing):
+
+- **selection** — how the output frame is chosen/built: `t` temporal (nearest/future-pick),
+  later `b` blend (pixel cross-fade of the bracket — *not* motion interpolation), `o`
+  optical-flow / NVOFA (true motion-compensated in-between frame).
+- **present_timing** — when to present: `60` (absolute-QPC timer, current), `vsync` (block on
+  the target/capture-card vblank), later arbitrary CFR.
+
+**`t:vsync` (IMPLEMENTED 2026-06-14):** temporal selection with vsync-locked present. The
+`FrameTemporalCaptureMode` takes a `vsyncPresent` flag: `GetPresentationInterval()` returns
+`INTERVAL_ONE` so the device is created vsync-synced; the present loop skips the QPC-timer wait
+and lets the blocking `INTERVAL_ONE` present be the wait, anchoring the selection target to
+"now" (just after the previous vblank) so selection runs on the **display clock**, not QPC. The
+capture thread/ring/bracketing/hysteresis are unchanged. `t` and `t:vsync` route here;
+`t:59.94` routes to the same mode with timer present. The old `VsyncTemporalCaptureMode` (a
+pre-CaptureRing implementation) has been **removed**.
+
+**Clarification — blend ≠ interpolation.** Blend is pixel averaging/cross-fade of the bracketing
+pair (softens a slip into a brief ghost/double-image); it does not synthesize motion. NVOFA is
+the only stage that produces a geometrically-correct in-between frame (true smooth motion).
+Blend's role is the POC that validates the bracket/weight pipeline NVOFA later plugs into.
+
+## Future work
+
+- **Blend mode** (next): identical capture/scheduler/ring/bracket; replace nearest-pick with a
+  weighted blend of the pair (its own spec).
+- **Optical flow (NVOFA)**: replace the blend with motion-compensated interpolation. NVOFA is a
+  CUDA hardware path (flow vectors + a warp kernel), not a D3D9 shader swap — see the archived
+  `garrett-nvofa-optical-flow-interpolation` branch, deliberately set aside as too complex until
+  this foundation is solid.
+- **VSync-driven present** — DONE (`t:vsync`, see Mode framework). Pending validation that it
+  resolves the 240→60 judder (the discriminator test above).
+- **Confirm the hysteresis 60→60 floor** — DONE: 4 dupes / EXCELLENT (see Round 4).
+- **Resolve the 240→60 judder mechanism** — run the t:vsync@240 discriminator; if still juddery,
+  investigate the target-selection path (uniform selection timestamps + uniform present timing
+  but period-2 video judder is currently unexplained).
+- **Direct-write capture (perf optimization, against the clean t:60 baseline)** — register the
+  shared ring slots as NvFBC output buffers (`dwNumBuffers = RING_SIZE`) and rotate `dwBufferIdx`
+  per grab so NvFBC writes each frame *directly* into its ring slot, dropping the capture target
+  and the per-grab capture-side `StretchRect` (one full-res copy/frame, significant at 240fps).
+  Keep the coherency flush. Must produce the *same* result as t:60 hysteresis (0 reversals, ~6
+  dupes/5min) at lower capture cost. NOTE: the earlier stash was for the single-device CaptureRing
+  and won't apply to two-device B — needs re-implementing on the shared-surface ring.
+
+## Out of scope
+
+Upconversion (source < present); HDR/DX11 output; the CUDA FRUC pipeline; multi-target output.
