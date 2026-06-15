@@ -54,6 +54,7 @@ void FrameTemporalCaptureMode::Run(
     MSG msg = {};
     RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
     LONGLONG lastPresentQpc = 0;
+    LONGLONG lastShownTs = 0;   // hysteresis: QPC of the last presented frame (strictly advances)
     m_scheduler.Seed();
 
     while (TRUE)
@@ -62,22 +63,32 @@ void FrameTemporalCaptureMode::Run(
         const LONGLONG deadline = m_scheduler.Deadline();
         const LONGLONG target = deadline - m_bracketingDelayQpc;
 
-        // Select: the ring frame nearest the target (before or after).
+        // Select: nearest-to-target frame, with HYSTERESIS — present frames in strictly
+        // increasing timestamp order. Among the bracket frames NEWER than the last presented
+        // one, pick the nearest to target. If neither is newer (capture produced no new frame
+        // this period — the genuine rate-matching stall at the drift boundary), repeat the
+        // last frame: that is the one unavoidable dupe per drift sweep (~6/5min at 60->60).
+        // This removes the boundary wobble where plain nearest-pick re-shows a frame ~14 times
+        // over the ~1s the phase lingers at the alignment point.
         FrameBracket bracket;
         m_ring.FindBracket(target, &bracket);
 
-        // Always-future selection (experiment): pick the first frame at/after the target,
-        // rather than the nearest of the bracket. A stable monotonic policy avoids the
-        // boundary wobble that, with nearest-pick, holds the same frame for ~6 presents at
-        // each drift slip (~81 dupes vs the ~12 fundamental rate-matching floor). Falls back
-        // to the newest before-frame only when no future frame exists (source slower than
-        // present). Costs up to one extra frame of latency vs nearest — acceptable.
+        bool beforeNew = bracket.hasBefore && bracket.beforeTs > lastShownTs;
+        bool afterNew  = bracket.hasAfter  && bracket.afterTs  > lastShownTs;
+
         IDirect3DSurface9* chosen = NULL;
         const char* pick = "none";
-        if (bracket.hasAfter) {
-            chosen = bracket.afterSurface; pick = "after";
-        } else if (bracket.hasBefore) {
-            chosen = bracket.beforeSurface; pick = "before-only";
+        if (beforeNew && afterNew) {
+            if (bracket.beforeDiff <= bracket.afterDiff) { chosen = bracket.beforeSurface; pick = "before"; lastShownTs = bracket.beforeTs; }
+            else { chosen = bracket.afterSurface; pick = "after"; lastShownTs = bracket.afterTs; }
+        } else if (afterNew) {
+            chosen = bracket.afterSurface; pick = "after-adv"; lastShownTs = bracket.afterTs;   // advance past last
+        } else if (beforeNew) {
+            chosen = bracket.beforeSurface; pick = "before-adv"; lastShownTs = bracket.beforeTs;
+        } else {
+            // No frame newer than the last shown: genuine stall — repeat (the fundamental dupe).
+            chosen = bracket.hasBefore ? bracket.beforeSurface : (bracket.hasAfter ? bracket.afterSurface : NULL);
+            pick = "repeat";
         }
 
         if (chosen) {
