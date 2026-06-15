@@ -197,7 +197,6 @@
     <ClCompile Include="TimerCaptureMode.cpp" />
     <ClCompile Include="VsyncBlendCaptureMode.cpp" />
     <ClCompile Include="VsyncCaptureMode.cpp" />
-    <ClCompile Include="VsyncTemporalCaptureMode.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\..\inc\NvFBC\NvFBCToDx9vid.h" />
@@ -209,7 +208,6 @@
     <ClInclude Include="TimerCaptureMode.h" />
     <ClInclude Include="VsyncBlendCaptureMode.h" />
     <ClInclude Include="VsyncCaptureMode.h" />
-    <ClInclude Include="VsyncTemporalCaptureMode.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

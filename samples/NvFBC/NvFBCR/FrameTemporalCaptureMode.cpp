@@ -7,8 +7,9 @@ extern IDirect3DSurface9* g_backbuffer;
 extern int BUF_WIDTH;
 extern int BUF_HEIGHT;
 
-FrameTemporalCaptureMode::FrameTemporalCaptureMode(float framerate)
+FrameTemporalCaptureMode::FrameTemporalCaptureMode(float framerate, bool vsyncPresent)
     : m_bracketingDelayQpc(0)
+    , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_device(NULL)
 {
@@ -16,7 +17,8 @@ FrameTemporalCaptureMode::FrameTemporalCaptureMode(float framerate)
 }
 
 UINT FrameTemporalCaptureMode::GetPresentationInterval() const {
-    return D3DPRESENT_INTERVAL_IMMEDIATE;
+    // vsync present needs the device created with INTERVAL_ONE so PresentEx blocks on vblank.
+    return m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
 }
 
 bool FrameTemporalCaptureMode::Setup() {
@@ -32,7 +34,8 @@ bool FrameTemporalCaptureMode::Setup() {
     // side of it (with source rate >= present rate, a frame newer than the target has arrived).
     m_bracketingDelayQpc = m_scheduler.PeriodQpc();
 
-    LOG("Temporal mode initialized - present %.2f fps, nearest-frame selection", m_targetFramerate);
+    LOG("Temporal mode initialized - %s present (%.2f fps nominal), nearest-frame selection + hysteresis",
+        m_vsyncPresent ? "vsync/vblank" : "QPC-timer", m_targetFramerate);
     return true;
 }
 
@@ -59,8 +62,19 @@ void FrameTemporalCaptureMode::Run(
 
     while (TRUE)
     {
-        m_scheduler.WaitUntilDeadline();
-        const LONGLONG deadline = m_scheduler.Deadline();
+        // Present timing. Timer mode waits on the absolute-QPC deadline. Vsync mode lets the
+        // INTERVAL_ONE present (below) be the wait, and anchors the target to "now" (just after
+        // the previous vblank) so selection runs on the display's vblank clock rather than QPC
+        // — the variable this t:vsync experiment isolates against the t:60 present.
+        LONGLONG deadline;
+        if (m_vsyncPresent) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            deadline = now.QuadPart;
+        } else {
+            m_scheduler.WaitUntilDeadline();
+            deadline = m_scheduler.Deadline();
+        }
         const LONGLONG target = deadline - m_bracketingDelayQpc;
 
         // Select: nearest-to-target frame, with HYSTERESIS — present frames in strictly
@@ -97,7 +111,10 @@ void FrameTemporalCaptureMode::Run(
 
         LARGE_INTEGER beforePresent;
         QueryPerformanceCounter(&beforePresent);
-        device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
+        // Timer: immediate (non-blocking). Vsync: INTERVAL_ONE blocks until the capture-card
+        // vblank — this present IS the frame-pacing wait in vsync mode.
+        device->PresentEx(NULL, NULL, NULL, NULL,
+            m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE);
 
         // Inter-present interval (should hold steady at the present period if the scheduler works).
         LONGLONG presentDelta = (lastPresentQpc != 0) ? (beforePresent.QuadPart - lastPresentQpc) : 0;
@@ -126,7 +143,7 @@ void FrameTemporalCaptureMode::Run(
             }
         }
 
-        m_scheduler.Advance();
+        if (!m_vsyncPresent) m_scheduler.Advance();   // vsync paces via the blocking present
 
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);

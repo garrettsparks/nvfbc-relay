@@ -58,7 +58,6 @@
 #include "FrameTemporalCaptureMode.h"
 #include "FrameBlendCaptureMode.h"
 #include "VsyncBlendCaptureMode.h"
-#include "VsyncTemporalCaptureMode.h"
 
 using namespace std;
 
@@ -80,17 +79,19 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         return new VsyncCaptureMode();
     }
 
-    // Check for vsync temporal mode (t:vsync or just t)
+    // Temporal selection + vsync present (t:vsync or just t): CaptureRing-based temporal mode,
+    // present blocked on the capture-card vblank. Nominal 60 fps drives the bracketing lag;
+    // the actual present rate is the display refresh.
     if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0) {
-        return new VsyncTemporalCaptureMode();
+        return new FrameTemporalCaptureMode(60.0f, /*vsyncPresent=*/true);
     }
 
-    // Check for temporal frame selection mode (t:60 format)
+    // Temporal selection + QPC-timer present (t:60 format).
     if (modeStr.length() > 2 && modeStr[0] == 't' && modeStr[1] == ':') {
         try {
             float framerate = stof(modeStr.substr(2));
             if (framerate > 0.0f && framerate <= 1000.0f) {
-                return new FrameTemporalCaptureMode(framerate);
+                return new FrameTemporalCaptureMode(framerate, /*vsyncPresent=*/false);
             }
         }
         catch (...) {
@@ -130,8 +131,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("Invalid capture mode: '%s'", modeStr.c_str());
     LOGERR("Valid modes:");
     LOGERR("  vsync          - VSync-driven presentation");
-    LOGERR("  t, t:vsync     - VSync temporal (frame selection, auto refresh rate)");
-    LOGERR("  t:59.94        - Timed temporal (frame selection, manual framerate)");
+    LOGERR("  t, t:vsync     - Temporal frame selection, presented on vblank (vsync timing)");
+    LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
     LOGERR("  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)");
     LOGERR("  b:59.94        - Timed blend (GPU shader blending, manual framerate)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
@@ -453,8 +454,8 @@ void ConsoleUserInput(string* framerateStr) {
     cout << endl << "Available capture modes:" << endl;
     cout << "  vsync          - VSync-driven presentation (matches target display refresh)" << endl;
     cout << endl;
-    cout << "  t, t:vsync     - VSync temporal (frame selection, auto refresh rate)" << endl;
-    cout << "  t:59.94        - Timed temporal (frame selection, manual framerate)" << endl;
+    cout << "  t, t:vsync     - Temporal frame selection, presented on vblank (vsync timing)" << endl;
+    cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
     cout << endl;
     cout << "  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)" << endl;
     cout << "  b:59.94        - Timed blend (GPU shader blending, manual framerate)" << endl;

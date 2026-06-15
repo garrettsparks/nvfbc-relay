@@ -7,12 +7,15 @@
 // Frame temporal capture mode — nearest-frame selection for smooth fixed-rate capture of a
 // (possibly variable-rate) source.
 //
-// Composition of the two shared pieces plus a trivial selection step:
-//   PresentScheduler — wakes this mode at each absolute-QPC present deadline.
+// Composition of the shared pieces plus a trivial selection step:
 //   CaptureRing      — capture thread fills a ring with source frames stamped at arrival.
-//   This mode        — each deadline: select the ring frame nearest to a content target
-//                      lagged one period behind the deadline (so the ring brackets it),
-//                      copy it to the backbuffer, present, log.
+//   Present timing   — two options (the <selection>:<present> framework's present axis):
+//                      timer  (t:60)    — PresentScheduler's absolute-QPC deadline drives it.
+//                      vsync  (t:vsync) — the INTERVAL_ONE present blocks on the capture-card
+//                                         vblank; selection anchors to "now" so the target is
+//                                         on the display clock (no QPC-vs-vblank mismatch).
+//   This mode        — each present: select the ring frame nearest a content target lagged one
+//                      period behind, with hysteresis (monotonic), copy to backbuffer, present.
 //
 // Blend mode will differ only in the last step (blend the bracketing pair instead of picking
 // one); optical flow later replaces that step again.
@@ -21,12 +24,13 @@ private:
     PresentScheduler m_scheduler;
     CaptureRing m_ring;
     LONGLONG m_bracketingDelayQpc;  // present-target lag (≈ one present period)
+    bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
     LARGE_INTEGER m_baseQpc;        // logging time origin
     float m_targetFramerate;
     IDirect3DDevice9Ex* m_device;
 
 public:
-    FrameTemporalCaptureMode(float framerate);
+    FrameTemporalCaptureMode(float framerate, bool vsyncPresent = false);
 
     virtual UINT GetPresentationInterval() const override;
     virtual bool Setup() override;
