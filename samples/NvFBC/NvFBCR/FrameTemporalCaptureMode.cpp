@@ -17,8 +17,12 @@ FrameTemporalCaptureMode::FrameTemporalCaptureMode(float framerate, bool vsyncPr
 }
 
 UINT FrameTemporalCaptureMode::GetPresentationInterval() const {
-    // vsync present needs the device created with INTERVAL_ONE so PresentEx blocks on vblank.
-    return m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
+    // Always IMMEDIATE. Timer present is paced by PresentScheduler; vsync present is paced by an
+    // explicit WaitForVBlank on the TARGET display (VBlankWaiter). We deliberately do NOT use
+    // INTERVAL_ONE: that would block on the present *device's adapter* vblank, which is the SOURCE
+    // display (the device is created on source.dxAdapterIndex) — so it paced to the source refresh
+    // (240Hz), not the capture-card target (60Hz). See the spec's "vsync targets the wrong display".
+    return D3DPRESENT_INTERVAL_IMMEDIATE;
 }
 
 bool FrameTemporalCaptureMode::Setup() {
@@ -48,6 +52,14 @@ void FrameTemporalCaptureMode::Run(
     QueryPerformanceCounter(&m_baseQpc);
     const double usPerTick = 1000000.0 / (double)m_scheduler.Freq();
 
+    // Vsync present paces on the TARGET display's vblank. The window is pseudo-fullscreen on the
+    // target, so MonitorFromWindow gives the target HMONITOR. Bail loudly if it can't bind rather
+    // than silently free-run (this mode's whole point is target-locked pacing).
+    if (m_vsyncPresent && !m_vblank.Setup(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST))) {
+        LOGERR("Temporal: could not bind vblank waiter to target display - aborting vsync mode");
+        return;
+    }
+
     // Note: Start releases nvfbcDx9 (the session bound to the present device) and rebinds
     // NvFBC to the ring's private capture device. nvfbcDx9 must not be used after this call.
     if (!m_ring.Start(nvfbcDx9, grabParams, m_baseQpc, hwnd)) {
@@ -62,12 +74,14 @@ void FrameTemporalCaptureMode::Run(
 
     while (TRUE)
     {
-        // Present timing. Timer mode waits on the absolute-QPC deadline. Vsync mode lets the
-        // INTERVAL_ONE present (below) be the wait, and anchors the target to "now" (just after
-        // the previous vblank) so selection runs on the display's vblank clock rather than QPC
-        // — the variable this t:vsync experiment isolates against the t:60 present.
+        // Present timing. Timer mode waits on the absolute-QPC deadline. Vsync mode blocks on the
+        // TARGET display's vblank (VBlankWaiter), then anchors the target to "now" (just after that
+        // vblank) so selection runs on the target's display clock rather than QPC — the variable
+        // this t:vsync experiment isolates against the t:60 present. (The wait is on the named
+        // output, so unlike INTERVAL_ONE it is immune to which adapter the present device is on.)
         LONGLONG deadline;
         if (m_vsyncPresent) {
+            if (!m_vblank.Wait()) break;   // output lost (adapter reset/unplug)
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
             deadline = now.QuadPart;
@@ -111,10 +125,10 @@ void FrameTemporalCaptureMode::Run(
 
         LARGE_INTEGER beforePresent;
         QueryPerformanceCounter(&beforePresent);
-        // Timer: immediate (non-blocking). Vsync: INTERVAL_ONE blocks until the capture-card
-        // vblank — this present IS the frame-pacing wait in vsync mode.
-        device->PresentEx(NULL, NULL, NULL, NULL,
-            m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE);
+        // Always a non-blocking present. Pacing already happened above (timer deadline, or the
+        // WaitForVBlank on the target). In windowed/DWM mode the immediate present is composited
+        // tear-free; what matters is that we produce exactly one new frame per pacing tick.
+        device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
 
         // Inter-present interval (should hold steady at the present period if the scheduler works).
         LONGLONG presentDelta = (lastPresentQpc != 0) ? (beforePresent.QuadPart - lastPresentQpc) : 0;

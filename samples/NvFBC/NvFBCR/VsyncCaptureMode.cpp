@@ -6,12 +6,14 @@ VsyncCaptureMode::VsyncCaptureMode() {}
 VsyncCaptureMode::~VsyncCaptureMode() {}
 
 UINT VsyncCaptureMode::GetPresentationInterval() const {
-    return D3DPRESENT_INTERVAL_ONE;
+    // IMMEDIATE: pacing comes from an explicit WaitForVBlank on the TARGET output, not from
+    // INTERVAL_ONE (which would sync to the present device's SOURCE adapter — the wrong display).
+    return D3DPRESENT_INTERVAL_IMMEDIATE;
 }
 
 bool VsyncCaptureMode::Setup() {
-    LOG("VSync mode initialized - VSync will control frame timing");
-    LOG("Output FPS will match target monitor's refresh rate");
+    LOG("VSync mode initialized - pacing on the TARGET display's vblank (WaitForVBlank)");
+    LOG("Output FPS will match the capture-card/target monitor's refresh rate");
     return true;
 }
 
@@ -22,6 +24,14 @@ void VsyncCaptureMode::Run(
     HWND hwnd)
 {
     MSG msg;
+
+    // The window is pseudo-fullscreen on the target display, so MonitorFromWindow gives the
+    // target HMONITOR. Bail loudly if the vblank source can't bind rather than free-run.
+    if (!m_vblank.Setup(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)))
+    {
+        LOGERR("VSync: could not bind vblank waiter to target display - aborting");
+        return;
+    }
 
     while (TRUE)
     {
@@ -35,9 +45,12 @@ void VsyncCaptureMode::Run(
         }
         // Ignore other errors (e.g., no new frame) - we'll just present what we have
 
-        // Present and wait for VSync - this blocks until monitor refresh
-        // This synchronizes our output with the actual display hardware
-        device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_ONE);
+        // Block until the TARGET display's vblank, then present non-blocking. This is the
+        // frame-pacing wait; locking it to the named output (not the device adapter) is the fix
+        // for vsync syncing to the source display.
+        if (!m_vblank.Wait())
+            break;   // output lost
+        device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
 
         // Process Windows messages
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))

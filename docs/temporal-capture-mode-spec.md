@@ -410,6 +410,106 @@ micro-judders period-2 — unexplained). **`t:vsync` is the discriminator:** it 
 selection but moves present to the vblank. Clean → present clock was it; still juddery → the
 ring/selection path is, independent of present clock. Test pending.
 
+## Round 5 (2026-06-14) — vsync present targets the WRONG display (bug)
+
+**Finding:** with the source monitor at 240Hz and the capture-card/target at 60Hz, `t:vsync`
+**still presents at 240/s** (log `pdt` ≈ 4166µs) — confirmed on a fresh capture with the capture
+card verified at 60Hz. Root cause: the present device is created on **`source.dxAdapterIndex`**
+(`NvFBCR.cpp:585`), so D3D9 `Present(INTERVAL_ONE)` blocks on the *source* display's vblank, not
+the target's. (Windowed DWM present compounds it — DWM composites at the highest-refresh attached
+display, also the 240Hz source.) The window being on the target display doesn't change which
+adapter's vblank the device syncs to.
+
+**Plain `VsyncCaptureMode` has the same bug** — same device (source adapter) + `INTERVAL_ONE`.
+Masked because normal streaming is source==target rate (both 60Hz), where syncing to the source
+60Hz coincidentally yields a correct 60Hz present. Only surfaces when source ≠ target. NOTE:
+plain vsync has been the user's smoothest result for a long time at 60→60 — the fix must be
+**A/B'd against it and must not regress it**.
+
+**Consequence:** the `t:vsync` 240→60 discriminator is still **unanswered** — vsync forces the
+240Hz source rate, so select-from-240/present-at-60 was never actually tested.
+
+**Fix — IMPLEMENTED 2026-06-14, see Round 6 below.** Replace `INTERVAL_ONE` with an explicit
+`IDXGIOutput::WaitForVBlank` on the TARGET output (located by HMONITOR), then `Present(IMMEDIATE)`.
+Locks present to the *named* display regardless of device adapter / DWM.
+
+## 240-content-on-60Hz caveat — and its correction (2026-06-14 recapture)
+
+**Original caveat (the Round-4-era "60 source" clips):** those were **240fps content on a 60Hz
+monitor**, not a true 60fps source. Motion was equivalent (median MAD 13.63) but NvFBC partly woke
+on the 240fps content → content-duplicate frames seeded in the ring, polluting dupe counts. Use a
+true 60fps source (60Hz monitor + 60fps content), or diffmap dedup (which B lacks), for clean
+60→60 dupe counts.
+
+**Correction — the 2026-06-14 recaptured clips ARE true 60fps.** Verified by capture-`dt`
+histogram, not by count alone: **86.9%** of capture gaps sit at 14–19ms (the 60Hz period), only
+~11% are sub-2ms. (A 240-content file looks completely different: 96.5% at 2–6ms — that's the
+240 `t:60` clip.) So the recaptured `t:60@60`/`t:vsync@60` are genuine 60→60. The ~74 captures/s
+(vs an ideal 60) is the **HW-cursor-wake tail** (`bWithHWCursor=1`, sub-2ms wakes), present
+equally in both 60-source files — *not* content over-wake. **Lesson: confirm source rate by the
+`dt` histogram (where the mass sits), not by captures/s or dupe count.**
+
+Residual puzzle on the true-60 clips: `t:60@60` still logged **61 dupes** (only 6 genuine
+`pick=repeat`; the rest bursty/clustered with 18 roughness episodes), while `t:vsync@60` logged a
+clean **6** (evenly ~50s apart = the drift floor). And `t:60@60` swung 4 (Round 4) → 61 (this
+run). So the timer-present path looks **run-condition-sensitive** at 60→60 (QPC-vs-display drift
+phase) where vsync-present is stable — but these were separate captures, not a same-session A/B,
+so it is not yet a clean verdict.
+
+## Round 6 (2026-06-14) — WaitForVBlank-on-target implemented; full t:60/t:vsync re-analysis
+
+### Full re-analysis of the recaptured clips (all `reverse` = 0)
+
+| Run | dupes (MAD) | pick=repeat | capture dt median | present pdt median | pacing |
+|---|---|---|---|---|---|
+| t:60 @60 | 61 (bursty) | 6 | 16662µs ✓60Hz | 16616µs ✓60Hz | EXCELLENT (P2/P3 = 0%) |
+| t:60 @240 (real 240→60) | **0** | 0 | 4176µs ✓240Hz | 16641µs ✓60Hz | GOOD — P2 2%, P3 3%, 16 rough windows / 6 spots |
+| t:vsync @60 | 6 (clean ~50s) | 2 | 16663µs ✓60Hz | 16673µs ✓60Hz | EXCELLENT |
+
+Both `t:60` and `t:vsync` work at 60→60. `t:60@240` is clean on dupes (always a fresh frame) but
+carries the open **mild period-2 micro-judder** (clustered, ~8% of windows). The 240 `t:vsync`
+discriminator is still unrun — vsync was forcing the 240Hz source rate (the bug below). See the
+"240-content-on-60Hz caveat — and its correction" section for why `t:60@60`'s 61 (vs `t:vsync`'s
+6) is a run-sensitivity artifact, not content pollution, and the histogram proof the sources are
+true 60.
+
+### The fix — `VBlankWaiter`
+
+`VBlankWaiter.{h,cpp}`: a minimal DXGI vblank clock. `Setup(HMONITOR)` enumerates DXGI
+adapters/outputs once and retains the `IDXGIOutput` whose monitor matches the target (the window's
+monitor via `MonitorFromWindow`); `Wait()` is just `m_output->WaitForVBlank()`. No watcher thread,
+no atomics, no period smoothing — we *block directly* on the target vblank as the pacing tick, so
+the heavy machinery in `phase-locked-timer-dxgi-spec.md` (which kept a free-running timer and only
+resynced) is not needed. DXGI is used purely as a clock; NvFBC capture (on the private capture
+device) and the D3D9 present path are untouched. `dxgi.lib` pulled in via `#pragma comment(lib)`.
+
+Applied to **both** vblank-paced modes (the user A/B's them against each other and the old build):
+- **`VsyncCaptureMode`** (plain `vsync`): grab → `m_vblank.Wait()` → `PresentEx(IMMEDIATE)`.
+- **`FrameTemporalCaptureMode`** vsync path (`t`/`t:vsync`): `m_vblank.Wait()` → anchor target to
+  "now" → select+hysteresis → `PresentEx(IMMEDIATE)`.
+- Both: `GetPresentationInterval()` now returns `IMMEDIATE` (was `INTERVAL_ONE`). The device is
+  still created on `source.dxAdapterIndex`, but pacing no longer comes from the device-adapter
+  vblank — it comes from the explicit wait on the named target output, so DWM/adapter no longer
+  matter for cadence. The immediate present is composited tear-free by DWM; correctness only needs
+  one new frame produced per target vblank.
+
+**Out of scope / still bugged:** `VsyncBlendCaptureMode` (`b`/`b:vsync`) still uses `INTERVAL_ONE`
+and shares the wrong-display bug. Left untouched (blend awaits its own CaptureRing rebuild); fix it
+the same way when that happens.
+
+### Validation plan (the reason for the change)
+
+1. **No-regression A/B at 60→60 (critical):** plain `vsync` (new WaitForVBlank) vs the prior
+   `INTERVAL_ONE` build, same-session — plain vsync has been the user's smoothest result for a long
+   time and **must not regress**. Expect `pdt` ≈ 16.6ms still (60==60 masked the bug, so cadence
+   should be unchanged) and pacing ≥ the old build.
+2. **The discriminator, finally testable — `t:vsync` @240:** with the fix, `pdt` should read
+   ~16.6ms (60Hz target) instead of ~4.16ms (240Hz source). Then compare its period-2 judder
+   against `t:60@240`: clean ⇒ present clock was the 240 judder (vblank present fixes it, `t:vsync`
+   stays); still juddery ⇒ the ring/selection path owns it, independent of present clock.
+3. Confirm the `VBlankWaiter: bound to target output at (...)` log line shows the **target**
+   display's coordinates (sanity that HMONITOR matching picked the right output).
+
 ## Mode framework: `<selection>:<present_timing>`
 
 The mode string is two orthogonal axes (already reflected in `t:60` vs `t:vsync` parsing):
@@ -420,14 +520,14 @@ The mode string is two orthogonal axes (already reflected in `t:60` vs `t:vsync`
 - **present_timing** — when to present: `60` (absolute-QPC timer, current), `vsync` (block on
   the target/capture-card vblank), later arbitrary CFR.
 
-**`t:vsync` (IMPLEMENTED 2026-06-14):** temporal selection with vsync-locked present. The
-`FrameTemporalCaptureMode` takes a `vsyncPresent` flag: `GetPresentationInterval()` returns
-`INTERVAL_ONE` so the device is created vsync-synced; the present loop skips the QPC-timer wait
-and lets the blocking `INTERVAL_ONE` present be the wait, anchoring the selection target to
-"now" (just after the previous vblank) so selection runs on the **display clock**, not QPC. The
-capture thread/ring/bracketing/hysteresis are unchanged. `t` and `t:vsync` route here;
-`t:59.94` routes to the same mode with timer present. The old `VsyncTemporalCaptureMode` (a
-pre-CaptureRing implementation) has been **removed**.
+**`t:vsync` (IMPLEMENTED 2026-06-14; WaitForVBlank target fix in Round 6):** temporal selection
+with vsync-locked present. The `FrameTemporalCaptureMode` takes a `vsyncPresent` flag:
+`GetPresentationInterval()` returns `IMMEDIATE` (the device no longer blocks on its own adapter's
+vblank); the present loop blocks on `VBlankWaiter::Wait()` against the **target** display, then
+anchors the selection target to "now" (just after that vblank) so selection runs on the **target's
+display clock**, not QPC, and presents `IMMEDIATE`. The capture thread/ring/bracketing/hysteresis
+are unchanged. `t` and `t:vsync` route here; `t:59.94` routes to the same mode with timer present.
+The old `VsyncTemporalCaptureMode` (a pre-CaptureRing implementation) has been **removed**.
 
 **Clarification — blend ≠ interpolation.** Blend is pixel averaging/cross-fade of the bracketing
 pair (softens a slip into a brief ghost/double-image); it does not synthesize motion. NVOFA is

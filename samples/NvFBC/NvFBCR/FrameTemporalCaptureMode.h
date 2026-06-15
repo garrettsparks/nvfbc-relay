@@ -3,6 +3,7 @@
 #include "IFrameCaptureMode.h"
 #include "PresentScheduler.h"
 #include "CaptureRing.h"
+#include "VBlankWaiter.h"
 
 // Frame temporal capture mode — nearest-frame selection for smooth fixed-rate capture of a
 // (possibly variable-rate) source.
@@ -11,9 +12,9 @@
 //   CaptureRing      — capture thread fills a ring with source frames stamped at arrival.
 //   Present timing   — two options (the <selection>:<present> framework's present axis):
 //                      timer  (t:60)    — PresentScheduler's absolute-QPC deadline drives it.
-//                      vsync  (t:vsync) — the INTERVAL_ONE present blocks on the capture-card
-//                                         vblank; selection anchors to "now" so the target is
-//                                         on the display clock (no QPC-vs-vblank mismatch).
+//                      vsync  (t:vsync) — VBlankWaiter blocks on the TARGET capture-card vblank
+//                                         (by HMONITOR, not the device adapter); selection anchors
+//                                         to "now" so the target is on the display clock.
 //   This mode        — each present: select the ring frame nearest a content target lagged one
 //                      period behind, with hysteresis (monotonic), copy to backbuffer, present.
 //
@@ -23,6 +24,7 @@ class FrameTemporalCaptureMode : public IFrameCaptureMode {
 private:
     PresentScheduler m_scheduler;
     CaptureRing m_ring;
+    VBlankWaiter m_vblank;          // vsync mode: blocks on the TARGET display's vblank
     LONGLONG m_bracketingDelayQpc;  // present-target lag (≈ one present period)
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
     LARGE_INTEGER m_baseQpc;        // logging time origin
