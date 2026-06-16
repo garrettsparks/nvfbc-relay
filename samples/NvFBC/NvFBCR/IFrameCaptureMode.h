@@ -13,6 +13,12 @@ public:
     // Get the D3DPRESENT_INTERVAL value for device creation
     virtual UINT GetPresentationInterval() const = 0;
 
+    // Whether the present device should be created on the TARGET (capture-card) adapter rather
+    // than the source. Only modes that bind NvFBC to a SEPARATE capture device (the CaptureRing
+    // two-device modes) may return true — others write NvFBC straight to the present device, so
+    // it must stay on the source adapter. Default: source.
+    virtual bool PresentsOnTargetAdapter() const { return false; }
+
     // Setup mode-specific resources
     virtual bool Setup() = 0;
 

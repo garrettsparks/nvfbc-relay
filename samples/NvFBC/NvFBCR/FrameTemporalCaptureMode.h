@@ -12,8 +12,9 @@
 //   Present timing   — two options (the <selection>:<present> framework's present axis):
 //                      timer  (t:60)    — PresentScheduler's absolute-QPC deadline drives it.
 //                      vsync  (t:vsync) — the INTERVAL_ONE present blocks on the capture-card
-//                                         vblank; selection anchors to "now" so the target is
-//                                         on the display clock (no QPC-vs-vblank mismatch).
+//                                         vblank; the present device is created on the TARGET
+//                                         adapter (PresentsOnTargetAdapter) so the vblank is the
+//                                         card's, not the source's. Selection anchors to "now".
 //   This mode        — each present: select the ring frame nearest a content target lagged one
 //                      period behind, with hysteresis (monotonic), copy to backbuffer, present.
 //
@@ -33,6 +34,10 @@ public:
     FrameTemporalCaptureMode(float framerate, bool vsyncPresent = false);
 
     virtual UINT GetPresentationInterval() const override;
+    // Present on the TARGET (capture-card) adapter so INTERVAL_ONE vblank-syncs to the card, not
+    // the source. Safe only because this mode's NvFBC lives on the ring's own capture device
+    // (pinned to the source adapter) — the present device is free to live on the target.
+    virtual bool PresentsOnTargetAdapter() const override { return true; }
     virtual bool Setup() override;
     virtual void Run(
         NvFBCToDx9Vid* nvfbcDx9,

@@ -155,6 +155,11 @@ NvFBCLibrary *pNVFBCLib;
 int BUF_WIDTH;
 int BUF_HEIGHT;
 
+// Source display's D3D9 adapter ordinal. CaptureRing creates its private capture device on this
+// (NvFBC must capture the source) independently of the present device, which for the temporal
+// modes lives on the TARGET adapter. Set in WinMain once displays are chosen.
+int g_sourceAdapterIndex = 0;
+
 DisplayPosition source, target;
 
 vector <DisplayPosition> displays;
@@ -582,7 +587,20 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     }
 
     g_bNvFBCLibLoaded = true;
-    if (!SUCCEEDED(InitD3D9(source.dxAdapterIndex, hWnd, captureMode->GetPresentationInterval())))
+
+    // The capture side (CaptureRing) always lives on the source adapter (NvFBC captures the
+    // source). The PRESENT device goes on the target adapter for modes that present on a separate
+    // device (temporal: NvFBC is rebound to the ring's capture device, so INTERVAL_ONE can sync to
+    // the capture-card vblank). Modes whose NvFBC writes straight to the present device keep it on
+    // the source adapter.
+    g_sourceAdapterIndex = source.dxAdapterIndex;
+    unsigned int presentAdapterIndex =
+        captureMode->PresentsOnTargetAdapter() ? target.dxAdapterIndex : source.dxAdapterIndex;
+    LOG("Present device on adapter %u (%s); capture/NvFBC on source adapter %d",
+        presentAdapterIndex, captureMode->PresentsOnTargetAdapter() ? "target" : "source",
+        g_sourceAdapterIndex);
+
+    if (!SUCCEEDED(InitD3D9(presentAdapterIndex, hWnd, captureMode->GetPresentationInterval())))
     {
         LOGERR("Unable to create D3D9Ex Device");
         delete captureMode;

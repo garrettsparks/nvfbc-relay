@@ -18,6 +18,8 @@ FrameTemporalCaptureMode::FrameTemporalCaptureMode(float framerate, bool vsyncPr
 
 UINT FrameTemporalCaptureMode::GetPresentationInterval() const {
     // vsync present needs the device created with INTERVAL_ONE so PresentEx blocks on vblank.
+    // The present device is created on the TARGET adapter (see PresentsOnTargetAdapter /
+    // NvFBCR.cpp), so INTERVAL_ONE blocks on the capture-card vblank, not the source's.
     return m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
 }
 
@@ -64,8 +66,9 @@ void FrameTemporalCaptureMode::Run(
     {
         // Present timing. Timer mode waits on the absolute-QPC deadline. Vsync mode lets the
         // INTERVAL_ONE present (below) be the wait, and anchors the target to "now" (just after
-        // the previous vblank) so selection runs on the display's vblank clock rather than QPC
-        // — the variable this t:vsync experiment isolates against the t:60 present.
+        // the previous vblank) so selection runs on the display's vblank clock rather than QPC.
+        // The present device is created on the TARGET adapter, so that vblank is the capture
+        // card's, not the source's.
         LONGLONG deadline;
         if (m_vsyncPresent) {
             LARGE_INTEGER now;
@@ -112,7 +115,7 @@ void FrameTemporalCaptureMode::Run(
         LARGE_INTEGER beforePresent;
         QueryPerformanceCounter(&beforePresent);
         // Timer: immediate (non-blocking). Vsync: INTERVAL_ONE blocks until the capture-card
-        // vblank — this present IS the frame-pacing wait in vsync mode.
+        // vblank (present device is on the target adapter) — this present IS the pacing wait.
         device->PresentEx(NULL, NULL, NULL, NULL,
             m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE);
 

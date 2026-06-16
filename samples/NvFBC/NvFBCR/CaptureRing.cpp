@@ -7,6 +7,7 @@
 extern IDirect3D9Ex* g_pD3DEx;
 extern NvFBCLibrary* pNVFBCLib;
 extern NvFBCToDx9Vid* NvFBCDX9;
+extern int g_sourceAdapterIndex;   // source display's adapter; NvFBC must capture the source
 
 // With a private capture device the blocking grab can wait as long as it likes — its lock
 // holds affect nothing the present thread uses. The timeout only bounds how quickly the
@@ -75,10 +76,11 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
                         LARGE_INTEGER baseQpc, HWND hwnd) {
     m_baseQpc = baseQpc;
 
-    // ---- Create the private capture device on the same adapter as the present device. ----
-    D3DDEVICE_CREATION_PARAMETERS cp = {};
-    m_presentDevice->GetCreationParameters(&cp);
-
+    // ---- Create the private capture device on the SOURCE adapter. ----
+    // NvFBC (rebound below) captures the source display, so the capture device must be on the
+    // source adapter regardless of where the present device lives. (The present device may be on
+    // the TARGET adapter for vsync-on-capture-card; the shared ring slots created here are opened
+    // on it via D3D9Ex shared handles — fine because both ordinals are the same physical GPU.)
     D3DPRESENT_PARAMETERS d3dpp = {};
     d3dpp.Windowed = TRUE;
     d3dpp.BackBufferFormat = D3DFMT_A2R10G10B10;
@@ -90,7 +92,7 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     d3dpp.hDeviceWindow = hwnd;
 
     HRESULT hr = g_pD3DEx->CreateDeviceEx(
-        cp.AdapterOrdinal, D3DDEVTYPE_HAL, hwnd,
+        g_sourceAdapterIndex, D3DDEVTYPE_HAL, hwnd,
         D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
         &d3dpp, NULL, &m_capDevice);
     if (FAILED(hr)) {
