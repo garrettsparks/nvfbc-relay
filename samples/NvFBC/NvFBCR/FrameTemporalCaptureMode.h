@@ -38,6 +38,10 @@ public:
     // the source. Safe only because this mode's NvFBC lives on the ring's own capture device
     // (pinned to the source adapter) — the present device is free to live on the target.
     virtual bool PresentsOnTargetAdapter() const override { return true; }
+    // Vsync present: try exclusive fullscreen on the target so INTERVAL_ONE can lock to the
+    // capture card's vblank (windowed DWM otherwise paces at the primary's rate). Timer present
+    // (t:60) doesn't need it. Fails fast if FS is unavailable (no windowed fallback).
+    virtual bool WantsExclusiveFullscreen() const override { return m_vsyncPresent; }
     virtual bool Setup() override;
     virtual void Run(
         NvFBCToDx9Vid* nvfbcDx9,

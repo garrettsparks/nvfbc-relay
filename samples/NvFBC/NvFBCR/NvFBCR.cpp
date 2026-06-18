@@ -292,7 +292,7 @@ int InitDisplays() {
     return 1;
 }
 
-HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
+HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval, bool exclusiveFullscreen)
 {
     HRESULT hr = S_OK;
     D3DPRESENT_PARAMETERS d3dpp;
@@ -318,14 +318,49 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
     // device, not the captured game's rendering.
     DWORD dwBehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED;
 
+    // Exclusive fullscreen attempt: the documented way to (try to) escape DWM composition and
+    // lock INTERVAL_ONE to THIS adapter's display vblank instead of the primary's compositor
+    // clock. D3D9Ex requires a valid D3DDISPLAYMODEEX for fullscreen; query the adapter's current
+    // mode so it is guaranteed valid (BUF_WIDTH/HEIGHT already equal the target's resolution).
+    D3DDISPLAYMODEEX fsMode = {};
+    D3DDISPLAYMODEEX* pFsMode = NULL;
+    if (exclusiveFullscreen)
+    {
+        fsMode.Size = sizeof(D3DDISPLAYMODEEX);
+        HRESULT mhr = g_pD3DEx->GetAdapterDisplayModeEx(deviceID, &fsMode, NULL);
+        if (FAILED(mhr))
+        {
+            // Fail fast: we asked for exclusive fullscreen and can't even read the mode. Don't
+            // silently run windowed — that would mask the very thing this test measures.
+            LOGERR("Exclusive fullscreen requested but GetAdapterDisplayModeEx failed (0x%08x)", mhr);
+            return mhr;
+        }
+        d3dpp.Windowed = FALSE;
+        d3dpp.BackBufferWidth = fsMode.Width;
+        d3dpp.BackBufferHeight = fsMode.Height;
+        d3dpp.BackBufferFormat = fsMode.Format;
+        d3dpp.FullScreen_RefreshRateInHz = fsMode.RefreshRate;
+        pFsMode = &fsMode;
+        LOG("Exclusive fullscreen on adapter %u: %ux%u @ %uHz (fmt %d)",
+            deviceID, fsMode.Width, fsMode.Height, fsMode.RefreshRate, (int)fsMode.Format);
+        if ((int)fsMode.Width != BUF_WIDTH || (int)fsMode.Height != BUF_HEIGHT)
+            LOG("  NOTE: FS mode %ux%u differs from BUF %dx%d - StretchRect may not fill the backbuffer",
+                fsMode.Width, fsMode.Height, BUF_WIDTH, BUF_HEIGHT);
+    }
+
     hr = g_pD3DEx->CreateDeviceEx(
         deviceID,
         D3DDEVTYPE_HAL,
         hwnd,
         dwBehaviorFlags,
         &d3dpp,
-        NULL,
+        pFsMode,
         &g_pD3D9Device);
+
+    // No windowed fallback: if exclusive fullscreen was requested but failed, surface the error so
+    // we know FS isn't available rather than measuring a silent windowed run.
+    if (FAILED(hr) && pFsMode)
+        LOGERR("Exclusive fullscreen device creation failed (0x%08x) - NOT falling back to windowed", hr);
 
     assert(SUCCEEDED(hr));
 
@@ -600,7 +635,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         presentAdapterIndex, captureMode->PresentsOnTargetAdapter() ? "target" : "source",
         g_sourceAdapterIndex);
 
-    if (!SUCCEEDED(InitD3D9(presentAdapterIndex, hWnd, captureMode->GetPresentationInterval())))
+    if (!SUCCEEDED(InitD3D9(presentAdapterIndex, hWnd, captureMode->GetPresentationInterval(),
+                            captureMode->WantsExclusiveFullscreen())))
     {
         LOGERR("Unable to create D3D9Ex Device");
         delete captureMode;

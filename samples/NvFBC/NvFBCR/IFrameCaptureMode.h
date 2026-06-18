@@ -19,6 +19,14 @@ public:
     // it must stay on the source adapter. Default: source.
     virtual bool PresentsOnTargetAdapter() const { return false; }
 
+    // Whether to attempt D3D9 EXCLUSIVE FULLSCREEN on the present adapter. This is the documented
+    // (pre-DWM) way to try to bypass DWM composition and lock INTERVAL_ONE to the present
+    // display's own vblank instead of the primary's composition clock. Only meaningful combined
+    // with PresentsOnTargetAdapter + vsync present; device creation fails fast if FS is
+    // unavailable (no windowed fallback, so a failed FS isn't silently measured as windowed).
+    // Default: no (windowed).
+    virtual bool WantsExclusiveFullscreen() const { return false; }
+
     // Setup mode-specific resources
     virtual bool Setup() = 0;
 

@@ -534,6 +534,78 @@ Validation: **60→60** must match the old EXCELLENT (std ~0.5) — though note 
 drop to 6 (that needs the source clock, i.e. passthrough); the win is correct rate + clean pacing.
 Then **240→60**: pdt should read 60Hz, and compare the period-2 judder against `t:60@240`.
 
+## Round 8 (2026-06-17) — the 240 discriminator, what the docs actually say, and the exclusive-FS test
+
+### Discriminator result (present-on-target build, same-session 240→60, both reverse=0, 0 dupes)
+
+| | t:vsync@240 | t:60@240 |
+|---|---|---|
+| present pdt | **4168µs (240Hz!)** | 16631µs (60Hz) |
+| std(Δ) | **0.430** | 0.558 |
+| period-2 judder | **0%** | 2% (5 trouble spots) |
+| roughness | none | scattered |
+| verdict | **EXCELLENT 100%** | GOOD 86% |
+
+t:vsync@240 is the cleanest 240→60 yet — **but its pdt is 4168µs = 240Hz, not 60Hz.** The
+present-on-target-adapter + `INTERVAL_ONE` build did **not** make the present pace at the capture
+card's 60Hz; it presents at the *source's* 240Hz. So t:vsync@240 is not "vsync-locked 60Hz
+present" — it is **present every selected frame at 240Hz and let the 60Hz capture card
+hardware-sample it down**, identical in mechanism to the old plain-vsync@240 bug (also clean). The
+card's hardware downsampling of a *uniform* 240Hz stream beats t:60's software 60Hz timer-selection
+(which snaps the high-rate source onto a 16.6ms grid → the period-2 wobble).
+
+**Caveat that blocks shipping t:vsync off this:** its cleanliness is a *uniform-source artifact* —
+the temporal selection is doing nothing useful; it's passthrough-at-source-rate + card-sample. For
+the real use case (a **variable** source: 80/90/144fps) presenting at the wobbly source rate and
+letting the card sample at fixed 60Hz would *reintroduce* judder — exactly what temporal resampling
+exists to remove. t:60 does *real* 60Hz resampling (so it would smooth a variable source) but pays
+the period-2 wobble on uniform high-rate content. **The variable-source case is still untested and
+is what actually decides the mode.**
+
+### Why the present won't pace at the target — confirmed by documentation (deep-research wf_3b2deab9)
+
+The "present rate follows the source/primary, not the window's display" behavior is **documented**,
+not just our measurement:
+
+- **Windowed presents follow the PRIMARY monitor's vsync clock**, regardless of window placement or
+  device adapter ordinal — Microsoft's compositor-clock doc
+  (`learn.microsoft.com/.../directcomp/compositor-clock/compositor-clock`). Source=primary=240Hz ⇒
+  present at 240Hz. The Win10-2004 "sync to fastest monitor" fix **degrades above ~3× mismatch**,
+  and 240/60 = **4×** — we're past where it holds (`blog.otterbro.com/dwm-mixed-refresh-rate-performance`).
+- **D3D9Ex has no per-output vsync selection.** `FLIPEX` hands surfaces to DWM and adds an implicit
+  back buffer (queue = count+1) (`direct3d9/d3dswapeffect`, `direct3d-9ex-improvements`).
+- **`IDXGIOutput::WaitForVBlank` is the documented per-output vblank pacer** — but it only paces a
+  CPU loop, it **does not gate the flip** (`dxgi/nf-dxgi-idxgioutput-waitforvblank`). That is exactly
+  why the Round-6 `VBlankWaiter` regressed: we paced the loop to the target vblank but the flip still
+  went through DWM at 240Hz → beat. Its *correct* use is as a **phase reference for a timer**, not a
+  present gate (= the archived `phase-locked-timer-dxgi-spec.md`).
+- **Refuted folklore (3-vote adversarial):** "fullscreen-exclusive grants complete display ownership
+  / DWM doesn't mediate" (0-3), "Independent Flip makes DWM stop composing and send frames straight
+  to scanout" (0-3), "window overlap picks which output governs the flip" (0-3). Under DWM-always-on
+  the docs do **not** support a clean per-display vsync bypass from a windowed app.
+- **DXGI flip-model migration (D3D11/D3D12 interop)** makes *windowed* "equal or better than FSE" but
+  is **not proven to pin a secondary vblank** (composed cadence still follows DWM/primary), and needs
+  manual cross-API sync (D3D9Ex shared surfaces are unsynchronized). High cost, doesn't solve it.
+
+### Exclusive fullscreen — the one documented lever left, tested next (low expectation)
+
+Per the research, FSE-bypasses-DWM is largely pre-Windows-8 folklore — but FSE on a **secondary
+display that is an HDMI capture card** is genuinely under-documented, so it's worth a cheap
+empirical rule-out. Implemented: `IFrameCaptureMode::WantsExclusiveFullscreen()` (temporal vsync →
+true); `InitD3D9` queries `GetAdapterDisplayModeEx(target)` and creates the device with
+`Windowed = FALSE` + a `D3DDISPLAYMODEEX`. **Fail-fast — no windowed fallback** (a silent windowed
+run would mask the very thing being measured).
+
+Test: **t:vsync@240** — does `pdt` now read ~16.6ms (FS bypassed DWM, present locked to the card's
+60Hz) or still ~4.17ms (DWM intercepts, as the docs predict)? Check the log for the
+`Exclusive fullscreen on adapter ...` line and that device creation succeeded.
+
+**If it fails (likely): the phase-locked timer is the next and documented-correct step** — run the
+QPC present timer and periodically resync its *phase* to the target output's vblank
+(`WaitForVBlank` / `DwmGetCompositionTimingInfo`), per `phase-locked-timer-dxgi-spec.md`. That gives
+vsync-grade phase consistency for *variable* sources without the decoupling beat, and is the real
+home for fixing t:60's present-vs-scanout phase wobble.
+
 ## Mode framework: `<selection>:<present_timing>`
 
 The mode string is two orthogonal axes (already reflected in `t:60` vs `t:vsync` parsing):
