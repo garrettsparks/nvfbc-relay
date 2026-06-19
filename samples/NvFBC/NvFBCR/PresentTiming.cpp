@@ -24,20 +24,24 @@ static bool WaitRasterVBlank(IDirect3DDevice9Ex* device, LONGLONG timeoutQpc) {
     }
 }
 
+static LONGLONG NowQpc() {
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
 // ---- TimerPresentTiming ----
-LONGLONG TimerPresentTiming::BeginFrame() {
+FrameStart TimerPresentTiming::BeginFrame(IDirect3DDevice9Ex*) {
     m_sched->WaitUntilDeadline();
-    return m_sched->Deadline();
+    return { true, true, m_sched->Deadline() };
 }
 void TimerPresentTiming::EndFrame() {
     m_sched->Advance();
 }
 
 // ---- VsyncPresentTiming ----
-LONGLONG VsyncPresentTiming::BeginFrame() {
+FrameStart VsyncPresentTiming::BeginFrame(IDirect3DDevice9Ex*) {
     m_sched->WaitUntilDeadline();          // 60Hz floor; INTERVAL_ONE present blocks on top
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    return now.QuadPart;                   // anchor selection target to "now"
+    return { true, true, NowQpc() };       // anchor selection target to "now"
 }
 void VsyncPresentTiming::EndFrame() {
     m_sched->Advance();
@@ -50,14 +54,11 @@ bool RasterLockPresentTiming::Setup(IDirect3DDevice9Ex*, HWND, PresentScheduler*
     m_gateTimeoutQpc = (s->PeriodQpc() * 13) / 10;
     return true;
 }
-LONGLONG RasterLockPresentTiming::BeginFrame() {
-    // No floor wait — the vblank gate (below) is the clock.
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    return now.QuadPart;
-}
-GateResult RasterLockPresentTiming::GateBeforePresent(IDirect3DDevice9Ex* device) {
+FrameStart RasterLockPresentTiming::BeginFrame(IDirect3DDevice9Ex* device) {
+    // The vblank gate IS the pace. Returning now() AFTER the wait anchors the selection target to
+    // the actual present moment (the flip lands ~one StretchRect into the blanking interval).
     bool hit = WaitRasterVBlank(device, m_gateTimeoutQpc);
-    return { true, hit };   // timeout is not fatal — we present anyway
+    return { true, hit, NowQpc() };        // timeout is not fatal — we present anyway
 }
 
 // ---- DxgiLockPresentTiming ----
@@ -69,11 +70,7 @@ bool DxgiLockPresentTiming::Setup(IDirect3DDevice9Ex*, HWND hwnd, PresentSchedul
     }
     return true;
 }
-LONGLONG DxgiLockPresentTiming::BeginFrame() {
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    return now.QuadPart;
-}
-GateResult DxgiLockPresentTiming::GateBeforePresent(IDirect3DDevice9Ex*) {
-    bool ok = m_vblank.Wait();              // false => output lost (fatal)
-    return { ok, ok };
+FrameStart DxgiLockPresentTiming::BeginFrame(IDirect3DDevice9Ex*) {
+    bool ok = m_vblank.Wait();             // false => output lost (fatal)
+    return { ok, ok, NowQpc() };
 }

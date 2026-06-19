@@ -85,8 +85,11 @@ void FrameTemporalCaptureMode::Run(
 
     while (TRUE)
     {
-        // --- pace + target anchor (strategy) ---
-        const LONGLONG deadline = m_timing->BeginFrame();
+        // --- pace + gate + target anchor (strategy). For lock modes this waits for the card
+        // vblank, so `deadline` (now, post-wait) anchors the selection target to the present moment.
+        const FrameStart fs = m_timing->BeginFrame(device);
+        if (!fs.ok) { LOGERR("present pacing/gate failed (%s) - stopping", m_timing->Name()); break; }
+        const LONGLONG deadline = fs.deadline;
         const LONGLONG target = deadline - m_bracketingDelayQpc;
 
         // --- selection: nearest-to-target with HYSTERESIS (monotonic) ---
@@ -114,11 +117,7 @@ void FrameTemporalCaptureMode::Run(
             m_device->StretchRect(chosen, &srcRect, g_backbuffer, &srcRect, D3DTEXF_NONE);
         }
 
-        // --- gate immediately before the flip (strategy; lock modes wait for the card vblank) ---
-        GateResult gate = m_timing->GateBeforePresent(device);
-        if (!gate.ok) { LOGERR("present gate failed (%s) - stopping", m_timing->Name()); break; }
-
-        // --- present ---
+        // --- present (the pace+gate already happened in BeginFrame; flip immediately) ---
         LARGE_INTEGER beforePresent;
         QueryPerformanceCounter(&beforePresent);
         HRESULT presentHr = device->PresentEx(NULL, NULL, NULL, NULL, m_timing->PresentInterval());
@@ -164,7 +163,7 @@ void FrameTemporalCaptureMode::Run(
             D3DRASTER_STATUS rs = {};
             HRESULT rasterHr = device->GetRasterStatus(0, &rs);
             LOG("diag #%d gate_hit=%d present_block=%lldus presentHr=0x%08x raster_hr=0x%08x inVBlank=%d scanline=%u",
-                diagCount, (int)gate.gateHit,
+                diagCount, (int)fs.gateHit,
                 (long long)((afterPresent.QuadPart - beforePresent.QuadPart) * usPerTick),
                 presentHr, rasterHr, (int)rs.InVBlank, rs.ScanLine);
             diagCount++;
