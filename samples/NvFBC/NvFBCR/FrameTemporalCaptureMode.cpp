@@ -62,20 +62,43 @@ void FrameTemporalCaptureMode::Run(
     LONGLONG lastShownTs = 0;   // hysteresis: QPC of the last presented frame (strictly advances)
     m_scheduler.Seed();
 
+    // Diagnostic (vsync only): does the present device's output (the capture card) actually have a
+    // real vblank that INTERVAL_ONE can lock to? Log the advertised present intervals once, and for
+    // the first kDiagN presents log the real PresentEx block time + GetRasterStatus. This settles
+    // whether INTERVAL_ONE blocks here (~16.6ms = real vblank) or free-runs (~µs = no vblank).
+    int diagCount = 0;
+    const int kDiagN = 30;
+    if (m_vsyncPresent) {
+        D3DCAPS9 caps;
+        if (SUCCEEDED(device->GetDeviceCaps(&caps))) {
+            // Interval dividers (TWO/THREE/FOUR) are fullscreen-only; if FS gives a real vblank
+            // they'd allow a hardware-locked divided present rate. Log all of them.
+            LOG("diag caps: PresentationIntervals=0x%08x ONE=%d TWO=%d THREE=%d FOUR=%d IMMEDIATE=%d",
+                caps.PresentationIntervals,
+                (caps.PresentationIntervals & D3DPRESENT_INTERVAL_ONE) != 0,
+                (caps.PresentationIntervals & D3DPRESENT_INTERVAL_TWO) != 0,
+                (caps.PresentationIntervals & D3DPRESENT_INTERVAL_THREE) != 0,
+                (caps.PresentationIntervals & D3DPRESENT_INTERVAL_FOUR) != 0,
+                (caps.PresentationIntervals & D3DPRESENT_INTERVAL_IMMEDIATE) != 0);
+        } else {
+            LOG("diag caps: GetDeviceCaps failed");
+        }
+    }
+
     while (TRUE)
     {
-        // Present timing. Timer mode waits on the absolute-QPC deadline. Vsync mode lets the
-        // INTERVAL_ONE present (below) be the wait, and anchors the target to "now" (just after
-        // the previous vblank) so selection runs on the display's vblank clock rather than QPC.
-        // The present device is created on the TARGET adapter, so that vblank is the capture
-        // card's, not the source's.
+        // 60Hz floor for BOTH modes (absolute-QPC schedule). Timer mode uses the scheduled
+        // deadline. Vsync mode anchors the target to "now" (just after the floor wait) so selection
+        // runs on the display clock — but the floor is also the runaway guard: if the INTERVAL_ONE
+        // present does NOT block (e.g. a capture-card display with no real vblank), the floor still
+        // caps the loop at the present rate instead of spinning and starving the source.
+        m_scheduler.WaitUntilDeadline();
         LONGLONG deadline;
         if (m_vsyncPresent) {
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
             deadline = now.QuadPart;
         } else {
-            m_scheduler.WaitUntilDeadline();
             deadline = m_scheduler.Deadline();
         }
         const LONGLONG target = deadline - m_bracketingDelayQpc;
@@ -114,10 +137,23 @@ void FrameTemporalCaptureMode::Run(
 
         LARGE_INTEGER beforePresent;
         QueryPerformanceCounter(&beforePresent);
-        // Timer: immediate (non-blocking). Vsync: INTERVAL_ONE blocks until the capture-card
-        // vblank (present device is on the target adapter) — this present IS the pacing wait.
-        device->PresentEx(NULL, NULL, NULL, NULL,
+        // Timer: immediate (non-blocking). Vsync: INTERVAL_ONE is meant to block until the
+        // capture-card vblank. Time the call directly (afterPresent - beforePresent) so we can see
+        // whether it actually blocks, independent of the loop floor above.
+        HRESULT presentHr = device->PresentEx(NULL, NULL, NULL, NULL,
             m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE);
+        LARGE_INTEGER afterPresent;
+        QueryPerformanceCounter(&afterPresent);
+
+        if (m_vsyncPresent && diagCount < kDiagN) {
+            D3DRASTER_STATUS rs = {};
+            HRESULT rasterHr = device->GetRasterStatus(0, &rs);
+            LOG("diag #%d present_block=%lldus presentHr=0x%08x raster_hr=0x%08x inVBlank=%d scanline=%u",
+                diagCount,
+                (long long)((afterPresent.QuadPart - beforePresent.QuadPart) * usPerTick),
+                presentHr, rasterHr, (int)rs.InVBlank, rs.ScanLine);
+            diagCount++;
+        }
 
         // Inter-present interval (should hold steady at the present period if the scheduler works).
         LONGLONG presentDelta = (lastPresentQpc != 0) ? (beforePresent.QuadPart - lastPresentQpc) : 0;
@@ -146,7 +182,7 @@ void FrameTemporalCaptureMode::Run(
             }
         }
 
-        if (!m_vsyncPresent) m_scheduler.Advance();   // vsync paces via the blocking present
+        m_scheduler.Advance();   // both modes advance the floor schedule (vsync now has the floor too)
 
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
