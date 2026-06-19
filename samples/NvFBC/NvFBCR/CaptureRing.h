@@ -42,7 +42,12 @@ struct FrameBracket {
 // output shows tearing/partial frames inside slots, that is the cause.
 class CaptureRing {
 public:
-    static const int RING_SIZE = 8;  // generous for validation; shrink later from logged depth
+    // 16 slots. At the observed ~386 publish/s (240fps content + HW-cursor wakes) an 8-slot ring
+    // spans only ~20.8ms — barely above the one-period (16.67ms) bracketing lag — so cursor-wake
+    // bursts pushed the target off the back of the ring (~23% of presents → "target older than
+    // ring window"). 16 slots span ~41ms at that rate, a robust margin. The before-frame logs at
+    // depth ~6, so 16 keeps it comfortably mid-ring. (Cheap: 16 shared RT textures per device.)
+    static const int RING_SIZE = 16;
 
     CaptureRing();
     ~CaptureRing();
