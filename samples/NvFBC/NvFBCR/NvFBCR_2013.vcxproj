@@ -194,7 +194,9 @@
     <ClCompile Include="CaptureRing.cpp" />
     <ClCompile Include="NvFBCR.cpp" />
     <ClCompile Include="PresentScheduler.cpp" />
+    <ClCompile Include="PresentTiming.cpp" />
     <ClCompile Include="TimerCaptureMode.cpp" />
+    <ClCompile Include="VBlankWaiter.cpp" />
     <ClCompile Include="VsyncBlendCaptureMode.cpp" />
     <ClCompile Include="VsyncCaptureMode.cpp" />
   </ItemGroup>
@@ -205,7 +207,9 @@
     <ClInclude Include="FrameTemporalCaptureMode.h" />
     <ClInclude Include="IFrameCaptureMode.h" />
     <ClInclude Include="PresentScheduler.h" />
+    <ClInclude Include="PresentTiming.h" />
     <ClInclude Include="TimerCaptureMode.h" />
+    <ClInclude Include="VBlankWaiter.h" />
     <ClInclude Include="VsyncBlendCaptureMode.h" />
     <ClInclude Include="VsyncCaptureMode.h" />
   </ItemGroup>

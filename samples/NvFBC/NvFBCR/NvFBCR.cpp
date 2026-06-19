@@ -56,6 +56,7 @@
 #include "VsyncCaptureMode.h"
 #include "TimerCaptureMode.h"
 #include "FrameTemporalCaptureMode.h"
+#include "PresentTiming.h"
 #include "FrameBlendCaptureMode.h"
 #include "VsyncBlendCaptureMode.h"
 
@@ -79,11 +80,21 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         return new VsyncCaptureMode();
     }
 
-    // Temporal selection + vsync present (t:vsync or just t): CaptureRing-based temporal mode,
-    // present blocked on the capture-card vblank. Nominal 60 fps drives the bracketing lag;
-    // the actual present rate is the display refresh.
+    // Temporal selection + vsync present (t:vsync or just t): INTERVAL_ONE on the target adapter
+    // (rides DWM, windowed). Nominal 60 fps drives the bracketing lag.
     if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0) {
-        return new FrameTemporalCaptureMode(60.0f, /*vsyncPresent=*/true);
+        return new FrameTemporalCaptureMode(60.0f, new VsyncPresentTiming());
+    }
+
+    // Temporal selection + phase-lock present, exclusive fullscreen, self-gating the flip to the
+    // capture-card vblank (the card's driver ignores INTERVAL_ONE). Two vblank observers:
+    //   t:rlock - GetRasterStatus poll (busy-poll edge-detect)
+    //   t:dlock - IDXGIOutput::WaitForVBlank (blocking)
+    if (_stricmp(modeStr.c_str(), "t:rlock") == 0) {
+        return new FrameTemporalCaptureMode(60.0f, new RasterLockPresentTiming());
+    }
+    if (_stricmp(modeStr.c_str(), "t:dlock") == 0) {
+        return new FrameTemporalCaptureMode(60.0f, new DxgiLockPresentTiming());
     }
 
     // Temporal selection + QPC-timer present (t:60 format).
@@ -91,7 +102,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         try {
             float framerate = stof(modeStr.substr(2));
             if (framerate > 0.0f && framerate <= 1000.0f) {
-                return new FrameTemporalCaptureMode(framerate, /*vsyncPresent=*/false);
+                return new FrameTemporalCaptureMode(framerate, new TimerPresentTiming());
             }
         }
         catch (...) {
@@ -131,7 +142,9 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("Invalid capture mode: '%s'", modeStr.c_str());
     LOGERR("Valid modes:");
     LOGERR("  vsync          - VSync-driven presentation");
-    LOGERR("  t, t:vsync     - Temporal frame selection, presented on vblank (vsync timing)");
+    LOGERR("  t, t:vsync     - Temporal selection, INTERVAL_ONE present (rides DWM)");
+    LOGERR("  t:rlock        - Temporal selection, FS self-gate to card vblank via GetRasterStatus");
+    LOGERR("  t:dlock        - Temporal selection, FS self-gate to card vblank via WaitForVBlank");
     LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
     LOGERR("  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)");
     LOGERR("  b:59.94        - Timed blend (GPU shader blending, manual framerate)");
