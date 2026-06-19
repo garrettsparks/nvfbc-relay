@@ -166,7 +166,13 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
 
     NVFBC_TODX9VID_SETUP_PARAMS setupParams = {};
     setupParams.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
-    setupParams.bWithHWCursor = 1;
+    // bWithHWCursor = 0: do NOT composite the HW cursor. With it on, NvFBC also wakes the grab on
+    // every cursor MOVE (mouse polling rate, 125-1000+Hz, decoupled from the monitor) — those
+    // sub-2ms wakes seed content-duplicate frames into the ring and put false timestamps on the
+    // content timeline (bad for bracketing/blend/NVOFA). Off => the grab wakes only on content
+    // frames => clean ~source-rate capture with accurate timestamps. Cost: the OS cursor won't
+    // appear in the captured/streamed image (fine for game capture where the game owns the cursor).
+    setupParams.bWithHWCursor = 0;
     setupParams.bStereoGrab = 0;
     setupParams.bDiffMap = 0;
     setupParams.ppBuffer = outBuf;
