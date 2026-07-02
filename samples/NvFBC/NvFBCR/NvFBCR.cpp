@@ -55,6 +55,7 @@
 #include "IFrameCaptureMode.h"
 #include "VsyncCaptureMode.h"
 #include "TimerCaptureMode.h"
+#include "DiagCaptureMode.h"
 #include "FrameTemporalCaptureMode.h"
 #include "FrameBlendCaptureMode.h"
 #include "VsyncBlendCaptureMode.h"
@@ -99,6 +100,16 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         }
     }
 
+    // Diagnostic clock probes (spec: "Open questions — phase-lock reference clock"):
+    //   diag        — QPC 60Hz + IMMEDIATE; logs DWM compose timing + card raster per tick
+    //   diag:vsync  — INTERVAL_ONE; present block time measures DWM's delivery cadence
+    if (_stricmp(modeStr.c_str(), "diag") == 0) {
+        return new DiagCaptureMode(/*vsyncPresent=*/false);
+    }
+    if (_stricmp(modeStr.c_str(), "diag:vsync") == 0) {
+        return new DiagCaptureMode(/*vsyncPresent=*/true);
+    }
+
     // Check for vsync blend mode (b:vsync or just b)
     if (_stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0) {
         return new VsyncBlendCaptureMode();
@@ -133,6 +144,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  vsync          - VSync-driven presentation");
     LOGERR("  t, t:vsync     - Temporal frame selection, presented on vblank (vsync timing)");
     LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
+    LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)");
     LOGERR("  b:59.94        - Timed blend (GPU shader blending, manual framerate)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
@@ -156,6 +168,10 @@ int BUF_WIDTH;
 int BUF_HEIGHT;
 
 DisplayPosition source, target;
+
+// Target display's D3D9 adapter ordinal (set once displays are chosen). DiagCaptureMode uses it
+// to open a private device on the capture-card adapter for GetRasterStatus probes.
+int g_targetAdapterIndex = 0;
 
 vector <DisplayPosition> displays;
 
@@ -532,6 +548,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     LOG("=== NvFBCR Starting ===");
     LOG("Source display: [%d] %s (%s)", source.dxAdapterIndex, source.friendlyName.c_str(), source.deviceName);
     LOG("Target display: [%d] %s (%s)", target.dxAdapterIndex, target.friendlyName.c_str(), target.deviceName);
+    g_targetAdapterIndex = target.dxAdapterIndex;
     LOG("Capture mode: %s", captureMode->GetModeName());
     LOG("Buffer size: %dx%d", BUF_WIDTH, BUF_HEIGHT);
 

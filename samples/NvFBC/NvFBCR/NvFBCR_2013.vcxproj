@@ -189,6 +189,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="DiagCaptureMode.cpp" />
     <ClCompile Include="FrameBlendCaptureMode.cpp" />
     <ClCompile Include="FrameTemporalCaptureMode.cpp" />
     <ClCompile Include="CaptureRing.cpp" />
@@ -201,6 +202,7 @@
   <ItemGroup>
     <ClInclude Include="..\..\..\inc\NvFBC\NvFBCToDx9vid.h" />
     <ClInclude Include="CaptureRing.h" />
+    <ClInclude Include="DiagCaptureMode.h" />
     <ClInclude Include="FrameBlendCaptureMode.h" />
     <ClInclude Include="FrameTemporalCaptureMode.h" />
     <ClInclude Include="IFrameCaptureMode.h" />
