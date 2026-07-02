@@ -705,6 +705,15 @@ test: run the same 30-base config on the COLLAPSE build — its output contains 
 members, so ghosting-still-present ⇒ member 1 = generated (keep-first wrong ⇒ build
 deferred-publish keep-last), always-crisp ⇒ member 1 = real (collapse correct as shipped).
 
+**A/B VALIDATED (2026-07-01, `30_x_2_t_60_{first,second}_kcd`, user frame-step + video review:
+"definitive").** Same config (30 base × SM, t:60, sky swings), only the collapse policy varied:
+`first` (keep gen) → ghosting/doubling throughout every swing; `second` (keep real) → crisp
+reticle even mid-swing. Logs: correct policy engaged, ~2000 collapses each, base-cadence valid
+timeline in both. **Wake order [generated, real] confirmed end-to-end; keep-`second` retraction
+is the production default. The frame-gen capture problem is SOLVED.** (186-pair sky review also
+found zero geometric artifacts on any member 2 — the two marginal B-frame halos were encoder
+bleed from artifacted neighbors, not gen content.)
+
 **Strategic fork opened by this finding (decide after the order test):**
 - **Path A (current roadmap):** collapse to base-rate real frames → clean timeline → our own
   blend/NVOFA interpolation later. SM output discarded; quality under our control; works for
@@ -781,7 +790,11 @@ Blend's role is the POC that validates the bracket/weight pipeline NVOFA later p
   hardware decimation, uniform sources only).
 - **Cursor in capture** — if desktop capture ever needs the OS cursor back: make
   `bWithHWCursor` a toggle and add diffmap dedup (skip publishing cursor-only grabs) so the
-  timeline stays clean. Round 9 explains why it defaults off.
+  timeline stays clean. Round 9 explains why it defaults off. NOTE: the cursor-wake flood was
+  only measured on the DESKTOP; `bWithHWCursor=1` is UNTESTED in-game — games typically hide
+  the OS cursor during gameplay (no cursor updates ⇒ possibly no wakes ⇒ `=1` might be free
+  in-game and restore the cursor for menus/desktop). Cheap test if the cursor is ever missed:
+  `=1` + in-game capture, watch for sub-2ms wakes during gameplay vs menus/map.
 - **Direct-write capture (perf optimization, against the clean t:60 baseline).** Goal: eliminate
   the per-grab capture-side `StretchRect` (one full-res copy/frame — significant at 240fps).
   Change on the two-device B `CaptureRing`:
