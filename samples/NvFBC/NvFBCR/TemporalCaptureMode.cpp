@@ -1,4 +1,4 @@
-#include "FrameTemporalCaptureMode.h"
+#include "TemporalCaptureMode.h"
 #include <SimpleLogger.h>
 
 // External global variables
@@ -7,7 +7,7 @@ extern IDirect3DSurface9* g_backbuffer;
 extern int BUF_WIDTH;
 extern int BUF_HEIGHT;
 
-FrameTemporalCaptureMode::FrameTemporalCaptureMode(float framerate, bool vsyncPresent)
+TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent)
     : m_bracketingDelayQpc(0)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
@@ -16,7 +16,7 @@ FrameTemporalCaptureMode::FrameTemporalCaptureMode(float framerate, bool vsyncPr
     m_baseQpc.QuadPart = 0;
 }
 
-UINT FrameTemporalCaptureMode::GetPresentationInterval() const {
+UINT TemporalCaptureMode::GetPresentationInterval() const {
     // vsync present needs the device created with INTERVAL_ONE so PresentEx blocks on vsync.
     // NOTE: windowed INTERVAL_ONE blocks on DWM's compose clock, whose identity is
     // regime-dependent: composed desktop → primary/source display; fullscreen game on the
@@ -25,7 +25,7 @@ UINT FrameTemporalCaptureMode::GetPresentationInterval() const {
     return m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
 }
 
-bool FrameTemporalCaptureMode::Setup() {
+bool TemporalCaptureMode::Setup() {
     m_device = g_pD3D9Device;
 
     if (!m_ring.Setup(m_device, BUF_WIDTH, BUF_HEIGHT)) {
@@ -43,7 +43,7 @@ bool FrameTemporalCaptureMode::Setup() {
     return true;
 }
 
-void FrameTemporalCaptureMode::Run(
+void TemporalCaptureMode::Run(
     NvFBCToDx9Vid* nvfbcDx9,
     NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
     IDirect3DDevice9Ex* device,
@@ -162,6 +162,6 @@ void FrameTemporalCaptureMode::Run(
     m_ring.Stop();
 }
 
-const char* FrameTemporalCaptureMode::GetModeName() const {
+const char* TemporalCaptureMode::GetModeName() const {
     return "Temporal";
 }

@@ -4,7 +4,7 @@
 #include "PresentScheduler.h"
 #include "CaptureRing.h"
 
-// Frame temporal capture mode — nearest-frame selection for smooth fixed-rate capture of a
+// Temporal capture mode — nearest-frame selection for smooth fixed-rate capture of a
 // (possibly variable-rate) source.
 //
 // Composition of the shared pieces plus a trivial selection step:
@@ -24,7 +24,7 @@
 //
 // Blend mode will differ only in the last step (blend the bracketing pair instead of picking
 // one); optical flow later replaces that step again.
-class FrameTemporalCaptureMode : public IFrameCaptureMode {
+class TemporalCaptureMode : public IFrameCaptureMode {
 private:
     PresentScheduler m_scheduler;
     CaptureRing m_ring;
@@ -35,7 +35,7 @@ private:
     IDirect3DDevice9Ex* m_device;
 
 public:
-    FrameTemporalCaptureMode(float framerate, bool vsyncPresent = false);
+    TemporalCaptureMode(float framerate, bool vsyncPresent = false);
 
     virtual UINT GetPresentationInterval() const override;
     virtual bool Setup() override;

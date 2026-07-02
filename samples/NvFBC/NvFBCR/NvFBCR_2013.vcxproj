@@ -190,7 +190,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="DiagCaptureMode.cpp" />
-    <ClCompile Include="FrameTemporalCaptureMode.cpp" />
+    <ClCompile Include="TemporalCaptureMode.cpp" />
     <ClCompile Include="CaptureRing.cpp" />
     <ClCompile Include="NvFBCR.cpp" />
     <ClCompile Include="PresentScheduler.cpp" />
@@ -201,7 +201,7 @@
     <ClInclude Include="..\..\..\inc\NvFBC\NvFBCToDx9vid.h" />
     <ClInclude Include="CaptureRing.h" />
     <ClInclude Include="DiagCaptureMode.h" />
-    <ClInclude Include="FrameTemporalCaptureMode.h" />
+    <ClInclude Include="TemporalCaptureMode.h" />
     <ClInclude Include="IFrameCaptureMode.h" />
     <ClInclude Include="PresentScheduler.h" />
     <ClInclude Include="TimerCaptureMode.h" />

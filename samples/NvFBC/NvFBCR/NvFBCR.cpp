@@ -56,7 +56,7 @@
 #include "VsyncCaptureMode.h"
 #include "TimerCaptureMode.h"
 #include "DiagCaptureMode.h"
-#include "FrameTemporalCaptureMode.h"
+#include "TemporalCaptureMode.h"
 
 using namespace std;
 
@@ -83,7 +83,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     // fullscreen game on the source — the production case). Nominal 60 fps drives the
     // bracketing lag; the actual present rate is DWM's delivery.
     if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0) {
-        return new FrameTemporalCaptureMode(60.0f, /*vsyncPresent=*/true);
+        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true);
     }
 
     // Temporal selection + QPC-timer present (t:60 format).
@@ -91,7 +91,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         try {
             float framerate = stof(modeStr.substr(2));
             if (framerate > 0.0f && framerate <= 1000.0f) {
-                return new FrameTemporalCaptureMode(framerate, /*vsyncPresent=*/false);
+                return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false);
             }
         }
         catch (...) {
