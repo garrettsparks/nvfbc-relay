@@ -19,6 +19,7 @@ static const char* const kPickRepeat    = "repeat";       // nothing newer than 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent)
     : m_bracketingDelayQpc(0)
     , m_stickinessQpc(0)
+    , m_lastPickAfter(false)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_device(NULL)
@@ -111,12 +112,16 @@ void TemporalCaptureMode::Run(
         // This removes the boundary wobble where plain nearest-pick re-shows a frame ~14 times
         // over the ~1s the phase lingers at the alignment point.
         //
-        // STICKINESS BAND: when both frames are candidates, take the after-frame only if it is
-        // closer by more than m_stickinessQpc. Plain nearest-pick lets ±300 µs capture jitter
-        // flip the choice every present while the target dwells near the bracket midpoint —
-        // at 240→60 that alternates the stride (3/5 instead of 4) for the several seconds the
-        // dwell lasts, a visible period-2 judder window every drift sweep. The band holds the
-        // pick through the dwell; the parity then slips once, cleanly, per sweep.
+        // STICKINESS BAND (Schmitt trigger): when both frames are candidates, the threshold
+        // depends on which side the LAST pick took — stay on that side unless the other frame
+        // is closer by more than m_stickinessQpc. Plain nearest-pick lets ±300 µs capture
+        // jitter flip the choice every present while the target dwells near the bracket
+        // midpoint — at 240→60 that alternates the stride (3/5 instead of 4) for the several
+        // seconds the dwell lasts, a visible period-2 judder window every drift sweep. The
+        // state bit is what makes this hysteresis: jitter would have to cross the full 2·band
+        // gap to flip the pick (a memoryless bias just relocates the flip-flop boundary —
+        // measured, it did not shrink the windows), while slow drift still crosses the gap
+        // exactly once per sweep: one clean single-frame slip instead of seconds of judder.
         FrameBracket bracket;
         m_ring.FindBracket(target, &bracket);
 
@@ -126,12 +131,13 @@ void TemporalCaptureMode::Run(
         IDirect3DSurface9* chosen = NULL;
         const char* pick = kPickNone;
         if (beforeNew && afterNew) {
-            if (bracket.beforeDiff <= bracket.afterDiff + m_stickinessQpc) { chosen = bracket.beforeSurface; pick = kPickBefore; lastShownTs = bracket.beforeTs; }
-            else { chosen = bracket.afterSurface; pick = kPickAfter; lastShownTs = bracket.afterTs; }
+            const LONGLONG bias = m_lastPickAfter ? -m_stickinessQpc : m_stickinessQpc;
+            if (bracket.beforeDiff <= bracket.afterDiff + bias) { chosen = bracket.beforeSurface; pick = kPickBefore; lastShownTs = bracket.beforeTs; m_lastPickAfter = false; }
+            else { chosen = bracket.afterSurface; pick = kPickAfter; lastShownTs = bracket.afterTs; m_lastPickAfter = true; }
         } else if (afterNew) {
-            chosen = bracket.afterSurface; pick = kPickAfterAdv; lastShownTs = bracket.afterTs;   // advance past last
+            chosen = bracket.afterSurface; pick = kPickAfterAdv; lastShownTs = bracket.afterTs; m_lastPickAfter = true;    // advance past last
         } else if (beforeNew) {
-            chosen = bracket.beforeSurface; pick = kPickBeforeAdv; lastShownTs = bracket.beforeTs;
+            chosen = bracket.beforeSurface; pick = kPickBeforeAdv; lastShownTs = bracket.beforeTs; m_lastPickAfter = false;
         } else {
             // No frame newer than the last shown: genuine stall — repeat (the fundamental dupe).
             chosen = bracket.hasBefore ? bracket.beforeSurface : (bracket.hasAfter ? bracket.afterSurface : NULL);
