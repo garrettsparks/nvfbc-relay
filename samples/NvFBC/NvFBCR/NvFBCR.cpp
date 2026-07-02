@@ -55,10 +55,8 @@
 #include "IFrameCaptureMode.h"
 #include "VsyncCaptureMode.h"
 #include "TimerCaptureMode.h"
+#include "DiagCaptureMode.h"
 #include "FrameTemporalCaptureMode.h"
-#include "FrameBlendCaptureMode.h"
-#include "VsyncBlendCaptureMode.h"
-#include "VsyncTemporalCaptureMode.h"
 
 using namespace std;
 
@@ -80,17 +78,20 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         return new VsyncCaptureMode();
     }
 
-    // Check for vsync temporal mode (t:vsync or just t)
+    // Temporal selection + vsync present (t:vsync or just t): CaptureRing-based temporal mode,
+    // present blocked on DWM's compose clock (windowed INTERVAL_ONE; card-locked 60 Hz under a
+    // fullscreen game on the source — the production case). Nominal 60 fps drives the
+    // bracketing lag; the actual present rate is DWM's delivery.
     if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0) {
-        return new VsyncTemporalCaptureMode();
+        return new FrameTemporalCaptureMode(60.0f, /*vsyncPresent=*/true);
     }
 
-    // Check for temporal frame selection mode (t:60 format)
+    // Temporal selection + QPC-timer present (t:60 format).
     if (modeStr.length() > 2 && modeStr[0] == 't' && modeStr[1] == ':') {
         try {
             float framerate = stof(modeStr.substr(2));
             if (framerate > 0.0f && framerate <= 1000.0f) {
-                return new FrameTemporalCaptureMode(framerate);
+                return new FrameTemporalCaptureMode(framerate, /*vsyncPresent=*/false);
             }
         }
         catch (...) {
@@ -98,22 +99,14 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         }
     }
 
-    // Check for vsync blend mode (b:vsync or just b)
-    if (_stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0) {
-        return new VsyncBlendCaptureMode();
+    // Diagnostic clock probes:
+    //   diag        — QPC 60Hz + IMMEDIATE; logs DWM compose timing + card raster per tick
+    //   diag:vsync  — INTERVAL_ONE; present block time measures DWM's delivery cadence
+    if (_stricmp(modeStr.c_str(), "diag") == 0) {
+        return new DiagCaptureMode(/*vsyncPresent=*/false);
     }
-
-    // Check for frame blend mode (b:60 format)
-    if (modeStr.length() > 2 && modeStr[0] == 'b' && modeStr[1] == ':') {
-        try {
-            float framerate = stof(modeStr.substr(2));
-            if (framerate > 0.0f && framerate <= 1000.0f) {
-                return new FrameBlendCaptureMode(framerate);
-            }
-        }
-        catch (...) {
-            // Invalid number after b:
-        }
+    if (_stricmp(modeStr.c_str(), "diag:vsync") == 0) {
+        return new DiagCaptureMode(/*vsyncPresent=*/true);
     }
 
     // Try to parse as numeric framerate
@@ -130,10 +123,9 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("Invalid capture mode: '%s'", modeStr.c_str());
     LOGERR("Valid modes:");
     LOGERR("  vsync          - VSync-driven presentation");
-    LOGERR("  t, t:vsync     - VSync temporal (frame selection, auto refresh rate)");
-    LOGERR("  t:59.94        - Timed temporal (frame selection, manual framerate)");
-    LOGERR("  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)");
-    LOGERR("  b:59.94        - Timed blend (GPU shader blending, manual framerate)");
+    LOGERR("  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)");
+    LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
+    LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
     return NULL;
 }
@@ -155,6 +147,10 @@ int BUF_WIDTH;
 int BUF_HEIGHT;
 
 DisplayPosition source, target;
+
+// Target display's D3D9 adapter ordinal (set once displays are chosen). DiagCaptureMode uses it
+// to open a private device on the capture-card adapter for GetRasterStatus probes.
+int g_targetAdapterIndex = 0;
 
 vector <DisplayPosition> displays;
 
@@ -306,7 +302,11 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
     d3dpp.PresentationInterval = presentationInterval;
     //d3dpp.Flags = D3DPRESENTFLAG_VIDEO;
     d3dpp.hDeviceWindow = hwnd;
-    DWORD dwBehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING;
+    // D3DCREATE_MULTITHREADED: the temporal modes drive capture on a separate thread from
+    // present, so D3D9 device calls (StretchRect/Present) come from two threads. This flag
+    // makes the D3D9 runtime serialize them safely. It only affects this process's own
+    // device, not the captured game's rendering.
+    DWORD dwBehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED;
 
     hr = g_pD3DEx->CreateDeviceEx(
         deviceID,
@@ -449,11 +449,10 @@ void ConsoleUserInput(string* framerateStr) {
     cout << endl << "Available capture modes:" << endl;
     cout << "  vsync          - VSync-driven presentation (matches target display refresh)" << endl;
     cout << endl;
-    cout << "  t, t:vsync     - VSync temporal (frame selection, auto refresh rate)" << endl;
-    cout << "  t:59.94        - Timed temporal (frame selection, manual framerate)" << endl;
+    cout << "  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)" << endl;
+    cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
     cout << endl;
-    cout << "  b, b:vsync     - VSync blend (GPU shader blending, auto refresh rate)" << endl;
-    cout << "  b:59.94        - Timed blend (GPU shader blending, manual framerate)" << endl;
+    cout << "  diag, diag:vsync - Clock probes (DWM compose timing + card raster)" << endl;
     cout << endl;
     cout << "  60             - Timer mode (simple timer-driven at specified fps)" << endl;
     cout << endl;
@@ -527,6 +526,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     LOG("=== NvFBCR Starting ===");
     LOG("Source display: [%d] %s (%s)", source.dxAdapterIndex, source.friendlyName.c_str(), source.deviceName);
     LOG("Target display: [%d] %s (%s)", target.dxAdapterIndex, target.friendlyName.c_str(), target.deviceName);
+    g_targetAdapterIndex = target.dxAdapterIndex;
     LOG("Capture mode: %s", captureMode->GetModeName());
     LOG("Buffer size: %dx%d", BUF_WIDTH, BUF_HEIGHT);
 
@@ -694,6 +694,11 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 
     NVFBC_TODX9VID_SETUP_PARAMS DX9SetupParams = {};
     DX9SetupParams.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
+    // bWithHWCursor = 1 here is fine: this session serves the plain vsync/timer modes, which grab
+    // with NOWAIT (poll, never wait) — cursor moves cannot inflate their rate, and keeping the OS
+    // cursor in the output is desirable for plain relay use. The temporal modes discard this
+    // session (CaptureRing rebinds NvFBC) and use bWithHWCursor = 0 there, where the BLOCKING grab
+    // would otherwise wake at mouse-polling rate and pollute the ring timeline (spec Round 9).
     DX9SetupParams.bWithHWCursor = 1;
     DX9SetupParams.bStereoGrab = 0;
     DX9SetupParams.bDiffMap = 0;

@@ -7,74 +7,39 @@ extern IDirect3DSurface9* g_backbuffer;
 extern int BUF_WIDTH;
 extern int BUF_HEIGHT;
 
-FrameTemporalCaptureMode::FrameTemporalCaptureMode(float framerate)
-    : m_currentHistoryIndex(0)
-    , m_captureTarget(NULL)
+FrameTemporalCaptureMode::FrameTemporalCaptureMode(float framerate, bool vsyncPresent)
+    : m_bracketingDelayQpc(0)
+    , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_device(NULL)
 {
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        m_frameHistory[i].surface = NULL;
-        m_frameHistory[i].valid = false;
-        m_frameHistory[i].timestamp.QuadPart = 0;
-    }
-    m_perfFreq.QuadPart = 0;
-}
-
-FrameTemporalCaptureMode::~FrameTemporalCaptureMode() {
-    // Release frame history surfaces
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        if (m_frameHistory[i].surface) {
-            m_frameHistory[i].surface->Release();
-            m_frameHistory[i].surface = NULL;
-        }
-    }
-
-    if (m_captureTarget) {
-        m_captureTarget->Release();
-        m_captureTarget = NULL;
-    }
+    m_baseQpc.QuadPart = 0;
 }
 
 UINT FrameTemporalCaptureMode::GetPresentationInterval() const {
-    return D3DPRESENT_INTERVAL_IMMEDIATE;
+    // vsync present needs the device created with INTERVAL_ONE so PresentEx blocks on vsync.
+    // NOTE: windowed INTERVAL_ONE blocks on DWM's compose clock, whose identity is
+    // regime-dependent: composed desktop → primary/source display; fullscreen game on the
+    // source → DWM composes only the card's display and the present is card-locked 60 Hz
+    // (the production case). See spec Rounds 5-10.
+    return m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
 }
 
 bool FrameTemporalCaptureMode::Setup() {
     m_device = g_pD3D9Device;
 
-    // Create capture target surface (where NvFBC will write)
-    HRESULT hr = m_device->CreateOffscreenPlainSurface(
-        BUF_WIDTH, BUF_HEIGHT,
-        D3DFMT_A2B10G10R10,
-        D3DPOOL_DEFAULT,
-        &m_captureTarget,
-        NULL);
-
-    if (FAILED(hr)) {
-        LOGERR("Failed to create capture target surface (error: 0x%08x)", hr);
+    if (!m_ring.Setup(m_device, BUF_WIDTH, BUF_HEIGHT)) {
         return false;
     }
-
-    // Create frame history surfaces
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        hr = m_device->CreateOffscreenPlainSurface(
-            BUF_WIDTH, BUF_HEIGHT,
-            D3DFMT_A2B10G10R10,
-            D3DPOOL_DEFAULT,
-            &m_frameHistory[i].surface,
-            NULL);
-
-        if (FAILED(hr)) {
-            LOGERR("Failed to create frame history surface %d (error: 0x%08x)", i, hr);
-            return false;
-        }
+    if (!m_scheduler.Setup(m_targetFramerate)) {
+        return false;
     }
+    // Lag the present target by one present period so the ring reliably holds a frame on each
+    // side of it (with source rate >= present rate, a frame newer than the target has arrived).
+    m_bracketingDelayQpc = m_scheduler.PeriodQpc();
 
-    QueryPerformanceFrequency(&m_perfFreq);
-
-    LOG("Frame selection mode initialized - target framerate: %.2f fps", m_targetFramerate);
-    LOG("Frame history size: %d (temporal frame selection for smooth VRR capture)", FRAME_HISTORY_SIZE);
+    LOG("Temporal mode initialized - %s present (%.2f fps nominal), nearest-frame selection + hysteresis",
+        m_vsyncPresent ? "vsync/vblank" : "QPC-timer", m_targetFramerate);
     return true;
 }
 
@@ -84,158 +49,119 @@ void FrameTemporalCaptureMode::Run(
     IDirect3DDevice9Ex* device,
     HWND hwnd)
 {
-    MSG msg;
-    LARGE_INTEGER nextPresentTime, currentTime;
-    QueryPerformanceCounter(&nextPresentTime);
-    LONGLONG ticksPerFrame = (LONGLONG)(m_perfFreq.QuadPart / m_targetFramerate);
+    QueryPerformanceCounter(&m_baseQpc);
+    const double usPerTick = 1000000.0 / (double)m_scheduler.Freq();
 
-    // Update NvFBC to write to our capture target instead of backbuffer
-    NVFBC_TODX9VID_OUT_BUF outBuf[1];
-    outBuf[0].pPrimary = m_captureTarget;
-
-    NVFBC_TODX9VID_SETUP_PARAMS setupParams = {};
-    setupParams.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
-    setupParams.bWithHWCursor = 1;
-    setupParams.bStereoGrab = 0;
-    setupParams.bDiffMap = 0;
-    setupParams.ppBuffer = outBuf;
-    setupParams.eMode = NVFBC_TODX9VID_ARGB10;
-    setupParams.dwNumBuffers = 1;
-    setupParams.bHDRRequest = TRUE;
-
-    if (NVFBC_SUCCESS != nvfbcDx9->NvFBCToDx9VidSetUp(&setupParams)) {
-        LOGERR("Failed to reconfigure NvFBC for frame selection mode");
+    // Note: Start releases nvfbcDx9 (the session bound to the present device) and rebinds
+    // NvFBC to the ring's private capture device. nvfbcDx9 must not be used after this call.
+    if (!m_ring.Start(nvfbcDx9, grabParams, m_baseQpc, hwnd)) {
         return;
     }
 
+    MSG msg = {};
+    RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
+    LONGLONG lastPresentQpc = 0;
+    LONGLONG lastShownTs = 0;   // hysteresis: QPC of the last presented frame (strictly advances)
+    m_scheduler.Seed();
+
     while (TRUE)
     {
-        QueryPerformanceCounter(&currentTime);
+        // Present timing. Timer mode waits on the absolute-QPC deadline. Vsync mode lets the
+        // INTERVAL_ONE present (below) be the wait, and anchors the target to "now" (just after
+        // the previous compose tick) so selection runs on DWM's compose clock rather than QPC.
+        // That clock is regime-dependent: composed desktop → primary/source display; fullscreen
+        // game on the source → card-locked 60 Hz (spec Rounds 5-10).
+        LONGLONG deadline;
+        if (m_vsyncPresent) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            deadline = now.QuadPart;
+        } else {
+            m_scheduler.WaitUntilDeadline();
+            deadline = m_scheduler.Deadline();
+        }
+        const LONGLONG target = deadline - m_bracketingDelayQpc;
 
-        // Calculate time until next present
-        LONGLONG timeUntilPresent = nextPresentTime.QuadPart - currentTime.QuadPart;
-        DWORD msUntilPresent = timeUntilPresent > 0 ?
-            (DWORD)((timeUntilPresent * 1000) / m_perfFreq.QuadPart) : 0;
+        // Select: nearest-to-target frame, with HYSTERESIS — present frames in strictly
+        // increasing timestamp order. Among the bracket frames NEWER than the last presented
+        // one, pick the nearest to target. If neither is newer (capture produced no new frame
+        // this period — the genuine rate-matching stall at the drift boundary), repeat the
+        // last frame: that is the one unavoidable dupe per drift sweep (~6/5min at 60->60).
+        // This removes the boundary wobble where plain nearest-pick re-shows a frame ~14 times
+        // over the ~1s the phase lingers at the alignment point.
+        FrameBracket bracket;
+        m_ring.FindBracket(target, &bracket);
 
-        // Smart sleep: if we're far from present time, sleep most of it
-        if (msUntilPresent > 5) {
-            Sleep(msUntilPresent - 4);  // Wake up 4ms before present time
-            continue;
+        bool beforeNew = bracket.hasBefore && bracket.beforeTs > lastShownTs;
+        bool afterNew  = bracket.hasAfter  && bracket.afterTs  > lastShownTs;
+
+        IDirect3DSurface9* chosen = NULL;
+        const char* pick = "none";
+        if (beforeNew && afterNew) {
+            if (bracket.beforeDiff <= bracket.afterDiff) { chosen = bracket.beforeSurface; pick = "before"; lastShownTs = bracket.beforeTs; }
+            else { chosen = bracket.afterSurface; pick = "after"; lastShownTs = bracket.afterTs; }
+        } else if (afterNew) {
+            chosen = bracket.afterSurface; pick = "after-adv"; lastShownTs = bracket.afterTs;   // advance past last
+        } else if (beforeNew) {
+            chosen = bracket.beforeSurface; pick = "before-adv"; lastShownTs = bracket.beforeTs;
+        } else {
+            // No frame newer than the last shown: genuine stall — repeat (the fundamental dupe).
+            chosen = bracket.hasBefore ? bracket.beforeSurface : (bracket.hasAfter ? bracket.afterSurface : NULL);
+            pick = "repeat";
         }
 
-        // Poll for latest frame (NOWAIT - never blocks)
-        NVFBCRESULT fbcRes = nvfbcDx9->NvFBCToDx9VidGrabFrame(grabParams);
-
-        if (fbcRes == NVFBC_ERROR_INVALIDATED_SESSION) {
-            LOGERR("NvFBC session invalidated - session needs to be recreated");
-            break;
+        if (chosen) {
+            m_device->StretchRect(chosen, &srcRect, g_backbuffer, &srcRect, D3DTEXF_NONE);
         }
 
-        // Only store frame if we're close to present time (within 2 frame periods)
-        if (fbcRes == NVFBC_SUCCESS && timeUntilPresent < (ticksPerFrame * 2)) {
-            QueryPerformanceCounter(&currentTime);
+        LARGE_INTEGER beforePresent;
+        QueryPerformanceCounter(&beforePresent);
+        // Timer: immediate (non-blocking). Vsync: INTERVAL_ONE blocks until DWM's next compose
+        // (source clock on a composed desktop; card clock under a fullscreen game) — this
+        // present IS the frame-pacing wait in vsync mode.
+        device->PresentEx(NULL, NULL, NULL, NULL,
+            m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE);
 
-            // Copy captured frame to current history slot
-            RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
-            device->StretchRect(
-                m_captureTarget,
-                &srcRect,
-                m_frameHistory[m_currentHistoryIndex].surface,
-                &srcRect,
-                D3DTEXF_NONE);
+        // Inter-present interval (should hold steady at the present period if the scheduler works).
+        LONGLONG presentDelta = (lastPresentQpc != 0) ? (beforePresent.QuadPart - lastPresentQpc) : 0;
+        lastPresentQpc = beforePresent.QuadPart;
 
-            // Update timestamp and mark valid
-            m_frameHistory[m_currentHistoryIndex].timestamp = currentTime;
-            m_frameHistory[m_currentHistoryIndex].valid = true;
-
-            // Advance to next slot
-            m_currentHistoryIndex = (m_currentHistoryIndex + 1) % FRAME_HISTORY_SIZE;
-        }
-
-        // Check if it's time to present
-        QueryPerformanceCounter(&currentTime);
-        if (currentTime.QuadPart >= nextPresentTime.QuadPart) {
-            // Select best frame from history based on target present time
-            SelectFrameToBackbuffer(nextPresentTime, g_backbuffer);
-
-            // Present the selected frame
-            device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
-
-            // Schedule next present
-            nextPresentTime.QuadPart += ticksPerFrame;
-
-            // Prevent falling too far behind
-            if (nextPresentTime.QuadPart < currentTime.QuadPart) {
-                nextPresentTime = currentTime;
+        // Logging: bracket timestamps double as the source timeline; w is what blend would use;
+        // jit is actual-present vs scheduled deadline; pdt is the actual inter-present gap.
+        if (!bracket.hasBefore) {
+            // Benign while the ring is still filling at startup; once it has wrapped at least
+            // once it means the target fell off the back of the ring.
+            if (m_ring.Published() >= CaptureRing::RING_SIZE) {
+                LOGERR("temporal: target older than ring window - ring too small / delay too large (p=%lld)",
+                    m_ring.Published());
+            }
+        } else {
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus",
+                (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
+                (long long)((target - m_baseQpc.QuadPart) * usPerTick),
+                (long long)((bracket.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
+                bracket.hasAfter ? (long long)((bracket.afterTs - m_baseQpc.QuadPart) * usPerTick) : -1LL,
+                bracket.weight, pick,
+                (long long)((beforePresent.QuadPart - deadline) * usPerTick),
+                (long long)(presentDelta * usPerTick));
+            if (!bracket.hasAfter) {
+                LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }
         }
 
-        // Process Windows messages
+        if (!m_vsyncPresent) m_scheduler.Advance();   // vsync paces via the blocking present
+
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
-
-        if (msg.message == WM_QUIT)
-            break;
+        if (msg.message == WM_QUIT) break;
+        if (m_ring.HasStopped()) break;  // capture thread hit a fatal error
     }
+
+    m_ring.Stop();
 }
 
 const char* FrameTemporalCaptureMode::GetModeName() const {
-    return "FrameTemporal";
-}
-
-void FrameTemporalCaptureMode::SelectFrameToBackbuffer(LARGE_INTEGER targetTime, IDirect3DSurface9* backbuffer) {
-    // Find the two frames that bracket the target time
-    int bestBefore = -1;
-    int bestAfter = -1;
-    LONGLONG smallestBeforeDiff = LLONG_MAX;
-    LONGLONG smallestAfterDiff = LLONG_MAX;
-
-    for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        if (!m_frameHistory[i].valid) continue;
-
-        LONGLONG diff = targetTime.QuadPart - m_frameHistory[i].timestamp.QuadPart;
-
-        if (diff >= 0 && diff < smallestBeforeDiff) {
-            smallestBeforeDiff = diff;
-            bestBefore = i;
-        }
-        else if (diff < 0 && -diff < smallestAfterDiff) {
-            smallestAfterDiff = -diff;
-            bestAfter = i;
-        }
-    }
-
-    RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
-
-    // Prefer frames from the past (before target time)
-    if (bestBefore >= 0 && bestAfter >= 0) {
-        // Both available - use the "before" frame
-        m_device->StretchRect(
-            m_frameHistory[bestBefore].surface,
-            &srcRect,
-            backbuffer,
-            &srcRect,
-            D3DTEXF_NONE);
-    }
-    else if (bestBefore >= 0) {
-        // Only have a "before" frame, use it
-        m_device->StretchRect(
-            m_frameHistory[bestBefore].surface,
-            &srcRect,
-            backbuffer,
-            &srcRect,
-            D3DTEXF_NONE);
-    }
-    else if (bestAfter >= 0) {
-        // Only have an "after" frame, use it
-        m_device->StretchRect(
-            m_frameHistory[bestAfter].surface,
-            &srcRect,
-            backbuffer,
-            &srcRect,
-            D3DTEXF_NONE);
-    }
-    // If no valid frames, backbuffer will just show whatever was there before
+    return "Temporal";
 }

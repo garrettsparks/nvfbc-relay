@@ -1,28 +1,41 @@
 #pragma once
 
 #include "IFrameCaptureMode.h"
+#include "PresentScheduler.h"
+#include "CaptureRing.h"
 
-// Frame temporal capture mode - temporal frame selection for smooth VRR capture
+// Frame temporal capture mode — nearest-frame selection for smooth fixed-rate capture of a
+// (possibly variable-rate) source.
+//
+// Composition of the shared pieces plus a trivial selection step:
+//   CaptureRing      — capture thread fills a ring with source frames stamped at arrival.
+//   Present timing   — two options (the <selection>:<present> framework's present axis):
+//                      timer  (t:60)    — PresentScheduler's absolute-QPC deadline drives it.
+//                      vsync  (t:vsync) — the INTERVAL_ONE present blocks on DWM's compose clock
+//                                         (windowed flips always ride DWM). That clock is
+//                                         regime-dependent: on a composed desktop it is the
+//                                         PRIMARY/source display ("wrong display", known and
+//                                         accepted); under a fullscreen game on the source, DWM
+//                                         composes only the card's display and the present
+//                                         becomes card-locked 60 Hz — the production use case
+//                                         (spec Rounds 5-10).
+//   This mode        — each present: select the ring frame nearest a content target lagged one
+//                      period behind, with hysteresis (monotonic), copy to backbuffer, present.
+//
+// Blend mode will differ only in the last step (blend the bracketing pair instead of picking
+// one); optical flow later replaces that step again.
 class FrameTemporalCaptureMode : public IFrameCaptureMode {
 private:
-    static const int FRAME_HISTORY_SIZE = 2;
-
-    struct FrameHistoryEntry {
-        IDirect3DSurface9* surface;
-        LARGE_INTEGER timestamp;
-        bool valid;
-    };
-
-    FrameHistoryEntry m_frameHistory[FRAME_HISTORY_SIZE];
-    int m_currentHistoryIndex;
-    IDirect3DSurface9* m_captureTarget;
-    LARGE_INTEGER m_perfFreq;
+    PresentScheduler m_scheduler;
+    CaptureRing m_ring;
+    LONGLONG m_bracketingDelayQpc;  // present-target lag (≈ one present period)
+    bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
+    LARGE_INTEGER m_baseQpc;        // logging time origin
     float m_targetFramerate;
-    IDirect3DDevice9Ex* m_device;  // Store device pointer for StretchRect
+    IDirect3DDevice9Ex* m_device;
 
 public:
-    FrameTemporalCaptureMode(float framerate);
-    virtual ~FrameTemporalCaptureMode();
+    FrameTemporalCaptureMode(float framerate, bool vsyncPresent = false);
 
     virtual UINT GetPresentationInterval() const override;
     virtual bool Setup() override;
@@ -32,7 +45,4 @@ public:
         IDirect3DDevice9Ex* device,
         HWND hwnd) override;
     virtual const char* GetModeName() const override;
-
-private:
-    void SelectFrameToBackbuffer(LARGE_INTEGER targetTime, IDirect3DSurface9* backbuffer);
 };
