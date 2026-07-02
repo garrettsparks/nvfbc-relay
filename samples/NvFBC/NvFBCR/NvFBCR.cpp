@@ -173,6 +173,14 @@ DisplayPosition source, target;
 // to open a private device on the capture-card adapter for GetRasterStatus probes.
 int g_targetAdapterIndex = 0;
 
+// Frame-gen batch-collapse policy for the CaptureRing blocking grab (see spec Round 10).
+// Wakes <3ms apart are one batch (Smooth Motion delivers [generated, real] per base frame).
+//   0 = off    : publish every wake (pre-collapse behavior; Path-B/pass-through experiments)
+//   1 = first  : skip intra-batch wakes — keeps member 1 (the GENERATED frame, per discriminator)
+//   2 = second : publish member 2 and retract member 1's slot — keeps the REAL frame (default)
+// Override with -collapse off|first|second.
+int g_collapsePolicy = 2;
+
 vector <DisplayPosition> displays;
 
 void Cleanup()
@@ -431,6 +439,15 @@ bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, s
             foundAny = true;
             i++; // Skip the value
         }
+        else if (args[i] == "-collapse" && i + 1 < args.size()) {
+            extern int g_collapsePolicy;
+            if (args[i + 1] == "off")         g_collapsePolicy = 0;
+            else if (args[i + 1] == "first")  g_collapsePolicy = 1;
+            else if (args[i + 1] == "second") g_collapsePolicy = 2;
+            else LOGERR("Unknown -collapse value '%s' (off|first|second) - keeping default", args[i + 1].c_str());
+            foundAny = true;
+            i++; // Skip the value
+        }
     }
 
     return foundAny;
@@ -483,6 +500,15 @@ void ConsoleUserInput(string* framerateStr) {
     getline(cin, cinString);
     if (!cinString.empty())
         *framerateStr = cinString;
+
+    // Frame-gen batch-collapse policy (temporal modes only; see g_collapsePolicy).
+    cout << endl << "Frame-gen collapse [second = keep real (default), first = keep generated, off] ? ";
+    string collapseStr;
+    getline(cin, collapseStr);
+    extern int g_collapsePolicy;
+    if (collapseStr == "off")        g_collapsePolicy = 0;
+    else if (collapseStr == "first") g_collapsePolicy = 1;
+    else                             g_collapsePolicy = 2;   // blank/anything else = default
 
     for (vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
 

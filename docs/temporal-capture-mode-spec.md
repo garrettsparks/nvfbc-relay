@@ -637,7 +637,11 @@ correlation is the reliable instrument here.
 
 ### Pair-batching RESOLVED (2026-07-01, three follow-up runs): it's FRAME GENERATION
 
-The original run used KCD2 with **2× DLSS frame gen at a 120 cap → base render rate 60**.
+The original run used KCD2 with **NVIDIA Smooth Motion (driver-level 2× frame gen) at a 120 cap
+→ base render rate 60** (the cap applies to post-generation OUTPUT, so cap/2 = base rate).
+NOTE: all frame-gen findings in this spec are for **Smooth Motion specifically**; in-game DLSS
+frame gen runs a different present path (in-engine, Reflex-paced) and its wake pattern is
+UNTESTED — re-characterize before assuming the same pair signature or collapse threshold.
 Follow-ups (log-only, `90_x_1_t_vsync` / `90_x_2_t_vsync` / `60_x_2_t_50`):
 
 | run | caps/s | structure |
@@ -680,7 +684,7 @@ order** (wakes are ε apart; display flips are ~half a base period apart):
 Hysteresis at 60 Hz alternates pair members (member 2 is the only newer frame at every other
 tick). Then: **detect.py dupes ≈ 50%** → members content-identical → collapse keeps either,
 done. **Dupes ≈ 0** → members distinct (gen content IS in the ring) → identify gen by stepping
-frames for DLSS-FG artifacts (HUD/UI shimmer, edge warping on alternating frames); the collapse
+frames for frame-gen artifacts (HUD/UI shimmer, edge warping on alternating frames); the collapse
 must keep the *other* member.
 
 **v1 ships keep-FIRST** (skip subsequent intra-batch wakes entirely): safest implementation —
@@ -689,6 +693,26 @@ reading, violating the lock-free invariant; if the discriminator demands last-me
 that needs a deferred-publish design, ~3 ms added latency, only build if proven necessary).
 Threshold 3 ms is safe for real cadences up to ~333 fps base (well above any FG base rate;
 non-FG 240 Hz gaps are 4.17 ms > threshold).
+
+**Discriminator RESULT (2026-07-01, `30_x_2_t_60_kcd`, pre-collapse build): pair members are
+DISTINCT — NvFBC captures Smooth Motion's generated frames.** Reticle ghosting (an FG artifact)
+is plainly visible in the captured video; log shows 29.9 batches/s at the 30 base (sizes: 2424
+×2, 1169 ×1), dupes in the strafe window = 22 % and fully accounted for by `pick=repeat` (1185)
++ size-1 batches — not member identity. The historical "NvFBC doesn't show generated frames"
+conclusion is corrected: that experiment used a latest-wins present, which only ever displayed
+member 2. **Member ORDER still unknown** ([real, gen] vs [gen, real]); alignment-free order
+test: run the same 30-base config on the COLLAPSE build — its output contains only kept (first)
+members, so ghosting-still-present ⇒ member 1 = generated (keep-first wrong ⇒ build
+deferred-publish keep-last), always-crisp ⇒ member 1 = real (collapse correct as shipped).
+
+**Strategic fork opened by this finding (decide after the order test):**
+- **Path A (current roadmap):** collapse to base-rate real frames → clean timeline → our own
+  blend/NVOFA interpolation later. SM output discarded; quality under our control; works for
+  non-FG sources too.
+- **Path B (new):** keep BOTH pair members and *reconstruct* timestamps to display cadence
+  (member 2 stamped member 1 + batchPeriod/2) → the relay passes through SM's own 60 fps
+  interpolation, properly paced. Near-term product for SM titles with zero interpolation work
+  on our side — the current judder is purely the ε-timestamps, not the content.
 
 ## Mode framework: `<selection>:<present_timing>`
 
@@ -735,6 +759,14 @@ Blend's role is the POC that validates the bracket/weight pipeline NVOFA later p
   observable via windowed `GetRasterStatus`), present `IMMEDIATE`, QPC floor backstop. Design
   bases: `phase-locked-timer-dwm-spec.md` / `phase-locked-timer-dxgi-spec.md`. Not built until
   a desktop-capture mode is actually wanted.
+- **Adaptive bracketing delay (prerequisite for blend).** The lag must cover one SOURCE period
+  to guarantee the future/bracketing frame exists; it is currently hardcoded to one PRESENT
+  period (16.7 ms), which assumes source ≥ 60 fps. Post-collapse the ring runs at BASE rate —
+  at a 30 fps base, frames are 33 ms apart and the target often has no after-frame (nearest-pick
+  degrades gracefully to repeats; blend/NVOFA cannot bracket at all). Fix: `bracketingDelay =
+  max(presentPeriod, ~1.25 × measured source period)` — the source period is observable from the
+  ring's batch cadence. Added latency (~41 ms at 30 base) is sanctioned by the latency policy
+  (constant pipeline offset in service of pacing).
 - **Blend mode** (after phase-lock): identical capture/scheduler/ring/bracket; replace
   nearest-pick with a weighted blend of the pair (its own spec). Blend/NVOFA is also what
   removes the 240→60 nearest-pick quantization judder (non-integer clock ratio — see Round 7).
