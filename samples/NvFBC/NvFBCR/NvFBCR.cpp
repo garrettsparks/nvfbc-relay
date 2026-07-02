@@ -699,11 +699,12 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 
     NVFBC_TODX9VID_SETUP_PARAMS DX9SetupParams = {};
     DX9SetupParams.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
-    // bWithHWCursor = 0: don't composite the HW cursor. With it on, the grab also wakes on every
-    // cursor MOVE (mouse polling rate, decoupled from the monitor refresh) — sub-2ms wakes that
-    // inflate the capture rate and pollute the content timeline. Off => clean source-rate capture.
-    // (Plain vsync/timer modes use this session; the temporal modes rebind in CaptureRing, also 0.)
-    DX9SetupParams.bWithHWCursor = 0;
+    // bWithHWCursor = 1 here is fine: this session serves the plain vsync/timer modes, which grab
+    // with NOWAIT (poll, never wait) — cursor moves cannot inflate their rate, and keeping the OS
+    // cursor in the output is desirable for plain relay use. The temporal modes discard this
+    // session (CaptureRing rebinds NvFBC) and use bWithHWCursor = 0 there, where the BLOCKING grab
+    // would otherwise wake at mouse-polling rate and pollute the ring timeline (spec Round 9).
+    DX9SetupParams.bWithHWCursor = 1;
     DX9SetupParams.bStereoGrab = 0;
     DX9SetupParams.bDiffMap = 0;
     DX9SetupParams.ppBuffer = NvFBC_OutBuf;

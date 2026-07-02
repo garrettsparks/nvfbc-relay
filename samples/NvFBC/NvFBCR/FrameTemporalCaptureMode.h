@@ -11,9 +11,12 @@
 //   CaptureRing      — capture thread fills a ring with source frames stamped at arrival.
 //   Present timing   — two options (the <selection>:<present> framework's present axis):
 //                      timer  (t:60)    — PresentScheduler's absolute-QPC deadline drives it.
-//                      vsync  (t:vsync) — the INTERVAL_ONE present blocks on the capture-card
-//                                         vblank; selection anchors to "now" so the target is
-//                                         on the display clock (no QPC-vs-vblank mismatch).
+//                      vsync  (t:vsync) — the INTERVAL_ONE present blocks on DWM's compose clock
+//                                         (the PRIMARY/source display — NOT the capture card;
+//                                         windowed flips always ride DWM, see spec Rounds 5-8).
+//                                         Correct only when source rate == target rate. To be
+//                                         replaced by the phase-locked timer (DWM-clock-steered
+//                                         scheduled present with known target T).
 //   This mode        — each present: select the ring frame nearest a content target lagged one
 //                      period behind, with hysteresis (monotonic), copy to backbuffer, present.
 //

@@ -34,8 +34,21 @@ governs only how fast the capture thread notices a stop/stall — not pacing.
 **Measured semantics (2026-06 validation runs): "new frame" = new display scan-out /
 composition, NOT new content frame.** On a fixed-refresh source display the grab wakes once
 per refresh regardless of the content's framerate — measured `dt` median ≈ 4.2 ms (~240 Hz)
-for *both* a 60 fps and an 80 fps UFO source on a 240 Hz monitor. HW cursor moves also wake
-the grab (`bWithHWCursor = 1`; observed as `dt` ≈ 100 µs spikes). Implications:
+for *both* a 60 fps and an 80 fps UFO source on a 240 Hz monitor.
+
+**HW cursor wakes — RESOLVED (Round 9, 2026-06-18): `bWithHWCursor = 0`.** With
+`bWithHWCursor = 1`, NvFBC wakes the blocking grab on every cursor *move* — at the mouse's
+polling rate (125–1000+ Hz), fully decoupled from the monitor refresh. Measured: hands-off =
+clean 240/s with 0% sub-2ms gaps; mouse moving = 434–495/s with 54–63% sub-2ms gaps —
+mode-independent, present in every historical log (the start/end-of-log spikes = mousing to
+launch/close). These cursor wakes seed content-duplicate frames with false timestamps into the
+ring — poison for bracketing/blend/NVOFA weights. Fix: `bWithHWCursor = 0` in the CaptureRing
+session (and the plain modes' session). Validated under constant mouse movement: 51 s,
+12,310 captures, flat 240/s, 0.1% sub-2ms — the cleanest capture timeline measured. Cost: OS
+cursor not composited into the capture (fine for game capture; a toggle or diffmap-dedup if
+desktop capture ever needs the cursor). Note: the plain modes use `NOWAIT` polling, which never
+waits — cursor moves never inflated *their* rate; only the blocking-grab temporal modes were
+affected. Implications:
 
 - **Fixed refresh:** the ring holds several timestamped copies of each content frame
   (refresh-rate / content-rate of them), and timestamps are *refresh* times. Nearest-pick
@@ -410,24 +423,167 @@ micro-judders period-2 — unexplained). **`t:vsync` is the discriminator:** it 
 selection but moves present to the vblank. Clean → present clock was it; still juddery → the
 ring/selection path is, independent of present clock. Test pending.
 
+## Rounds 5–8 (2026-06-14 → 06-18) — the vsync-to-target investigation (distilled)
+
+Full experimental record (code + long-form spec rounds) lives on branch
+**`temporal-b-two-devices-full-screen-experiments`**; this branch was hard-reset to the clean
+pre-detour base (`912ec74`) once the investigation concluded. Companion evidence doc:
+**`d3d-per-display-vsync-research.md`** (adversarially-verified, cited). What was tried, what
+each attempt proved, and the conclusions that now bind the design:
+
+**Round 5 — vsync presents on the WRONG display (bug found).** With source 240 Hz / capture
+card 60 Hz, `t:vsync` presented at **240/s** (`pdt` ≈ 4166 µs). Windowed `Present(INTERVAL_ONE)`
+does not sync to the window's display: DWM owns every windowed flip and composes on the
+**primary/source** monitor's clock, regardless of window placement *or which adapter the present
+device was created on* (verified empirically after moving the present device to the target
+adapter — no change; and documented: Microsoft's compositor-clock doc. Win10-2004's
+sync-to-fastest-monitor mitigation degrades above ~3× mismatch; 240/60 = 4×). Plain
+`VsyncCaptureMode` shares the mechanism, masked whenever source rate == target rate.
+
+**Round 6 — WaitForVBlank gate (reverted): the two-clock lesson.** Replaced `INTERVAL_ONE` with
+`IDXGIOutput::WaitForVBlank` on the *target* output (matched by HMONITOR) + `PresentEx(IMMEDIATE)`.
+It targeted the right display but **regressed pacing** — same-session A/B at 60→60: plain vsync
+6 → 102 dupes, std(Δ) 0.496 → 1.154, new ~25 s periodic defect; t:vsync 6 → 38, std 0.777.
+**Root cause — the loop was paced by one clock while the flip shipped on another.** WaitForVBlank
+synced the loop to the *card's hardware* vblank, but DWM still delivered the windowed flip on the
+*primary's* clock: two independent 60 Hz crystals → beat. `INTERVAL_ONE` is smooth precisely
+because it blocks on **the same clock that delivers the flip** (DWM's compose clock). Per the
+docs, `WaitForVBlank` "paces a CPU loop; it does not gate the flip" — its correct use is as a
+*phase reference for a timer*, never as a present gate.
+
+**Round 7 — present-on-target-adapter + the 240→60 discriminator.** Adapter move changed nothing
+windowed (DWM still paced at source — see Round 5), but restoring `INTERVAL_ONE` restored the
+clean baseline (t:vsync@60: 7 dupes, std 0.506 ≈ the pristine pre-detour numbers — proving the
+Round-6 damage was the decoupled gate, not "targeting the card's clock" per se). Discriminator
+result at 240→60, same-session: **t:vsync@240 = cleanest 240→60 ever captured** (EXCELLENT 100%,
+std 0.430, period-2 0%) — *but* it presents at 240/s and the card **hardware-decimates** the
+uniform stream (identical mechanism to plain vsync@240; the temporal selection is along for the
+ride). **t:60@240 = GOOD 86%, period-2 2%** (clustered, ~5 spots). The t:60 judder mechanism,
+finally pinned: the measured ratio is **239.5/60.13 ≈ 3.98, not 4.00** (free QPC timer vs source
+clock — two crystals), so nearest-pick strides +4,+4,+4,+3… with a correction ≈ every 1.1 s →
+the period-2/3 clusters. **A selection-quantization artifact of unsynced clocks — no present-
+timing change can fix it for non-integer ratios; that is interpolation's job.**
+
+**Round 8 — exclusive fullscreen + self-gated flip (operationally dead).** FS on the target
+engaged cleanly (mode-set OK, caps advertise ONE/TWO/THREE/FOUR/IMMEDIATE = 0x8000000f) but
+`INTERVAL_ONE` **still didn't block** (`present_block` 73–457 µs, not ~16.6 ms): the capture-card
+sink accepts flips immediately. First unthrottled run → **runaway** (~82 k presents/s, 100%
+`pick=repeat`, starved the source; 50 MB log in seconds) — any vsync-style loop must keep a
+timer floor as a backstop. `GetRasterStatus` on the FS device **did** show a real moving raster
+(scanline sweeps, InVBlank observable) — the card *has* an observable vblank — so we built
+self-gated flips (`t:rlock` = GetRasterStatus busy-poll edge-detect; `t:dlock` =
+WaitForVBlank), which **mechanically worked**: gate landed the flip at scanline 0 in-blank,
+`pdt` steady 16.6 ms, capture clean. Then the kill: **`S_PRESENT_OCCLUDED` (0x08760878)** the
+moment the relay lost foreground — exclusive fullscreen requires foreground, and a relay can
+never hold it while the user games. **FS is fundamentally incompatible with the relay use
+case.** (Also proven along the way: the ~10 s "OBS freeze" was FS occlusion on focus change —
+never the card, USB, OBS, or our code; per-frame `CheckDeviceState` + PresentEx-HRESULT
+instrumentation, logged on transition only, is what caught it and is worth re-adding to any
+future risky present path. A latency bug was also found+fixed there: a vblank gate must *be*
+the pace — wait first, then select against post-wait "now" — or the selection target goes ~one
+frame stale and falls off the ring.)
+
+**Bindings from the investigation (do not re-litigate):**
+1. **Windowed flips belong to DWM and ride the primary/source clock.** No windowed mechanism —
+   adapter choice, WaitForVBlank, window position — changes that. Verified empirically ×3 and
+   documented (`d3d-per-display-vsync-research.md`).
+2. **Never pace a loop with a clock other than the one delivering the flips.** Two-crystal beat
+   is the failure mode of Rounds 6 (and t:60's residual ~30 s beat vs the card).
+3. **Exclusive fullscreen is dead for a relay** (occlusion on focus loss), independent of the
+   fact that the card's driver ignores INTERVAL_ONE in FS anyway.
+4. **`INTERVAL_ONE` cannot serve interpolation.** It blocks until *some* vsync you never know in
+   advance — there is no target timestamp T to select/blend/synthesize *for*. An INTERVAL_ONE
+   present is inherently "show latest, synced" = plain vsync. Interpolation (t/b/n modes) needs a
+   **scheduled** present with a known future T.
+5. Therefore **t:vsync's real design = the phase-locked timer**: a fixed-rate *scheduled*
+   present (known T → interpolation-capable, the `n:vsync` foundation) whose period/phase are
+   steered to an external display-clock reference, presenting `IMMEDIATE` with the QPC floor as
+   backstop. That much is settled. **Which reference clock is an OPEN question** — see "Open
+   questions — phase-lock reference clock" below. Design base: `phase-locked-timer-dwm-spec.md`
+   / `phase-locked-timer-dxgi-spec.md` (the two candidate references, pre-written).
+
+## Round 9 (2026-06-18) — cursor wakes eliminated (`bWithHWCursor = 0`)
+
+See the "HW cursor wakes — RESOLVED" block under *Capture timing* above for the full finding.
+Summary: cursor moves woke the blocking grab at mouse-polling rate (434–495/s with 54–63%
+sub-2ms gaps while mousing vs a flat 240/s hands-off), polluting the ring with content-duplicate
+frames under false timestamps. Inherent NvFBC behavior, present in every historical log — *not*
+introduced by any of our changes (verified across old logs: spikes only at log start/end =
+launch/close mousing). `bWithHWCursor = 0` validated under constant mouse movement: flat 240/s,
+0.1% sub-2ms, present pdt 16,661 µs. Also retired the "16631 µs scheduler anomaly": current runs
+measure 16,655–16,661 µs (6–12 µs off ideal — noise); the old 16,631 was an outlier/load
+artifact, and the residual drift vs the card is the fundamental two-crystal beat (~30 s period),
+benign for timer mode and phase-lock's job to absorb.
+
+## Open questions — phase-lock reference clock (investigate BEFORE building)
+
+The phase-locked timer needs an external reference to steer period/phase toward. Two candidates,
+each with an unresolved problem. **Do not build until an instrumentation run picks one.**
+
+**Candidate A — DWM compose clock (`DwmGetCompositionTimingInfo`).** Pro: it is the clock that
+ships windowed flips (binding #2 — sync to the delivering clock), the same clock the
+proven-smooth `INTERVAL_ONE` rides; QPC-stamped values (sub-µs, same domain as our scheduler).
+Cons / unknowns:
+- The API is **global-only** (the hwnd param is dead since Win 8.1) and reports the **primary**
+  monitor's cadence. There is no documented per-monitor DWM timing — no way to ask for the
+  card's compose timing.
+- **G-Sync hole — and G-Sync is the primary use case.** With VRR engaged on the source
+  (primary), DWM's compose cadence follows the game's variable rate → the reference wobbles
+  exactly when the product matters. (Mitigation: our QPC timer *generates* the 16.667 ms
+  cadence; the reference only nudges period/phase via smoothed corrections, so a noisy
+  reference degrades gracefully toward plain t:60 — but "gracefully degraded" may not beat
+  t:60 at all under VRR.)
+
+**Candidate B — card hardware vblank (`IDXGIOutput::WaitForVBlank` on the target output, or
+`GetRasterStatus` on a target-adapter device) + a TUNED PHASE OFFSET.** Pro: the card is fixed
+60 Hz, no VRR — **the steadiest clock in the entire system**, and under G-Sync possibly the only
+stable reference left. Both observation methods are proven readable on this rig (Round 6 paced
+correctly at 60 Hz; Round 8 saw a real moving raster — though `GetRasterStatus` is only verified
+in FS, windowed unverified). Cons / unknowns:
+- Round 6 regressed using this reference — **but** Round 6 presented *exactly at the vblank
+  boundary* (worst phase, racing DWM's latch) and **never tuned a phase offset**. The regression
+  may have been a fixable phase-race, not proof the reference is unusable. Untested.
+- Whether it can work hinges on the key unknown below.
+
+**Key unknown that decides A vs B: which clock does DWM use to latch frames destined for the
+CARD monitor?** If one global compose pass (primary-paced — what the compositor-clock doc and
+our present-drain measurements suggest), then pacing to the card beats against the latch
+(Round 6's result) unless a tuned offset rides inside the beat tolerance. If per-monitor
+composition (card monitor latched on the card's own 60 Hz), then the card vblank is the *right*
+reference and Round 6's failure was purely the untuned phase.
+
+**Instrumentation run (cheap, before any build):** ~30 s each of (a) fixed-240 source and
+(b) G-Sync engaged with a variable-rate game, logging: `DwmGetCompositionTimingInfo` period +
+qpcVBlank drift, `GetRasterStatus` on the card from a *windowed* target-adapter device (verify
+readability + rate), present-drain timing. Outputs: DWM cadence behavior under VRR (does the
+reference survive G-Sync?), windowed raster readability, and latch-clock evidence. Pick the
+reference from data; possibly both (DWM for fixed-refresh sources, card+offset under VRR).
+
 ## Mode framework: `<selection>:<present_timing>`
 
 The mode string is two orthogonal axes (already reflected in `t:60` vs `t:vsync` parsing):
 
 - **selection** — how the output frame is chosen/built: `t` temporal (nearest/future-pick),
-  later `b` blend (pixel cross-fade of the bracket — *not* motion interpolation), `o`
+  later `b` blend (pixel cross-fade of the bracket — *not* motion interpolation), `n`
   optical-flow / NVOFA (true motion-compensated in-between frame).
-- **present_timing** — when to present: `60` (absolute-QPC timer, current), `vsync` (block on
-  the target/capture-card vblank), later arbitrary CFR.
+- **present_timing** — when to present: `60` (absolute-QPC timer, current), `vsync` (display-
+  clock-synced — see redefinition below), later arbitrary CFR.
 
-**`t:vsync` (IMPLEMENTED 2026-06-14):** temporal selection with vsync-locked present. The
-`FrameTemporalCaptureMode` takes a `vsyncPresent` flag: `GetPresentationInterval()` returns
-`INTERVAL_ONE` so the device is created vsync-synced; the present loop skips the QPC-timer wait
-and lets the blocking `INTERVAL_ONE` present be the wait, anchoring the selection target to
-"now" (just after the previous vblank) so selection runs on the **display clock**, not QPC. The
-capture thread/ring/bracketing/hysteresis are unchanged. `t` and `t:vsync` route here;
-`t:59.94` routes to the same mode with timer present. The old `VsyncTemporalCaptureMode` (a
-pre-CaptureRing implementation) has been **removed**.
+**`t:vsync` — as currently implemented vs as it must become.** The current code (`vsyncPresent`
+flag): `GetPresentationInterval()` returns `INTERVAL_ONE`; the present loop lets the blocking
+present be the wait and anchors the selection target to "now". **Round 5 proved the blocking
+present syncs to DWM's compose clock (primary/source display), NOT the capture card** — at
+matched rates that's coincidentally correct and smooth; at 240→60 it presents at the source rate
+and the card hardware-decimates. **Rounds 5–8 binding #4 proved the deeper problem:**
+INTERVAL_ONE never knows its flip time in advance, so there is no target timestamp to
+select/interpolate *for* — an INTERVAL_ONE t:vsync is functionally plain vsync with extra steps
+and is a dead end for blend/NVOFA. **Redefinition (next to build): t:vsync = phase-locked
+timer** — the scheduled QPC present (known target T, interpolation-capable) with period and
+phase steered to a display-clock reference, presenting `IMMEDIATE`. **The reference clock is an
+open question** (DWM compose clock vs card vblank + tuned phase offset — see "Open questions —
+phase-lock reference clock"; instrumentation run decides, G-Sync behavior is the crux). The
+capture thread/ring/bracketing/hysteresis are unchanged. `t`/`t:vsync` route here; `t:59.94` =
+timer present. (The old `VsyncTemporalCaptureMode` — pre-CaptureRing — was removed long ago.)
 
 **Clarification — blend ≠ interpolation.** Blend is pixel averaging/cross-fade of the bracketing
 pair (softens a slip into a brief ghost/double-image); it does not synthesize motion. NVOFA is
@@ -436,18 +592,31 @@ Blend's role is the POC that validates the bracket/weight pipeline NVOFA later p
 
 ## Future work
 
-- **Blend mode** (next): identical capture/scheduler/ring/bracket; replace nearest-pick with a
-  weighted blend of the pair (its own spec).
+- **Phase-lock reference-clock instrumentation (NEXT).** Cheap logging run — see "Open
+  questions — phase-lock reference clock". Decides DWM compose clock vs card vblank + tuned
+  phase offset; G-Sync behavior of the DWM reference is the crux (G-Sync is the primary use
+  case). No phase-lock build until this answers.
+- **Phase-locked timer present (after instrumentation — this is the real `t:vsync`).** Fixed-60
+  scheduled present steered (period *and* phase) to the chosen reference, present `IMMEDIATE`,
+  keep the QPC floor as runaway backstop. Design bases: `phase-locked-timer-dwm-spec.md` /
+  `phase-locked-timer-dxgi-spec.md`. Validate 60→60 same-session vs plain vsync (must match
+  std ≈ 0.5) and vs t:60 (must kill the ~30 s beat); then a G-Sync variable-source run. This is
+  the load-bearing test for all interpolation: n:vsync must present this way (needs known T).
+- **Blend mode** (after phase-lock): identical capture/scheduler/ring/bracket; replace
+  nearest-pick with a weighted blend of the pair (its own spec). Blend/NVOFA is also what
+  removes the 240→60 nearest-pick quantization judder (non-integer clock ratio — see Round 7).
 - **Optical flow (NVOFA)**: replace the blend with motion-compensated interpolation. NVOFA is a
   CUDA hardware path (flow vectors + a warp kernel), not a D3D9 shader swap — see the archived
   `garrett-nvofa-optical-flow-interpolation` branch, deliberately set aside as too complex until
   this foundation is solid.
-- **VSync-driven present** — DONE (`t:vsync`, see Mode framework). Pending validation that it
-  resolves the 240→60 judder (the discriminator test above).
 - **Confirm the hysteresis 60→60 floor** — DONE: 4 dupes / EXCELLENT (see Round 4).
-- **Resolve the 240→60 judder mechanism** — run the t:vsync@240 discriminator; if still juddery,
-  investigate the target-selection path (uniform selection timestamps + uniform present timing
-  but period-2 video judder is currently unexplained).
+- **240→60 judder mechanism** — RESOLVED (Round 7): nearest-pick stride quantization at the
+  measured non-integer ratio (≈3.98:1, two unsynced crystals). Not fixable by present timing;
+  addressed by interpolation (blend/NVOFA) or by riding the source clock (plain vsync + card
+  hardware decimation, uniform sources only).
+- **Cursor in capture** — if desktop capture ever needs the OS cursor back: make
+  `bWithHWCursor` a toggle and add diffmap dedup (skip publishing cursor-only grabs) so the
+  timeline stays clean. Round 9 explains why it defaults off.
 - **Direct-write capture (perf optimization, against the clean t:60 baseline).** Goal: eliminate
   the per-grab capture-side `StretchRect` (one full-res copy/frame — significant at 240fps).
   Change on the two-device B `CaptureRing`:
