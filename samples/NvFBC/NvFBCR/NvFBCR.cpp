@@ -485,6 +485,18 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+    // No-op shader compile whose only purpose is keeping the d3dcompiler.dll import in the
+    // binary. The blend modes were the only real D3DCompile callers; deleting them dropped the
+    // import and the next build tripped a Defender Wacatac.B!ml false positive (old build clean,
+    // new build flagged, same-day scans). Experiment: restore the import, observe the verdict.
+    // Blend mode will reintroduce a real D3DCompile call later; remove this shim then.
+    {
+        ID3DBlob* nopBlob = NULL;
+        const char* nopShader = "float4 main() : COLOR0 { return 0; }";
+        D3DCompile(nopShader, strlen(nopShader), NULL, NULL, NULL, "main", "ps_3_0", 0, 0, &nopBlob, NULL);
+        if (nopBlob) nopBlob->Release();
+    }
+
     if (!InitDisplays()) {
         LOGERR("Unable to enumerate display adapters");
         return -1;
