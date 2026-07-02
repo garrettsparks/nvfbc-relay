@@ -559,6 +559,137 @@ readability + rate), present-drain timing. Outputs: DWM cadence behavior under V
 reference survive G-Sync?), windowed raster readability, and latch-clock evidence. Pick the
 reference from data; possibly both (DWM for fixed-refresh sources, card+offset under VRR).
 
+### ANSWERED (2026-07-01, `diag`/`diag:vsync` runs — fixed-240 UFO vs G-Sync + KCD2 @120 cap)
+
+**Headline: with a fullscreen G-Sync game on the primary, DWM stops composing at the primary's
+rate and delivers windowed presents on the CARD's 60 Hz clock, hard-locked to the card's
+vblank.** The game takes the primary via independent flip, so the only surface DWM still
+composes is the card's display — the compose clock follows it. Measured:
+
+| run | INTERVAL_ONE block | delivery | `dwm_per` | card scanline at unblock |
+|---|---|---|---|---|
+| desktop/UFO (fixed 240) | ~3.95 ms | 240/s (primary) | 4167 µs | uniform 0–1125 (uncorrelated) |
+| game running (G-Sync) | **~16.45 ms** | **60/s** | **16 667 µs** | **p50 = 0, 99% ≤ 140, 51% in-blank** |
+
+The scanline column is the proof: under the game, `Present(INTERVAL_ONE)` unblocks at scanline 0
+of the capture card — flips are delivered on the card's own scanout. Transitions are visible
+live in the logs at game start/quit (dwm_per snaps 4167 ↔ 16667).
+
+**Consequences:**
+1. **The Round-5 "vsync targets the wrong display" bug is a DESKTOP-conditions bug.** Every
+   prior t:vsync@240 measurement used browser-UFO on a composed desktop — unrepresentative of
+   production (fullscreen game). Under the game, windowed INTERVAL_ONE is already card-locked.
+2. **Candidates A and B converge under the game** (DWM clock == card clock). The A-vs-B
+   question dissolves into: game running → INTERVAL_ONE already correct; desktop source →
+   INTERVAL_ONE rides the primary (out of scope — gaming is the product; a "desktop capture"
+   mode can be added later if ever needed).
+3. **Known-T under the game:** each INTERVAL_ONE unblock is a card tick, so next flip ≈
+   unblock + 16.67 ms — predictable enough for selection anchoring now and plausibly for
+   interpolation (n:vsync) later. The "INTERVAL_ONE has no known T" objection applies to the
+   composed-desktop regime, not this one.
+4. **QPC-vs-card drift is ~ppm, far smaller than assumed:** in both timer runs the card
+   scanline sat in a ~30-line band for 30+ s (a free 60 Hz QPC schedule holds phase against the
+   card for minutes). The earlier "~30 s beat" attribution needs re-examination.
+5. Windowed `GetRasterStatus` on a target-adapter device works everywhere (raster_hr S_OK) —
+   the card raster remains available as a reference/verification probe.
+
+**Revised next step: re-test `t:vsync` (current INTERVAL_ONE build) under production
+conditions** — G-Sync game + OBS. Expect log pdt ≈ 16 667 µs steady, healthy picks, no ring
+misses; validation is log-led (gameplay content doesn't suit the scroll-based detectors; a
+steady-pan stretch helps `pacing`, `dupes --mad` works regardless). If quality holds, the
+present problem is solved for the gaming use case and the phase-locked timer is demoted to a
+desktop-source fallback (not built until needed).
+
+## Round 10 (2026-07-01) — t:vsync production test: present SOLVED; capture pair-batching discovered
+
+`t:vsync` (INTERVAL_ONE, build `01d4c06`) under production conditions (KCD2, G-Sync, 120 cap,
+OBS recording; `t_vsync_kcd.{log,mp4}`):
+
+**Present timing: SOLVED.** Entire ~5 min game session: pdt median 16 663–16 673 µs, jit 3 µs,
+`pick=repeat` 0 (in steady state), `older than ring` 0. Regime transitions captured live
+(240 Hz desktop ↔ 60 Hz card-locked at game start/quit). INTERVAL_ONE t:vsync = card-locked
+steady 60 Hz under a game, exactly as the diag runs predicted.
+
+**Visible "slight stutter" (first half) = nearest-pick boundary dither, not present timing.**
+Pick-flip analysis: windows with 40–50 % before↔after flip rate correlate exactly with
+detect.py's rough spots and the user's perceived stutter; 0 %-flip stretches (pure-before or
+pure-after for minutes) = the smooth second half. Hysteresis cannot prevent this dither (both
+candidates advance). Period-2 detected in 11 % of windows.
+
+**NEW FRONT-LINE FINDING — capture timestamps arrive as 60 Hz PAIRS under the game.** Capture
+`dt` histogram in the game-steady region: **zero gaps at 8.33 ms (120 Hz)**; instead 51 % at
+~16.6 ms + 48 % under 2 ms. The game's 120 fps frames reach the blocking grab batched
+two-at-a-time on a 60 Hz cadence (presumably tied to DWM's compose clock, which follows the
+card under the game). Consequences:
+- Ring timestamps do not reflect true content cadence (pairs stamped T, T+ε instead of
+  T, T+8.3 ms) — this is what amplifies the selection dither (pair members nearly co-timed ⇒
+  "nearest" is a coin flip at boundary phases).
+- **Bracket weights from these timestamps are unusable for blend/NVOFA** (ε vs 16.6 ms instead
+  of 8.3/8.3). Timestamp fidelity is now the front-line problem for the interpolation roadmap.
+- Candidate mitigations (undecided): selection policy "newest frame of the latest complete
+  pair" (≈ show-latest; kills the dither at 2:1, trades away target-time semantics);
+  timestamp reconstruction (re-space pair members by known/measured content cadence);
+  investigate NvFBC wake semantics under independent flip.
+
+detect.py caveats on gameplay content: 20 % idle (menus/standing), 1.6 s "freeze" = quit
+screen, head-bob/stop-start break the constant-motion assumptions — the log-side flip
+correlation is the reliable instrument here.
+
+### Pair-batching RESOLVED (2026-07-01, three follow-up runs): it's FRAME GENERATION
+
+The original run used KCD2 with **2× DLSS frame gen at a 120 cap → base render rate 60**.
+Follow-ups (log-only, `90_x_1_t_vsync` / `90_x_2_t_vsync` / `60_x_2_t_50`):
+
+| run | caps/s | structure |
+|---|---|---|
+| FG **off**, 90 cap | 78 | **batch size 1 (3434/3435), uniform 11.1 ms** — no pairs |
+| FG **on** (90 base) | 152 | batch size 2 dominant, **batches at ~78/s = base rate** |
+| FG on (60 base), our present at **50 Hz** | 104 | **batches at 58.5/s = base rate, NOT 50** |
+
+Conclusions:
+1. **Capture and present are fully decoupled, including inside Windows** — moving our present
+   to 50 Hz moved nothing. The DWM-compose-gating hypothesis is dead.
+2. **The batch clock is the game's BASE render rate.** The "60 Hz pairs" were FG's base 60 —
+   coinciding with the card, DWM, and our present rate (quadruple confound, now resolved).
+3. **Without FG, NvFBC arrival timestamps are accurate** — uniform content-cadence wakes, and
+   they faithfully tracked a real regime change (60 fps menu stretch → steady 90 gameplay).
+   NvFBC (per prior observation) does not surface generated frames as a display-rate stream;
+   it wakes ~2× per base frame (pair members ε apart).
+4. Remaining defect is FG-only: pair members stamped (T, T+ε). **Fix: batch-collapse in the
+   capture thread** — a wake arriving <~3 ms after the previous one is treated as the same
+   batch and skipped (no StretchRect, no publish; counted). Ring then holds one frame per base
+   frame with uniform base-rate timestamps; kills the selection dither and restores meaningful
+   bracket weights. Timestamp = first wake of the batch — order-independent, since both members
+   can only exist after real frame N completes, so batch-start ≈ N's arrival.
+
+### Which pair member is the real frame? OPEN — discriminator experiment defined
+
+Wake order is NOT settled, because the wakes track **submission/ready order, not display
+order** (wakes are ε apart; display flips are ~half a base period apart):
+- **Display order** is definitively gen-before-real (gen represents a moment between N-1 and N).
+- **Creation order** is real-before-gen (gen is derived from N, so it exists only after N).
+  If Present(N) fires the first wake and the driver's gen-injection the second → **[real, gen]**.
+- Third scenario: both grabs (<1 ms apart) may snapshot the **same front buffer** →
+  content-identical pair regardless of wake cause.
+- The prior "NvFBC doesn't show generated frames" experiment (base-30×FG → capture looked
+  30 fps with dups) is **ambiguous**: it used a latest-wins present, which always shows the
+  *second* member — it proves member 2 ≈ the real frame's content *or* a duplicate, but says
+  nothing about member 1.
+
+**Discriminator (current build, no code needed): base-30 × FG, mode `t:60`, OBS capture.**
+Hysteresis at 60 Hz alternates pair members (member 2 is the only newer frame at every other
+tick). Then: **detect.py dupes ≈ 50%** → members content-identical → collapse keeps either,
+done. **Dupes ≈ 0** → members distinct (gen content IS in the ring) → identify gen by stepping
+frames for DLSS-FG artifacts (HUD/UI shimmer, edge warping on alternating frames); the collapse
+must keep the *other* member.
+
+**v1 ships keep-FIRST** (skip subsequent intra-batch wakes entirely): safest implementation —
+never writes to a published slot (keep-last would overwrite a slot the present thread may be
+reading, violating the lock-free invariant; if the discriminator demands last-member content,
+that needs a deferred-publish design, ~3 ms added latency, only build if proven necessary).
+Threshold 3 ms is safe for real cadences up to ~333 fps base (well above any FG base rate;
+non-FG 240 Hz gaps are 4.17 ms > threshold).
+
 ## Mode framework: `<selection>:<present_timing>`
 
 The mode string is two orthogonal axes (already reflected in `t:60` vs `t:vsync` parsing):
@@ -592,16 +723,18 @@ Blend's role is the POC that validates the bracket/weight pipeline NVOFA later p
 
 ## Future work
 
-- **Phase-lock reference-clock instrumentation (NEXT).** Cheap logging run — see "Open
-  questions — phase-lock reference clock". Decides DWM compose clock vs card vblank + tuned
-  phase offset; G-Sync behavior of the DWM reference is the crux (G-Sync is the primary use
-  case). No phase-lock build until this answers.
-- **Phase-locked timer present (after instrumentation — this is the real `t:vsync`).** Fixed-60
-  scheduled present steered (period *and* phase) to the chosen reference, present `IMMEDIATE`,
-  keep the QPC floor as runaway backstop. Design bases: `phase-locked-timer-dwm-spec.md` /
-  `phase-locked-timer-dxgi-spec.md`. Validate 60→60 same-session vs plain vsync (must match
-  std ≈ 0.5) and vs t:60 (must kill the ~30 s beat); then a G-Sync variable-source run. This is
-  the load-bearing test for all interpolation: n:vsync must present this way (needs known T).
+- **Phase-lock reference-clock instrumentation — DONE (2026-07-01), see "ANSWERED" above.**
+  Under a fullscreen G-Sync game, DWM delivers windowed INTERVAL_ONE presents card-locked at
+  60 Hz. The question dissolved for the gaming use case.
+- **Re-test `t:vsync` (INTERVAL_ONE, current build) under production conditions (NEXT).**
+  G-Sync game + OBS; log-led validation (pdt ≈ 16 667 µs steady, healthy picks, no ring
+  misses). If quality holds, present timing is solved for gaming and the row below is demoted.
+- **Phase-locked timer present (demoted — desktop-source fallback only).** Only needed if a
+  composed-desktop source ever matters (INTERVAL_ONE rides the primary there). Fixed-60
+  scheduled present steered to a reference (DWM compose clock on desktop; card raster always
+  observable via windowed `GetRasterStatus`), present `IMMEDIATE`, QPC floor backstop. Design
+  bases: `phase-locked-timer-dwm-spec.md` / `phase-locked-timer-dxgi-spec.md`. Not built until
+  a desktop-capture mode is actually wanted.
 - **Blend mode** (after phase-lock): identical capture/scheduler/ring/bracket; replace
   nearest-pick with a weighted blend of the pair (its own spec). Blend/NVOFA is also what
   removes the 240→60 nearest-pick quantization judder (non-integer clock ratio — see Round 7).

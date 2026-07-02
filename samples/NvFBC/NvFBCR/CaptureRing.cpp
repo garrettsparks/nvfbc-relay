@@ -209,6 +209,18 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     RECT srcRect = { 0, 0, (LONG)m_width, (LONG)m_height };
     const double usPerTick = 1000000.0 / (double)m_freqQuad;
     LONGLONG lastArrival = 0;
+    long long collapsed = 0;
+
+    // Batch-collapse threshold. Under DLSS frame generation the grab wakes ~2x per BASE frame,
+    // pair members arriving <2 ms apart (submission-batched; display flips are ~half a base
+    // period apart) — see spec Round 10. Real content cadences never produce sub-3ms gaps
+    // (333+ fps base would be required; non-FG 240 Hz gaps are 4.17 ms). A wake this soon after
+    // the previous one is the same batch: SKIP it (keep-FIRST). Keeping the first member is the
+    // only overwrite-free option (the previous slot is already published; rewriting it would
+    // race the present thread's read). If the pair discriminator experiment (spec Round 10)
+    // shows member 2 is the real frame and member 1 is generated content, this needs the
+    // deferred-publish keep-last design instead.
+    const LONGLONG batchThresholdQpc = (m_freqQuad * 3) / 1000;
 
     while (!m_stop.load()) {
         NVFBCRESULT res = m_nvfbc->NvFBCToDx9VidGrabFrame(grabParams);
@@ -225,6 +237,15 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
 
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
+
+        if (lastArrival != 0 && (now.QuadPart - lastArrival) < batchThresholdQpc) {
+            // Same batch as the previous wake (frame-gen pair member): skip — no copy, no
+            // publish. The kept (first) member's timestamp = batch start ≈ the real frame's
+            // completion, which is order-independent. Counted as col= in the capture log.
+            collapsed++;
+            lastArrival = now.QuadPart;   // chain: a 3rd member ε after the 2nd also collapses
+            continue;
+        }
 
         long long count = m_writeCount;
         int slot = (int)(count % RING_SIZE);
@@ -252,13 +273,15 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         m_published.store(count + 1);  // publish only after the slot write is GPU-complete
 
         // Verbose: source arrival timeline (dt = inter-arrival gap ≈ source frame period);
-        // flush = GPU-completion wait added by the cross-device coherency fix.
+        // flush = GPU-completion wait added by the cross-device coherency fix; col = cumulative
+        // batch-collapsed wakes (frame-gen pair members skipped).
         LONGLONG dt = (lastArrival != 0) ? (now.QuadPart - lastArrival) : 0;
-        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus",
+        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld",
             count,
             (long long)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
             (long long)(dt * usPerTick),
-            (long long)flushUs);
+            (long long)flushUs,
+            collapsed);
         lastArrival = now.QuadPart;
     }
 }
