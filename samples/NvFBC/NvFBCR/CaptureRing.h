@@ -35,9 +35,10 @@ struct FrameBracket {
 // uses. Grabs go back to long, fully event-driven blocking waits (true arrival timestamps,
 // no polling, no diffmap needed).
 //
-// Ring slots are SHARED render-target textures: created on the capture device (NvFBC's
-// StretchRect source side) and opened on the present device via D3D9Ex shared handles, so the
-// present thread reads them without touching the capture device. Known risk: D3D9Ex shared
+// Ring slots are SHARED render-target textures: created on the capture device (registered
+// directly as NvFBC output buffers — the grab writes each slot in place, no intermediate copy)
+// and opened on the present device via D3D9Ex shared handles, so the present thread reads
+// them without touching the capture device. Known risk: D3D9Ex shared
 // surfaces have no cross-device sync primitive; ordering relies on driver behavior. If the
 // output shows tearing/partial frames inside slots, that is the cause.
 class CaptureRing {
@@ -74,7 +75,7 @@ public:
 
 private:
     struct Slot {
-        IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
+        IDirect3DTexture9* capTexture;    // capture device (registered NvFBC output buffer)
         IDirect3DSurface9* capSurface;
         IDirect3DTexture9* mainTexture;   // present device alias (opened via shared handle)
         IDirect3DSurface9* mainSurface;
@@ -85,7 +86,6 @@ private:
     void CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
 
     Slot m_ring[RING_SIZE];
-    IDirect3DSurface9* m_captureTarget;   // on the capture device; NvFBC writes here
     IDirect3DDevice9Ex* m_presentDevice;
     IDirect3DDevice9Ex* m_capDevice;      // private capture device
     IDirect3DQuery9* m_capSync;           // event query: flush capture writes before publish

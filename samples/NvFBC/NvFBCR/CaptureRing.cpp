@@ -14,8 +14,7 @@ extern NvFBCToDx9Vid* NvFBCDX9;
 static const NvU32 kGrabWaitMs = 100;
 
 CaptureRing::CaptureRing()
-    : m_captureTarget(NULL)
-    , m_presentDevice(NULL)
+    : m_presentDevice(NULL)
     , m_capDevice(NULL)
     , m_capSync(NULL)
     , m_nvfbc(NULL)
@@ -45,10 +44,6 @@ CaptureRing::~CaptureRing() {
         if (m_ring[i].mainTexture) { m_ring[i].mainTexture->Release(); m_ring[i].mainTexture = NULL; }
         if (m_ring[i].capSurface)  { m_ring[i].capSurface->Release();  m_ring[i].capSurface = NULL; }
         if (m_ring[i].capTexture)  { m_ring[i].capTexture->Release();  m_ring[i].capTexture = NULL; }
-    }
-    if (m_captureTarget) {
-        m_captureTarget->Release();
-        m_captureTarget = NULL;
     }
     if (m_capSync) {
         m_capSync->Release();
@@ -98,7 +93,7 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
         return false;
     }
 
-    // Event query on the capture device. After each StretchRect into a shared slot we issue
+    // Event query on the capture device. After each grab writes a shared slot we issue
     // and drain this so the capture device's GPU write is COMPLETE before we publish the slot.
     // Without it the present device can read stale pixels from a freshly-written shared slot
     // (D3D9Ex shared surfaces have no implicit cross-device coherency) — observed as periodic
@@ -107,14 +102,6 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     hr = m_capDevice->CreateQuery(D3DQUERYTYPE_EVENT, &m_capSync);
     if (FAILED(hr)) {
         LOGERR("CaptureRing: failed to create capture sync query (error: 0x%08x)", hr);
-        return false;
-    }
-
-    // ---- Capture-side resources. ----
-    hr = m_capDevice->CreateOffscreenPlainSurface(
-        m_width, m_height, D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT, &m_captureTarget, NULL);
-    if (FAILED(hr)) {
-        LOGERR("CaptureRing: failed to create capture target surface (error: 0x%08x)", hr);
         return false;
     }
 
@@ -161,8 +148,14 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     }
     NvFBCDX9 = m_nvfbc;
 
-    NVFBC_TODX9VID_OUT_BUF outBuf[1];
-    outBuf[0].pPrimary = m_captureTarget;
+    // DIRECT WRITE: register every ring slot as an NvFBC output buffer. Each grab names its
+    // destination slot via dwBufferIdx, so the captured frame lands in the shared ring texture
+    // with no intermediate capture-target surface and no per-frame StretchRect. Setup is the
+    // loud failure point if the driver rejects shared-handle textures as outputs.
+    NVFBC_TODX9VID_OUT_BUF outBuf[RING_SIZE];
+    for (int i = 0; i < RING_SIZE; i++) {
+        outBuf[i].pPrimary = m_ring[i].capSurface;
+    }
 
     NVFBC_TODX9VID_SETUP_PARAMS setupParams = {};
     setupParams.dwVersion = NVFBC_TODX9VID_SETUP_PARAMS_V3_VER;
@@ -177,7 +170,7 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     setupParams.bDiffMap = 0;
     setupParams.ppBuffer = outBuf;
     setupParams.eMode = NVFBC_TODX9VID_ARGB10;
-    setupParams.dwNumBuffers = 1;
+    setupParams.dwNumBuffers = RING_SIZE;
     setupParams.bHDRRequest = TRUE;
 
     if (NVFBC_SUCCESS != m_nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
@@ -206,7 +199,6 @@ void CaptureRing::Stop() {
 }
 
 void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
-    RECT srcRect = { 0, 0, (LONG)m_width, (LONG)m_height };
     const double usPerTick = 1000000.0 / (double)m_freqQuad;
     LONGLONG lastArrival = 0;
     long long collapsed = 0;
@@ -227,6 +219,14 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     LOG("CaptureRing: batch-collapse keep-real (intra-batch wake <3ms = real member; previous slot retracted)");
 
     while (!m_stop.load()) {
+        // Direct write: name the destination slot before the grab. The slot is the oldest ring
+        // position (one past the FindBracket scan window), so NvFBC's in-place write can never
+        // touch a slot the present thread might read — same eviction geometry as the copy
+        // design, minus the copy.
+        long long count = m_writeCount;
+        int slot = (int)(count % RING_SIZE);
+        grabParams->dwBufferIdx = (NvU32)slot;
+
         NVFBCRESULT res = m_nvfbc->NvFBCToDx9VidGrabFrame(grabParams);
 
         if (res == NVFBC_ERROR_INVALIDATED_SESSION) {
@@ -248,11 +248,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         if (!intraBatch) batchStartQpc = now.QuadPart;
         lastArrival = now.QuadPart;   // chain: a 3rd member ε after the 2nd is still intra-batch
 
-        long long count = m_writeCount;
-        int slot = (int)(count % RING_SIZE);
-        m_capDevice->StretchRect(m_captureTarget, &srcRect, m_ring[slot].capSurface, &srcRect, D3DTEXF_NONE);
-
-        // Force the StretchRect to complete on the capture GPU before publishing, so the
+        // Force the grab's write to complete on the capture GPU before publishing, so the
         // present device never reads a not-yet-coherent shared slot. D3DGETDATA_FLUSH kicks
         // the command buffer; GetData returns S_FALSE until the GPU signals the event.
         m_capSync->Issue(D3DISSUE_END);
