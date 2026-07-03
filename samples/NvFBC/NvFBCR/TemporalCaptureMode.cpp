@@ -18,6 +18,7 @@ static const char* const kPickRepeat    = "repeat";       // nothing newer than 
 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent)
     : m_bracketingDelayQpc(0)
+    , m_lagSlewMaxQpc(0)
     , m_stickinessQpc(0)
     , m_lastPickAfter(false)
     , m_vsyncPresent(vsyncPresent)
@@ -45,9 +46,12 @@ bool TemporalCaptureMode::Setup() {
     if (!m_scheduler.Setup(m_targetFramerate)) {
         return false;
     }
-    // Lag the present target by one present period so the ring reliably holds a frame on each
-    // side of it (with source rate >= present rate, a frame newer than the target has arrived).
+    // Seed the target lag at one present period; per-present it adapts toward
+    // max(present period, 1.25 x measured source period) so an after-frame exists even when
+    // the source runs slower than the present rate (30-base frame gen, heavy scenes). The
+    // slew limit turns regime changes into a bounded latency ramp instead of a step.
     m_bracketingDelayQpc = m_scheduler.PeriodQpc();
+    m_lagSlewMaxQpc = m_scheduler.Freq() / 10000;   // 100 us per present
 
     // Selection stickiness (Schmitt band): prefer the before-frame unless the after-frame is
     // closer by more than this margin. Without it, when the target dwells near the midpoint
@@ -102,6 +106,21 @@ void TemporalCaptureMode::Run(
         } else {
             m_scheduler.WaitUntilDeadline();
             deadline = m_scheduler.Deadline();
+        }
+        // ADAPTIVE BRACKETING DELAY: follow the capture thread's source-period estimate.
+        // 1.25x covers arrival jitter on top of one full source period; the estimate is 0
+        // until the ring warms up, leaving the seed value (one present period) in effect.
+        {
+            const LONGLONG srcP = m_ring.EstimatedSourcePeriodQpc();
+            LONGLONG desired = m_scheduler.PeriodQpc();
+            if (srcP > 0) {
+                const LONGLONG fromSrc = srcP + srcP / 4;
+                if (fromSrc > desired) desired = fromSrc;
+            }
+            LONGLONG delta = desired - m_bracketingDelayQpc;
+            if (delta > m_lagSlewMaxQpc) delta = m_lagSlewMaxQpc;
+            else if (delta < -m_lagSlewMaxQpc) delta = -m_lagSlewMaxQpc;
+            m_bracketingDelayQpc += delta;
         }
         const LONGLONG target = deadline - m_bracketingDelayQpc;
 
@@ -178,14 +197,15 @@ void TemporalCaptureMode::Run(
                     m_ring.Published());
             }
         } else {
-            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus",
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((bracket.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
                 bracket.hasAfter ? (long long)((bracket.afterTs - m_baseQpc.QuadPart) * usPerTick) : -1LL,
                 bracket.weight, pick,
                 (long long)((beforePresent.QuadPart - deadline) * usPerTick),
-                (long long)(presentDelta * usPerTick));
+                (long long)(presentDelta * usPerTick),
+                (long long)(m_bracketingDelayQpc * usPerTick));
             if (!bracket.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }

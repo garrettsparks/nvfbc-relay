@@ -28,7 +28,8 @@ class TemporalCaptureMode : public IFrameCaptureMode {
 private:
     PresentScheduler m_scheduler;
     CaptureRing m_ring;
-    LONGLONG m_bracketingDelayQpc;  // present-target lag (≈ one present period)
+    LONGLONG m_bracketingDelayQpc;  // present-target lag (adaptive: >= one present period)
+    LONGLONG m_lagSlewMaxQpc;       // max lag change per present (bounded latency ramp)
     LONGLONG m_stickinessQpc;       // selection Schmitt band (anti flip-flop at bracket midpoint)
     bool m_lastPickAfter;           // Schmitt state: which bracket side the last pick took
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
