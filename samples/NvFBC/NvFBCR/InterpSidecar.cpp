@@ -5,6 +5,8 @@
 
 #pragma comment(lib, "d3d11.lib")
 
+extern int g_interpBackend;   // NvFBCR.cpp: -interp fruc|flow
+
 static const int kMaxConsecutiveFailures = 3;
 
 // Fullscreen-triangle conversion: 10-bit ring texture -> 8-bit BGRA with alpha FORCED to 1.0.
@@ -29,7 +31,8 @@ static const char* kConvPs =
 InterpSidecar::InterpSidecar()
     : m_dev11(NULL), m_ctx11(NULL)
     , m_convVs(NULL), m_convPs(NULL), m_convSampler(NULL), m_flushQuery(NULL)
-    , m_frucOutput(NULL), m_sharedOut11(NULL)
+    , m_frucOutput(NULL), m_sharedOutRtv(NULL), m_sharedOut11(NULL)
+    , m_backend(0)
     , m_outTexture9(NULL), m_outSurface9(NULL)
     , m_frucLib(NULL), m_frucHandle(NULL)
     , m_fnCreate(NULL), m_fnRegister(NULL), m_fnUnregister(NULL), m_fnProcess(NULL), m_fnDestroy(NULL)
@@ -38,7 +41,7 @@ InterpSidecar::InterpSidecar()
     , m_consecutiveFailures(0), m_enabled(false), m_lastProcessUs(0)
 {
     for (int i = 0; i < CaptureRing::RING_SIZE; i++) { m_ringAlias[i] = NULL; m_ringSrv[i] = NULL; }
-    for (int i = 0; i < 2; i++) { m_frucInput[i] = NULL; m_frucInputRtv[i] = NULL; }
+    for (int i = 0; i < 2; i++) { m_frucInput[i] = NULL; m_frucInputRtv[i] = NULL; m_frucInputSrv[i] = NULL; }
     m_baseQpc.QuadPart = 0;
 }
 
@@ -49,9 +52,11 @@ InterpSidecar::~InterpSidecar() {
     if (m_frucLib) FreeLibrary(m_frucLib);
     if (m_outSurface9) m_outSurface9->Release();
     if (m_outTexture9) m_outTexture9->Release();
+    if (m_sharedOutRtv) m_sharedOutRtv->Release();
     if (m_sharedOut11) m_sharedOut11->Release();
     if (m_frucOutput) m_frucOutput->Release();
     for (int i = 0; i < 2; i++) {
+        if (m_frucInputSrv[i]) m_frucInputSrv[i]->Release();
         if (m_frucInputRtv[i]) m_frucInputRtv[i]->Release();
         if (m_frucInput[i]) m_frucInput[i]->Release();
     }
@@ -75,13 +80,23 @@ bool InterpSidecar::Setup(IDirect3DDevice9Ex* presentDevice, CaptureRing* ring,
                           int width, int height, LARGE_INTEGER baseQpc, LONGLONG freqQpc) {
     m_width = width; m_height = height; m_baseQpc = baseQpc; m_freqQpc = freqQpc;
 
+    m_backend = g_interpBackend;
+
     if (!CreateDeviceAndRingAliases(ring)) return false;
     if (!CreateConversionPipeline()) return false;
     if (!CreateOutputShare(presentDevice)) return false;
-    if (!CreateFruc()) return false;
+
+    // Chosen backend only - a failed backend falls back to blend (attribution stays clean),
+    // never silently to the other backend.
+    if (m_backend == kInterpBackendFlow) {
+        if (!m_flow.Setup(m_dev11, m_ctx11, m_width, m_height)) return false;
+    } else {
+        if (!CreateFruc()) return false;
+    }
 
     m_enabled = true;
-    LOG("InterpSidecar initialized - D3D11 sidecar + NvOFFRUC, %dx%d BGRA8 (alpha forced 1.0)",
+    LOG("InterpSidecar initialized - D3D11 sidecar + %s, %dx%d BGRA8 (alpha forced 1.0)",
+        m_backend == kInterpBackendFlow ? "NVOFA raw flow + warp v1" : "NvOFFRUC",
         m_width, m_height);
     return true;
 }
@@ -157,6 +172,8 @@ bool InterpSidecar::CreateConversionPipeline() {
         if (FAILED(hr2)) { LOGERR("InterpSidecar: fruc input %d failed (0x%08x)", i, hr2); return false; }
         hr2 = m_dev11->CreateRenderTargetView(m_frucInput[i], NULL, &m_frucInputRtv[i]);
         if (FAILED(hr2)) { LOGERR("InterpSidecar: fruc input RTV %d failed (0x%08x)", i, hr2); return false; }
+        hr2 = m_dev11->CreateShaderResourceView(m_frucInput[i], NULL, &m_frucInputSrv[i]);
+        if (FAILED(hr2)) { LOGERR("InterpSidecar: fruc input SRV %d failed (0x%08x)", i, hr2); return false; }
     }
     HRESULT hr3 = m_dev11->CreateTexture2D(&td, NULL, &m_frucOutput);
     if (FAILED(hr3)) { LOGERR("InterpSidecar: fruc output failed (0x%08x)", hr3); return false; }
@@ -192,6 +209,8 @@ bool InterpSidecar::CreateOutputShare(IDirect3DDevice9Ex* presentDevice) {
     }
     hr = m_outTexture9->GetSurfaceLevel(0, &m_outSurface9);
     if (FAILED(hr)) { LOGERR("InterpSidecar: output surface failed (0x%08x)", hr); return false; }
+    hr = m_dev11->CreateRenderTargetView(m_sharedOut11, NULL, &m_sharedOutRtv);
+    if (FAILED(hr)) { LOGERR("InterpSidecar: shared output RTV failed (0x%08x)", hr); return false; }
     return true;
 }
 
@@ -276,6 +295,30 @@ void InterpSidecar::FlushD3D11() {
 bool InterpSidecar::Interpolate(const FrameBracket& bracket, LONGLONG targetQpc) {
     if (!m_enabled) return false;
     if (!bracket.hasBefore || !bracket.hasAfter) return false;
+
+    if (m_backend == kInterpBackendFlow) {
+        // Stateless per present: convert both bracket frames, flow + warp straight into the
+        // shared output, flush the cross-API boundary.
+        if (!ConvertSlotToBgra(bracket.beforeSlot, 0)) return false;
+        if (!ConvertSlotToBgra(bracket.afterSlot, 1)) return false;
+        LARGE_INTEGER t0, t1;
+        QueryPerformanceCounter(&t0);
+        bool ok = m_flow.Interpolate(m_frucInputSrv[0], m_frucInputSrv[1],
+                                     m_frucInput[0], m_frucInput[1],
+                                     (float)bracket.weight, m_sharedOutRtv);
+        QueryPerformanceCounter(&t1);
+        m_lastProcessUs = (t1.QuadPart - t0.QuadPart) * 1000000 / m_freqQpc;
+        if (!ok) {
+            if (++m_consecutiveFailures >= kMaxConsecutiveFailures) {
+                LOGERR("InterpSidecar: flow backend failing - disabling for this session");
+                m_enabled = false;
+            }
+            return false;
+        }
+        FlushD3D11();
+        m_consecutiveFailures = 0;
+        return true;
+    }
 
     // Feed any bracket frame FRUC hasn't seen (in timestamp order), then request the output
     // at the target instant with the newest feed. FRUC keeps its own history; feeding only

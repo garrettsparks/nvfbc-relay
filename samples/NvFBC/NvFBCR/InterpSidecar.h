@@ -4,6 +4,15 @@
 #include <d3d9.h>
 #include <d3d11.h>
 #include "CaptureRing.h"
+#include "FlowWarpEngine.h"
+
+// Interp backend selection (-interp fruc|flow). FRUC is the runnable default until the
+// raw-flow session-init is verified against the dropped-in D3D11 OF header; flow is the
+// favored long-term bet (we own the blend math - no dimming possible).
+enum InterpBackend {
+    kInterpBackendFruc = 0,
+    kInterpBackendFlow = 1,
+};
 
 // D3D11 interpolation sidecar: reads ring slots via their shared handles, converts the
 // bracket frames to 8-bit BGRA (alpha forced to 1.0 — the prior FRUC attempt's dimming had
@@ -60,7 +69,11 @@ private:
     // FRUC-registered resources: 2 input ping/pong + 1 output (NvOFFRUC_MIN_RESOURCE = 3)
     ID3D11Texture2D* m_frucInput[2];
     ID3D11RenderTargetView* m_frucInputRtv[2];
+    ID3D11ShaderResourceView* m_frucInputSrv[2];
     ID3D11Texture2D* m_frucOutput;
+    ID3D11RenderTargetView* m_sharedOutRtv;   // flow backend renders straight to the share
+    FlowWarpEngine m_flow;
+    int m_backend;                             // InterpBackend, latched at Setup
 
     // Cross-API output path: FRUC output -> CopyResource -> shared -> opened on D3D9
     ID3D11Texture2D* m_sharedOut11;

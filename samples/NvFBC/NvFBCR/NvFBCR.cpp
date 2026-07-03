@@ -169,6 +169,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  b:59.94        - Temporal blend, presented on a timer at given fps");
     LOGERR("  o, o:vsync     - Optical-flow interpolation (NvOFFRUC), presented on vsync");
     LOGERR("  o:59.94        - Optical-flow interpolation, presented on a timer at given fps");
+    LOGERR("Options:");
+    LOGERR("  -interp fruc|flow - o:* engine (default fruc; flow = raw NVOFA + our warp)");
     LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
     return NULL;
@@ -195,6 +197,11 @@ DisplayPosition source, target;
 // Target display's D3D9 adapter ordinal (set once displays are chosen). DiagCaptureMode uses it
 // to open a private device on the capture-card adapter for GetRasterStatus probes.
 int g_targetAdapterIndex = 0;
+
+// Interp compositor backend for o:* modes (-interp fruc|flow). FRUC is the runnable default
+// until the raw-flow session init is verified against the dropped-in D3D11 OF header (see
+// FlowWarpEngine); flow is the favored long-term bet.
+int g_interpBackend = 0;
 
 vector <DisplayPosition> displays;
 
@@ -451,6 +458,13 @@ bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, s
         }
         else if (args[i] == "-framerate" && i + 1 < args.size()) {
             *framerateStr = args[i + 1];  // Store as string instead of converting to int
+            foundAny = true;
+            i++; // Skip the value
+        }
+        else if (args[i] == "-interp" && i + 1 < args.size()) {
+            if (args[i + 1] == "flow")       g_interpBackend = 1;
+            else if (args[i + 1] == "fruc")  g_interpBackend = 0;
+            else LOGERR("Unknown -interp value '%s' (fruc|flow) - keeping default", args[i + 1].c_str());
             foundAny = true;
             i++; // Skip the value
         }
