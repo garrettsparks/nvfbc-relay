@@ -89,9 +89,12 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
     d3dpp.hDeviceWindow = hwnd;
 
+    // No D3DCREATE_MULTITHREADED: this device is created here (main thread, during Start)
+    // and thereafter used only by the capture thread; std::thread creation is the
+    // synchronization point between the two phases. No concurrent access exists.
     HRESULT hr = g_pD3DEx->CreateDeviceEx(
         cp.AdapterOrdinal, D3DDEVTYPE_HAL, hwnd,
-        D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+        D3DCREATE_HARDWARE_VERTEXPROCESSING,
         &d3dpp, NULL, &m_capDevice);
     if (FAILED(hr)) {
         LOGERR("CaptureRing: failed to create capture device (error: 0x%08x)", hr);

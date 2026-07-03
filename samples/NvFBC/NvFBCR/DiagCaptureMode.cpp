@@ -61,7 +61,7 @@ void DiagCaptureMode::Run(
         d3dpp.hDeviceWindow = hwnd;
         HRESULT hr = g_pD3DEx->CreateDeviceEx(
             g_targetAdapterIndex, D3DDEVTYPE_HAL, hwnd,
-            D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+            D3DCREATE_HARDWARE_VERTEXPROCESSING,
             &d3dpp, NULL, &m_rasterDevice);
         if (FAILED(hr)) {
             // Not fatal — DWM/present probes still run; raster columns log hr only.
