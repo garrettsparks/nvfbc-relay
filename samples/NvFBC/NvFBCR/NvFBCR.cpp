@@ -127,6 +127,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
     LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
+    LOGERR("Options:");
+    LOGERR("  -fg keep       - Publish frame-gen members re-stamped (Path B; default: collapse)");
     return NULL;
 }
 
@@ -151,6 +153,13 @@ DisplayPosition source, target;
 // Target display's D3D9 adapter ordinal (set once displays are chosen). DiagCaptureMode uses it
 // to open a private device on the capture-card adapter for GetRasterStatus probes.
 int g_targetAdapterIndex = 0;
+
+// Frame-gen handling in the CaptureRing (-fg collapse|keep). collapse (default, validated):
+// keep-real batch collapse - the ring carries base-cadence real frames only. keep (Path B):
+// publish every batch member re-stamped and tagged - the driver's generated frames become
+// selection candidates, using its interpolation as the rate converter. See
+// docs/fg-passthrough-spec.md.
+int g_fgPassthrough = 0;
 
 vector <DisplayPosition> displays;
 
@@ -407,6 +416,13 @@ bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, s
         }
         else if (args[i] == "-framerate" && i + 1 < args.size()) {
             *framerateStr = args[i + 1];  // Store as string instead of converting to int
+            foundAny = true;
+            i++; // Skip the value
+        }
+        else if (args[i] == "-fg" && i + 1 < args.size()) {
+            if (args[i + 1] == "keep")          g_fgPassthrough = 1;
+            else if (args[i + 1] == "collapse") g_fgPassthrough = 0;
+            else LOGERR("Unknown -fg value '%s' (collapse|keep) - keeping default", args[i + 1].c_str());
             foundAny = true;
             i++; // Skip the value
         }

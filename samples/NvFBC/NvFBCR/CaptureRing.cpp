@@ -7,6 +7,7 @@
 extern IDirect3D9Ex* g_pD3DEx;
 extern NvFBCLibrary* pNVFBCLib;
 extern NvFBCToDx9Vid* NvFBCDX9;
+extern int g_fgPassthrough;   // 0 = keep-real collapse (validated default); 1 = Path B passthrough
 
 // With a private capture device the blocking grab can wait as long as it likes — its lock
 // holds affect nothing the present thread uses. The timeout only bounds how quickly the
@@ -33,6 +34,7 @@ CaptureRing::CaptureRing()
         m_ring[i].mainTexture = NULL;
         m_ring[i].mainSurface = NULL;
         m_ring[i].valid = false;
+        m_ring[i].generated = false;
         m_ring[i].timestamp.QuadPart = 0;
     }
     m_baseQpc.QuadPart = 0;
@@ -225,7 +227,25 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     // keep-first ghosted throughout, keep-real crisp throughout (Round 10).
     const LONGLONG batchThresholdQpc = (m_freqQuad * 3) / 1000;
     LONGLONG batchStartQpc = 0;
-    LOG("CaptureRing: batch-collapse keep-real (intra-batch wake <3ms = real member; previous slot retracted)");
+
+    // PATH B (passthrough, -fg keep): publish every batch member instead of retracting the
+    // generated ones. Wakes arrive submission-batched (members epsilon apart at batch start),
+    // so raw wake times are FALSE display times for generated frames; re-stamp member i of a
+    // k-batch at batchStart + i*(P_hat/k_hat), where P_hat is the source-period EMA and k_hat
+    // the predicted batch size (mode of the last 8 completed batches - the size of the
+    // CURRENT batch is unknowable until it ends, so we predict; mispredicts self-heal next
+    // batch and only misplace a stamp within one base period). Members before the last are
+    // tagged generated (measured order [gen..., real]). Selection needs no changes: gen
+    // frames are legitimate candidates with honest interpolated timestamps - the driver's
+    // own frame generation becomes the rate converter.
+    int batchIdx = 0;
+    int sizeHist[8] = { 1, 1, 1, 1, 1, 1, 1, 1 };
+    int sizeHistIdx = 0;
+    int kHat = 1;
+    long long restamped = 0;
+    LOG(g_fgPassthrough
+        ? "CaptureRing: frame-gen PASSTHROUGH (batch members re-stamped batchStart + i*(P/k), tagged)"
+        : "CaptureRing: batch-collapse keep-real (intra-batch wake <3ms = real member; previous slot retracted)");
 
     while (!m_stop.load()) {
         NVFBCRESULT res = m_nvfbc->NvFBCToDx9VidGrabFrame(grabParams);
@@ -258,7 +278,19 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
                     m_srcPeriodEmaQpc.store(ema, std::memory_order_relaxed);
                 }
             }
+            // Completed batch size feeds the k_hat predictor (mode of recent sizes).
+            sizeHist[sizeHistIdx] = batchIdx + 1;
+            sizeHistIdx = (sizeHistIdx + 1) % 8;
+            int bestCount = 0;
+            for (int i = 0; i < 8; i++) {
+                int c = 0;
+                for (int j = 0; j < 8; j++) if (sizeHist[j] == sizeHist[i]) c++;
+                if (c > bestCount || (c == bestCount && sizeHist[i] > kHat)) { bestCount = c; kHat = sizeHist[i]; }
+            }
+            batchIdx = 0;
             batchStartQpc = now.QuadPart;
+        } else {
+            batchIdx++;
         }
         lastArrival = now.QuadPart;   // chain: a 3rd member ε after the 2nd is still intra-batch
 
@@ -281,15 +313,27 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         QueryPerformanceCounter(&afterFlush);
         LONGLONG flushUs = (afterFlush.QuadPart - now.QuadPart) * 1000000 / m_freqQuad;
 
-        // The intra-batch (real) member is stamped with the BATCH-START time so the ring
-        // timeline stays at base cadence; everything else is stamped at its own arrival.
-        m_ring[slot].timestamp.QuadPart = intraBatch ? batchStartQpc : now.QuadPart;
+        if (g_fgPassthrough) {
+            // Passthrough: spread member i across the base period at the predicted density.
+            const LONGLONG pHat = m_srcPeriodEmaQpc.load(std::memory_order_relaxed);
+            const int denom = (kHat > batchIdx) ? kHat : (batchIdx + 1);   // mispredict guard
+            m_ring[slot].timestamp.QuadPart = (pHat > 0 && batchIdx > 0)
+                ? batchStartQpc + ((LONGLONG)batchIdx * pHat) / denom
+                : (intraBatch ? batchStartQpc : now.QuadPart);
+            m_ring[slot].generated = (batchIdx < kHat - 1);   // last predicted member = real
+            if (intraBatch) restamped++;
+        } else {
+            // Keep-real collapse: the intra-batch (real) member is stamped with the BATCH-START
+            // time so the ring timeline stays at base cadence; everything else at its arrival.
+            m_ring[slot].timestamp.QuadPart = intraBatch ? batchStartQpc : now.QuadPart;
+            m_ring[slot].generated = false;
+        }
         m_ring[slot].valid = true;
 
         m_writeCount = count + 1;
         m_published.store(count + 1);  // publish only after the slot write is GPU-complete
 
-        if (intraBatch && count >= 1) {
+        if (!g_fgPassthrough && intraBatch && count >= 1) {
             // Retract the previous member (the generated frame): hide it from future brackets.
             // Content is never overwritten, so a present read already in flight stays coherent.
             m_ring[(int)((count - 1) % RING_SIZE)].valid = false;
@@ -300,12 +344,13 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         // flush = GPU-completion wait added by the cross-device coherency fix; col = cumulative
         // batch-collapsed wakes (skipped or retracted frame-gen members).
         LONGLONG dt = (prevArrival != 0) ? (now.QuadPart - prevArrival) : 0;
-        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld",
+        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld g=%d",
             count,
             (long long)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
             (long long)(dt * usPerTick),
             (long long)flushUs,
-            collapsed);
+            g_fgPassthrough ? restamped : collapsed,
+            m_ring[slot].generated ? 1 : 0);
     }
 }
 

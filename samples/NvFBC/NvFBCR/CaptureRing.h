@@ -84,6 +84,7 @@ private:
         IDirect3DSurface9* mainSurface;
         LARGE_INTEGER timestamp;
         bool valid;
+        bool generated;                   // frame-gen member (passthrough mode tags; advisory)
     };
 
     void CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
