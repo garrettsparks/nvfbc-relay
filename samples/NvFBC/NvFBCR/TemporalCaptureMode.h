@@ -4,6 +4,15 @@
 #include "PresentScheduler.h"
 #include "CaptureRing.h"
 #include "BlendRenderer.h"
+#include "InterpSidecar.h"
+
+// Compose-step strategy for the temporal loop. Blend spec deferred a full interface until a
+// third variant existed; this enum is that moment's lightweight form.
+enum TemporalCompositor {
+    kCompositorNearest = 0,   // t:*  - nearest-pick + hysteresis + Schmitt band
+    kCompositorBlend,         // b:*  - lerp(before, after, w)
+    kCompositorInterp,        // o:*  - NvOFFRUC motion-compensated (falls back to blend)
+};
 
 // Temporal capture mode — nearest-frame selection for smooth fixed-rate capture of a
 // (possibly variable-rate) source.
@@ -35,7 +44,8 @@ class TemporalCaptureMode : public IFrameCaptureMode {
 private:
     PresentScheduler m_scheduler;
     CaptureRing m_ring;
-    BlendRenderer m_blendRenderer;  // used only when m_blend
+    BlendRenderer m_blendRenderer;  // blend compositor + runtime fallback for interp
+    InterpSidecar m_sidecar;        // used only when kCompositorInterp
     LONGLONG m_bracketingDelayQpc;  // present-target lag (adaptive: >= one present period)
     LONGLONG m_lagSlewMaxQpc;       // max lag change per present (bounded latency ramp)
     LONGLONG m_stickinessQpc;       // selection Schmitt band (anti flip-flop at bracket midpoint)
@@ -45,13 +55,14 @@ private:
     LONGLONG m_phasePullSlewQpc;    // max pull change per present
     bool m_lastPickAfter;           // Schmitt state: which bracket side the last pick took
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
-    bool m_blend;                   // false: nearest-pick (t:*); true: lerp compositor (b:*)
+    TemporalCompositor m_comp;      // compose-step strategy (see enum)
     LARGE_INTEGER m_baseQpc;        // logging time origin
     float m_targetFramerate;
     IDirect3DDevice9Ex* m_device;
 
 public:
-    TemporalCaptureMode(float framerate, bool vsyncPresent = false, bool blend = false);
+    TemporalCaptureMode(float framerate, bool vsyncPresent = false,
+                        TemporalCompositor comp = kCompositorNearest);
 
     virtual UINT GetPresentationInterval() const override;
     virtual bool Setup() override;

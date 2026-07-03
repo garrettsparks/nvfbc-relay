@@ -22,6 +22,8 @@ struct FrameBracket {
     LONGLONG beforeDiff;               // target - beforeTs (>= 0)
     LONGLONG afterDiff;                // afterTs - target (> 0)
     int beforeDepth;                   // captures back from newest where the before frame sits
+    int beforeSlot;                    // ring slot indices (cross-API consumers pick their own
+    int afterSlot;                     //  per-device aliases by slot; -1 when absent)
     double weight;                     // beforeDiff / (beforeDiff + afterDiff); 1.0 if no after
 };
 
@@ -76,12 +78,18 @@ public:
     // Find the published frames bracketing targetQpc (present-device aliases).
     void FindBracket(LONGLONG targetQpc, FrameBracket* out) const;
 
+    // Shared handle of slot i (for opening the same texture on another API's device).
+    HANDLE SlotSharedHandle(int i) const { return m_ring[i].sharedHandle; }
+
 private:
     struct Slot {
         IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
         IDirect3DSurface9* capSurface;
         IDirect3DTexture9* mainTexture;   // present device alias (opened via shared handle)
         IDirect3DSurface9* mainSurface;
+        HANDLE sharedHandle;              // retained for cross-API consumers (D3D11 sidecar
+                                          // opens the same resource; duplicated on the probe
+                                          // branch - dedupe at merge)
         LARGE_INTEGER timestamp;
         bool valid;
     };

@@ -17,8 +17,9 @@ static const char* const kPickBeforeAdv = "before-adv";
 static const char* const kPickRepeat    = "repeat";       // nothing newer than last shown — genuine stall
 static const char* const kPickBlend     = "blend";        // composed lerp(before, after, w)
 static const char* const kPickStall     = "stall";        // blend wanted a bracket, only one side exists
+static const char* const kPickInterp    = "interp";       // NvOFFRUC motion-compensated frame
 
-TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, bool blend)
+TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, TemporalCompositor comp)
     : m_bracketingDelayQpc(0)
     , m_lagSlewMaxQpc(0)
     , m_phasePullQpc(0)
@@ -28,7 +29,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, boo
     , m_stickinessQpc(0)
     , m_lastPickAfter(false)
     , m_vsyncPresent(vsyncPresent)
-    , m_blend(blend)
+    , m_comp(comp)
     , m_targetFramerate(framerate)
     , m_device(NULL)
 {
@@ -70,14 +71,17 @@ bool TemporalCaptureMode::Setup() {
     // comfortably above jitter, well below any source period we target (4.17 ms at 240 Hz).
     m_stickinessQpc = m_scheduler.Freq() / 1000;
 
-    if (m_blend && !m_blendRenderer.Setup(m_device)) {
-        LOGERR("Temporal blend mode refused - BlendRenderer setup failed");
+    // Blend renderer serves blend mode AND as interp's runtime fallback.
+    if (m_comp != kCompositorNearest && !m_blendRenderer.Setup(m_device)) {
+        LOGERR("Temporal blend/interp mode refused - BlendRenderer setup failed");
         return false;
     }
 
     LOG("Temporal mode initialized - %s present (%.2f fps nominal), %s",
         m_vsyncPresent ? "vsync/vblank" : "QPC-timer", m_targetFramerate,
-        m_blend ? "lerp-blend compositor" : "nearest-frame selection + hysteresis");
+        m_comp == kCompositorInterp ? "NvOFFRUC interp compositor (blend fallback)" :
+        m_comp == kCompositorBlend ? "lerp-blend compositor" :
+        "nearest-frame selection + hysteresis");
     LOG("Selection stickiness band: %lld us (anti flip-flop at bracket midpoint)",
         m_stickinessQpc * 1000000 / m_scheduler.Freq());
     return true;
@@ -96,6 +100,15 @@ void TemporalCaptureMode::Run(
     // NvFBC to the ring's private capture device. nvfbcDx9 must not be used after this call.
     if (!m_ring.Start(nvfbcDx9, grabParams, m_baseQpc, hwnd)) {
         return;
+    }
+
+    // The sidecar opens ring slot shared handles, so it can only start after the ring did.
+    // Setup failure is loud and non-fatal: the compose arm falls back to blend.
+    if (m_comp == kCompositorInterp) {
+        if (!m_sidecar.Setup(m_device, &m_ring, BUF_WIDTH, BUF_HEIGHT,
+                             m_baseQpc, m_scheduler.Freq())) {
+            LOGERR("Temporal interp: sidecar setup failed - running with blend fallback");
+        }
     }
 
     MSG msg = {};
@@ -167,7 +180,7 @@ void TemporalCaptureMode::Run(
         // (devEma small = near-integer rate ratio, lock possible); at sweeping ratios
         // (90->60) the pull returns to zero and interpolation proceeds — it is genuinely
         // needed there. See docs/phase-alignment-spec.md.
-        if (m_blend && bracket.hasBefore && bracket.hasAfter) {
+        if (m_comp != kCompositorNearest && bracket.hasBefore && bracket.hasAfter) {
             const LONGLONG err = bracket.beforeDiff;
             m_phaseErrEmaQpc = m_phaseErrEmaQpc ? (m_phaseErrEmaQpc * 15 + err) / 16 : err;
             LONGLONG dev = err - m_phaseErrEmaQpc;
@@ -196,14 +209,17 @@ void TemporalCaptureMode::Run(
 
         IDirect3DSurface9* chosen = NULL;
         const char* pick = kPickNone;
-        if (m_blend) {
+        if (m_comp != kCompositorNearest) {
             // BLEND COMPOSE: render lerp(before, after, w) at the target instant. No
             // hysteresis or Schmitt band — there is no discrete pick to oscillate; the
             // schedule's monotonic targets guarantee monotonic content time. When the
             // bracket is one-sided (source stall, warmup) present the existing side
             // unblended; the adaptive lag makes that rare.
             if (bracket.hasBefore && bracket.hasAfter) {
-                if (m_blendRenderer.Blend(bracket.beforeTexture, bracket.afterTexture, (float)bracket.weight)) {
+                if (m_comp == kCompositorInterp && m_sidecar.Enabled()
+                    && m_sidecar.Interpolate(bracket, target)) {
+                    chosen = m_sidecar.OutputSurface9(); pick = kPickInterp;
+                } else if (m_blendRenderer.Blend(bracket.beforeTexture, bracket.afterTexture, (float)bracket.weight)) {
                     pick = kPickBlend;
                 } else {
                     chosen = bracket.beforeSurface; pick = kPickStall;
@@ -284,5 +300,6 @@ void TemporalCaptureMode::Run(
 }
 
 const char* TemporalCaptureMode::GetModeName() const {
-    return m_blend ? "TemporalBlend" : "Temporal";
+    return m_comp == kCompositorInterp ? "TemporalInterp"
+         : m_comp == kCompositorBlend ? "TemporalBlend" : "Temporal";
 }

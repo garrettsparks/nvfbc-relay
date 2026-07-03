@@ -114,17 +114,38 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     // removes stride quantization at non-integer rate ratios (e.g. 90->60) at the cost of
     // motion blur proportional to the bracket gap.
     if (_stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0) {
-        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, /*blend=*/true);
+        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, kCompositorBlend);
     }
     if (modeStr.length() > 2 && modeStr[0] == 'b' && modeStr[1] == ':') {
         try {
             float framerate = stof(modeStr.substr(2));
             if (framerate > 0.0f && framerate <= 1000.0f) {
-                return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, /*blend=*/true);
+                return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, kCompositorBlend);
             }
         }
         catch (...) {
             // Invalid number after b:
+        }
+    }
+
+    // Optical-flow interpolation (o, o:vsync, o:<rate>): the temporal loop with the NvOFFRUC
+    // motion-compensated compositor (D3D11 sidecar). Falls back to blend at runtime on any
+    // sidecar/engine failure. Prior attempt's conclusions are contaminated evidence (no
+    // decoupled capture, guessed timestamps, gen frames unknowingly fed) - this is the
+    // clean-timeline re-trial. Expectation of quality issues is on record; the raw-flow
+    // variant is the co-primary bet (see -interp on the nvof-warp branch).
+    if (_stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
+        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, kCompositorInterp);
+    }
+    if (modeStr.length() > 2 && modeStr[0] == 'o' && modeStr[1] == ':') {
+        try {
+            float framerate = stof(modeStr.substr(2));
+            if (framerate > 0.0f && framerate <= 1000.0f) {
+                return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, kCompositorInterp);
+            }
+        }
+        catch (...) {
+            // Invalid number after o:
         }
     }
 
@@ -146,6 +167,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
     LOGERR("  b, b:vsync     - Temporal blend (lerp of bracketing frames), presented on vsync");
     LOGERR("  b:59.94        - Temporal blend, presented on a timer at given fps");
+    LOGERR("  o, o:vsync     - Optical-flow interpolation (NvOFFRUC), presented on vsync");
+    LOGERR("  o:59.94        - Optical-flow interpolation, presented on a timer at given fps");
     LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
     return NULL;

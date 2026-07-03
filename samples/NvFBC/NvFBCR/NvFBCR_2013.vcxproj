@@ -191,6 +191,7 @@
   <ItemGroup>
     <ClCompile Include="BlendRenderer.cpp" />
     <ClCompile Include="DiagCaptureMode.cpp" />
+    <ClCompile Include="InterpSidecar.cpp" />
     <ClCompile Include="TemporalCaptureMode.cpp" />
     <ClCompile Include="CaptureRing.cpp" />
     <ClCompile Include="NvFBCR.cpp" />
@@ -203,6 +204,7 @@
     <ClInclude Include="BlendRenderer.h" />
     <ClInclude Include="CaptureRing.h" />
     <ClInclude Include="DiagCaptureMode.h" />
+    <ClInclude Include="InterpSidecar.h" />
     <ClInclude Include="TemporalCaptureMode.h" />
     <ClInclude Include="IFrameCaptureMode.h" />
     <ClInclude Include="PresentScheduler.h" />
