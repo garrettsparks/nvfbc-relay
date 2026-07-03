@@ -23,6 +23,7 @@ CaptureRing::CaptureRing()
     , m_height(0)
     , m_freqQuad(0)
     , m_published(0)
+    , m_srcPeriodEmaQpc(0)
     , m_stop(true)   // not running until Start()
     , m_writeCount(0)
 {
@@ -245,7 +246,20 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         const LONGLONG prevArrival = lastArrival;
         const bool intraBatch =
             (prevArrival != 0 && (now.QuadPart - prevArrival) < batchThresholdQpc);
-        if (!intraBatch) batchStartQpc = now.QuadPart;
+        if (!intraBatch) {
+            // Source-period estimate (batch-start to batch-start, so frame-gen epsilon gaps
+            // never pollute it; >125 ms gaps are stalls/timeouts, not cadence). EMA alpha=1/8:
+            // stable within ~8 source frames of a regime change, jitter-immune in steady state.
+            if (batchStartQpc != 0) {
+                const LONGLONG gap = now.QuadPart - batchStartQpc;
+                if (gap < m_freqQuad / 8) {
+                    long long ema = m_srcPeriodEmaQpc.load(std::memory_order_relaxed);
+                    ema = ema ? (ema * 7 + gap) / 8 : gap;
+                    m_srcPeriodEmaQpc.store(ema, std::memory_order_relaxed);
+                }
+            }
+            batchStartQpc = now.QuadPart;
+        }
         lastArrival = now.QuadPart;   // chain: a 3rd member ε after the 2nd is still intra-batch
 
         long long count = m_writeCount;
