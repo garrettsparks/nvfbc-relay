@@ -21,6 +21,10 @@ static const char* const kPickStall     = "stall";        // blend wanted a brac
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, bool blend)
     : m_bracketingDelayQpc(0)
     , m_lagSlewMaxQpc(0)
+    , m_phasePullQpc(0)
+    , m_phaseErrEmaQpc(0)
+    , m_phaseDevEmaQpc(0)
+    , m_phasePullSlewQpc(0)
     , m_stickinessQpc(0)
     , m_lastPickAfter(false)
     , m_vsyncPresent(vsyncPresent)
@@ -55,6 +59,7 @@ bool TemporalCaptureMode::Setup() {
     // slew limit turns regime changes into a bounded latency ramp instead of a step.
     m_bracketingDelayQpc = m_scheduler.PeriodQpc();
     m_lagSlewMaxQpc = m_scheduler.Freq() / 10000;   // 100 us per present
+    m_phasePullSlewQpc = m_scheduler.Freq() / 40000; // 25 us per present (phase-pull, blend only)
 
     // Selection stickiness (Schmitt band): prefer the before-frame unless the after-frame is
     // closer by more than this margin. Without it, when the target dwells near the midpoint
@@ -130,7 +135,7 @@ void TemporalCaptureMode::Run(
             else if (delta < -m_lagSlewMaxQpc) delta = -m_lagSlewMaxQpc;
             m_bracketingDelayQpc += delta;
         }
-        const LONGLONG target = deadline - m_bracketingDelayQpc;
+        const LONGLONG target = deadline - (m_bracketingDelayQpc + m_phasePullQpc);
 
         // Select: nearest-to-target frame, with HYSTERESIS — present frames in strictly
         // increasing timestamp order. Among the bracket frames NEWER than the last presented
@@ -152,6 +157,39 @@ void TemporalCaptureMode::Run(
         // exactly once per sweep: one clean single-frame slip instead of seconds of judder.
         FrameBracket bracket;
         m_ring.FindBracket(target, &bracket);
+
+        // PHASE PULL (blend only): w is the phase offset between the present and capture
+        // clocks — it drifts through [0,1] over each beat period and is essentially never
+        // 0/1, so an interpolating compositor synthesizes EVERY frame even at matched rates
+        // where passthrough is pixel-perfect. Fix: a slow control term pulls the target back
+        // onto the before-frame timeline (increasing lag by the filtered beforeDiff — the
+        // safe direction, it adds bracket margin). Engaged only while the phase is STABLE
+        // (devEma small = near-integer rate ratio, lock possible); at sweeping ratios
+        // (90->60) the pull returns to zero and interpolation proceeds — it is genuinely
+        // needed there. See docs/phase-alignment-spec.md.
+        if (m_blend && bracket.hasBefore && bracket.hasAfter) {
+            const LONGLONG err = bracket.beforeDiff;
+            m_phaseErrEmaQpc = m_phaseErrEmaQpc ? (m_phaseErrEmaQpc * 15 + err) / 16 : err;
+            LONGLONG dev = err - m_phaseErrEmaQpc;
+            if (dev < 0) dev = -dev;
+            m_phaseDevEmaQpc = (m_phaseDevEmaQpc * 15 + dev) / 16;
+
+            const LONGLONG srcP = m_ring.EstimatedSourcePeriodQpc();
+            LONGLONG want = 0;
+            if (srcP > 0 && m_phaseDevEmaQpc < srcP / 8) {
+                want = m_phasePullQpc + m_phaseErrEmaQpc;   // absorb the measured offset
+                if (want > srcP) want = srcP;               // bounded: <= one source period
+            }
+            // Asymmetric slew: approach a lock at full rate; back away at quarter rate so a
+            // transient wrap-resync (dev spike once per beat) dents the pull instead of
+            // draining it. Persistent disengage (non-integer ratio) still decays to zero.
+            const LONGLONG up = m_phasePullSlewQpc;
+            const LONGLONG down = m_phasePullSlewQpc / 4;
+            LONGLONG delta = want - m_phasePullQpc;
+            if (delta > up) delta = up;
+            else if (delta < -down) delta = -down;
+            m_phasePullQpc += delta;
+        }
 
         bool beforeNew = bracket.hasBefore && bracket.beforeTs > lastShownTs;
         bool afterNew  = bracket.hasAfter  && bracket.afterTs  > lastShownTs;
@@ -217,7 +255,7 @@ void TemporalCaptureMode::Run(
                     m_ring.Published());
             }
         } else {
-            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus",
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((bracket.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
@@ -225,7 +263,8 @@ void TemporalCaptureMode::Run(
                 bracket.weight, pick,
                 (long long)((beforePresent.QuadPart - deadline) * usPerTick),
                 (long long)(presentDelta * usPerTick),
-                (long long)(m_bracketingDelayQpc * usPerTick));
+                (long long)(m_bracketingDelayQpc * usPerTick),
+                (long long)(m_phasePullQpc * usPerTick));
             if (!bracket.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }
