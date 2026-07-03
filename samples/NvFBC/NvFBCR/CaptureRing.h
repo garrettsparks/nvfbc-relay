@@ -42,7 +42,17 @@ struct FrameBracket {
 // output shows tearing/partial frames inside slots, that is the cause.
 class CaptureRing {
 public:
-    static const int RING_SIZE = 8;  // generous for validation; shrink later from logged depth
+    // Ring capacity is a STARTUP decision (-ring N, default 8, clamped [3, MAX_RING_SIZE]).
+    // Deliberately not runtime-adaptive: slots are shared GPU textures whose handles the
+    // present device opened at Start — reallocating mid-session would break
+    // publish-then-never-touch and churn shared handles for no benefit. Size once from the
+    // regime you run (FG multipliers halve/divide the valid population: keep-real retraction
+    // leaves ~capacity/k valid frames at multiplier k — at ×2 the default 8 gives 4 valid;
+    // higher multipliers want -ring 4*k). The logged bracket depth d<n> is the margin gauge.
+    static const int MAX_RING_SIZE = 32;
+
+    // Configured slot count for this run.
+    int Capacity() const { return m_capacity; }
 
     CaptureRing();
     ~CaptureRing();
@@ -84,7 +94,8 @@ private:
 
     void CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
 
-    Slot m_ring[RING_SIZE];
+    Slot m_ring[MAX_RING_SIZE];
+    int m_capacity;                       // configured slot count (3..MAX_RING_SIZE)
     IDirect3DSurface9* m_captureTarget;   // on the capture device; NvFBC writes here
     IDirect3DDevice9Ex* m_presentDevice;
     IDirect3DDevice9Ex* m_capDevice;      // private capture device

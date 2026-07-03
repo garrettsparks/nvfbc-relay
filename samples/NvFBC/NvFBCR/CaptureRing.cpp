@@ -7,14 +7,22 @@
 extern IDirect3D9Ex* g_pD3DEx;
 extern NvFBCLibrary* pNVFBCLib;
 extern NvFBCToDx9Vid* NvFBCDX9;
+extern int g_ringCapacity;   // -ring N (NvFBCR.cpp); clamped here at construction
 
 // With a private capture device the blocking grab can wait as long as it likes — its lock
 // holds affect nothing the present thread uses. The timeout only bounds how quickly the
 // capture thread notices a stop request.
 static const NvU32 kGrabWaitMs = 100;
 
+static int ClampCapacity(int n) {
+    if (n < 3) return 3;                            // bracket + eviction margin minimum
+    if (n > CaptureRing::MAX_RING_SIZE) return CaptureRing::MAX_RING_SIZE;
+    return n;
+}
+
 CaptureRing::CaptureRing()
-    : m_captureTarget(NULL)
+    : m_capacity(ClampCapacity(g_ringCapacity))
+    , m_captureTarget(NULL)
     , m_presentDevice(NULL)
     , m_capDevice(NULL)
     , m_capSync(NULL)
@@ -26,7 +34,7 @@ CaptureRing::CaptureRing()
     , m_stop(true)   // not running until Start()
     , m_writeCount(0)
 {
-    for (int i = 0; i < RING_SIZE; i++) {
+    for (int i = 0; i < MAX_RING_SIZE; i++) {
         m_ring[i].capTexture = NULL;
         m_ring[i].capSurface = NULL;
         m_ring[i].mainTexture = NULL;
@@ -40,7 +48,7 @@ CaptureRing::CaptureRing()
 CaptureRing::~CaptureRing() {
     Stop();
 
-    for (int i = 0; i < RING_SIZE; i++) {
+    for (int i = 0; i < MAX_RING_SIZE; i++) {
         if (m_ring[i].mainSurface) { m_ring[i].mainSurface->Release(); m_ring[i].mainSurface = NULL; }
         if (m_ring[i].mainTexture) { m_ring[i].mainTexture->Release(); m_ring[i].mainTexture = NULL; }
         if (m_ring[i].capSurface)  { m_ring[i].capSurface->Release();  m_ring[i].capSurface = NULL; }
@@ -121,7 +129,7 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     // Shared ring slots: create on the capture device with a shared handle, open the same
     // resource on the present device. Slots are render-target textures so consumers can
     // StretchRect the surface (temporal) or sample the texture in a shader (blend).
-    for (int i = 0; i < RING_SIZE; i++) {
+    for (int i = 0; i < m_capacity; i++) {
         HANDLE shared = NULL;
         hr = m_capDevice->CreateTexture(
             m_width, m_height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT,
@@ -189,7 +197,7 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     grabParams->dwFlags = NVFBC_TODX9VID_WAIT_WITH_TIMEOUT;
     grabParams->dwWaitTime = kGrabWaitMs;
 
-    LOG("CaptureRing initialized - %dx%d, %d shared slots, private capture device", m_width, m_height, RING_SIZE);
+    LOG("CaptureRing initialized - %dx%d, %d shared slots, private capture device", m_width, m_height, m_capacity);
 
     m_published.store(0);
     m_writeCount = 0;
@@ -249,7 +257,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         lastArrival = now.QuadPart;   // chain: a 3rd member ε after the 2nd is still intra-batch
 
         long long count = m_writeCount;
-        int slot = (int)(count % RING_SIZE);
+        int slot = (int)(count % m_capacity);
         m_capDevice->StretchRect(m_captureTarget, &srcRect, m_ring[slot].capSurface, &srcRect, D3DTEXF_NONE);
 
         // Force the StretchRect to complete on the capture GPU before publishing, so the
@@ -278,7 +286,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         if (intraBatch && count >= 1) {
             // Retract the previous member (the generated frame): hide it from future brackets.
             // Content is never overwritten, so a present read already in flight stays coherent.
-            m_ring[(int)((count - 1) % RING_SIZE)].valid = false;
+            m_ring[(int)((count - 1) % m_capacity)].valid = false;
             collapsed++;
         }
 
@@ -299,12 +307,12 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, FrameBracket* out) const {
     *out = FrameBracket{};
 
     const long long p = m_published.load();
-    long long oldest = p - (RING_SIZE - 1);
+    long long oldest = p - (m_capacity - 1);
     if (oldest < 0) oldest = 0;
 
     LONGLONG bestBeforeDiff = LLONG_MAX, bestAfterDiff = LLONG_MAX;
     for (long long i = p - 1; i >= oldest; i--) {
-        int slot = (int)(i % RING_SIZE);
+        int slot = (int)(i % m_capacity);
         if (!m_ring[slot].valid) continue;
         LONGLONG ts = m_ring[slot].timestamp.QuadPart;
         LONGLONG diff = targetQpc - ts;

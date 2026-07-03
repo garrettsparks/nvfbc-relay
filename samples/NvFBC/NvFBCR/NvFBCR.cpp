@@ -127,6 +127,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
     LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
+    LOGERR("Options:");
+    LOGERR("  -ring N        - Capture ring slot count for t: modes (default 8)");
     return NULL;
 }
 
@@ -151,6 +153,11 @@ DisplayPosition source, target;
 // Target display's D3D9 adapter ordinal (set once displays are chosen). DiagCaptureMode uses it
 // to open a private device on the capture-card adapter for GetRasterStatus probes.
 int g_targetAdapterIndex = 0;
+
+// CaptureRing slot count (-ring N). Startup-only; CaptureRing clamps to [3, MAX_RING_SIZE].
+// Default 8 = validated baseline. Raise for high frame-gen multipliers (keep-real retraction
+// leaves ~N/k valid frames at multiplier k; see docs/ring-capacity-spec.md).
+int g_ringCapacity = 8;
 
 vector <DisplayPosition> displays;
 
@@ -407,6 +414,12 @@ bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, s
         }
         else if (args[i] == "-framerate" && i + 1 < args.size()) {
             *framerateStr = args[i + 1];  // Store as string instead of converting to int
+            foundAny = true;
+            i++; // Skip the value
+        }
+        else if (args[i] == "-ring" && i + 1 < args.size()) {
+            try { g_ringCapacity = stoi(args[i + 1]); }
+            catch (...) { LOGERR("Invalid -ring value '%s' - keeping default %d", args[i + 1].c_str(), g_ringCapacity); }
             foundAny = true;
             i++; // Skip the value
         }

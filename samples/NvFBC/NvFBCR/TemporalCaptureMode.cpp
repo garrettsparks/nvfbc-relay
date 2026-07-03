@@ -165,7 +165,7 @@ void TemporalCaptureMode::Run(
         if (!bracket.hasBefore) {
             // Benign while the ring is still filling at startup; once it has wrapped at least
             // once it means the target fell off the back of the ring.
-            if (m_ring.Published() >= CaptureRing::RING_SIZE) {
+            if (m_ring.Published() >= m_ring.Capacity()) {
                 LOGERR("temporal: target older than ring window - ring too small / delay too large (p=%lld)",
                     m_ring.Published());
             }
