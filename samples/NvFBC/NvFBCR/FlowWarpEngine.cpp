@@ -55,8 +55,14 @@ FlowWarpEngine::FlowWarpEngine()
 
 FlowWarpEngine::~FlowWarpEngine() {
 #ifdef NVOF_D3D11_AVAILABLE
-    // VERIFY-ON-HEADER-DROP: release registered OF buffers + destroy the session per the
-    // D3D11 header's function list (names below follow the SDK samples' conventions).
+    NV_OF_D3D11_API_FUNCTION_LIST* funcs = (NV_OF_D3D11_API_FUNCTION_LIST*)m_ofFuncs;
+    if (funcs) {
+        if (m_regBefore) funcs->nvOFUnregisterResourceD3D11((NvOFGPUBufferHandle)m_regBefore);
+        if (m_regAfter) funcs->nvOFUnregisterResourceD3D11((NvOFGPUBufferHandle)m_regAfter);
+        if (m_regFlow) funcs->nvOFUnregisterResourceD3D11((NvOFGPUBufferHandle)m_regFlow);
+        if (m_ofHandle) funcs->nvOFDestroy((NvOFHandle)m_ofHandle);
+        delete funcs;
+    }
 #endif
     if (m_ofLib) FreeLibrary((HMODULE)m_ofLib);
     if (m_warpSampler) m_warpSampler->Release();
@@ -130,27 +136,76 @@ bool FlowWarpEngine::CreateWarpPipeline() {
 bool FlowWarpEngine::CreateFlowSession() {
 #ifndef NVOF_D3D11_AVAILABLE
     LOGERR("FlowWarpEngine: nvOpticalFlowD3D11.h not present in third_party/NvOFSDK/ - "
-           "drop it from your Optical Flow SDK and rebuild to enable the raw-flow path");
+           "vendor it from the Optical Flow SDK and rebuild to enable the raw-flow path");
     return false;
 #else
-    // VERIFY-ON-HEADER-DROP: everything in this block follows the SDK samples' documented
-    // sequence; diff names/signatures against the real header on first build.
-    //   1. LoadLibrary("nvofapi64.dll")                        (driver-shipped)
-    //   2. NvOFAPICreateInstanceD3D11(NV_OF_API_VERSION, &funcList)
-    //   3. funcList.nvCreateOpticalFlowD3D11(m_dev, m_ctx, &m_ofHandle)
-    //   4. nvOFInit: NV_OF_INIT_PARAMS { width, height, outGridSize = GRID_SIZE_4,
-    //        mode = NV_OF_MODE_OPTICALFLOW, perfLevel = NV_OF_PERF_LEVEL_MEDIUM,
-    //        predDirection = NV_OF_PRED_DIRECTION_FORWARD, inputBufferFormat = ABGR8 }
-    //   5. nvOFRegisterResourceD3D11 for the two input textures (sidecar's converted BGRA8;
-    //      byte-order verify vs ABGR8) and m_flowTex as the OUTPUT buffer.
     m_ofLib = (void*)LoadLibraryA("nvofapi64.dll");
     if (!m_ofLib) {
         LOGERR("FlowWarpEngine: nvofapi64.dll not found (driver R455+ required)");
         return false;
     }
-    LOGERR("FlowWarpEngine: session init not yet verified against the dropped header - "
-           "complete CreateFlowSession per the VERIFY block and remove this line");
-    return false;
+    typedef NV_OF_STATUS(NVOFAPI* PFNCreateInstance)(uint32_t, NV_OF_D3D11_API_FUNCTION_LIST*);
+    PFNCreateInstance createInstance =
+        (PFNCreateInstance)GetProcAddress((HMODULE)m_ofLib, "NvOFAPICreateInstanceD3D11");
+    if (!createInstance) {
+        LOGERR("FlowWarpEngine: NvOFAPICreateInstanceD3D11 export missing (driver too old for D3D11 OF?)");
+        return false;
+    }
+    NV_OF_D3D11_API_FUNCTION_LIST* funcs = new NV_OF_D3D11_API_FUNCTION_LIST{};
+    NV_OF_STATUS st = createInstance(NV_OF_API_VERSION, funcs);
+    if (st != NV_OF_SUCCESS) {
+        LOGERR("FlowWarpEngine: NvOFAPICreateInstanceD3D11 failed (status %d)", (int)st);
+        delete funcs;
+        return false;
+    }
+    m_ofFuncs = funcs;
+
+    NvOFHandle hOf = NULL;
+    st = funcs->nvCreateOpticalFlowD3D11(m_dev, m_ctx, &hOf);
+    if (st != NV_OF_SUCCESS) {
+        LOGERR("FlowWarpEngine: nvCreateOpticalFlowD3D11 failed (status %d)", (int)st);
+        return false;
+    }
+    m_ofHandle = hOf;
+
+    // Log the driver's supported input formats once - if BGRA8 turns out wrong for ABGR8,
+    // this line plus a channel-swap symptom pins it immediately.
+    uint32_t fmtCount = 0;
+    if (funcs->nvOFGetSurfaceFormatCountD3D11(hOf, NV_OF_BUFFER_USAGE_INPUT,
+            NV_OF_MODE_OPTICALFLOW, &fmtCount) == NV_OF_SUCCESS && fmtCount > 0 && fmtCount <= 16) {
+        DXGI_FORMAT fmts[16] = {};
+        if (funcs->nvOFGetSurfaceFormatD3D11(hOf, NV_OF_BUFFER_USAGE_INPUT,
+                NV_OF_MODE_OPTICALFLOW, fmts) == NV_OF_SUCCESS) {
+            for (uint32_t i = 0; i < fmtCount; i++) {
+                LOG("FlowWarpEngine: supported input DXGI format %d", (int)fmts[i]);
+            }
+        }
+    }
+
+    NV_OF_INIT_PARAMS init = {};
+    init.width = (uint32_t)m_width;
+    init.height = (uint32_t)m_height;
+    init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
+    init.mode = NV_OF_MODE_OPTICALFLOW;
+    init.perfLevel = NV_OF_PERF_LEVEL_MEDIUM;   // SLOW = best quality; knob for later A/B
+    init.predDirection = NV_OF_PRED_DIRECTION_FORWARD;   // BOTH + bwdOutputBuffer = v2 occlusion
+    init.inputBufferFormat = NV_OF_BUFFER_FORMAT_ABGR8;
+    st = funcs->nvOFInit(hOf, &init);
+    if (st != NV_OF_SUCCESS) {
+        LOGERR("FlowWarpEngine: nvOFInit failed (status %d)", (int)st);
+        return false;
+    }
+
+    // Flow output registers now; the two input textures register lazily on first Interpolate
+    // (the sidecar owns them and hands stable pointers per call).
+    NvOFGPUBufferHandle hFlow = NULL;
+    st = funcs->nvOFRegisterResourceD3D11(hOf, m_flowTex, &hFlow);
+    if (st != NV_OF_SUCCESS) {
+        LOGERR("FlowWarpEngine: flow buffer registration failed (status %d)", (int)st);
+        return false;
+    }
+    m_regFlow = hFlow;
+    return true;
 #endif
 }
 
@@ -160,12 +215,38 @@ bool FlowWarpEngine::Interpolate(ID3D11ShaderResourceView* beforeSrv, ID3D11Shad
     if (!m_enabled) return false;
 
 #ifdef NVOF_D3D11_AVAILABLE
-    // VERIFY-ON-HEADER-DROP: nvOFExecute with inputFrame=beforeTex, referenceFrame=afterTex,
-    // outputBuffer=m_regFlow (writes m_flowTex). Synchronous on the immediate context.
-    (void)beforeTex; (void)afterTex;
-    return false;   // unreachable until CreateFlowSession completes
+    NV_OF_D3D11_API_FUNCTION_LIST* funcs = (NV_OF_D3D11_API_FUNCTION_LIST*)m_ofFuncs;
+    // Lazy input registration: the sidecar's ping/pong pointers are stable for the session.
+    if (!m_regBefore) {
+        NvOFGPUBufferHandle h = NULL;
+        if (funcs->nvOFRegisterResourceD3D11((NvOFHandle)m_ofHandle, beforeTex, &h) != NV_OF_SUCCESS) {
+            LOGERR("FlowWarpEngine: before-frame registration failed");
+            return false;
+        }
+        m_regBefore = h;
+    }
+    if (!m_regAfter) {
+        NvOFGPUBufferHandle h = NULL;
+        if (funcs->nvOFRegisterResourceD3D11((NvOFHandle)m_ofHandle, afterTex, &h) != NV_OF_SUCCESS) {
+            LOGERR("FlowWarpEngine: after-frame registration failed");
+            return false;
+        }
+        m_regAfter = h;
+    }
+    NV_OF_EXECUTE_INPUT_PARAMS in = {};
+    in.inputFrame = (NvOFGPUBufferHandle)m_regBefore;
+    in.referenceFrame = (NvOFGPUBufferHandle)m_regAfter;
+    in.disableTemporalHints = NV_OF_FALSE;   // successive video frames: prior flow seeds this one
+    NV_OF_EXECUTE_OUTPUT_PARAMS out = {};
+    out.outputBuffer = (NvOFGPUBufferHandle)m_regFlow;
+    NV_OF_STATUS st = funcs->nvOFExecute((NvOFHandle)m_ofHandle, &in, &out);
+    if (st != NV_OF_SUCCESS) {
+        LOGERR("FlowWarpEngine: nvOFExecute failed (status %d)", (int)st);
+        return false;
+    }
 #else
     (void)beforeTex; (void)afterTex;
+    return false;
 #endif
 
     // Warp pass (live code, runs once the session above is completed):
