@@ -15,13 +15,16 @@ static const char* const kPickAfter     = "after";
 static const char* const kPickAfterAdv  = "after-adv";    // only the after-frame is newer than last shown
 static const char* const kPickBeforeAdv = "before-adv";
 static const char* const kPickRepeat    = "repeat";       // nothing newer than last shown — genuine stall
+static const char* const kPickBlend     = "blend";        // composed lerp(before, after, w)
+static const char* const kPickStall     = "stall";        // blend wanted a bracket, only one side exists
 
-TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent)
+TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, bool blend)
     : m_bracketingDelayQpc(0)
     , m_lagSlewMaxQpc(0)
     , m_stickinessQpc(0)
     , m_lastPickAfter(false)
     , m_vsyncPresent(vsyncPresent)
+    , m_blend(blend)
     , m_targetFramerate(framerate)
     , m_device(NULL)
 {
@@ -62,8 +65,14 @@ bool TemporalCaptureMode::Setup() {
     // comfortably above jitter, well below any source period we target (4.17 ms at 240 Hz).
     m_stickinessQpc = m_scheduler.Freq() / 1000;
 
-    LOG("Temporal mode initialized - %s present (%.2f fps nominal), nearest-frame selection + hysteresis",
-        m_vsyncPresent ? "vsync/vblank" : "QPC-timer", m_targetFramerate);
+    if (m_blend && !m_blendRenderer.Setup(m_device)) {
+        LOGERR("Temporal blend mode refused - BlendRenderer setup failed");
+        return false;
+    }
+
+    LOG("Temporal mode initialized - %s present (%.2f fps nominal), %s",
+        m_vsyncPresent ? "vsync/vblank" : "QPC-timer", m_targetFramerate,
+        m_blend ? "lerp-blend compositor" : "nearest-frame selection + hysteresis");
     LOG("Selection stickiness band: %lld us (anti flip-flop at bracket midpoint)",
         m_stickinessQpc * 1000000 / m_scheduler.Freq());
     return true;
@@ -149,7 +158,26 @@ void TemporalCaptureMode::Run(
 
         IDirect3DSurface9* chosen = NULL;
         const char* pick = kPickNone;
-        if (beforeNew && afterNew) {
+        if (m_blend) {
+            // BLEND COMPOSE: render lerp(before, after, w) at the target instant. No
+            // hysteresis or Schmitt band — there is no discrete pick to oscillate; the
+            // schedule's monotonic targets guarantee monotonic content time. When the
+            // bracket is one-sided (source stall, warmup) present the existing side
+            // unblended; the adaptive lag makes that rare.
+            if (bracket.hasBefore && bracket.hasAfter) {
+                if (m_blendRenderer.Blend(bracket.beforeTexture, bracket.afterTexture, (float)bracket.weight)) {
+                    pick = kPickBlend;
+                } else {
+                    chosen = bracket.beforeSurface; pick = kPickStall;
+                }
+            } else if (bracket.hasBefore) {
+                chosen = bracket.beforeSurface; pick = kPickStall;
+            } else if (bracket.hasAfter) {
+                chosen = bracket.afterSurface; pick = kPickStall;
+            } else {
+                pick = kPickRepeat;
+            }
+        } else if (beforeNew && afterNew) {
             const LONGLONG bias = m_lastPickAfter ? -m_stickinessQpc : m_stickinessQpc;
             if (bracket.beforeDiff <= bracket.afterDiff + bias) { chosen = bracket.beforeSurface; pick = kPickBefore; lastShownTs = bracket.beforeTs; m_lastPickAfter = false; }
             else { chosen = bracket.afterSurface; pick = kPickAfter; lastShownTs = bracket.afterTs; m_lastPickAfter = true; }
@@ -217,5 +245,5 @@ void TemporalCaptureMode::Run(
 }
 
 const char* TemporalCaptureMode::GetModeName() const {
-    return "Temporal";
+    return m_blend ? "TemporalBlend" : "Temporal";
 }

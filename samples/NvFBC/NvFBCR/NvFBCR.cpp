@@ -109,6 +109,25 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         return new DiagCaptureMode(/*vsyncPresent=*/true);
     }
 
+    // Blend selection (b, b:vsync, b:<rate>): the same CaptureRing temporal loop, but the
+    // compose step renders lerp(before, after, w) instead of picking the nearest frame —
+    // removes stride quantization at non-integer rate ratios (e.g. 90->60) at the cost of
+    // motion blur proportional to the bracket gap.
+    if (_stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0) {
+        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, /*blend=*/true);
+    }
+    if (modeStr.length() > 2 && modeStr[0] == 'b' && modeStr[1] == ':') {
+        try {
+            float framerate = stof(modeStr.substr(2));
+            if (framerate > 0.0f && framerate <= 1000.0f) {
+                return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, /*blend=*/true);
+            }
+        }
+        catch (...) {
+            // Invalid number after b:
+        }
+    }
+
     // Try to parse as numeric framerate
     try {
         float framerate = stof(modeStr);
@@ -125,6 +144,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  vsync          - VSync-driven presentation");
     LOGERR("  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)");
     LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
+    LOGERR("  b, b:vsync     - Temporal blend (lerp of bracketing frames), presented on vsync");
+    LOGERR("  b:59.94        - Temporal blend, presented on a timer at given fps");
     LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
     return NULL;
@@ -452,6 +473,9 @@ void ConsoleUserInput(string* framerateStr) {
     cout << "  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)" << endl;
     cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
     cout << endl;
+    cout << "  b, b:vsync     - Temporal blend (lerp of bracketing frames), presented on vsync" << endl;
+    cout << "  b:59.94        - Temporal blend, presented on a timer at given fps" << endl;
+    cout << endl;
     cout << "  diag, diag:vsync - Clock probes (DWM compose timing + card raster)" << endl;
     cout << endl;
     cout << "  60             - Timer mode (simple timer-driven at specified fps)" << endl;
@@ -484,18 +508,6 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     int nCmdShow)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-
-    // No-op shader compile whose only purpose is keeping the d3dcompiler.dll import in the
-    // binary. The blend modes were the only real D3DCompile callers; deleting them dropped the
-    // import and the next build tripped a Defender Wacatac.B!ml false positive (old build clean,
-    // new build flagged, same-day scans). Experiment: restore the import, observe the verdict.
-    // Blend mode will reintroduce a real D3DCompile call later; remove this shim then.
-    {
-        ID3DBlob* nopBlob = NULL;
-        const char* nopShader = "float4 main() : COLOR0 { return 0; }";
-        D3DCompile(nopShader, strlen(nopShader), NULL, NULL, NULL, "main", "ps_3_0", 0, 0, &nopBlob, NULL);
-        if (nopBlob) nopBlob->Release();
-    }
 
     if (!InitDisplays()) {
         LOGERR("Unable to enumerate display adapters");
