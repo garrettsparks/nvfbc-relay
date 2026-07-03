@@ -84,3 +84,11 @@ and the existing pacing suite (blend must not regress pacing in any variant).
 Decision rule: if option 2 locks reliably at near-integer ratios and 90→60 blend looks clean
 without anchoring, ship 2 and drop 3 (simpler); 3 wins only if its anchoring visibly improves
 non-integer content without visible breathing.
+
+## Implementation notes (branch `claude/phase-pull-snap`)
+
+Snap lives entirely in the blend compose arm: Schmitt pair latch < P̂/8 / release > P̂/4 on
+`min(beforeDiff, afterDiff)`; latched → StretchRect the nearer real frame (`pick=snap`),
+else blend as usual. One bool of state (`m_snapLatched`). If the source-period estimate is
+unavailable (warmup) snap stays off. The snapped side may be the *after* frame — that is
+nearest semantics, safe: it exists, it is real, and it is within P̂/8 of the target.

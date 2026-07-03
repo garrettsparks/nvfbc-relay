@@ -46,6 +46,7 @@ private:
     bool m_lastPickAfter;           // Schmitt state: which bracket side the last pick took
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
     bool m_blend;                   // false: nearest-pick (t:*); true: lerp compositor (b:*)
+    bool m_snapLatched;             // blend snap-anchor state (Schmitt: latch P/8, release P/4)
     LARGE_INTEGER m_baseQpc;        // logging time origin
     float m_targetFramerate;
     IDirect3DDevice9Ex* m_device;

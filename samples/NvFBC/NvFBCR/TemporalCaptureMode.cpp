@@ -17,6 +17,7 @@ static const char* const kPickBeforeAdv = "before-adv";
 static const char* const kPickRepeat    = "repeat";       // nothing newer than last shown — genuine stall
 static const char* const kPickBlend     = "blend";        // composed lerp(before, after, w)
 static const char* const kPickStall     = "stall";        // blend wanted a bracket, only one side exists
+static const char* const kPickSnap      = "snap";         // real frame within snap threshold - passthrough
 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, bool blend)
     : m_bracketingDelayQpc(0)
@@ -29,6 +30,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, boo
     , m_lastPickAfter(false)
     , m_vsyncPresent(vsyncPresent)
     , m_blend(blend)
+    , m_snapLatched(false)
     , m_targetFramerate(framerate)
     , m_device(NULL)
 {
@@ -203,7 +205,32 @@ void TemporalCaptureMode::Run(
             // bracket is one-sided (source stall, warmup) present the existing side
             // unblended; the adaptive lag makes that rare.
             if (bracket.hasBefore && bracket.hasAfter) {
-                if (m_blendRenderer.Blend(bracket.beforeTexture, bracket.afterTexture, (float)bracket.weight)) {
+                // SNAP ANCHORING: when a real frame lies within P/8 of the target, present it
+                // directly - real pixels beat a 90/10 blend, and (for FRUC later) the
+                // interpolation cost/artifact surface disappears on those frames. Schmitt
+                // thresholds (latch < P/8, release > P/4) because the drifting phase crossing
+                // a single threshold would flip passthrough<->blend every present - the same
+                // boundary lesson as the selection stickiness band. Under phase-pull lock the
+                // latch holds permanently (nearDiff ~ 0); at sweeping ratios it anchors the
+                // pass near w=0/1 once per cycle.
+                const LONGLONG srcP = m_ring.EstimatedSourcePeriodQpc();
+                const LONGLONG nearDiff =
+                    bracket.beforeDiff < bracket.afterDiff ? bracket.beforeDiff : bracket.afterDiff;
+                if (srcP > 0) {
+                    if (m_snapLatched) {
+                        if (nearDiff > srcP / 4) m_snapLatched = false;
+                    } else {
+                        if (nearDiff < srcP / 8) m_snapLatched = true;
+                    }
+                } else {
+                    m_snapLatched = false;
+                }
+
+                if (m_snapLatched) {
+                    chosen = (bracket.beforeDiff <= bracket.afterDiff)
+                        ? bracket.beforeSurface : bracket.afterSurface;
+                    pick = kPickSnap;
+                } else if (m_blendRenderer.Blend(bracket.beforeTexture, bracket.afterTexture, (float)bracket.weight)) {
                     pick = kPickBlend;
                 } else {
                     chosen = bracket.beforeSurface; pick = kPickStall;
