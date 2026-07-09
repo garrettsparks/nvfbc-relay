@@ -7,6 +7,7 @@
 extern IDirect3D9Ex* g_pD3DEx;
 extern NvFBCLibrary* pNVFBCLib;
 extern NvFBCToDx9Vid* NvFBCDX9;
+extern int g_nvbufCount;   // console triage knob: NvFBC output buffers to register (0 = RING_SIZE)
 
 // With a private capture device the blocking grab can wait as long as it likes — its lock
 // holds affect nothing the present thread uses. The timeout only bounds how quickly the
@@ -20,6 +21,7 @@ CaptureRing::CaptureRing()
     , m_nvfbc(NULL)
     , m_width(0)
     , m_height(0)
+    , m_numBuf(RING_SIZE)
     , m_freqQuad(0)
     , m_published(0)
     , m_stop(true)   // not running until Start()
@@ -148,12 +150,20 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     }
     NvFBCDX9 = m_nvfbc;
 
-    // DIRECT WRITE: register every ring slot as an NvFBC output buffer. Each grab names its
+    // DIRECT WRITE: register ring slots as NvFBC output buffers. Each grab names its
     // destination slot via dwBufferIdx, so the captured frame lands in the shared ring texture
     // with no intermediate capture-target surface and no per-frame StretchRect. Setup is the
     // loud failure point if the driver rejects shared-handle textures as outputs.
-    NVFBC_TODX9VID_OUT_BUF outBuf[RING_SIZE];
-    for (int i = 0; i < RING_SIZE; i++) {
+    //
+    // TRIAGE: dwNumBuffers = RING_SIZE (8) fail-fasts inside NvFBC64_.dll during SetUp
+    // (0xc0000409 STATUS_STACK_BUFFER_OVERRUN, driver 6.14.15.9597) — looks like an
+    // undocumented buffer-count cap with no bounds check. g_nvbufCount (console prompt)
+    // binary-searches the limit. Any value below RING_SIZE breaks the eviction-geometry
+    // safety argument (writes recycle into the FindBracket scan window): crash triage
+    // only, NOT for quality captures.
+    m_numBuf = (g_nvbufCount >= 1 && g_nvbufCount <= RING_SIZE) ? g_nvbufCount : RING_SIZE;
+    NVFBC_TODX9VID_OUT_BUF outBuf[RING_SIZE] = {};   // zero pSecondary (reserved) on every entry
+    for (int i = 0; i < m_numBuf; i++) {
         outBuf[i].pPrimary = m_ring[i].capSurface;
     }
 
@@ -170,19 +180,21 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     setupParams.bDiffMap = 0;
     setupParams.ppBuffer = outBuf;
     setupParams.eMode = NVFBC_TODX9VID_ARGB10;
-    setupParams.dwNumBuffers = RING_SIZE;
+    setupParams.dwNumBuffers = (NvU32)m_numBuf;
     setupParams.bHDRRequest = TRUE;
 
+    LOG("CaptureRing: calling NvFBCToDx9VidSetUp - %d output buffers (ring %d)", m_numBuf, RING_SIZE);
     if (NVFBC_SUCCESS != m_nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
         LOGERR("CaptureRing: NvFBCToDx9VidSetUp on capture device failed");
         return false;
     }
+    LOG("CaptureRing: NvFBCToDx9VidSetUp succeeded");
 
     // Fully event-driven blocking grab — safe now that the lock it holds is private.
     grabParams->dwFlags = NVFBC_TODX9VID_WAIT_WITH_TIMEOUT;
     grabParams->dwWaitTime = kGrabWaitMs;
 
-    LOG("CaptureRing initialized - %dx%d, %d shared slots, private capture device", m_width, m_height, RING_SIZE);
+    LOG("CaptureRing initialized - %dx%d, %d shared slots (%d registered as NvFBC buffers), private capture device", m_width, m_height, RING_SIZE, m_numBuf);
 
     m_published.store(0);
     m_writeCount = 0;
@@ -219,12 +231,13 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     LOG("CaptureRing: batch-collapse keep-real (intra-batch wake <3ms = real member; previous slot retracted)");
 
     while (!m_stop.load()) {
-        // Direct write: name the destination slot before the grab. The slot is the oldest ring
-        // position (one past the FindBracket scan window), so NvFBC's in-place write can never
-        // touch a slot the present thread might read — same eviction geometry as the copy
-        // design, minus the copy.
+        // Direct write: name the destination slot before the grab. At m_numBuf == RING_SIZE the
+        // slot is the oldest ring position (one past the FindBracket scan window), so NvFBC's
+        // in-place write can never touch a slot the present thread might read — same eviction
+        // geometry as the copy design, minus the copy. Below RING_SIZE (triage) that guarantee
+        // is void.
         long long count = m_writeCount;
-        int slot = (int)(count % RING_SIZE);
+        int slot = (int)(count % m_numBuf);
         grabParams->dwBufferIdx = (NvU32)slot;
 
         NVFBCRESULT res = m_nvfbc->NvFBCToDx9VidGrabFrame(grabParams);

@@ -152,6 +152,12 @@ DisplayPosition source, target;
 // to open a private device on the capture-card adapter for GetRasterStatus probes.
 int g_targetAdapterIndex = 0;
 
+// Direct-write triage knob (console prompt): NvFBC output buffers to register in SetUp.
+// 0 = default (CaptureRing uses RING_SIZE). SetUp with all 8 fail-fasts inside NvFBC64_.dll
+// (0xc0000409 STATUS_STACK_BUFFER_OVERRUN) - binary-search the driver's undocumented
+// buffer-count cap. See CaptureRing::Start for the full note.
+int g_nvbufCount = 0;
+
 vector <DisplayPosition> displays;
 
 void Cleanup()
@@ -461,6 +467,10 @@ void ConsoleUserInput(string* framerateStr) {
     getline(cin, cinString);
     if (!cinString.empty())
         *framerateStr = cinString;
+
+    int nvbufInput = ReadIntFromCmd("NvFBC output buffers 1-8 (direct-write triage, blank = 8) ? ");
+    if (nvbufInput >= 1)
+        g_nvbufCount = nvbufInput;
 
     for (vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
 

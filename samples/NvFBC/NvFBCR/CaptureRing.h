@@ -92,6 +92,7 @@ private:
     NvFBCToDx9Vid* m_nvfbc;               // session bound to the capture device
     int m_width;
     int m_height;
+    int m_numBuf;                         // NvFBC output buffers registered (triage knob; RING_SIZE for quality runs)
     LARGE_INTEGER m_baseQpc;              // logging origin
     LONGLONG m_freqQuad;                  // QPC ticks/sec
 
