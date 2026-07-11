@@ -84,6 +84,7 @@ void TemporalCaptureMode::Run(
     RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
     LONGLONG lastPresentQpc = 0;
     LONGLONG lastShownTs = 0;   // hysteresis: QPC of the last presented frame (strictly advances)
+    IDirect3DSurface9* lastShownSurface = NULL;   // what pick=repeat must re-present
     m_scheduler.Seed();
 
     while (TRUE)
@@ -140,12 +141,19 @@ void TemporalCaptureMode::Run(
             chosen = bracket.beforeSurface; pick = kPickBeforeAdv; lastShownTs = bracket.beforeTs; m_lastPickAfter = false;
         } else {
             // No frame newer than the last shown: genuine stall — repeat (the fundamental dupe).
-            chosen = bracket.hasBefore ? bracket.beforeSurface : (bracket.hasAfter ? bracket.afterSurface : NULL);
+            // Repeat must re-present the last SHOWN frame, and bracket.before is not always
+            // it. After an after-pick the target can still trail the shown frame (lag > one
+            // source period, e.g. adaptive lag on a slow source), leaving before one frame
+            // BEHIND the screen, so fetching it steps the display backward.
+            chosen = lastShownSurface;
+            if (!chosen && bracket.hasBefore) chosen = bracket.beforeSurface;
+            if (!chosen && bracket.hasAfter)  chosen = bracket.afterSurface;
             pick = kPickRepeat;
         }
 
         if (chosen) {
             m_device->StretchRect(chosen, &srcRect, g_backbuffer, &srcRect, D3DTEXF_NONE);
+            lastShownSurface = chosen;
         }
 
         LARGE_INTEGER beforePresent;
