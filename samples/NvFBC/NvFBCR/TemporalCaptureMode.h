@@ -34,6 +34,7 @@ private:
     LONGLONG m_stickinessQpc;       // selection Schmitt band (anti flip-flop at bracket midpoint)
     int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
     bool m_lastPickAfter;           // Schmitt state: which bracket side the last pick took
+    bool m_advGateOpen;             // Schmitt state: last advance-gate decision (see ADVANCE GATE)
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
     LARGE_INTEGER m_baseQpc;        // logging time origin
     float m_targetFramerate;

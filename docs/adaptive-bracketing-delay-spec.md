@@ -30,13 +30,17 @@ gracefully, having nothing to blend toward — is blocked on exactly this.
   → error line with the suggested `-src` (starvation warning). Measured at least 2× faster
   with a real win available (> 2 ms) → info line with the lower-latency `-src` suggestion.
 
-**Selection midpoint gate** (same rework): when only the after-frame is newer than the last
-shown, advance to it only once the target has passed the bracket midpoint, with the
-stickiness band as margin. The ungated advance boundary sits exactly where
-`before == lastShown` begins (w = 0); the present/source clock beat parks the target phase
-there periodically and arrival jitter flip-flops the crossing for seconds — a cluster of
-early-advance cadence glitches. Gated, both sides of the crossing produce the same clean
-cadence, and the advance lands when the target genuinely reaches the after-frame.
+**Advance gate** (same rework): when only the after-frame is newer than the last shown,
+advance UNLESS the target is still on the shown frame (`beforeDiff` inside the stickiness
+band), with Schmitt state (reopen at 2x band) so a crossing costs one clean flip. The
+ungated advance boundary sits exactly where `before == lastShown` begins (w = 0); the
+present/source clock beat parks the target phase there periodically and arrival jitter
+flip-flops the crossing for seconds — a cluster of early-advance cadence glitches. Healthy
+operating points keep `beforeDiff` far above the band in every regime, so the gate is inert
+outside the crossing. A midpoint comparison is deliberately NOT used: matched-rate steady
+state operates at the midpoint, and any threshold at the operating point flip-flops on
+jitter regardless of margin (measured: ~280 dupe+skip pairs per 60→60 run, replay-simulated
+and confirmed; the proximity gate replays bit-identical to ungated there).
 
 ## Constants
 

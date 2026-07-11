@@ -27,6 +27,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent)
     , m_stickinessQpc(0)
     , m_telemetryCountdown(0)
     , m_lastPickAfter(false)
+    , m_advGateOpen(true)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_device(NULL)
@@ -149,21 +150,30 @@ void TemporalCaptureMode::Run(
         bool beforeNew = bracket.hasBefore && bracket.beforeTs > lastShownTs;
         bool afterNew  = bracket.hasAfter  && bracket.afterTs  > lastShownTs;
 
+        // ADVANCE GATE (Schmitt): when only the after-frame is newer than the last shown,
+        // advance UNLESS the target is still on the shown frame (beforeDiff inside the band).
+        // The ungated advance boundary sits exactly where before == lastShown begins (w = 0);
+        // the clock beat parks the target phase there periodically and arrival jitter
+        // flip-flops the crossing, early-advancing a full source period each flip. Healthy
+        // operating points keep beforeDiff far above the band in every regime, so the gate is
+        // inert outside the crossing; the state bit widens the reopen threshold so a crossing
+        // costs one clean flip. A midpoint comparison is WRONG here: matched-rate steady
+        // state operates at the midpoint, and any threshold at the operating point
+        // flip-flops on jitter regardless of margin (the stickiness-band lesson).
+        bool advance = afterNew;
+        if (advance && bracket.hasBefore && !beforeNew) {
+            const LONGLONG reopen = m_advGateOpen ? m_stickinessQpc : 2 * m_stickinessQpc;
+            m_advGateOpen = bracket.beforeDiff >= reopen;
+            advance = m_advGateOpen;
+        }
+
         IDirect3DSurface9* chosen = NULL;
         const char* pick = kPickNone;
         if (beforeNew && afterNew) {
             const LONGLONG bias = m_lastPickAfter ? -m_stickinessQpc : m_stickinessQpc;
             if (bracket.beforeDiff <= bracket.afterDiff + bias) { chosen = bracket.beforeSurface; pick = kPickBefore; lastShownTs = bracket.beforeTs; m_lastPickAfter = false; }
             else { chosen = bracket.afterSurface; pick = kPickAfter; lastShownTs = bracket.afterTs; m_lastPickAfter = true; }
-        } else if (afterNew && (!bracket.hasBefore || bracket.beforeDiff > bracket.afterDiff + m_stickinessQpc)) {
-            // Only the after-frame is newer than the last shown: advance to it, but ONLY once
-            // the target has passed the bracket midpoint (stickiness band as margin). Before
-            // the midpoint the target still points at the frame on screen, and advancing
-            // would jump the content ahead early. Without this gate the advance boundary
-            // sits exactly where before == lastShown begins, and arrival jitter flip-flops
-            // that crossing for seconds each time the clock beat dwells on it. Declining the
-            // advance falls through to repeat; the next presents advance once the target
-            // genuinely reaches the after-frame.
+        } else if (advance) {
             chosen = bracket.afterSurface; pick = kPickAfterAdv; lastShownTs = bracket.afterTs; m_lastPickAfter = true;
         } else if (beforeNew) {
             chosen = bracket.beforeSurface; pick = kPickBeforeAdv; lastShownTs = bracket.beforeTs; m_lastPickAfter = false;
