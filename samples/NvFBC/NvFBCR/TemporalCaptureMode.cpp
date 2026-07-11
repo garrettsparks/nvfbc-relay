@@ -6,11 +6,14 @@ extern IDirect3DDevice9Ex* g_pD3D9Device;
 extern IDirect3DSurface9* g_backbuffer;
 extern int BUF_WIDTH;
 extern int BUF_HEIGHT;
-extern float g_srcRateHint;   // -src <fps>: declared source rate; 0 = unset (assume >= 60)
 
 // Presents between estimator-vs-assumption audits (about 10 s at 60 Hz): rare enough to keep
 // the log quiet, frequent enough that a wrong -src is caught within the first minute.
 static const int kTelemetryPeriodPresents = 600;
+
+// Source rate assumed when -src is not given: the slowest source served without
+// configuration, at any present rate. Slower sources need an explicit -src.
+static const float kDefaultAssumedSrcFps = 60.0f;
 
 // Selection-outcome labels for the per-present "pick=" log field. The temporal log line is a
 // stable format consumed by offline analysis — change values only deliberately.
@@ -21,7 +24,7 @@ static const char* const kPickAfterAdv  = "after-adv";    // only the after-fram
 static const char* const kPickBeforeAdv = "before-adv";
 static const char* const kPickRepeat    = "repeat";       // nothing newer than last shown — genuine stall
 
-TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent)
+TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_stickinessQpc(0)
@@ -30,9 +33,16 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent)
     , m_advGateOpen(true)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
+    , m_srcRateHint(srcRateHint)
     , m_device(NULL)
 {
     m_baseQpc.QuadPart = 0;
+}
+
+LONGLONG TemporalCaptureMode::LagForSourcePeriod(LONGLONG srcPeriodQpc) const {
+    LONGLONG lag = srcPeriodQpc + srcPeriodQpc / 4;
+    if (lag < m_scheduler.PeriodQpc()) lag = m_scheduler.PeriodQpc();
+    return lag;
 }
 
 UINT TemporalCaptureMode::GetPresentationInterval() const {
@@ -61,10 +71,9 @@ bool TemporalCaptureMode::Setup() {
     // ride the present-period floor. Computed once and never moved: the lag is output
     // latency, and only a constant can be compensated for downstream (T10). The measured
     // source period is not fed back into the lag; it only audits the assumption (telemetry).
-    const float assumedFps = (g_srcRateHint > 0.0f) ? g_srcRateHint : 60.0f;
+    const float assumedFps = (m_srcRateHint > 0.0f) ? m_srcRateHint : kDefaultAssumedSrcFps;
     m_assumedSrcPeriodQpc = (LONGLONG)((double)m_scheduler.Freq() / assumedFps);
-    m_bracketingDelayQpc = m_assumedSrcPeriodQpc + m_assumedSrcPeriodQpc / 4;
-    if (m_bracketingDelayQpc < m_scheduler.PeriodQpc()) m_bracketingDelayQpc = m_scheduler.PeriodQpc();
+    m_bracketingDelayQpc = LagForSourcePeriod(m_assumedSrcPeriodQpc);
     m_telemetryCountdown = kTelemetryPeriodPresents;
 
     // Selection stickiness (Schmitt band): prefer the before-frame unless the after-frame is
@@ -80,7 +89,7 @@ bool TemporalCaptureMode::Setup() {
         m_vsyncPresent ? "vsync/vblank" : "QPC-timer", m_targetFramerate);
     LOG("Temporal lag fixed at %lld us (source assumed %s%.1f fps)",
         m_bracketingDelayQpc * 1000000 / m_scheduler.Freq(),
-        (g_srcRateHint > 0.0f) ? "-src " : ">= ", assumedFps);
+        (m_srcRateHint > 0.0f) ? "-src " : ">= ", assumedFps);
     LOG("Selection stickiness band: %lld us (anti flip-flop at bracket midpoint)",
         m_stickinessQpc * 1000000 / m_scheduler.Freq());
     return true;
@@ -94,6 +103,7 @@ void TemporalCaptureMode::Run(
 {
     QueryPerformanceCounter(&m_baseQpc);
     const double usPerTick = 1000000.0 / (double)m_scheduler.Freq();
+    const long long lagUs = (long long)(m_bracketingDelayQpc * usPerTick);
 
     // Note: Start releases nvfbcDx9 (the session bound to the present device) and rebinds
     // NvFBC to the ring's private capture device. nvfbcDx9 must not be used after this call.
@@ -225,29 +235,33 @@ void TemporalCaptureMode::Run(
                 bracket.weight, pick,
                 (long long)((beforePresent.QuadPart - deadline) * usPerTick),
                 (long long)(presentDelta * usPerTick),
-                (long long)(m_bracketingDelayQpc * usPerTick));
+                lagUs);
             if (!bracket.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }
         }
 
-        // ESTIMATOR TELEMETRY: the measured source period no longer drives the lag; it audits
+        // ESTIMATOR TELEMETRY: the measured source period never drives the lag; it audits
         // the declared assumption. Slower than assumed means the bracketing headroom is gone
         // and repeats follow (wrong -src, or the source is struggling); much faster than
-        // assumed means latency is being left on the table.
+        // assumed means latency is left on the table, and a lag exceeding the ring's history
+        // at the measured rate means selection is pinned at the ring's oldest frame.
         if (--m_telemetryCountdown <= 0) {
             m_telemetryCountdown = kTelemetryPeriodPresents;
             const LONGLONG est = m_ring.EstimatedSourcePeriodQpc();
             if (est > 0) {
                 const double estFps = (double)m_scheduler.Freq() / (double)est;
-                LONGLONG lagForEst = est + est / 4;
-                if (lagForEst < m_scheduler.PeriodQpc()) lagForEst = m_scheduler.PeriodQpc();
-                if (est > m_assumedSrcPeriodQpc + m_assumedSrcPeriodQpc / 8) {
+                const LONGLONG lagForEst = LagForSourcePeriod(est);
+                const long long lagForEstUs = (long long)(lagForEst * usPerTick);
+                if (m_bracketingDelayQpc > est * CaptureRing::RING_SIZE) {
+                    LOGERR("temporal telemetry: lag %lld us exceeds ring history at the measured ~%.1f fps - display pinned at oldest frame; pass -src %.0f (lag %lld us)",
+                        lagUs, estFps, estFps, lagForEstUs);
+                } else if (est > m_assumedSrcPeriodQpc + m_assumedSrcPeriodQpc / 8) {
                     LOGERR("temporal telemetry: source measuring ~%.1f fps, slower than assumed - expect repeats; pass -src %.0f (lag %lld us)",
-                        estFps, estFps, lagForEst * 1000000 / m_scheduler.Freq());
+                        estFps, estFps, lagForEstUs);
                 } else if (est * 2 < m_assumedSrcPeriodQpc && lagForEst + m_scheduler.Freq() / 500 < m_bracketingDelayQpc) {
                     LOG("temporal telemetry: source measuring ~%.1f fps; -src %.0f would lower lag to %lld us",
-                        estFps, estFps, lagForEst * 1000000 / m_scheduler.Freq());
+                        estFps, estFps, lagForEstUs);
                 }
             }
         }

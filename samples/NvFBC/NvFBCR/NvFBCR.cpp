@@ -71,6 +71,23 @@ struct DisplayPosition {
     string friendlyName;
 };
 
+// Assumed source frame rate for the temporal lag (-src <fps>). The lag is static per run:
+// max(present period, 1.25 x assumed source period); 0 means unset and the temporal modes
+// assume sources run at 60 fps or faster. Declare slower sources (-src 30) to avoid
+// after-frame starvation; declare faster ones (-src 240) to ride the present-period floor.
+float g_srcRateHint = 0.0f;
+
+// Single fps validation policy for every entry point that accepts a rate (mode strings,
+// -src): accept (0, 1000].
+static bool ParseFps(const string& value, float* outFps) {
+    try {
+        float v = stof(value);
+        if (v > 0.0f && v <= 1000.0f) { *outFps = v; return true; }
+    }
+    catch (...) {}
+    return false;
+}
+
 // Helper function to parse capture mode string and create appropriate mode instance
 IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     if (modeStr.empty() || _stricmp(modeStr.c_str(), "vsync") == 0) {
@@ -83,19 +100,14 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     // fullscreen game on the source — the production case). Nominal 60 fps drives the
     // bracketing lag; the actual present rate is DWM's delivery.
     if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0) {
-        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true);
+        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint);
     }
 
     // Temporal selection + QPC-timer present (t:60 format).
     if (modeStr.length() > 2 && modeStr[0] == 't' && modeStr[1] == ':') {
-        try {
-            float framerate = stof(modeStr.substr(2));
-            if (framerate > 0.0f && framerate <= 1000.0f) {
-                return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false);
-            }
-        }
-        catch (...) {
-            // Invalid number after t:
+        float framerate;
+        if (ParseFps(modeStr.substr(2), &framerate)) {
+            return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint);
         }
     }
 
@@ -110,14 +122,11 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     }
 
     // Try to parse as numeric framerate
-    try {
-        float framerate = stof(modeStr);
-        if (framerate > 0.0f && framerate <= 1000.0f) {
+    {
+        float framerate;
+        if (ParseFps(modeStr, &framerate)) {
             return new TimerCaptureMode(framerate);
         }
-    }
-    catch (...) {
-        // Not a valid number
     }
 
     LOGERR("Invalid capture mode: '%s'", modeStr.c_str());
@@ -153,12 +162,6 @@ DisplayPosition source, target;
 // Target display's D3D9 adapter ordinal (set once displays are chosen). DiagCaptureMode uses it
 // to open a private device on the capture-card adapter for GetRasterStatus probes.
 int g_targetAdapterIndex = 0;
-
-// Assumed source frame rate for the temporal lag (-src <fps>). The lag is static per run:
-// max(present period, 1.25 x assumed source period); 0 means unset and the temporal modes
-// assume sources run at 60 fps or faster. Declare slower sources (-src 30) to avoid
-// after-frame starvation; declare faster ones (-src 240) to ride the present-period floor.
-float g_srcRateHint = 0.0f;
 
 vector <DisplayPosition> displays;
 
@@ -370,14 +373,31 @@ int ReadIntFromCmd(string prompt) {
     return cinString.empty() ? -1 : stoi(cinString);
 }
 
-// Shared by the command line and the console prompt: validate and apply an -src value.
-static void ApplySrcRate(const string& value) {
-    try {
-        float v = stof(value);
-        if (v > 0.0f && v <= 1000.0f) { g_srcRateHint = v; return; }
+// Whitespace tokenizer shared by the command line and the console prompt, so both paths
+// always split options identically.
+static vector<string> SplitTokens(const string& text) {
+    vector<string> tokens;
+    size_t pos = 0;
+    while (pos < text.length()) {
+        while (pos < text.length() && text[pos] == ' ') pos++;
+        size_t start = pos;
+        while (pos < text.length() && text[pos] != ' ') pos++;
+        if (pos > start) tokens.push_back(text.substr(start, pos - start));
     }
-    catch (...) {}
-    LOGERR("-src value '%s' invalid (1-1000) - ignored", value.c_str());
+    return tokens;
+}
+
+// Option dispatch shared by the command line and the console prompt: applies the option at
+// tokens[i] and returns how many tokens it consumed (0 = not a recognized option). New
+// value-taking options belong here so both entry points accept them.
+static size_t ApplyOption(const vector<string>& tokens, size_t i) {
+    if (tokens[i] == "-src" && i + 1 < tokens.size()) {
+        float v;
+        if (ParseFps(tokens[i + 1], &v)) g_srcRateHint = v;
+        else LOGERR("-src value '%s' invalid (1-1000) - ignored", tokens[i + 1].c_str());
+        return 2;
+    }
+    return 0;
 }
 
 bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, string* framerateStr) {
@@ -389,25 +409,7 @@ bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, s
         return false;
     }
 
-    string cmdLine(lpCmdLine);
-    vector<string> args;
-
-    // Split command line into tokens
-    size_t pos = 0;
-    while (pos < cmdLine.length()) {
-        // Skip whitespace
-        while (pos < cmdLine.length() && cmdLine[pos] == ' ') {
-            pos++;
-        }
-        if (pos >= cmdLine.length()) break;
-
-        // Extract token
-        size_t tokenStart = pos;
-        while (pos < cmdLine.length() && cmdLine[pos] != ' ') {
-            pos++;
-        }
-        args.push_back(cmdLine.substr(tokenStart, pos - tokenStart));
-    }
+    vector<string> args = SplitTokens(string(lpCmdLine));
 
     bool foundAny = false;
 
@@ -428,10 +430,12 @@ bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, s
             foundAny = true;
             i++; // Skip the value
         }
-        else if (args[i] == "-src" && i + 1 < args.size()) {
-            ApplySrcRate(args[i + 1]);
-            foundAny = true;
-            i++; // Skip the value
+        else {
+            size_t consumed = ApplyOption(args, i);
+            if (consumed > 0) {
+                foundAny = true;
+                i += consumed - 1;
+            }
         }
     }
 
@@ -485,19 +489,14 @@ void ConsoleUserInput(string* framerateStr) {
     getline(cin, cinString);
     if (!cinString.empty()) {
         // The prompt is the usual launch path, so the mode may carry options ("t:60 -src 30").
-        // Only -src is meaningful here; displays were already chosen interactively.
+        // Display indices were already chosen interactively; everything after the mode token
+        // goes through the same option dispatch as the command line.
         size_t space = cinString.find(' ');
         if (space != string::npos) {
-            vector<string> opts;
-            size_t p = space;
-            while (p < cinString.length()) {
-                while (p < cinString.length() && cinString[p] == ' ') p++;
-                size_t s = p;
-                while (p < cinString.length() && cinString[p] != ' ') p++;
-                if (p > s) opts.push_back(cinString.substr(s, p - s));
-            }
+            vector<string> opts = SplitTokens(cinString.substr(space));
             for (size_t i = 0; i < opts.size(); i++) {
-                if (opts[i] == "-src" && i + 1 < opts.size()) { ApplySrcRate(opts[i + 1]); i++; }
+                size_t consumed = ApplyOption(opts, i);
+                if (consumed > 0) i += consumed - 1;
                 else cout << "Unknown option '" << opts[i] << "' - ignored" << endl;
             }
             if (g_srcRateHint > 0.0f) cout << "Declared source rate: " << g_srcRateHint << " fps" << endl;

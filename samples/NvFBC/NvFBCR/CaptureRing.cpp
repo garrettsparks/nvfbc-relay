@@ -248,8 +248,11 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             (prevArrival != 0 && (now.QuadPart - prevArrival) < batchThresholdQpc);
         if (!intraBatch) {
             // Source-period estimate (batch-start to batch-start, so frame-gen epsilon gaps
-            // never pollute it; >125 ms gaps are stalls/timeouts, not cadence). EMA alpha=1/8:
-            // stable within ~8 source frames of a regime change, jitter-immune in steady state.
+            // never pollute it; gaps over 125 ms are stalls, not cadence). Grab-timeout
+            // re-grabs of a static source return SUCCESS at the timeout period and DO
+            // enter: that is the source's effective cadence while nothing new is drawn.
+            // EMA alpha 1/8: stable within ~8 source frames of a regime change,
+            // jitter-immune in steady state.
             if (batchStartQpc != 0) {
                 const LONGLONG gap = now.QuadPart - batchStartQpc;
                 if (gap < m_freqQuad / 8) {

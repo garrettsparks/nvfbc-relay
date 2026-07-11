@@ -38,10 +38,15 @@ private:
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
     LARGE_INTEGER m_baseQpc;        // logging time origin
     float m_targetFramerate;
+    float m_srcRateHint;            // declared source fps (-src); 0 = unset, assume >= 60
     IDirect3DDevice9Ex* m_device;
 
+    // The one lag-sizing rule: 1.25x the source period for bracketing headroom, floored at
+    // the present period. Setup sizes the operative lag with it; telemetry sizes suggestions.
+    LONGLONG LagForSourcePeriod(LONGLONG srcPeriodQpc) const;
+
 public:
-    TemporalCaptureMode(float framerate, bool vsyncPresent = false);
+    TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f);
 
     virtual UINT GetPresentationInterval() const override;
     virtual bool Setup() override;
