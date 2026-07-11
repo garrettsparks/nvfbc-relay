@@ -84,6 +84,7 @@ void TemporalCaptureMode::Run(
     RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
     LONGLONG lastPresentQpc = 0;
     LONGLONG lastShownTs = 0;   // hysteresis: QPC of the last presented frame (strictly advances)
+    IDirect3DSurface9* lastShownSurface = NULL;   // what pick=repeat must re-present (see below)
     m_scheduler.Seed();
 
     while (TRUE)
@@ -140,12 +141,21 @@ void TemporalCaptureMode::Run(
             chosen = bracket.beforeSurface; pick = kPickBeforeAdv; lastShownTs = bracket.beforeTs; m_lastPickAfter = false;
         } else {
             // No frame newer than the last shown: genuine stall — repeat (the fundamental dupe).
-            chosen = bracket.hasBefore ? bracket.beforeSurface : (bracket.hasAfter ? bracket.afterSurface : NULL);
+            // Repeat must re-present the LAST SHOWN surface, not bracket.before: whenever the
+            // last pick took the after-frame and the target still trails it (any regime where
+            // the lag exceeds one source period), bracket.before is one frame OLDER than what
+            // is on screen — fetching it steps the display backward for a frame. Measured on
+            // the adaptive-lag branch at 30 fps source / 60 Hz present: every [after-adv,
+            // repeat] pair oscillated forward-back (+2S/-S pixel shifts), while dev regimes
+            // masked the bug because there before == lastShown always held.
+            chosen = lastShownSurface ? lastShownSurface
+                   : (bracket.hasBefore ? bracket.beforeSurface : (bracket.hasAfter ? bracket.afterSurface : NULL));
             pick = kPickRepeat;
         }
 
         if (chosen) {
             m_device->StretchRect(chosen, &srcRect, g_backbuffer, &srcRect, D3DTEXF_NONE);
+            lastShownSurface = chosen;   // ring surfaces live for the session; borrowed, not owned
         }
 
         LARGE_INTEGER beforePresent;
