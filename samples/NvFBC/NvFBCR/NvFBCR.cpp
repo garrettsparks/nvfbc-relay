@@ -77,6 +77,11 @@ struct DisplayPosition {
 // after-frame starvation; declare faster ones (-src 240) to ride the present-period floor.
 float g_srcRateHint = 0.0f;
 
+// Content probe (-probe): temporal modes log per-grab NvFBC diffmap and classification-map
+// reductions (blk=/hf= on capture lines). Instrument for FG characterization and source-dupe
+// ground truth; adds driver work per grab, so OFF is the production default.
+int g_contentProbe = 0;
+
 // Single fps validation policy for every entry point that accepts a rate (mode strings,
 // -src): accept (0, 1000].
 static bool ParseFps(const string& value, float* outFps) {
@@ -100,14 +105,14 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     // fullscreen game on the source — the production case). Nominal 60 fps drives the
     // bracketing lag; the actual present rate is DWM's delivery.
     if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0) {
-        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint);
+        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_contentProbe != 0);
     }
 
     // Temporal selection + QPC-timer present (t:60 format).
     if (modeStr.length() > 2 && modeStr[0] == 't' && modeStr[1] == ':') {
         float framerate;
         if (ParseFps(modeStr.substr(2), &framerate)) {
-            return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint);
+            return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_contentProbe != 0);
         }
     }
 
@@ -138,6 +143,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
     LOGERR("Options:");
     LOGERR("  -src 30        - Declared source fps; sizes the static temporal lag (default: assume >= 60)");
+    LOGERR("  -probe         - Log per-grab content probe (diffmap/classification) - instrument runs only");
     return NULL;
 }
 
@@ -391,6 +397,10 @@ static vector<string> SplitTokens(const string& text) {
 // tokens[i] and returns how many tokens it consumed (0 = not a recognized option). New
 // value-taking options belong here so both entry points accept them.
 static size_t ApplyOption(const vector<string>& tokens, size_t i) {
+    if (tokens[i] == "-probe") {
+        g_contentProbe = 1;
+        return 1;
+    }
     if (tokens[i] == "-src" && i + 1 < tokens.size()) {
         float v;
         if (ParseFps(tokens[i + 1], &v)) g_srcRateHint = v;
@@ -479,6 +489,7 @@ void ConsoleUserInput(string* framerateStr) {
     cout << "  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)" << endl;
     cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
     cout << "  t:60 -src 30   - Mode plus options: -src <fps> declares the source rate (lag sizing)" << endl;
+    cout << "  t:60 -probe    - Content probe on capture log lines (instrument runs only)" << endl;
     cout << endl;
     cout << "  diag, diag:vsync - Clock probes (DWM compose timing + card raster)" << endl;
     cout << endl;

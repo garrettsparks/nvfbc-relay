@@ -26,6 +26,13 @@ CaptureRing::CaptureRing()
     , m_srcPeriodEmaQpc(0)
     , m_stop(true)   // not running until Start()
     , m_writeCount(0)
+    , m_probeRequested(false)
+    , m_probeActive(false)
+    , m_classMapActive(false)
+    , m_diffMap(NULL)
+    , m_classMap(NULL)
+    , m_diffBlocks(0)
+    , m_classStamps(0)
 {
     for (int i = 0; i < RING_SIZE; i++) {
         m_ring[i].capTexture = NULL;
@@ -59,6 +66,10 @@ CaptureRing::~CaptureRing() {
         m_capDevice->Release();
         m_capDevice = NULL;
     }
+    // Safe to free after Stop(): the driver only writes the probe maps during grab calls,
+    // and the grab thread is joined.
+    if (m_diffMap)  { VirtualFree(m_diffMap, 0, MEM_RELEASE);  m_diffMap = NULL; }
+    if (m_classMap) { VirtualFree(m_classMap, 0, MEM_RELEASE); m_classMap = NULL; }
 }
 
 bool CaptureRing::Setup(IDirect3DDevice9Ex* presentDevice, int width, int height) {
@@ -181,7 +192,59 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     setupParams.dwNumBuffers = 1;
     setupParams.bHDRRequest = TRUE;
 
-    if (NVFBC_SUCCESS != m_nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
+    // CONTENT PROBE (-probe): ask the driver for a per-grab diffmap (changed 32x32 blocks vs
+    // the previous grab) and a high-frequency-content classification map. Both are written
+    // into client memory alongside the grab; the capture loop reduces them to two numbers on
+    // the capture log line. Driver support varies by feature, so degrade one rung at a time:
+    // full probe -> diffmap only -> no probe (loud, so a silent-zero column is impossible).
+    void* diffMaps[1] = { NULL };
+    void* classMaps[1] = { NULL };
+    if (m_probeRequested) {
+        m_diffBlocks  = ((m_width + 31) / 32) * ((m_height + 31) / 32);
+        m_classStamps = ((m_width + 15) / 16) * ((m_height + 15) / 16);
+        m_diffMap  = VirtualAlloc(NULL, NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        m_classMap = VirtualAlloc(NULL, NVFBC_TODX9VID_MAX_CLASSIFICATION_MAP_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (m_diffMap && m_classMap) {
+            diffMaps[0] = m_diffMap;
+            classMaps[0] = m_classMap;
+            setupParams.bDiffMap = 1;
+            setupParams.eDiffMapBlockSize = NVFBC_TODX9VID_DIFFMAP_BLOCKSIZE_32X32;
+            setupParams.dwDiffMapBuffSize = NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE;
+            setupParams.ppDiffMap = diffMaps;
+            setupParams.bClassificationMap = 1;
+            setupParams.dwClassificationMapBuffSize = NVFBC_TODX9VID_MAX_CLASSIFICATION_MAP_SIZE;
+            setupParams.dwClassificationMapStampWidth = 16;
+            setupParams.dwClassificationMapStampHeight = 16;
+            setupParams.ppClassificationMap = classMaps;
+            m_probeActive = true;
+            m_classMapActive = true;
+        } else {
+            LOGERR("CaptureRing: probe buffer allocation failed - content probe disabled");
+        }
+    }
+
+    if (m_probeActive && NVFBC_SUCCESS != m_nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
+        LOGERR("CaptureRing: probe setup refused with classification map - retrying diffmap-only");
+        setupParams.bClassificationMap = 0;
+        setupParams.dwClassificationMapBuffSize = 0;
+        setupParams.dwClassificationMapStampWidth = 0;
+        setupParams.dwClassificationMapStampHeight = 0;
+        setupParams.ppClassificationMap = NULL;
+        m_classMapActive = false;
+        if (NVFBC_SUCCESS != m_nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
+            LOGERR("CaptureRing: probe setup refused entirely - content probe disabled");
+            setupParams.bDiffMap = 0;
+            setupParams.dwDiffMapBuffSize = 0;
+            setupParams.ppDiffMap = NULL;
+            m_probeActive = false;
+        }
+    }
+    if (m_probeActive) {
+        LOG("CaptureRing: content probe ACTIVE - diffmap 32x32 (%d blocks)%s; capture lines gain blk=/hf=",
+            m_diffBlocks, m_classMapActive ? ", classification 16x16 stamps" : " (classification unavailable)");
+    }
+
+    if (!m_probeActive && NVFBC_SUCCESS != m_nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
         LOGERR("CaptureRing: NvFBCToDx9VidSetUp on capture device failed");
         return false;
     }
@@ -303,12 +366,32 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         // flush = GPU-completion wait added by the cross-device coherency fix; col = cumulative
         // batch-collapsed wakes (skipped or retracted frame-gen members).
         LONGLONG dt = (prevArrival != 0) ? (now.QuadPart - prevArrival) : 0;
-        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld",
+        // Probe reduction: blk = diffmap blocks changed vs the previous grab (0 = content
+        // dupe); hf = classification-map byte sum (relative high-frequency-content measure,
+        // format empirically calibrated). The scan runs after publish so it never delays a
+        // frame, but it does widen the wake-to-regrab window - probe runs are instrument
+        // runs, not reference runs.
+        char probeSuffix[64];
+        probeSuffix[0] = '\0';
+        if (m_probeActive) {
+            const unsigned char* diff = (const unsigned char*)m_diffMap;
+            int changed = 0;
+            for (int i = 0; i < m_diffBlocks; i++) changed += (diff[i] != 0);
+            unsigned long long hfSum = 0;
+            if (m_classMapActive) {
+                const unsigned char* cls = (const unsigned char*)m_classMap;
+                for (int i = 0; i < m_classStamps; i++) hfSum += cls[i];
+            }
+            snprintf(probeSuffix, sizeof(probeSuffix), " blk=%d/%d hf=%llu", changed, m_diffBlocks, hfSum);
+        }
+
+        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld%s",
             count,
             (long long)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
             (long long)(dt * usPerTick),
             (long long)flushUs,
-            collapsed);
+            collapsed,
+            probeSuffix);
     }
 }
 

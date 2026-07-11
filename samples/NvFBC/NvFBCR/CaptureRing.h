@@ -80,6 +80,13 @@ public:
     // Find the published frames bracketing targetQpc (present-device aliases).
     void FindBracket(LONGLONG targetQpc, FrameBracket* out) const;
 
+    // Request the content probe (-probe) before Start: per-grab NvFBC diffmap (changed 32x32
+    // blocks vs the previous grab) and high-frequency-content classification map, appended to
+    // the capture log line. Instrument-only; adds driver-side per-grab work plus a small scan
+    // to the capture loop (widens the wake-to-regrab window), so keep it OFF for production
+    // runs and same-config A/B any numbers gathered with it on.
+    void EnableContentProbe() { m_probeRequested = true; }
+
 private:
     struct Slot {
         IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
@@ -108,4 +115,12 @@ private:
     std::atomic<long long> m_srcPeriodEmaQpc;  // capture-thread-written source period estimate
     std::atomic<bool> m_stop;
     long long m_writeCount;               // capture-thread-local
+
+    bool m_probeRequested;                // content probe asked for (-probe)
+    bool m_probeActive;                   // probe survived session setup (driver support)
+    bool m_classMapActive;                // classification map survived setup (may lack driver support separately)
+    void* m_diffMap;                      // VirtualAlloc'd; one byte per block, driver-written per grab
+    void* m_classMap;                     // VirtualAlloc'd; high-frequency-content stamps, driver-written per grab
+    int m_diffBlocks;                     // diffmap bytes to scan for m_width x m_height
+    int m_classStamps;                    // classification bytes to scan for m_width x m_height
 };

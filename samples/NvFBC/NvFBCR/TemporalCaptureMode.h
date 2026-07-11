@@ -39,6 +39,7 @@ private:
     LARGE_INTEGER m_baseQpc;        // logging time origin
     float m_targetFramerate;
     float m_srcRateHint;            // declared source fps (-src); 0 = unset, assume >= 60
+    bool m_contentProbe;            // -probe: per-grab diffmap + classification instrument
     IDirect3DDevice9Ex* m_device;
 
     // The one lag-sizing rule: 1.25x the source period for bracketing headroom, floored at
@@ -46,7 +47,8 @@ private:
     LONGLONG LagForSourcePeriod(LONGLONG srcPeriodQpc) const;
 
 public:
-    TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f);
+    TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
+                        bool contentProbe = false);
 
     virtual UINT GetPresentationInterval() const override;
     virtual bool Setup() override;
