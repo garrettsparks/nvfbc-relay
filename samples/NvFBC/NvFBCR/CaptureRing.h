@@ -69,6 +69,14 @@ public:
     // Count of fully-published frames so far.
     long long Published() const { return m_published.load(); }
 
+    // EMA of the source's batch-start period in QPC ticks (0 until warmed up). TELEMETRY
+    // ONLY: consumers may audit their configured source-rate assumption against it, but it
+    // must never drive the bracketing lag; the lag is a static launch-time constant so that
+    // output latency stays compensable downstream. Intra-batch frame-gen gaps and stall gaps
+    // over 125 ms are excluded; grab-timeout re-grabs of a static source DO enter (they are
+    // the source's effective cadence while nothing new is drawn).
+    LONGLONG EstimatedSourcePeriodQpc() const { return m_srcPeriodEmaQpc.load(); }
+
     // Find the published frames bracketing targetQpc (present-device aliases).
     void FindBracket(LONGLONG targetQpc, FrameBracket* out) const;
 
@@ -97,6 +105,7 @@ private:
 
     std::thread m_captureThread;
     std::atomic<long long> m_published;
+    std::atomic<long long> m_srcPeriodEmaQpc;  // capture-thread-written source period estimate
     std::atomic<bool> m_stop;
     long long m_writeCount;               // capture-thread-local
 };

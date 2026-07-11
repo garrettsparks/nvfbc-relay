@@ -37,7 +37,8 @@ future refactor will be tempted to take.
 - The validation suite (below) executed and signed off.
 
 **Explicitly out of scope (successor work, do not let it creep in):** interpolation of any kind
-(blend/NVOFA); generated-frame tagging or pass-through (Path B); adaptive bracketing delay;
+(blend/NVOFA); generated-frame tagging or pass-through (Path B); source-rate-aware bracketing
+lag (shipped later as the static `-src` lag; see docs/adaptive-bracketing-delay-spec.md);
 direct-write (`dwBufferIdx`) capture; upconversion (source < present); desktop-source display
 sync (phase-locked timer); HDR/DX11 output.
 
@@ -213,9 +214,10 @@ present-device aliases — never Released by the caller.
 2. `target = deadline − bracketingDelay` where `bracketingDelay = one present period` — lag the
    content target so a frame *newer* than it exists (bracketing). Known limitation: this assumes
    source ≥ present rate; at lower base rates (e.g. 30-base FG) the after-frame often doesn't
-   exist and selection degrades gracefully to repeats. The adaptive version
-   (`max(presentPeriod, ~1.25 × measured source period)`) is a successor item — a **blend**
-   prerequisite, not a nearest-pick one.
+   exist and selection degrades gracefully to repeats. The successor fix (a **blend**
+   prerequisite, not a nearest-pick one) shipped as the static `-src`-declared lag; a
+   continuously-adaptive lag was implemented first, measured, and rejected for wandering
+   output latency — see docs/adaptive-bracketing-delay-spec.md History before revisiting.
 3. **Select with hysteresis** (T6): among bracket frames *newer than lastShownTs*, pick the
    nearest to target; if both are older, repeat the last frame (`pick=repeat`). Track
    `lastShownTs` monotonically.
