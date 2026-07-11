@@ -1,64 +1,74 @@
-# Adaptive Bracketing Delay — Feature Spec
+# Static Bracketing Lag (-src) — Feature Spec
 
-Branch: `claude/adaptive-bracketing-delay` (off dev @ v0.0.11). Prerequisite for blend
-(stacked branch `claude/blend-mode`). Status: implemented.
+Branch: `claude/adaptive-bracketing-delay` (off dev @ v0.0.12). Prerequisite for blend
+(stacked branch `claude/blend-mode`). Status: implemented (rework of the original
+continuous-adaptation design; see History).
 
 ## Problem
 
-The present target lags "now" by a fixed one present period (16.7 ms) so that a frame *newer*
-than the target exists — bracketing. That assumption fails whenever the source runs slower
-than the present rate (30-base frame gen, heavy scenes, menus): the after-frame usually does
-not exist yet, selection degrades to repeats, and blend — which cannot degrade gracefully,
-having nothing to blend toward — is blocked on exactly this.
+The present target lags "now" so that a frame *newer* than the target exists at pick time —
+bracketing. A lag of one present period fails whenever the source runs slower than the
+present rate (30-base frame gen, heavy scenes, matched-rate beat): the after-frame usually
+does not exist yet, selection degrades to repeats, and blend — which cannot degrade
+gracefully, having nothing to blend toward — is blocked on exactly this.
 
 ## Design
 
-**One number crosses the capture→present seam**: the capture thread's estimate of the source
-period.
+**The lag is a launch-time constant**: `lag = max(presentPeriod, 1.25 × assumedSrcPeriod)`.
 
-- **Capture side** (`CaptureRing`): `m_srcPeriodEmaQpc`, an EMA (α = 1/8) over **batch-start
-  to batch-start** gaps. Batch-start gaps make the estimate frame-gen-proof by construction —
-  intra-batch ε wakes never enter it. Gaps > 125 ms (stalls, grab-timeout re-grabs) are
-  excluded as non-cadence. Written with relaxed atomics by the capture thread; read by the
-  present thread via `EstimatedSourcePeriodQpc()` (0 until warmed).
-- **Present side** (`TemporalCaptureMode`): per present,
-  `desired = max(presentPeriod, 1.25 × P̂)`, then the actual lag *slews* toward desired at
-  ≤ 100 µs per present. Seed = one present period (baseline behavior until the estimate
-  warms).
+- The source-rate assumption defaults to **60 fps** — the slowest source served without
+  configuration — and `-src <fps>` overrides it in either direction. Slower sources need
+  more lag (`-src 30` → 41.7 ms); faster ones can ride the present-period floor
+  (`-src 240` → 16.7 ms at 60 Hz present). At 60 Hz present the default yields 20.8 ms.
+- The lag never moves during a run. It is output latency, and only a constant can be
+  compensated for downstream (T10): the operator sets one audio-delay per title config.
+  Forgetting `-src` never produces artifacts for sources ≥ 60 fps — worst case is latency
+  left on the table.
+- The capture-side source-period estimator (`m_srcPeriodEmaQpc`, EMA α = 1/8 over
+  batch-start gaps, stall gaps > 125 ms excluded) is retained as **telemetry only**: every
+  ~10 s the present thread audits the assumption. Measured slower than assumed (> 9/8×)
+  → error line with the suggested `-src` (starvation warning). Measured at least 2× faster
+  with a real win available (> 2 ms) → info line with the lower-latency `-src` suggestion.
 
-## Latency policy analysis (T10)
-
-The lag IS output latency, so an adaptive lag is variable latency — the thing T10 forbids —
-*unless bounded and slow*. The slew limit is that bound: 100 µs/present = 6 ms/s of drift.
-A 60→90-base regime change moves the lag ~7 ms over ~1.2 s — a controlled content-time ramp,
-imperceptible, instead of a step (visible) or per-frame jitter (stutter). In steady state the
-EMA is effectively constant and the lag freezes; V-suite `jit`/`pdt` metrics are untouched
-because the lag shifts *which* frame is picked, never *when* the present fires.
+**Selection midpoint gate** (same rework): when only the after-frame is newer than the last
+shown, advance to it only once the target has passed the bracket midpoint, with the
+stickiness band as margin. The ungated advance boundary sits exactly where
+`before == lastShown` begins (w = 0); the present/source clock beat parks the target phase
+there periodically and arrival jitter flip-flops the crossing for seconds — a cluster of
+early-advance cadence glitches. Gated, both sides of the crossing produce the same clean
+cadence, and the advance lands when the target genuinely reaches the after-frame.
 
 ## Constants
 
 | constant | value | why |
 |---|---|---|
-| EMA α | 1/8 | stable ≈ 8 source frames after a regime change; jitter-immune steady-state |
-| headroom | 1.25× | one full source period + 25% for arrival jitter (successor-spec value) |
-| slew | 100 µs/present | 6 ms/s ramp; regime transitions complete in ~1–2 s |
-| stall cutoff | 125 ms | excludes grab-timeout re-grabs (100 ms) and load hitches from cadence |
+| headroom | 1.25× | one full source period + 25% for arrival jitter |
+| default assumption | 60 fps | slowest source served without configuration, at any present rate |
+| slow-source warning | est > 9/8 × assumed | beyond what the headroom absorbs; 59.98 Hz vs 60 stays quiet |
+| fast-source suggestion | est × 2 < assumed, win > 2 ms | only flag meaningful latency savings |
+| telemetry cadence | 600 presents | ~10 s at 60 Hz; wrong -src caught within the first minute |
+| midpoint gate margin | stickiness band (1 ms) | same anti-flip-flop constant as the nearest-pick Schmitt band |
 
 ## Observability
 
-`lag=<µs>` appended to the per-present `temporal` log line (append-only: existing parsers and
-stride.py are unaffected). Expected: 16667 steady at sources ≥ 60 Hz (identical to baseline);
-~41.7 ms at 30-base; smooth ramps at regime changes.
+`lag=<µs>` on the per-present `temporal` log line (append-only) — now a constant; analysis
+treats any change mid-run as a defect. Setup logs the fixed lag and the assumption it came
+from. `temporal telemetry:` lines carry the estimator audit.
 
 ## Validation
 
 | run | pass |
 |---|---|
-| `240_x1_t_60_adl_ufo` | numbers identical to v0.0.11 (source ≥ present → lag pinned at 16667 µs; log confirms) |
-| `60_x1_t_60_adl_ufo` | lag ≈ max(16.7, 1.25×16.7) = **20.8 ms** — note: slightly higher than baseline at matched rates; floor must stay ≤ baseline (~4–5 repeats) and no-after ≈ 0 |
-| `30cap` or `30`-base FG KCD `t:60` | the payoff: `no after-frame` log lines ≈ 0 vs ~constant at baseline; picks healthy instead of repeat-degraded |
+| `240_x1_t_60_ufo` | reference-identical to baseline (lag pinned at floor 16667 µs with `-src 240`; 20833 µs default — both static) |
+| `60_x1_t_60_ufo` | lag constant 20833 µs from first present; no ramp; floor ≤ baseline; no-after ≈ 0 |
+| 30-base KCD `t:60` with `-src 30` | lag constant 41.7 ms; no-after ≈ dips only; boundary-dwell early-advance clusters (1-3-2 cadence) GONE |
+| 30-base KCD `t:60` without `-src` | telemetry error line suggesting `-src 30` within ~1 min |
 
-The matched-rate case deserves attention: at 60→60 the adaptive formula raises lag from 1.0
-to 1.25 present periods (+4 ms constant latency). That is the designed trade (T10: constant
-offset is acceptable without limit, in service of pacing) — but it is a *behavior change* at
-the config the floor was calibrated on; the run above guards it.
+## History
+
+The original design adapted the lag continuously toward 1.25× the live period EMA with a
+100 µs/present slew. Validated mechanics survive in the estimator and the headroom constant.
+Demoted after measurement: gameplay lag wandered 23.8–49 ms at 30-base KCD and 20.0–26.6 ms
+at 120cap×2 (the EMA rides content dips), which is dynamic output latency — impossible to
+compensate downstream — and the moving target phase interacted with regime shifts (ring-window
+misses at menu transitions). Static-by-declaration deletes the class instead of tuning it.

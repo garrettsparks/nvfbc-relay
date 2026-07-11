@@ -19,8 +19,9 @@
 //                                         composes only the card's display and the present
 //                                         becomes card-locked 60 Hz — the production use case
 //                                         (spec Rounds 5-10).
-//   This mode        — each present: select the ring frame nearest a content target lagged one
-//                      period behind, with hysteresis (monotonic), copy to backbuffer, present.
+//   This mode        — each present: select the ring frame nearest a content target lagged a
+//                      fixed bracketing delay behind, with hysteresis (monotonic), copy to
+//                      backbuffer, present.
 //
 // Blend mode will differ only in the last step (blend the bracketing pair instead of picking
 // one); optical flow later replaces that step again.
@@ -28,9 +29,10 @@ class TemporalCaptureMode : public IFrameCaptureMode {
 private:
     PresentScheduler m_scheduler;
     CaptureRing m_ring;
-    LONGLONG m_bracketingDelayQpc;  // present-target lag (adaptive: >= one present period)
-    LONGLONG m_lagSlewMaxQpc;       // max lag change per present (bounded latency ramp)
+    LONGLONG m_bracketingDelayQpc;  // present-target lag; static: max(present period, 1.25 x assumed source period)
+    LONGLONG m_assumedSrcPeriodQpc; // declared/default source period the lag was sized for
     LONGLONG m_stickinessQpc;       // selection Schmitt band (anti flip-flop at bracket midpoint)
+    int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
     bool m_lastPickAfter;           // Schmitt state: which bracket side the last pick took
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
     LARGE_INTEGER m_baseQpc;        // logging time origin

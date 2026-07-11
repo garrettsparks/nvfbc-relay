@@ -127,6 +127,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
     LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
+    LOGERR("Options:");
+    LOGERR("  -src 30        - Declared source fps; sizes the static temporal lag (default: assume >= 60)");
     return NULL;
 }
 
@@ -151,6 +153,12 @@ DisplayPosition source, target;
 // Target display's D3D9 adapter ordinal (set once displays are chosen). DiagCaptureMode uses it
 // to open a private device on the capture-card adapter for GetRasterStatus probes.
 int g_targetAdapterIndex = 0;
+
+// Assumed source frame rate for the temporal lag (-src <fps>). The lag is static per run:
+// max(present period, 1.25 x assumed source period); 0 means unset and the temporal modes
+// assume sources run at 60 fps or faster. Declare slower sources (-src 30) to avoid
+// after-frame starvation; declare faster ones (-src 240) to ride the present-period floor.
+float g_srcRateHint = 0.0f;
 
 vector <DisplayPosition> displays;
 
@@ -362,6 +370,16 @@ int ReadIntFromCmd(string prompt) {
     return cinString.empty() ? -1 : stoi(cinString);
 }
 
+// Shared by the command line and the console prompt: validate and apply an -src value.
+static void ApplySrcRate(const string& value) {
+    try {
+        float v = stof(value);
+        if (v > 0.0f && v <= 1000.0f) { g_srcRateHint = v; return; }
+    }
+    catch (...) {}
+    LOGERR("-src value '%s' invalid (1-1000) - ignored", value.c_str());
+}
+
 bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, string* framerateStr) {
     *sourceIndex = -1;
     *targetIndex = -1;
@@ -410,6 +428,11 @@ bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, s
             foundAny = true;
             i++; // Skip the value
         }
+        else if (args[i] == "-src" && i + 1 < args.size()) {
+            ApplySrcRate(args[i + 1]);
+            foundAny = true;
+            i++; // Skip the value
+        }
     }
 
     return foundAny;
@@ -451,6 +474,7 @@ void ConsoleUserInput(string* framerateStr) {
     cout << endl;
     cout << "  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)" << endl;
     cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
+    cout << "  t:60 -src 30   - Mode plus options: -src <fps> declares the source rate (lag sizing)" << endl;
     cout << endl;
     cout << "  diag, diag:vsync - Clock probes (DWM compose timing + card raster)" << endl;
     cout << endl;
@@ -459,8 +483,28 @@ void ConsoleUserInput(string* framerateStr) {
     cout << "Capture/Present framerate (blank for vsync) ? ";
     string cinString;
     getline(cin, cinString);
-    if (!cinString.empty())
+    if (!cinString.empty()) {
+        // The prompt is the usual launch path, so the mode may carry options ("t:60 -src 30").
+        // Only -src is meaningful here; displays were already chosen interactively.
+        size_t space = cinString.find(' ');
+        if (space != string::npos) {
+            vector<string> opts;
+            size_t p = space;
+            while (p < cinString.length()) {
+                while (p < cinString.length() && cinString[p] == ' ') p++;
+                size_t s = p;
+                while (p < cinString.length() && cinString[p] != ' ') p++;
+                if (p > s) opts.push_back(cinString.substr(s, p - s));
+            }
+            for (size_t i = 0; i < opts.size(); i++) {
+                if (opts[i] == "-src" && i + 1 < opts.size()) { ApplySrcRate(opts[i + 1]); i++; }
+                else cout << "Unknown option '" << opts[i] << "' - ignored" << endl;
+            }
+            if (g_srcRateHint > 0.0f) cout << "Declared source rate: " << g_srcRateHint << " fps" << endl;
+            cinString = cinString.substr(0, space);
+        }
         *framerateStr = cinString;
+    }
 
     for (vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
 
