@@ -27,11 +27,28 @@
 // one); optical flow later replaces that step again.
 class TemporalCaptureMode : public IFrameCaptureMode {
 private:
+    // Shadow phase-pull instrument: the phase-pull control math run as a DEAD computation,
+    // one instance per source-period variant. Each instance closes its own loop with a
+    // private bracket query at its pulled target and drives nothing; the temporal log line
+    // reports what a live pull would be doing.
+    struct PhaseShadow {
+        LONGLONG pullQpc;     // extra lag a live pull would apply right now
+        LONGLONG errEmaQpc;   // EMA of the phase error at the pulled target
+        LONGLONG devEmaQpc;   // EMA of |err - errEma|: phase stability (lock gate input)
+        bool engaged;         // lock-gate state at the last update
+        bool seeded;          // wrap variant only: errEma holds a sample (0 is a legal value)
+        double weight;        // bracket weight at the pulled target (extreme at lock)
+    };
+
     PresentScheduler m_scheduler;
     CaptureRing m_ring;
     LONGLONG m_bracketingDelayQpc;  // present-target lag; static: max(present period, 1.25 x assumed source period)
     LONGLONG m_assumedSrcPeriodQpc; // declared/default source period the lag was sized for
     LONGLONG m_stickinessQpc;       // selection Schmitt band (anti flip-flop at bracket midpoint)
+    LONGLONG m_phasePullSlewQpc;    // max shadow pull change per present (approach rate)
+    PhaseShadow m_shadowEst;        // variant fed by the ring's source-period estimator
+    PhaseShadow m_shadowSrc;        // variant anchored to the declared -src period
+    PhaseShadow m_shadowWrap;       // circular-phase variant, anchored to the declared -src period
     int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
     bool m_lastPickAfter;           // Schmitt state: which bracket side the last pick took
     bool m_advGateOpen;             // Schmitt state: last advance-gate decision (see ADVANCE GATE)
@@ -44,6 +61,15 @@ private:
     // The one lag-sizing rule: 1.25x the source period for bracketing headroom, floored at
     // the present period. Setup sizes the operative lag with it; telemetry sizes suggestions.
     LONGLONG LagForSourcePeriod(LONGLONG srcPeriodQpc) const;
+
+    // One shadow update step: private bracket query at the pulled target, then the pull
+    // control math (EMA filter, stability gate, bounded asymmetric slew). srcPeriodQpc feeds
+    // the gate and clamp; 0 keeps the variant disengaged (estimator not warmed up).
+    void UpdatePhaseShadow(PhaseShadow* s, LONGLONG deadline, LONGLONG srcPeriodQpc);
+
+    // Circular-phase counterpart: the error and its EMAs live in (-srcP/2, srcP/2], the pull
+    // wraps modulo the source period behind a hysteresis band, and the slew is symmetric.
+    void UpdatePhaseShadowWrap(PhaseShadow* s, LONGLONG deadline, LONGLONG srcPeriodQpc);
 
 public:
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f);

@@ -28,6 +28,10 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_stickinessQpc(0)
+    , m_phasePullSlewQpc(0)
+    , m_shadowEst()
+    , m_shadowSrc()
+    , m_shadowWrap()
     , m_telemetryCountdown(0)
     , m_lastPickAfter(false)
     , m_advGateOpen(true)
@@ -85,6 +89,11 @@ bool TemporalCaptureMode::Setup() {
     // comfortably above jitter, well below any source period we target (4.17 ms at 240 Hz).
     m_stickinessQpc = m_scheduler.Freq() / 1000;
 
+    // Shadow phase-pull slew: 25 us per present. An order above the measured inter-crystal
+    // drift (~0.12 ms/s), three orders below perception; a live pull tracking a locked phase
+    // must outrun the drift or the lock slips.
+    m_phasePullSlewQpc = m_scheduler.Freq() / 40000;
+
     LOG("Temporal mode initialized - %s present (%.2f fps nominal), nearest-frame selection + hysteresis",
         m_vsyncPresent ? "vsync/vblank" : "QPC-timer", m_targetFramerate);
     LOG("Temporal lag fixed at %lld us (source assumed %s%.1f fps)",
@@ -92,7 +101,98 @@ bool TemporalCaptureMode::Setup() {
         (m_srcRateHint > 0.0f) ? "-src " : ">= ", assumedFps);
     LOG("Selection stickiness band: %lld us (anti flip-flop at bracket midpoint)",
         m_stickinessQpc * 1000000 / m_scheduler.Freq());
+    LOG("Phase-pull shadow telemetry: dead computation; estimator-fed (pull/pw/plk) active, -src-anchored (apull/apw/aplk) and circular-phase (wpull/wpw/wplk) %s",
+        (m_srcRateHint > 0.0f) ? "active" : "inactive (no -src)");
     return true;
+}
+
+void TemporalCaptureMode::UpdatePhaseShadow(PhaseShadow* s, LONGLONG deadline, LONGLONG srcPeriodQpc) {
+    // Closed loop is load-bearing: err must be measured at the PULLED target, because
+    // want = pull + errEma assumes the pull already absorbed into the error signal; measured
+    // at the raw target the error never shrinks and the pull integrates without bound. The
+    // extra bracket query is a lock-free ring scan, safe to run per present.
+    FrameBracket bracket;
+    m_ring.FindBracket(deadline - (m_bracketingDelayQpc + s->pullQpc), &bracket);
+    s->weight = bracket.weight;
+    if (!bracket.hasBefore || !bracket.hasAfter) {
+        return;
+    }
+
+    // errEma (alpha 1/16) filters the phase offset to the before frame; devEma (alpha 1/16
+    // of |err - errEma|) measures phase STABILITY. Stable phase means a near-integer rate
+    // ratio where lock is possible; a sweeping phase means genuine rate conversion, the gate
+    // stays open and the pull decays to zero.
+    const LONGLONG err = bracket.beforeDiff;
+    s->errEmaQpc = s->errEmaQpc ? (s->errEmaQpc * 15 + err) / 16 : err;
+    LONGLONG dev = err - s->errEmaQpc;
+    if (dev < 0) dev = -dev;
+    s->devEmaQpc = (s->devEmaQpc * 15 + dev) / 16;
+
+    s->engaged = (srcPeriodQpc > 0 && s->devEmaQpc < srcPeriodQpc / 8);
+    LONGLONG want = 0;
+    if (s->engaged) {
+        want = s->pullQpc + s->errEmaQpc;               // absorb the measured offset
+        if (want > srcPeriodQpc) want = srcPeriodQpc;   // bounded: at most one source period
+    }
+
+    // Asymmetric slew: approach a lock at full rate; back away at quarter rate so a transient
+    // wrap-resync (dev spike once per beat) dents the pull instead of draining it. Persistent
+    // disengage (non-integer ratio) still decays to zero.
+    const LONGLONG up = m_phasePullSlewQpc;
+    const LONGLONG down = m_phasePullSlewQpc / 4;
+    LONGLONG delta = want - s->pullQpc;
+    if (delta > up) delta = up;
+    else if (delta < -down) delta = -down;
+    s->pullQpc += delta;
+}
+
+// Map a tick offset into (-p/2, p/2]: the signed distance to the nearest point on a p-periodic
+// timeline. C++ % truncates toward zero, so negative remainders need folding up first.
+static LONGLONG WrapHalf(LONGLONG d, LONGLONG p) {
+    LONGLONG m = (d + p / 2) % p;
+    if (m < 0) m += p;
+    return m - p / 2;
+}
+
+void TemporalCaptureMode::UpdatePhaseShadowWrap(PhaseShadow* s, LONGLONG deadline, LONGLONG srcPeriodQpc) {
+    // Circular-phase variant. The linear controller treats phase as a line, so monotonic
+    // clock skew walks it into its clamp once per beat and it must drain back through a
+    // disengaged sweep. Here the error is the SIGNED distance to the nearest source frame,
+    // EMAs accumulate on wrapped differences, and the pull wraps modulo the source period:
+    // one discrete one-frame step per beat (the slip a nearest-pick already pays) instead of
+    // a saturate-and-drain cycle. The slew is symmetric; the asymmetric back-off existed to
+    // protect the linear controller's drain path, which no longer exists.
+    FrameBracket bracket;
+    m_ring.FindBracket(deadline - (m_bracketingDelayQpc + s->pullQpc), &bracket);
+    s->weight = bracket.weight;
+    if (!bracket.hasBefore || !bracket.hasAfter || srcPeriodQpc <= 0) {
+        return;
+    }
+
+    const LONGLONG err = WrapHalf(bracket.beforeDiff, srcPeriodQpc);
+    if (!s->seeded) {
+        s->errEmaQpc = err;
+        s->seeded = true;
+    } else {
+        s->errEmaQpc += WrapHalf(err - s->errEmaQpc, srcPeriodQpc) / 16;
+        s->errEmaQpc = WrapHalf(s->errEmaQpc, srcPeriodQpc);
+    }
+    LONGLONG dev = WrapHalf(err - s->errEmaQpc, srcPeriodQpc);
+    if (dev < 0) dev = -dev;
+    s->devEmaQpc = (s->devEmaQpc * 15 + dev) / 16;
+
+    s->engaged = s->devEmaQpc < srcPeriodQpc / 8;
+    const LONGLONG want = s->engaged ? s->pullQpc + s->errEmaQpc : 0;
+    LONGLONG delta = want - s->pullQpc;
+    if (delta > m_phasePullSlewQpc) delta = m_phasePullSlewQpc;
+    else if (delta < -m_phasePullSlewQpc) delta = -m_phasePullSlewQpc;
+    s->pullQpc += delta;
+
+    // Wrap hysteresis: let the pull overshoot the [0, srcP) domain by a band before wrapping,
+    // so jitter-scale wander at the boundary cannot chatter one-frame steps.
+    const LONGLONG band = srcPeriodQpc / 16;
+    if (s->pullQpc < -band) s->pullQpc += srcPeriodQpc;
+    else if (s->pullQpc >= srcPeriodQpc + band) s->pullQpc -= srcPeriodQpc;
 }
 
 void TemporalCaptureMode::Run(
@@ -113,6 +213,7 @@ void TemporalCaptureMode::Run(
 
     MSG msg = {};
     RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
+    const bool anchoredShadow = (m_srcRateHint > 0.0f);
     LONGLONG lastPresentQpc = 0;
     LONGLONG lastShownTs = 0;   // hysteresis: QPC of the last presented frame (strictly advances)
     IDirect3DSurface9* lastShownSurface = NULL;   // what pick=repeat must re-present
@@ -156,6 +257,23 @@ void TemporalCaptureMode::Run(
         // exactly once per sweep: one clean single-frame slip instead of seconds of judder.
         FrameBracket bracket;
         m_ring.FindBracket(target, &bracket);
+
+        // PHASE-PULL SHADOW (telemetry only, drives nothing): w is the phase offset between
+        // the present and capture clocks; it drifts through [0,1] over each beat period and
+        // is essentially never 0/1, so an interpolating compositor would synthesize EVERY
+        // frame even at matched rates where passthrough is pixel-perfect. The eventual fix
+        // is a slow control term pulling the target back onto the before-frame timeline
+        // (increasing lag by the filtered offset, the safe direction: it adds bracket
+        // margin). Here that math runs dead so its lock behavior can be validated from logs
+        // before any compositor depends on it. Two variants differ only in the source period
+        // feeding the gate and clamp: estimator-trusting vs declared-rate-anchored. The
+        // anchored variant runs only on an EXPLICIT -src; anchoring to the default-60
+        // fallback would manufacture false locks on undeclared sources.
+        UpdatePhaseShadow(&m_shadowEst, deadline, m_ring.EstimatedSourcePeriodQpc());
+        if (anchoredShadow) {
+            UpdatePhaseShadow(&m_shadowSrc, deadline, m_assumedSrcPeriodQpc);
+            UpdatePhaseShadowWrap(&m_shadowWrap, deadline, m_assumedSrcPeriodQpc);
+        }
 
         bool beforeNew = bracket.hasBefore && bracket.beforeTs > lastShownTs;
         bool afterNew  = bracket.hasAfter  && bracket.afterTs  > lastShownTs;
@@ -227,7 +345,15 @@ void TemporalCaptureMode::Run(
                     m_ring.Published());
             }
         } else {
-            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus",
+            // Shadow fields are append-only: pull/pw/plk = estimator-fed variant,
+            // apull/apw/aplk = -src-anchored variant, wpull/wpw/wplk = circular-phase
+            // anchored variant (-1 lock fields mark an inactive variant).
+            int aplk = -1, wplk = -1;
+            if (anchoredShadow) {
+                aplk = m_shadowSrc.engaged ? 1 : 0;
+                wplk = m_shadowWrap.engaged ? 1 : 0;
+            }
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus pw=%.3f plk=%d apull=%lldus apw=%.3f aplk=%d wpull=%lldus wpw=%.3f wplk=%d",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((bracket.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
@@ -235,7 +361,16 @@ void TemporalCaptureMode::Run(
                 bracket.weight, pick,
                 (long long)((beforePresent.QuadPart - deadline) * usPerTick),
                 (long long)(presentDelta * usPerTick),
-                lagUs);
+                lagUs,
+                (long long)(m_shadowEst.pullQpc * usPerTick),
+                m_shadowEst.weight,
+                m_shadowEst.engaged ? 1 : 0,
+                (long long)(m_shadowSrc.pullQpc * usPerTick),
+                anchoredShadow ? m_shadowSrc.weight : -1.0,
+                aplk,
+                (long long)(m_shadowWrap.pullQpc * usPerTick),
+                anchoredShadow ? m_shadowWrap.weight : -1.0,
+                wplk);
             if (!bracket.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }
