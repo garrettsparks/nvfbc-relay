@@ -1,0 +1,104 @@
+{
+  "_purpose": "Pinned validation reference numbers. Analysis compares runs against these instead of memory. Update only with new measured evidence; every value carries provenance.",
+  "_baseline": "v0.0.12 (b55025b). Behavior identical to v0.0.11 in all previously-validated regimes (fetch-identical proof), so v0.0.11 reference numbers carry over.",
+  "_provenance_note": "Values distilled from the 2026-07 testing campaign (kickoff doc post-v0.0.12). Runs before the repeat-surface fix (pre-b55025b adl builds, incl. 2026-07-10 30cap) are bugged-build artifacts: never reference their video analysis.",
+
+  "constants": {
+    "source_monitor_actual_hz_at_60_setting": 59.98,
+    "source_monitor": "ROG PG279QM, 240Hz G-Sync, adapter 0",
+    "present_card": "EVGA XR1 Pro HDMI capture card, 60Hz, adapter 1",
+    "adaptive_lag_formula": "max(presentPeriod, 1.25 x srcPeriodEma), slew <= 100us/present",
+    "adaptive_lag_engages_when": "source period > present period / 1.25 (includes 120cap x2 FG = 60 real base)"
+  },
+
+  "global_caveats": {
+    "content_metronome": "Standard ufo content = testufo.com/framerates-versus playing a 60.000fps clip on the 59.98Hz monitor: player resyncs every ~50s. Good decode days: 1 dupe frame/cycle. Bad days: ~12-frame bursts over ~2s. The historical '4-5 dupe floor' at 60->60 IS this metronome; true relay floor ~= 0.",
+    "relay_beat_repeat": "~1 pick=repeat per ~50s = present-clock vs source-clock beat (59.98 vs 60). Exists in every mode with unlocked clocks. Not a defect.",
+    "same_day_ab": "Content-burst severity tracks browser decode health. Cross-build DUPE comparisons are valid ONLY as same-day A/B pairs.",
+    "reverse_instrument": "Needs directional content; sky/map segments false-positive.",
+    "stride_py": "Repeat carry-forward assumption CORRECT for v0.0.12+ builds; WRONG for pre-fix adl logs.",
+    "jitter_tails": "Present-jit p99 swings with desktop state (measured 571us and 1014us same config, different days). Same-day pairing required for jit comparisons too.",
+    "desktop_bracketing": "Logs ALWAYS begin and end with desktop/loading content at the desktop refresh rate (game launch and quit). At sub-rate -src configs this produces ring-window lines and rate-mismatch noise in the head/tail. Exclude head and tail from all counts by default; only in-regime gameplay/content windows are scored."
+  },
+
+  "log_format": {
+    "temporal_line_v12": "temporal dl= tgt= before=(d) after= w= pick= jit= pdt=",
+    "temporal_line_adl": "adds lag=<us> (append-only)",
+    "temporal_line_phase_pull": "adds pull=<us> (append-only); effective latency = lag + pull, SUM both fields",
+    "pick_labels_v12": ["before", "after", "after-adv", "before-adv", "repeat", "none"],
+    "pick_labels_future_branches": ["blend", "stall", "snap", "interp"]
+  },
+
+  "corners": {
+    "240_x1_t_60_ufo": {
+      "build": "v0.0.12",
+      "slips_per_run": "0-7 steady-state (stride-3 singles), warmup excluded",
+      "windows": "0 steady-state",
+      "stride_4_share": ">= 99%",
+      "mean_stride": "3.999x",
+      "dupes": 0,
+      "reversals": 0,
+      "warmup_note": "First ~5s of LOG (pre-OBS) may show repeats/slips/alternation depending on desktop+content state at relay launch; excluded from slip counting. v12 guard run: 78 warmup repeats, then 0 slips in 219s.",
+      "provenance": "v0.0.11 ref (Jul 8: 7 steady-state slips) + v0.0.12 guard PASS (Jul 11: 0 steady-state slips)"
+    },
+    "240_x1_t_60_adl_ufo": {
+      "build": "adl",
+      "lag_us": "pinned single-value 16666",
+      "everything_else": "identical to v0.0.12 corner above",
+      "provenance": "adl test 1 PASS (pre-rebase build), video EXCELLENT, strides reference"
+    },
+    "60_x1_t_60_ufo_srclag": {
+      "build": "srclag2+ (static lag, proximity advance gate)",
+      "lag_us": "20833 flat from first present (default assumption)",
+      "stride": "99.95% stride-1; stride-0 <= ~10 per run (beat repeats); 0 alternation windows",
+      "no_after_per_run": "~0-2 (vs pre-adl dev 36-75: starvation mechanism proof)",
+      "dupes_per_run": "decode-day dominated, NOT a reference number",
+      "gate_regression_history": "midpoint-gate build measured 284 stride-0 + 279 stride-2 + 5 windows on this corner; proximity gate returned it to 5/1/0",
+      "provenance": "srclag2 run 2026-07-11 PASS; supersedes adl ramp expectations (lag no longer ramps)"
+    },
+    "30cap_x1_t_60_adl_kcd": {
+      "build": "adl (post-fix rebase, run 29142931696 onward)",
+      "lag_us": "~41700 (1.25 x 33333), held pinned; bugged pre-fix run measured med 41660 (lag mechanism valid, video invalid)",
+      "no_after_measured": "~218 in gameplay (KCD 30cap wanders; '~0' holds only for metronome sources)",
+      "srclag2_reference": "in-regime uncorrelated hold/skip events 1.4/min (vs 25/min pre-fix); dip-correlated hold6+skip3 pairs are honest KCD 100ms hitches, expect ~10-15/min depending on scene",
+      "stride_pattern": "alternating 0/1 at ~50/50 (each frame two presents; source-frame units)",
+      "shift_pattern": "clean 0/+S/0/+S",
+      "reverse_steps_video": 0,
+      "eyeball": "frame-step REQUIRED first post-fix run: forward-two-back-one must be gone",
+      "known_artifact": "boundary-dwell early-advance: clock beat walks target phase into w=0 every ~50s, arrival jitter dwells there ~4s -> 1-3-2 cadence glitch clusters; fix = PROXIMITY advance gate (decline while beforeDiff < band, Schmitt reopen 2x band). Midpoint gate REJECTED: matched-rate steady state operates at the midpoint; memoryless threshold there measured ~280 dupe+skip pairs per 60->60 run",
+      "ring_window_note": "at sub-rate -src configs, uncapped UI bursts (dialogs/menus) lap the 8-slot ring while lag exceeds burst-rate ring depth -> transient 'older than ring window' lines; expected, -ring 16 is the cure if visible",
+      "provenance": "retest bill item 2 run 2026-07-11: repeat-surface fix CONFIRMED (no backward steps); early-advance artifact found by user eyeball + trace at 122.9s"
+    },
+    "120cap_x2_t_vsync_adl_kcd": {
+      "build": "adl",
+      "lag_us": "settle 16667->20833 in ~1.8s, steady median ~20825; MEASURED gameplay wander 20018-26550 (EMA riding KCD dips) - motivates -src static rework",
+      "no_after_per_run": "adl ~460 vs base ~1210 (KCD dips; ratio is the mechanism metric, not the absolute)",
+      "stride": "pair-identical to base (~93% stride-1, 0 windows) - no pacing regression",
+      "dupes": "content-dominated both builds; the matching 1:45-2:11 clusters were map open/close performed in BOTH runs (controlled); relay-attributable = scattered beat singles",
+      "map_lesson": "NO map/menu flips mid-run in future tests (confuses dupe data); 120cap map A/V result: lag stayed flat 20.8ms through 21s map, one +4ms 1s blip - batch-start EMA is burst-immune by construction",
+      "latency_delta_vs_base": "+4ms constant, ACCEPTED by design (T10: constant offset)",
+      "in_regime_rates": "repeats/min in-regime: ~24-32 across all builds (content/dip variance, corner is not gate-sensitive: ring carries ~61.7fps > present); no-after/min: ~16-23 with adequate lag vs ~68 at bare present-period lag. ALWAYS compare in-regime rates, never whole-log totals (head/tail desktop segments dominate totals)",
+      "provenance": "retest bill items 3+4, same-day pair 2026-07-11 PASS (analysis side; feel verdict user's); srclag2 in-regime lineage comparison 2026-07-11"
+    },
+    "present_jitter": {
+      "t_vsync_jit_us": "3/5 (kickoff notation from same-day 2v1 pair)",
+      "t_60_jit_p99_us": "~571 reference, epistemic caveat: 1014 measured with lock on another day; tails swing with desktop state",
+      "provenance": "session 2 (no-mt-lock investigation)"
+    }
+  },
+
+  "fg_characterization_2026_07_11": {
+    "sm_x2": "CLOSED MODEL: submission ε-pairs [gen(soft), real(sharp)]; gen content survives capture ~50-67% (race with real flip); pan-run accounting exact at 60.0 real/s captured. Keep-real collapse lossless — production regime, no changes needed.",
+    "dup_pairs": "15% (x2) / 26% (x3) of ε-pairs are [X,X] double-captures of one sharp frame; verified mid-motion (100% first-member full-change, uniform in time); harmless to collapse.",
+    "hf_fingerprint": "blend-gen reads ~3x lower hf than real; marks blend-style interpolation ONLY (x3 MFG second frame is sharp); relative comparisons only, never absolute thresholds.",
+    "sm_x3": "UNSUPPORTED for relay: ε-pair + paced sharp single at +11ms; frame accounting does not close (~15/s unexplained); batch-start EMA reads ~12.4ms not 16.7 (telemetry would mis-suggest -src). Do not run SM x3.",
+    "probe_notes": "blk binary per block: saturates under yaw pan (repeat discriminator), compresses under forward motion (radial flow); blk=0 = direct content-dupe count; probe observer effect ≈ nil.",
+    "provenance": "kcd none/x2/x3 probe + x2/x3 pan runs, 2026-07-11; full analysis in fg-characterization memory"
+  },
+
+  "assertions_any_temporal_run": {
+    "lag_ramp_rate": "<= 100us per present, always",
+    "lag_at_fast_source": "pinned at present period (16667 at t:60)",
+    "pdt_stride": "present cadence unaffected by lag changes (lag shifts WHICH frame, never WHEN present fires)"
+  }
+}
