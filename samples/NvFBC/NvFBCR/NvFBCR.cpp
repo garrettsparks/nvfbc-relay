@@ -267,7 +267,6 @@ int InitDisplays() {
         return HRESULT_FROM_WIN32(result);
     }
 
-    int i = 0;
     // For each active path
     for (int i = 0; i < paths.size(); i++)
     {
@@ -303,15 +302,11 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
 
     d3dpp.Windowed = TRUE;
     d3dpp.BackBufferFormat = D3DFMT_A2R10G10B10;
-    //d3dpp.BackBufferFormat = D3DFMT_X8R8G8B8;
-
     d3dpp.BackBufferWidth  = BUF_WIDTH;
     d3dpp.BackBufferHeight = BUF_HEIGHT;
     d3dpp.BackBufferCount = 1;
     d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    //d3dpp.SwapEffect = D3DSWAPEFFECT_FLIPEX;
     d3dpp.PresentationInterval = presentationInterval;
-    //d3dpp.Flags = D3DPRESENTFLAG_VIDEO;
     d3dpp.hDeviceWindow = hwnd;
     // D3DCREATE_MULTITHREADED: the temporal modes drive capture on a separate thread from
     // present, so D3D9 device calls (StretchRect/Present) come from two threads. This flag
@@ -340,12 +335,11 @@ HRESULT InitD3D9Surfaces()
     if (g_pD3D9Device)
     {
 
-        hr = g_pD3D9Device->CreateOffscreenPlainSurface(BUF_WIDTH, BUF_HEIGHT, D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT, &g_backbuffer, NULL); //D3DFMT_A8R8G8B8 D3DFMT_A2B10G10R10
+        hr = g_pD3D9Device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &g_backbuffer);
         if (FAILED(hr))
         {
-            LOGERR("Failed to create D3D9 surface D3DFMT_A2B10G10R10 (error: 0x%08x)", hr);
+            LOGERR("Failed to get backbuffer surface (error: 0x%08x)", hr);
         }
-        g_pD3D9Device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &g_backbuffer);
     }
 
     return hr;
@@ -583,10 +577,10 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     LOG("Target display: [%d] %s (%s)", target.dxAdapterIndex, target.friendlyName.c_str(), target.deviceName);
     g_targetAdapterIndex = target.dxAdapterIndex;
     LOG("Capture mode: %s", captureMode->GetModeName());
-    LOG("Buffer size: %dx%d", BUF_WIDTH, BUF_HEIGHT);
 
     BUF_WIDTH = target.position.right - target.position.left;
     BUF_HEIGHT = target.position.bottom - target.position.top;
+    LOG("Buffer size: %dx%d", BUF_WIDTH, BUF_HEIGHT);
 
     HWND hWnd;
     WNDCLASSEX wc;
@@ -621,7 +615,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     NvFBCFrameGrabInfo frameGrabInfo = { 0 };
 
     //! DX9 resources
-    NVFBC_TODX9VID_OUT_BUF NvFBC_OutBuf[1];
+    NVFBC_TODX9VID_OUT_BUF NvFBC_OutBuf[1] = {};
 
     //! Load the nvfbc Library
     pNVFBCLib = new NvFBCLibrary();
@@ -758,7 +752,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     DX9SetupParams.bStereoGrab = 0;
     DX9SetupParams.bDiffMap = 0;
     DX9SetupParams.ppBuffer = NvFBC_OutBuf;
-    DX9SetupParams.eMode = NVFBC_TODX9VID_ARGB10; //NVFBC_TODX9VID_ARGB10; //NVFBC_TODX9VID_ARGB;
+    DX9SetupParams.eMode = NVFBC_TODX9VID_ARGB10;
     DX9SetupParams.dwNumBuffers = 1;
     DX9SetupParams.bHDRRequest = TRUE;
 
