@@ -1,8 +1,9 @@
-# Content Probe (-probe) — Instrument Spec
+# Content Probe (-probe) and Frame Dump (-dump) — Instrument Spec
 
-Branch: `fg-and-dupe-content-probe` (off dev @ v0.0.13). Status: implemented, calibration
-pending. Instrument, not a feature: informs the `-fg` frame-gen handling redesign and gives
-dupe analysis content ground truth.
+Branch: `fg-and-dupe-content-probe` (off dev @ v0.0.13). Status: -probe implemented and
+calibrated (2026-07-11 runs closed the SM x2 capture model); -dump implemented. Instruments,
+not features: they inform the `-fg` frame-gen handling redesign and give dupe analysis
+content ground truth.
 
 ## Problem
 
@@ -56,7 +57,29 @@ Same three KCD log-only characterization runs, probe on (`t:60 -probe`, 60s game
 Plus the standing sentinel use: probe-on ufo run when the decoder metronome needs direct
 confirmation, and a DLSS-G title (paced regime) when available.
 
+## Frame dump (-dump <seconds>)
+
+The probe answered every SM x2 question but left SM x3's structure undecodable from timing
+plus hf alone (the paced single is sharp; no label assignment closes the frame accounting).
+The dump is the ground-truth instrument: `-dump 60` stages 30 consecutive captures starting
+60 s in and writes them as `dump_NN_capXXXX.bmp` beside the exe, with a `dump NN cap= arr=
+dt= blk= hf= file=` log line mapping each file to its capture metadata.
+
+Timeline integrity is the design constraint: writing to disk inside the capture loop
+(10-50 ms/frame) would stall grab re-entry and decimate the very batch structure being
+photographed. So the window stages GPU-to-GPU only (StretchRect into 30 pre-allocated
+capture-device render targets, ~0.1 ms, ~250 MB VRAM for the run) and the drain — readback,
+A2R10G10B10 to 24-bit unpack, BMP write — runs once the window is full, when the run's
+timing no longer matters. A partial window drains at capture shutdown. The drain pauses
+capture for its duration (logged); everything after the drain in that log is non-reference.
+
+Run recipe for the x3 question: `t:60 -probe -dump 60`, SM x3, constant yaw pan through the
+window. Interpolated frames show double-image ghosting under pan; a repeat is
+pixel-identical to its predecessor; a warped/extrapolated frame shows edge smearing without
+the double image. One pass over 30 BMPs assigns every batch position its true label.
+
 ## Analysis notes
 
-Capture-line regex consumers are unaffected (fields append-only). Probe runs are instrument
-runs: never compare their timing statistics against reference numbers from probe-off runs.
+Capture-line regex consumers are unaffected (fields append-only). Probe and dump runs are
+instrument runs: never compare their timing statistics against reference numbers from
+probe-off runs.

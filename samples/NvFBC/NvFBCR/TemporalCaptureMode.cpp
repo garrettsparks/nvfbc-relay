@@ -25,7 +25,7 @@ static const char* const kPickBeforeAdv = "before-adv";
 static const char* const kPickRepeat    = "repeat";       // nothing newer than last shown — genuine stall
 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint,
-                                         bool contentProbe)
+                                         bool contentProbe, int dumpAtSeconds)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_stickinessQpc(0)
@@ -36,6 +36,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_targetFramerate(framerate)
     , m_srcRateHint(srcRateHint)
     , m_contentProbe(contentProbe)
+    , m_dumpAtSeconds(dumpAtSeconds)
     , m_device(NULL)
 {
     m_baseQpc.QuadPart = 0;
@@ -60,6 +61,7 @@ bool TemporalCaptureMode::Setup() {
     m_device = g_pD3D9Device;
 
     if (m_contentProbe) m_ring.EnableContentProbe();
+    if (m_dumpAtSeconds > 0) m_ring.EnableFrameDump(m_dumpAtSeconds);
     if (!m_ring.Setup(m_device, BUF_WIDTH, BUF_HEIGHT)) {
         return false;
     }

@@ -82,6 +82,11 @@ float g_srcRateHint = 0.0f;
 // ground truth; adds driver work per grab, so OFF is the production default.
 int g_contentProbe = 0;
 
+// Frame dump (-dump <seconds>): temporal modes stage 30 consecutive captures starting N
+// seconds in, then write them as BMPs beside the exe. Ground-truth instrument for frame-gen
+// structure (which captured frames are interpolated). Off by default.
+int g_dumpAtSeconds = 0;
+
 // Single fps validation policy for every entry point that accepts a rate (mode strings,
 // -src): accept (0, 1000].
 static bool ParseFps(const string& value, float* outFps) {
@@ -105,14 +110,14 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     // fullscreen game on the source — the production case). Nominal 60 fps drives the
     // bracketing lag; the actual present rate is DWM's delivery.
     if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0) {
-        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_contentProbe != 0);
+        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_contentProbe != 0, g_dumpAtSeconds);
     }
 
     // Temporal selection + QPC-timer present (t:60 format).
     if (modeStr.length() > 2 && modeStr[0] == 't' && modeStr[1] == ':') {
         float framerate;
         if (ParseFps(modeStr.substr(2), &framerate)) {
-            return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_contentProbe != 0);
+            return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_contentProbe != 0, g_dumpAtSeconds);
         }
     }
 
@@ -144,6 +149,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("Options:");
     LOGERR("  -src 30        - Declared source fps; sizes the static temporal lag (default: assume >= 60)");
     LOGERR("  -probe         - Log per-grab content probe (diffmap/classification) - instrument runs only");
+    LOGERR("  -dump 60       - Write 30 consecutive captures as BMPs, starting N seconds in (instrument)");
     return NULL;
 }
 
@@ -401,6 +407,12 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         g_contentProbe = 1;
         return 1;
     }
+    if (tokens[i] == "-dump" && i + 1 < tokens.size()) {
+        float v;
+        if (ParseFps(tokens[i + 1], &v)) g_dumpAtSeconds = (int)v;
+        else LOGERR("-dump value '%s' invalid (seconds, 1-1000) - ignored", tokens[i + 1].c_str());
+        return 2;
+    }
     if (tokens[i] == "-src" && i + 1 < tokens.size()) {
         float v;
         if (ParseFps(tokens[i + 1], &v)) g_srcRateHint = v;
@@ -490,6 +502,7 @@ void ConsoleUserInput(string* framerateStr) {
     cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
     cout << "  t:60 -src 30   - Mode plus options: -src <fps> declares the source rate (lag sizing)" << endl;
     cout << "  t:60 -probe    - Content probe on capture log lines (instrument runs only)" << endl;
+    cout << "  t:60 -dump 60  - Write 30 consecutive captures as BMPs, starting N seconds in" << endl;
     cout << endl;
     cout << "  diag, diag:vsync - Clock probes (DWM compose timing + card raster)" << endl;
     cout << endl;

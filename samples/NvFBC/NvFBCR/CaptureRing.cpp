@@ -1,6 +1,8 @@
 #include "CaptureRing.h"
 #include <SimpleLogger.h>
 #include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 // External globals (NvFBCR.cpp). Start() rebinds the NvFBC session to the capture device and
 // must update the global so WinMain's Cleanup releases the right session.
@@ -26,6 +28,10 @@ CaptureRing::CaptureRing()
     , m_srcPeriodEmaQpc(0)
     , m_stop(true)   // not running until Start()
     , m_writeCount(0)
+    , m_dumpAtSeconds(0)
+    , m_dumpStartQpc(0)
+    , m_dumpCount(0)
+    , m_dumpDrained(false)
     , m_probeRequested(false)
     , m_probeActive(false)
     , m_classMapActive(false)
@@ -42,6 +48,7 @@ CaptureRing::CaptureRing()
         m_ring[i].valid = false;
         m_ring[i].timestamp.QuadPart = 0;
     }
+    for (int i = 0; i < DUMP_FRAMES; i++) m_dumpStaging[i] = NULL;
     m_baseQpc.QuadPart = 0;
 }
 
@@ -70,6 +77,9 @@ CaptureRing::~CaptureRing() {
     // and the grab thread is joined.
     if (m_diffMap)  { VirtualFree(m_diffMap, 0, MEM_RELEASE);  m_diffMap = NULL; }
     if (m_classMap) { VirtualFree(m_classMap, 0, MEM_RELEASE); m_classMap = NULL; }
+    for (int i = 0; i < DUMP_FRAMES; i++) {
+        if (m_dumpStaging[i]) { m_dumpStaging[i]->Release(); m_dumpStaging[i] = NULL; }
+    }
 }
 
 bool CaptureRing::Setup(IDirect3DDevice9Ex* presentDevice, int width, int height) {
@@ -244,6 +254,30 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
             m_diffBlocks, m_classMapActive ? ", classification 16x16 stamps" : " (classification unavailable)");
     }
 
+    // Frame-dump staging: capture-device render targets, filled by GPU-to-GPU StretchRect
+    // during the dump window (cheap enough not to distort the arrival timeline the dump
+    // exists to photograph) and drained to disk afterward.
+    if (m_dumpAtSeconds > 0) {
+        bool ok = true;
+        for (int i = 0; i < DUMP_FRAMES && ok; i++) {
+            if (FAILED(m_capDevice->CreateRenderTarget(m_width, m_height, D3DFMT_A2R10G10B10,
+                    D3DMULTISAMPLE_NONE, 0, FALSE, &m_dumpStaging[i], NULL))) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            m_dumpStartQpc = baseQpc.QuadPart + (LONGLONG)m_dumpAtSeconds * m_freqQuad;
+            LOG("CaptureRing: frame dump ARMED - %d frames at t+%ds -> dump_NN_capXXXX.bmp",
+                DUMP_FRAMES, m_dumpAtSeconds);
+        } else {
+            LOGERR("CaptureRing: frame-dump staging allocation failed - dump disabled");
+            for (int i = 0; i < DUMP_FRAMES; i++) {
+                if (m_dumpStaging[i]) { m_dumpStaging[i]->Release(); m_dumpStaging[i] = NULL; }
+            }
+            m_dumpAtSeconds = 0;
+        }
+    }
+
     if (!m_probeActive && NVFBC_SUCCESS != m_nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
         LOGERR("CaptureRing: NvFBCToDx9VidSetUp on capture device failed");
         return false;
@@ -373,16 +407,17 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         // runs, not reference runs.
         char probeSuffix[64];
         probeSuffix[0] = '\0';
+        int probeChanged = -1;
+        unsigned long long probeHf = 0;
         if (m_probeActive) {
             const unsigned char* diff = (const unsigned char*)m_diffMap;
-            int changed = 0;
-            for (int i = 0; i < m_diffBlocks; i++) changed += (diff[i] != 0);
-            unsigned long long hfSum = 0;
+            probeChanged = 0;
+            for (int i = 0; i < m_diffBlocks; i++) probeChanged += (diff[i] != 0);
             if (m_classMapActive) {
                 const unsigned char* cls = (const unsigned char*)m_classMap;
-                for (int i = 0; i < m_classStamps; i++) hfSum += cls[i];
+                for (int i = 0; i < m_classStamps; i++) probeHf += cls[i];
             }
-            snprintf(probeSuffix, sizeof(probeSuffix), " blk=%d/%d hf=%llu", changed, m_diffBlocks, hfSum);
+            snprintf(probeSuffix, sizeof(probeSuffix), " blk=%d/%d hf=%llu", probeChanged, m_diffBlocks, probeHf);
         }
 
         LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld%s",
@@ -392,7 +427,97 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             (long long)flushUs,
             collapsed,
             probeSuffix);
+
+        // Frame-dump window: stage this capture GPU-to-GPU (does not disturb the timeline);
+        // drain to disk only once the window is full, when timing no longer matters.
+        if (m_dumpStartQpc != 0 && !m_dumpDrained && now.QuadPart >= m_dumpStartQpc
+            && m_dumpCount < DUMP_FRAMES) {
+            m_capDevice->StretchRect(m_ring[slot].capSurface, NULL, m_dumpStaging[m_dumpCount], NULL, D3DTEXF_NONE);
+            DumpMeta& meta = m_dumpMeta[m_dumpCount];
+            meta.captureIndex = count;
+            meta.arrQpc = now.QuadPart;
+            meta.dtQpc = dt;
+            meta.blkChanged = probeChanged;
+            meta.hfSum = probeHf;
+            m_dumpCount++;
+            if (m_dumpCount == DUMP_FRAMES) DrainFrameDump();
+        }
     }
+
+    // Partial window at shutdown (stop requested mid-dump): drain what was staged.
+    if (m_dumpCount > 0 && !m_dumpDrained) DrainFrameDump();
+}
+
+// 24bpp bottom-up BMP. A2R10G10B10 layout: A[31:30] R[29:20] G[19:10] B[9:0]; 8-bit
+// conversion drops the two low bits per channel. A wrong channel order would only tint the
+// image - the dump's purpose (ghosting visibility) survives any color mistake.
+static bool WriteBmp24(const char* path, const unsigned int* pixels, int width, int height, int pitchPx) {
+    FILE* f = NULL;
+    if (fopen_s(&f, path, "wb") != 0 || !f) return false;
+    const int rowBytes = ((width * 3 + 3) / 4) * 4;
+    const int dataSize = rowBytes * height;
+    unsigned char fileHdr[14] = { 'B','M' };
+    *(unsigned int*)(fileHdr + 2) = 14 + 40 + dataSize;
+    *(unsigned int*)(fileHdr + 10) = 14 + 40;
+    unsigned char infoHdr[40] = { 0 };
+    *(unsigned int*)(infoHdr + 0) = 40;
+    *(int*)(infoHdr + 4) = width;
+    *(int*)(infoHdr + 8) = height;
+    *(unsigned short*)(infoHdr + 12) = 1;
+    *(unsigned short*)(infoHdr + 14) = 24;
+    *(unsigned int*)(infoHdr + 20) = dataSize;
+    fwrite(fileHdr, 1, 14, f);
+    fwrite(infoHdr, 1, 40, f);
+    unsigned char* row = (unsigned char*)malloc(rowBytes);
+    if (!row) { fclose(f); return false; }
+    memset(row, 0, rowBytes);
+    for (int y = height - 1; y >= 0; y--) {
+        const unsigned int* src = pixels + (size_t)y * pitchPx;
+        for (int x = 0; x < width; x++) {
+            const unsigned int px = src[x];
+            row[x * 3 + 0] = (unsigned char)((px >> 2)  & 0xFF);   // B10 -> 8
+            row[x * 3 + 1] = (unsigned char)((px >> 12) & 0xFF);   // G10 -> 8
+            row[x * 3 + 2] = (unsigned char)((px >> 22) & 0xFF);   // R10 -> 8
+        }
+        fwrite(row, 1, rowBytes, f);
+    }
+    free(row);
+    fclose(f);
+    return true;
+}
+
+void CaptureRing::DrainFrameDump() {
+    m_dumpDrained = true;
+    LOG("CaptureRing: frame-dump drain start (%d frames) - capture paused", m_dumpCount);
+
+    IDirect3DSurface9* sysmem = NULL;
+    if (FAILED(m_capDevice->CreateOffscreenPlainSurface(m_width, m_height, D3DFMT_A2R10G10B10,
+            D3DPOOL_SYSTEMMEM, &sysmem, NULL))) {
+        LOGERR("CaptureRing: frame-dump sysmem surface failed - dump lost");
+        return;
+    }
+
+    const double usPerTick = 1000000.0 / (double)m_freqQuad;
+    for (int i = 0; i < m_dumpCount; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "dump_%02d_cap%lld.bmp", i, m_dumpMeta[i].captureIndex);
+        bool ok = false;
+        if (SUCCEEDED(m_capDevice->GetRenderTargetData(m_dumpStaging[i], sysmem))) {
+            D3DLOCKED_RECT lr;
+            if (SUCCEEDED(sysmem->LockRect(&lr, NULL, D3DLOCK_READONLY))) {
+                ok = WriteBmp24(path, (const unsigned int*)lr.pBits, m_width, m_height, lr.Pitch / 4);
+                sysmem->UnlockRect();
+            }
+        }
+        LOG("dump %02d cap=%lld arr=%lldus dt=%lldus blk=%d hf=%llu file=%s%s",
+            i, m_dumpMeta[i].captureIndex,
+            (long long)((m_dumpMeta[i].arrQpc - m_baseQpc.QuadPart) * usPerTick),
+            (long long)(m_dumpMeta[i].dtQpc * usPerTick),
+            m_dumpMeta[i].blkChanged, m_dumpMeta[i].hfSum,
+            path, ok ? "" : " WRITE-FAILED");
+    }
+    sysmem->Release();
+    LOG("CaptureRing: frame-dump drain complete");
 }
 
 void CaptureRing::FindBracket(LONGLONG targetQpc, FrameBracket* out) const {

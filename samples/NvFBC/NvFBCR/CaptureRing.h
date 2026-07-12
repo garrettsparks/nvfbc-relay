@@ -87,6 +87,16 @@ public:
     // runs and same-config A/B any numbers gathered with it on.
     void EnableContentProbe() { m_probeRequested = true; }
 
+    // Request a frame dump (-dump <seconds>) before Start: DUMP_FRAMES consecutive captures,
+    // starting the given number of seconds after capture begins, are copied GPU-to-GPU into
+    // staging surfaces as they arrive (cheap, timeline-preserving) and drained to BMP files
+    // in the working directory once the window completes (capture stalls during the drain -
+    // the run's timing is over at that point). Ground-truth instrument: the files show which
+    // captured frames are real vs interpolated (ghosting under panning motion).
+    void EnableFrameDump(int atSeconds) { m_dumpAtSeconds = atSeconds; }
+
+    static const int DUMP_FRAMES = 30;
+
 private:
     struct Slot {
         IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
@@ -115,6 +125,23 @@ private:
     std::atomic<long long> m_srcPeriodEmaQpc;  // capture-thread-written source period estimate
     std::atomic<bool> m_stop;
     long long m_writeCount;               // capture-thread-local
+
+    struct DumpMeta {
+        long long captureIndex;
+        LONGLONG arrQpc;
+        LONGLONG dtQpc;
+        int blkChanged;                   // -1 when the probe is off
+        unsigned long long hfSum;
+    };
+
+    void DrainFrameDump();
+
+    int m_dumpAtSeconds;                  // 0 = disabled
+    LONGLONG m_dumpStartQpc;              // window opens (computed at Start)
+    int m_dumpCount;                      // staged so far
+    bool m_dumpDrained;
+    IDirect3DSurface9* m_dumpStaging[DUMP_FRAMES];   // capture-device render targets
+    DumpMeta m_dumpMeta[DUMP_FRAMES];
 
     bool m_probeRequested;                // content probe asked for (-probe)
     bool m_probeActive;                   // probe survived session setup (driver support)
