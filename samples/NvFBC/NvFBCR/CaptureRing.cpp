@@ -162,7 +162,7 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     }
     NvFBCDX9 = m_nvfbc;
 
-    NVFBC_TODX9VID_OUT_BUF outBuf[1];
+    NVFBC_TODX9VID_OUT_BUF outBuf[1] = {};
     outBuf[0].pPrimary = m_captureTarget;
 
     NVFBC_TODX9VID_SETUP_PARAMS setupParams = {};
