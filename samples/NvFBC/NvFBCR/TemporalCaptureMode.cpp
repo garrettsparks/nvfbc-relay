@@ -32,6 +32,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_shadowEst()
     , m_shadowSrc()
     , m_shadowWrap()
+    , m_combQpc(0)
     , m_telemetryCountdown(0)
     , m_lastPickAfter(false)
     , m_advGateOpen(true)
@@ -103,6 +104,30 @@ bool TemporalCaptureMode::Setup() {
         m_stickinessQpc * 1000000 / m_scheduler.Freq());
     LOG("Phase-pull shadow telemetry: dead computation; estimator-fed (pull/pw/plk) active, -src-anchored (apull/apw/aplk) and circular-phase (wpull/wpw/wplk) %s",
         (m_srcRateHint > 0.0f) ? "active" : "inactive (no -src)");
+
+    // PHASE COMB: each present the target advances one present period, so its phase within a
+    // source interval advances (presentP mod srcP). At a rational rate ratio N:M (reduced),
+    // the phase visits exactly M distinct values spaced srcP/M apart - the comb. Locking the
+    // circular variant to the comb modulus rather than the full period parks one present in
+    // M on a real frame (the theoretical maximum) and holds the rest at fixed offsets, so an
+    // interpolating consumer sees a constant-cadence pulldown instead of a drifting sweep.
+    // M=1 at integer ratios: the modulus degenerates to the full source period and the math
+    // is unchanged. The denominator scan is capped: past M=8 the comb spacing approaches
+    // arrival jitter, the stability gate cannot close, and the variant refuses - the correct
+    // behavior for effectively-irrational ratios.
+    int combM = 1;
+    if (m_srcRateHint > 0.0f) {
+        const double ratio = (double)m_srcRateHint / (double)m_targetFramerate;
+        for (int m = 1; m <= 8; m++) {
+            const double nm = ratio * (double)m;
+            const long long n = (long long)(nm + 0.5);
+            const double frac = nm - (double)n;
+            if (n >= 1 && frac > -0.02 && frac < 0.02) { combM = m; break; }
+        }
+    }
+    m_combQpc = m_assumedSrcPeriodQpc / combM;
+    LOG("Phase comb modulus: %lld us (ratio denominator M=%d; M>1 = fractional-ratio pulldown lock)",
+        m_combQpc * 1000000 / m_scheduler.Freq(), combM);
     return true;
 }
 
@@ -154,7 +179,7 @@ static LONGLONG WrapHalf(LONGLONG d, LONGLONG p) {
     return m - p / 2;
 }
 
-void TemporalCaptureMode::UpdatePhaseShadowWrap(PhaseShadow* s, LONGLONG deadline, LONGLONG srcPeriodQpc) {
+void TemporalCaptureMode::UpdatePhaseShadowWrap(PhaseShadow* s, LONGLONG deadline, LONGLONG modulusQpc) {
     // Circular-phase variant. The linear controller treats phase as a line, so monotonic
     // clock skew walks it into its clamp once per beat and it must drain back through a
     // disengaged sweep. Here the error is the SIGNED distance to the nearest source frame,
@@ -165,23 +190,23 @@ void TemporalCaptureMode::UpdatePhaseShadowWrap(PhaseShadow* s, LONGLONG deadlin
     FrameBracket bracket;
     m_ring.FindBracket(deadline - (m_bracketingDelayQpc + s->pullQpc), &bracket);
     s->weight = bracket.weight;
-    if (!bracket.hasBefore || !bracket.hasAfter || srcPeriodQpc <= 0) {
+    if (!bracket.hasBefore || !bracket.hasAfter || modulusQpc <= 0) {
         return;
     }
 
-    const LONGLONG err = WrapHalf(bracket.beforeDiff, srcPeriodQpc);
+    const LONGLONG err = WrapHalf(bracket.beforeDiff, modulusQpc);
     if (!s->seeded) {
         s->errEmaQpc = err;
         s->seeded = true;
     } else {
-        s->errEmaQpc += WrapHalf(err - s->errEmaQpc, srcPeriodQpc) / 16;
-        s->errEmaQpc = WrapHalf(s->errEmaQpc, srcPeriodQpc);
+        s->errEmaQpc += WrapHalf(err - s->errEmaQpc, modulusQpc) / 16;
+        s->errEmaQpc = WrapHalf(s->errEmaQpc, modulusQpc);
     }
-    LONGLONG dev = WrapHalf(err - s->errEmaQpc, srcPeriodQpc);
+    LONGLONG dev = WrapHalf(err - s->errEmaQpc, modulusQpc);
     if (dev < 0) dev = -dev;
     s->devEmaQpc = (s->devEmaQpc * 15 + dev) / 16;
 
-    s->engaged = s->devEmaQpc < srcPeriodQpc / 8;
+    s->engaged = s->devEmaQpc < modulusQpc / 8;
     const LONGLONG want = s->engaged ? s->pullQpc + s->errEmaQpc : 0;
     LONGLONG delta = want - s->pullQpc;
     if (delta > m_phasePullSlewQpc) delta = m_phasePullSlewQpc;
@@ -190,9 +215,9 @@ void TemporalCaptureMode::UpdatePhaseShadowWrap(PhaseShadow* s, LONGLONG deadlin
 
     // Wrap hysteresis: let the pull overshoot the [0, srcP) domain by a band before wrapping,
     // so jitter-scale wander at the boundary cannot chatter one-frame steps.
-    const LONGLONG band = srcPeriodQpc / 16;
-    if (s->pullQpc < -band) s->pullQpc += srcPeriodQpc;
-    else if (s->pullQpc >= srcPeriodQpc + band) s->pullQpc -= srcPeriodQpc;
+    const LONGLONG band = modulusQpc / 16;
+    if (s->pullQpc < -band) s->pullQpc += modulusQpc;
+    else if (s->pullQpc >= modulusQpc + band) s->pullQpc -= modulusQpc;
 }
 
 void TemporalCaptureMode::Run(
@@ -272,7 +297,7 @@ void TemporalCaptureMode::Run(
         UpdatePhaseShadow(&m_shadowEst, deadline, m_ring.EstimatedSourcePeriodQpc());
         if (anchoredShadow) {
             UpdatePhaseShadow(&m_shadowSrc, deadline, m_assumedSrcPeriodQpc);
-            UpdatePhaseShadowWrap(&m_shadowWrap, deadline, m_assumedSrcPeriodQpc);
+            UpdatePhaseShadowWrap(&m_shadowWrap, deadline, m_combQpc);
         }
 
         bool beforeNew = bracket.hasBefore && bracket.beforeTs > lastShownTs;

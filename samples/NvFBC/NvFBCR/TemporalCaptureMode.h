@@ -48,7 +48,8 @@ private:
     LONGLONG m_phasePullSlewQpc;    // max shadow pull change per present (approach rate)
     PhaseShadow m_shadowEst;        // variant fed by the ring's source-period estimator
     PhaseShadow m_shadowSrc;        // variant anchored to the declared -src period
-    PhaseShadow m_shadowWrap;       // circular-phase variant, anchored to the declared -src period
+    PhaseShadow m_shadowWrap;       // circular-phase variant, anchored to the declared -src comb
+    LONGLONG m_combQpc;             // phase-comb spacing: assumed srcP / M (M=1 at integer ratios)
     int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
     bool m_lastPickAfter;           // Schmitt state: which bracket side the last pick took
     bool m_advGateOpen;             // Schmitt state: last advance-gate decision (see ADVANCE GATE)
@@ -67,9 +68,11 @@ private:
     // the gate and clamp; 0 keeps the variant disengaged (estimator not warmed up).
     void UpdatePhaseShadow(PhaseShadow* s, LONGLONG deadline, LONGLONG srcPeriodQpc);
 
-    // Circular-phase counterpart: the error and its EMAs live in (-srcP/2, srcP/2], the pull
-    // wraps modulo the source period behind a hysteresis band, and the slew is symmetric.
-    void UpdatePhaseShadowWrap(PhaseShadow* s, LONGLONG deadline, LONGLONG srcPeriodQpc);
+    // Circular-phase counterpart: the error and its EMAs live in (-mod/2, mod/2], the pull
+    // wraps modulo modulusQpc behind a hysteresis band, and the slew is symmetric. The
+    // modulus is the phase-comb spacing: the full source period at integer ratios, srcP/M at
+    // a rational ratio N:M (see the comb derivation in Setup).
+    void UpdatePhaseShadowWrap(PhaseShadow* s, LONGLONG deadline, LONGLONG modulusQpc);
 
 public:
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f);
