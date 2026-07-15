@@ -32,7 +32,15 @@ private:
     LONGLONG m_bracketingDelayQpc;  // present-target lag; static: max(present period, 1.25 x assumed source period)
     LONGLONG m_assumedSrcPeriodQpc; // declared/default source period the lag was sized for
     LONGLONG m_stickinessQpc;       // selection Schmitt band (anti flip-flop at bracket midpoint)
+    LONGLONG m_combQpc;             // phase-comb spacing (assumed srcP / M); 0 = lock disabled
+    LONGLONG m_phasePullQpc;        // live comb-lock pull: extra lag holding the target on the comb
+    LONGLONG m_phaseErrEmaQpc;      // EMA of the wrapped phase error (alpha 1/16)
+    LONGLONG m_phaseDevEmaQpc;      // EMA of |err - errEma|: phase stability (lock gate input)
+    LONGLONG m_phasePullSlewQpc;    // max pull change per present
     int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
+    bool m_phaseSeeded;             // errEma holds a sample (0 is a legal EMA value)
+    bool m_lockEngaged;             // stability-gate state at the last pull update
+    bool m_noLock;                  // -nolock: comb lock disabled, lag sizing untouched (A/B control)
     bool m_lastPickAfter;           // Schmitt state: which bracket side the last pick took
     bool m_advGateOpen;             // Schmitt state: last advance-gate decision (see ADVANCE GATE)
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
@@ -45,8 +53,15 @@ private:
     // the present period. Setup sizes the operative lag with it; telemetry sizes suggestions.
     LONGLONG LagForSourcePeriod(LONGLONG srcPeriodQpc) const;
 
+    // One comb-lock step, closed-loop on the live bracket: the pull is already inside the
+    // target the bracket was found at, so bracket.beforeDiff is the loop error. Updates the
+    // pull for the NEXT present (EMA filter, stability gate, symmetric bounded slew, wrap
+    // modulo the comb behind a hysteresis band).
+    void UpdatePhaseLock(LONGLONG beforeDiffQpc);
+
 public:
-    TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f);
+    TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
+                        bool noLock = false);
 
     virtual UINT GetPresentationInterval() const override;
     virtual bool Setup() override;
