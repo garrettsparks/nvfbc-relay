@@ -24,11 +24,19 @@ static const char* const kPickAfterAdv  = "after-adv";    // only the after-fram
 static const char* const kPickBeforeAdv = "before-adv";
 static const char* const kPickRepeat    = "repeat";       // nothing newer than last shown — genuine stall
 
-TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint)
+TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_stickinessQpc(0)
+    , m_combQpc(0)
+    , m_phasePullQpc(0)
+    , m_phaseErrEmaQpc(0)
+    , m_phaseDevEmaQpc(0)
+    , m_phasePullSlewQpc(0)
     , m_telemetryCountdown(0)
+    , m_phaseSeeded(false)
+    , m_lockEngaged(false)
+    , m_lock(lock)
     , m_lastPickAfter(false)
     , m_advGateOpen(true)
     , m_vsyncPresent(vsyncPresent)
@@ -92,7 +100,80 @@ bool TemporalCaptureMode::Setup() {
         (m_srcRateHint > 0.0f) ? "-src " : ">= ", assumedFps);
     LOG("Selection stickiness band: %lld us (anti flip-flop at bracket midpoint)",
         m_stickinessQpc * 1000000 / m_scheduler.Freq());
+
+    // PHASE COMB LOCK (see docs/phase-comb-lock-spec.md). Each present the target's phase
+    // within a source interval advances by (presentP mod srcP); at a rational rate ratio
+    // N:M (reduced) it visits exactly M values spaced srcP/M apart - the comb. A slow
+    // control term (the pull, applied as extra lag) locks the target onto the comb, so
+    // selection operates at a stable phase just behind each real frame instead of sweeping
+    // through the bracket every beat: the boundary-dwell excursions (gate-decline repeat,
+    // then a multi-frame catch-up) become unreachable, and one comb-spacing slip per beat
+    // remains - the same slip an unlocked beat already pays. Anchored ONLY to an explicit
+    // -src: anchoring the default-60 fallback would manufacture false locks on undeclared
+    // sources. The denominator scan is capped: past M=8 the comb spacing approaches arrival
+    // jitter, the stability gate cannot close, and the lock refuses - correct for
+    // effectively-irrational ratios. Latency: the pull adds a bounded slow sawtooth
+    // (<= one comb spacing peak-to-peak, drift-rate ramp, one discrete step per beat),
+    // accepted as a documented trade alongside the static lag (spec clause 4).
+    m_phasePullSlewQpc = m_scheduler.Freq() / 40000;   // 25 us per present
+    if (m_lock && m_srcRateHint > 0.0f) {
+        int combM = 1;
+        const double ratio = (double)m_srcRateHint / (double)m_targetFramerate;
+        for (int m = 1; m <= 8; m++) {
+            const double nm = ratio * (double)m;
+            const long long n = (long long)(nm + 0.5);
+            const double frac = nm - (double)n;
+            if (n >= 1 && frac > -0.02 && frac < 0.02) { combM = m; break; }
+        }
+        m_combQpc = m_assumedSrcPeriodQpc / combM;
+        LOG("Phase comb lock ACTIVE (-lock): modulus %lld us (ratio denominator M=%d); pull=/lk= on the temporal line",
+            m_combQpc * 1000000 / m_scheduler.Freq(), combM);
+    } else {
+        LOG("Phase comb lock off (%s); target rides the static lag alone",
+            !m_lock ? "-lock not set" : "-lock set but no -src to derive the comb");
+    }
     return true;
+}
+
+// Map a tick offset into (-p/2, p/2]: the signed distance to the nearest point on a
+// p-periodic timeline. C++ % truncates toward zero, so negative remainders need folding up.
+static LONGLONG WrapHalf(LONGLONG d, LONGLONG p) {
+    LONGLONG m = (d + p / 2) % p;
+    if (m < 0) m += p;
+    return m - p / 2;
+}
+
+void TemporalCaptureMode::UpdatePhaseLock(LONGLONG beforeDiffQpc) {
+    // Closed loop: the pull is already inside the target this error was measured at, so
+    // want = pull + errEma converges instead of integrating. Error and EMAs live on the
+    // circular comb domain; a linear controller here saturates against clock skew and
+    // drains through a disengaged sweep every beat (measured - see the spec).
+    const LONGLONG err = WrapHalf(beforeDiffQpc, m_combQpc);
+    if (!m_phaseSeeded) {
+        m_phaseErrEmaQpc = err;
+        m_phaseSeeded = true;
+    } else {
+        m_phaseErrEmaQpc += WrapHalf(err - m_phaseErrEmaQpc, m_combQpc) / 16;
+        m_phaseErrEmaQpc = WrapHalf(m_phaseErrEmaQpc, m_combQpc);
+    }
+    LONGLONG dev = WrapHalf(err - m_phaseErrEmaQpc, m_combQpc);
+    if (dev < 0) dev = -dev;
+    m_phaseDevEmaQpc = (m_phaseDevEmaQpc * 15 + dev) / 16;
+
+    // Stability gate: stable phase = near-rational ratio, lock possible; sweeping phase =
+    // genuine rate conversion, the pull decays to zero and selection proceeds unlocked.
+    m_lockEngaged = m_phaseDevEmaQpc < m_combQpc / 8;
+    const LONGLONG want = m_lockEngaged ? m_phasePullQpc + m_phaseErrEmaQpc : 0;
+    LONGLONG delta = want - m_phasePullQpc;
+    if (delta > m_phasePullSlewQpc) delta = m_phasePullSlewQpc;
+    else if (delta < -m_phasePullSlewQpc) delta = -m_phasePullSlewQpc;
+    m_phasePullQpc += delta;
+
+    // Wrap hysteresis: the pull may overshoot the [0, comb) domain by a band before
+    // wrapping, so jitter-scale wander at the boundary cannot chatter one-frame slips.
+    const LONGLONG band = m_combQpc / 16;
+    if (m_phasePullQpc < -band) m_phasePullQpc += m_combQpc;
+    else if (m_phasePullQpc >= m_combQpc + band) m_phasePullQpc -= m_combQpc;
 }
 
 void TemporalCaptureMode::Run(
@@ -134,7 +215,10 @@ void TemporalCaptureMode::Run(
             m_scheduler.WaitUntilDeadline();
             deadline = m_scheduler.Deadline();
         }
-        const LONGLONG target = deadline - m_bracketingDelayQpc;
+        // Comb lock applies the pull as extra lag; zero when disabled or disengaged. The
+        // pull was computed from LAST present's bracket (closed loop, one-present latency
+        // in the control path - negligible at 25 us/present slew).
+        const LONGLONG target = deadline - (m_bracketingDelayQpc + m_phasePullQpc);
 
         // Select: nearest-to-target frame, with HYSTERESIS — present frames in strictly
         // increasing timestamp order. Among the bracket frames NEWER than the last presented
@@ -156,6 +240,13 @@ void TemporalCaptureMode::Run(
         // exactly once per sweep: one clean single-frame slip instead of seconds of judder.
         FrameBracket bracket;
         m_ring.FindBracket(target, &bracket);
+
+        // Update the comb-lock pull for the next present. Skipped when the bracket is
+        // incomplete (startup, stalls): the pull freezes rather than integrating on a
+        // one-sided error, and the frozen value stays bounded by construction.
+        if (m_combQpc > 0 && bracket.hasBefore && bracket.hasAfter) {
+            UpdatePhaseLock(bracket.beforeDiff);
+        }
 
         bool beforeNew = bracket.hasBefore && bracket.beforeTs > lastShownTs;
         bool afterNew  = bracket.hasAfter  && bracket.afterTs  > lastShownTs;
@@ -227,7 +318,9 @@ void TemporalCaptureMode::Run(
                     m_ring.Published());
             }
         } else {
-            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus",
+            // pull/lk are append-only: effective latency = lag + pull (a bounded sawtooth
+            // at lock); lk=-1 marks the lock feature disabled entirely.
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((bracket.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
@@ -235,7 +328,9 @@ void TemporalCaptureMode::Run(
                 bracket.weight, pick,
                 (long long)((beforePresent.QuadPart - deadline) * usPerTick),
                 (long long)(presentDelta * usPerTick),
-                lagUs);
+                lagUs,
+                (long long)(m_phasePullQpc * usPerTick),
+                (m_combQpc > 0) ? (m_lockEngaged ? 1 : 0) : -1);
             if (!bracket.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }
