@@ -77,10 +77,12 @@ bool FrameMarker::Init(IDirect3DDevice9Ex* device, int bufWidth, int bufHeight) 
     if (m_destRect.bottom > bufHeight) m_destRect.bottom = bufHeight;
 
     HRESULT hr = device->CreateOffscreenPlainSurface(
-        kGridW, kGridH, D3DFMT_A2R10G10B10, D3DPOOL_SYSTEMMEM, &m_sysmem, NULL);
+        kGridW * kTexelsPerCell, kGridH * kTexelsPerCell,
+        D3DFMT_A2R10G10B10, D3DPOOL_SYSTEMMEM, &m_sysmem, NULL);
     if (SUCCEEDED(hr)) {
         hr = device->CreateOffscreenPlainSurface(
-            kGridW, kGridH, D3DFMT_A2R10G10B10, D3DPOOL_DEFAULT, &m_vram, NULL);
+            kGridW * kTexelsPerCell, kGridH * kTexelsPerCell,
+            D3DFMT_A2R10G10B10, D3DPOOL_DEFAULT, &m_vram, NULL);
     }
     if (FAILED(hr)) {
         LOGERR("marker: surface creation failed (hr=0x%08lx) - running unmarked", (unsigned long)hr);
@@ -100,10 +102,12 @@ bool FrameMarker::BurnBlit(IDirect3DSurface9* backbuffer, const bool cells[kCell
     D3DLOCKED_RECT locked;
     HRESULT hr = m_sysmem->LockRect(&locked, NULL, 0);
     if (FAILED(hr)) return false;
-    for (int y = 0; y < kGridH; y++) {
+    for (int y = 0; y < kGridH * kTexelsPerCell; y++) {
         DWORD* row = (DWORD*)((BYTE*)locked.pBits + y * locked.Pitch);
-        for (int x = 0; x < kGridW; x++) {
-            const bool white = (y == 1) && (x >= 1) && (x <= kCells) && cells[x - 1];
+        const bool cellRow = (y / kTexelsPerCell) == 1;
+        for (int x = 0; x < kGridW * kTexelsPerCell; x++) {
+            const int cx = x / kTexelsPerCell;
+            const bool white = cellRow && (cx >= 1) && (cx <= kCells) && cells[cx - 1];
             row[x] = white ? kTexelWhite : kTexelBlack;
         }
     }

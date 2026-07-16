@@ -47,14 +47,22 @@ public:
     unsigned int Burn(IDirect3DSurface9* backbuffer, int pickCode, int weightQ);
 
 private:
-    // Grid geometry: one texel per cell plus a one-cell quiet zone on every side.
-    // The strip is blitted at a fixed fraction of the output width (kCellsPerWidth
-    // cells per width: 32 px cells at 1920) so the decoder locates cells by frame
-    // fraction at any recording resolution.
+    // Grid geometry: kTexelsPerCell texels per cell plus a one-cell quiet zone on
+    // every side. The strip is blitted at a fixed fraction of the output width
+    // (kCellsPerWidth cells per width: 32 px cells at 1920) so the decoder locates
+    // cells by frame fraction at any recording resolution.
+    //
+    // Multiple texels per cell defend against the D3D9 half-texel sampling
+    // convention: driver StretchRect paths that anchor on texel centers stretch an
+    // N-texel source across N-1 texel spans, which at one texel per cell displaces
+    // far cells by a full cell width (measured: a 46x3 grid rendered as 45x2). At
+    // kTexelsPerCell the worst displacement is 1/kTexelsPerCell of a cell, inside
+    // the decoder's inner-50% center-sampling margin either way.
     static const int kCells = 44;          // sync + 39 payload bits + 4 checksum
     static const int kGridW = kCells + 2;  // quiet zone left/right
     static const int kGridH = 3;           // quiet zone above/below
     static const int kCellsPerWidth = 60;
+    static const int kTexelsPerCell = 8;
 
     // Primary draw path: write the grid into the sysmem strip, UpdateSurface it to
     // the default-pool copy, one point-sampled StretchRect into the marker region.

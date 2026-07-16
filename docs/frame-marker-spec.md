@@ -63,7 +63,7 @@ a checksum + counter monotonicity instead.
 | 30-31 | compositor ID (v2) | 00 nearest, 01 blend, 10 fruc, 11 flow-warp (HOW the output was made) |
 | 32-33 | source provenance (v2+) | 00 real, 01 gen-believed, 10 unknown, 11 mixed (WHAT the input frame was) |
 | 34-36 | pick code (LIVE in v1) | 0 none, 1 before, 2 after, 3 after-adv, 4 before-adv, 5 repeat |
-| 37-39 | extension schema ID | 0 = core only (v1); nonzero selects a future extension layout |
+| 37-39 | extension schema ID | 0 = core only (v1); 1-6 select future extension layouts; 7 reserved = "extended: true schema ID lives in the first extension row" (unbounded schema space) |
 | 40-43 | checksum | 4-bit XOR of the payload nibbles (cells 1-39; misread detection) |
 
 ### Compatibility contract (append-only, same philosophy as the temporal log line)
@@ -242,8 +242,19 @@ pre-optimize; batch only if measured.
 
 ## Gotchas
 
+- **D3D9 half-texel sampling (MEASURED, first real capture 2026-07-16):** the driver's
+  StretchRect anchored sampling on texel centers, stretching the N-texel source across N-1
+  texel spans — a 46x3 one-texel-per-cell grid rendered as 45 columns x 2 rows (cells
+  drifted up to a full cell at the strip's far end; bottom quiet zone never drawn; x-run
+  boundaries matched the (N-1) model exactly: predicted 294/360/425/916/1145/1407 vs
+  observed 294/360/425/915/1144/1406). Checksums failed at exactly the 1/16 chance rate
+  until geometry-corrected — the misread was systematic, not noise. FIX: multiple texels
+  per cell (8) bounds the displacement to 1/8 cell under EITHER convention, absorbed by the
+  decoder's inner-50% center sampling; verified synthetically under both conventions. The
+  capture itself was fully recoverable at the (N-1) pitch — 100% checksum, all counters
+  joined — so the payload design survived its own geometry bug.
 - ColorFill format/pool restriction on the ARGB10 backbuffer — verify; have the StretchRect
-  fallback ready.
+  fallback ready. (ColorFill geometry is direct dest rects, immune to sampling conventions.)
 - OBS crop/scale: position the marker as a frame fraction and keep the region clear of HUD in
   test captures; account for the 1080p-card-into-1440p-canvas geometry the user runs.
 - Chroma subsampling: luma-only cells (done by design).
