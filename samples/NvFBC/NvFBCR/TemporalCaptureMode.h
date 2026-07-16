@@ -40,7 +40,7 @@ private:
     int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
     bool m_phaseSeeded;             // errEma holds a sample (0 is a legal EMA value)
     bool m_lockEngaged;             // stability-gate state at the last pull update
-    bool m_noLock;                  // -nolock: comb lock disabled, lag sizing untouched (A/B control)
+    bool m_lock;                    // -lock: opt in to the comb lock (needs -src); default off
     bool m_lastPickAfter;           // Schmitt state: which bracket side the last pick took
     bool m_advGateOpen;             // Schmitt state: last advance-gate decision (see ADVANCE GATE)
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
@@ -61,7 +61,7 @@ private:
 
 public:
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
-                        bool noLock = false);
+                        bool lock = false);
 
     virtual UINT GetPresentationInterval() const override;
     virtual bool Setup() override;

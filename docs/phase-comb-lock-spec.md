@@ -2,8 +2,10 @@
 
 Status: mechanism VALIDATED as dead telemetry (branch `shadow-phase-telemetry`, 2026-07-12;
 sim → integer-exact replay → hardware, all agreeing). LIVE in nearest mode on branch
-`phase-comb-lock` (2026-07-14): the pull drives the real selection target, enabled by an
-explicit `-src`, disabled by `-nolock` (the A/B control arm — lag sizing unaffected).
+`phase-comb-lock` (2026-07-14): the pull drives the real selection target. OPT-IN via `-lock`
+(off by default); `-src` alone keeps its established lag-sizing meaning and v15 selection.
+`-lock` needs `-src` to derive the comb. A/B: `-src N` (control) vs `-src N -lock` (treatment),
+identical lag.
 Motivating find for going live before blend: the gate-excursion mechanism (dupe, ~9 presents
 riding one frame behind, 2-frame makeup) measured live at 402.51s/410.21s of the 2026-07-14
 stream log — at lock, selection operates in the beforeNew arm and the excursion path is
@@ -48,9 +50,12 @@ pull integrates without bound).
 
 M derives from the DECLARED ratio only: rationalize `-src` fps against the present rate
 (denominator scan m=1..8, tolerance 0.02, fallback M=1). Never anchor to the default-60
-fallback — anchoring to a guess manufactures false locks. Past M=8 the comb spacing
-approaches arrival jitter, the gate cannot close, and the variant refuses: the correct
-behavior for effectively-irrational ratios. A wrong `-src` produces a misfit comb and the
+fallback — anchoring to a guess manufactures false locks. The refusal criterion is `comb/8 < arrival jitter`: when the comb teeth (srcP/M) approach
+the ~300us jitter, a jittery lock and a slow sweep are indistinguishable from the phase
+signal, so the gate cannot close and the lock refuses. This bites at M>=~5 (e.g. 144->60 =
+12:5, comb 1389us, gate 174us < 300us -> refuses to v15 nearest; 120->60 M=1 and 90->60 M=2
+lock robustly). The property is self-selecting: real-frame harvest is 1/M, so the ratios that
+are hardest to lock (fine comb, high M) are exactly the ones where locking is worth least. A wrong `-src` produces a misfit comb and the
 same clean refusal.
 
 Locked, one present in M lands on a real frame — the theoretical maximum — and the remaining
@@ -77,12 +82,52 @@ log's `dt` measures last-batch-member → next-batch-start and reads short by th
 1. **Targeting term**: the comb wrap math above, applied as extra lag on the selection
    target. Blend modes only; nearest modes keep their validated selection untouched.
 2. **Compositing consumes lock state, not raw w.** Per present, with the bracket at the
-   pulled target: if `min(beforeDiff, afterDiff) < comb/8`, present that real frame
-   directly; else blend at the bracket weight. The threshold sits at a boundary far from
-   both operating points (locked presents measure ≤ ~0.65 ms from a real frame; hole/off-comb
-   presents ≥ ~⅓ comb), so it cannot flip-flop — the gate-placement lesson. Which side the
-   lock settles on (w≈0 vs w≈1) is thereby irrelevant, and instantaneous-w jitter never
-   reaches the output.
+   pulled target: if `min(beforeDiff, afterDiff)` is under a passthrough threshold, present
+   that real frame directly; else blend at the bracket weight. The threshold sits at a
+   boundary far from both operating points (locked presents measure ≤ ~0.65 ms from a real
+   frame; hole/off-comb presents ≥ ~⅓ comb), so it cannot flip-flop — the gate-placement
+   lesson. Which side the lock settles on (w≈0 vs w≈1) is thereby irrelevant, and
+   instantaneous-w jitter never reaches the output.
+
+   The passthrough threshold keys off the SOURCE period, not the comb, so it is well-defined
+   when the lock refused (no comb): it is fundamentally "is a real frame close enough that
+   blending would only trade sharpness for sub-frame timing." Two regimes:
+   - **Source oversamples the present** (src fps > present fps: 144/120/240 → 60). A real
+     frame is always within srcP/2 of any target, so passthrough dominates WITHOUT the lock —
+     the threshold should approach srcP/2 here and blend essentially never fires. This is why
+     144→60 refusing to lock does NOT mean "blend every frame": nearest already lands on real
+     frames every present, and the compositor passes them through sharp. The lock's alignment
+     bonus is redundant when the source oversamples.
+   - **Source at or below the present** (60→60, or FG-collapsed 60-base, or sub-rate). Here
+     the target sweeps through the bracket un-locked and only ~1/8 of presents land near a
+     real frame; a tighter threshold (~srcP/8) with the lock engaged is what raises passthrough
+     to ~100%. THIS is the regime the lock exists for.
+   Net: the lock matters when source ≤ present (alignment needed to hit real frames); when
+   source > present the compositor passes through real frames for free, lock or no lock.
+
+   **Threshold value: srcP/4 as a robust default; placement settled, perceptual sign-off
+   pending blend (2026-07-15).** Geometry pins the range (srcP/2 hard ceiling — past it the
+   other bracket frame is nearer; ~300us jitter floor below which "on target" is meaningless).
+   Replaying the actual lock-validation session logs through a threshold sweep showed a wide
+   DEAD-ZONE PLATEAU at every regime — the passed-through SET is insensitive to the exact
+   value across [~1ms, srcP/4], and the plateau held across 60x2 / 90cap / unlocked, so the
+   choice is NOT environment-dependent and needs no fine numerical calibration. What the
+   replay CANNOT settle (no interpolated frames exist yet): whether boundary frames read
+   better passed-through-sharp (displaced ≤ srcP/2) or interpolated (correct-but-soft) — a
+   visual judgment for the blend A/B, which confirms the plateau + the sharp-lean rather than
+   hunting a value. Regime detail from the sweep:
+   - Locked 60x2 (production): any T in [1ms, srcP/4] passes 98-99.9% of presents at median
+     displacement ~190us (~1% of a frame period, invisible). Passthrough under lock is free.
+   - Locked 90cap (M=2): pass fraction flat at ~50% across [0.5ms, 4.4ms] (on-comb reals at
+     ~100us vs mid-gap members, separated by a gulf). CAUTION: at srcP/2 it jumps to 96% by
+     swallowing mid-gap frames at p95 5.5ms displacement = half-frame judder. Do NOT go wider
+     than ~srcP/4 — at fractional locks wide thresholds trade interpolation for judder.
+   - Unlocked sweep (60x2 -nolock control): no good threshold exists (73% pass costs 3.9ms
+     median displacement) — correct, since blend IS the intended behavior when unlocked.
+   Velocity cancels in the trade (passthrough error v·Δt vs ghost spread v·srcP, ratio ≤ 1/2
+   always), so pan speed does not move the threshold; content/eye-tracking effects only matter
+   in the unlocked regime. The blend-mode visual A/B reduces to confirming the plateau, not
+   calibrating a knob.
 3. **Dropped frames need no detection.** A missing source frame is invisible to the lock
    (the wrapped error is invariant modulo the comb) and visible to the bracket (it widens):
    the hole present reads w≈0.5 and clause 2 classifies it BLEND — an interpolated

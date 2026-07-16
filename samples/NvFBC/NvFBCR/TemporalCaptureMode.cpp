@@ -24,7 +24,7 @@ static const char* const kPickAfterAdv  = "after-adv";    // only the after-fram
 static const char* const kPickBeforeAdv = "before-adv";
 static const char* const kPickRepeat    = "repeat";       // nothing newer than last shown — genuine stall
 
-TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool noLock)
+TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_stickinessQpc(0)
@@ -36,7 +36,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_telemetryCountdown(0)
     , m_phaseSeeded(false)
     , m_lockEngaged(false)
-    , m_noLock(noLock)
+    , m_lock(lock)
     , m_lastPickAfter(false)
     , m_advGateOpen(true)
     , m_vsyncPresent(vsyncPresent)
@@ -116,7 +116,7 @@ bool TemporalCaptureMode::Setup() {
     // (<= one comb spacing peak-to-peak, drift-rate ramp, one discrete step per beat),
     // accepted as a documented trade alongside the static lag (spec clause 4).
     m_phasePullSlewQpc = m_scheduler.Freq() / 40000;   // 25 us per present
-    if (m_srcRateHint > 0.0f && !m_noLock) {
+    if (m_lock && m_srcRateHint > 0.0f) {
         int combM = 1;
         const double ratio = (double)m_srcRateHint / (double)m_targetFramerate;
         for (int m = 1; m <= 8; m++) {
@@ -126,11 +126,11 @@ bool TemporalCaptureMode::Setup() {
             if (n >= 1 && frac > -0.02 && frac < 0.02) { combM = m; break; }
         }
         m_combQpc = m_assumedSrcPeriodQpc / combM;
-        LOG("Phase comb lock ACTIVE: modulus %lld us (ratio denominator M=%d); pull=/lk= on the temporal line",
+        LOG("Phase comb lock ACTIVE (-lock): modulus %lld us (ratio denominator M=%d); pull=/lk= on the temporal line",
             m_combQpc * 1000000 / m_scheduler.Freq(), combM);
     } else {
-        LOG("Phase comb lock inactive (%s); target rides the static lag alone",
-            m_noLock ? "-nolock" : "no explicit -src");
+        LOG("Phase comb lock off (%s); target rides the static lag alone",
+            !m_lock ? "-lock not set" : "-lock set but no -src to derive the comb");
     }
     return true;
 }
