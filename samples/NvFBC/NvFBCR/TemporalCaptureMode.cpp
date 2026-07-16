@@ -24,7 +24,19 @@ static const char* const kPickAfterAdv  = "after-adv";    // only the after-fram
 static const char* const kPickBeforeAdv = "before-adv";
 static const char* const kPickRepeat    = "repeat";       // nothing newer than last shown — genuine stall
 
-TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock)
+// The marker's 3-bit pick encoding (FrameMarker cell layout). Pointer identity is
+// sufficient: pick labels are only ever the kPick* constants above.
+static int PickCodeForLabel(const char* pick) {
+    if (pick == kPickBefore)    return 1;
+    if (pick == kPickAfter)     return 2;
+    if (pick == kPickAfterAdv)  return 3;
+    if (pick == kPickBeforeAdv) return 4;
+    if (pick == kPickRepeat)    return 5;
+    return 0;
+}
+
+TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
+                                         bool mark)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_stickinessQpc(0)
@@ -37,6 +49,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_phaseSeeded(false)
     , m_lockEngaged(false)
     , m_lock(lock)
+    , m_mark(mark)
     , m_lastPickAfter(false)
     , m_advGateOpen(true)
     , m_vsyncPresent(vsyncPresent)
@@ -70,6 +83,11 @@ bool TemporalCaptureMode::Setup() {
     }
     if (!m_scheduler.Setup(m_targetFramerate)) {
         return false;
+    }
+    // Marker resources live on the PRESENT device (the burn is a backbuffer overlay,
+    // never a ring-surface write). A failed Init disables the marker, not the relay.
+    if (m_mark) {
+        m_marker.Init(m_device, BUF_WIDTH, BUF_HEIGHT);
     }
     // STATIC BRACKETING LAG: max(present period, 1.25 x assumed source period). The lag
     // exists so that a frame newer than the target has already arrived at pick time; the
@@ -118,16 +136,18 @@ bool TemporalCaptureMode::Setup() {
     m_phasePullSlewQpc = m_scheduler.Freq() / 40000;   // 25 us per present
     if (m_lock && m_srcRateHint > 0.0f) {
         int combM = 1;
+        bool combMatched = false;
         const double ratio = (double)m_srcRateHint / (double)m_targetFramerate;
         for (int m = 1; m <= 8; m++) {
             const double nm = ratio * (double)m;
             const long long n = (long long)(nm + 0.5);
             const double frac = nm - (double)n;
-            if (n >= 1 && frac > -0.02 && frac < 0.02) { combM = m; break; }
+            if (n >= 1 && frac > -0.02 && frac < 0.02) { combM = m; combMatched = true; break; }
         }
         m_combQpc = m_assumedSrcPeriodQpc / combM;
-        LOG("Phase comb lock ACTIVE (-lock): modulus %lld us (ratio denominator M=%d); pull=/lk= on the temporal line",
-            m_combQpc * 1000000 / m_scheduler.Freq(), combM);
+        LOG("Phase comb lock ACTIVE (-lock): modulus %lld us (ratio denominator M=%d%s); pull=/lk= on the temporal line",
+            m_combQpc * 1000000 / m_scheduler.Freq(), combM,
+            combMatched ? "" : ", no rational match: M=1 fallback, stability gate decides");
     } else {
         LOG("Phase comb lock off (%s); target rides the static lag alone",
             !m_lock ? "-lock not set" : "-lock set but no -src to derive the comb");
@@ -135,7 +155,7 @@ bool TemporalCaptureMode::Setup() {
     return true;
 }
 
-// Map a tick offset into (-p/2, p/2]: the signed distance to the nearest point on a
+// Map a tick offset into [-p/2, p/2): the signed distance to the nearest point on a
 // p-periodic timeline. C++ % truncates toward zero, so negative remainders need folding up.
 static LONGLONG WrapHalf(LONGLONG d, LONGLONG p) {
     LONGLONG m = (d + p / 2) % p;
@@ -162,6 +182,11 @@ void TemporalCaptureMode::UpdatePhaseLock(LONGLONG beforeDiffQpc) {
 
     // Stability gate: stable phase = near-rational ratio, lock possible; sweeping phase =
     // genuine rate conversion, the pull decays to zero and selection proceeds unlocked.
+    // Deliberately a bare comparator, no hysteresis: every lockable ratio holds devEma far
+    // below the gate, so engage/disengage chatter requires a declared -src about a percent
+    // off the true rate (steady-state dev parks at the threshold). If in-regime lk flapping
+    // ever shows up in real logs, give this the selection-stickiness Schmitt treatment
+    // (engage below comb/8, release above comb/6) rather than tightening the -src tolerance.
     m_lockEngaged = m_phaseDevEmaQpc < m_combQpc / 8;
     const LONGLONG want = m_lockEngaged ? m_phasePullQpc + m_phaseErrEmaQpc : 0;
     LONGLONG delta = want - m_phasePullQpc;
@@ -296,6 +321,16 @@ void TemporalCaptureMode::Run(
             lastShownSurface = chosen;
         }
 
+        // Burn the marker over the composed backbuffer, once per present (repeats
+        // included: the counter identifies presented frames, not source frames).
+        // Before the present stamp, so jit/pdt absorb its cost and a -mark on/off
+        // A/B measures it.
+        long long markN = -1;
+        if (m_mark) {
+            const int weightQ = bracket.hasBefore ? (int)(bracket.weight * 15.0 + 0.5) : 0;
+            markN = (long long)m_marker.Burn(g_backbuffer, PickCodeForLabel(pick), weightQ);
+        }
+
         LARGE_INTEGER beforePresent;
         QueryPerformanceCounter(&beforePresent);
         // Timer: immediate (non-blocking). Vsync: INTERVAL_ONE blocks until DWM's next compose
@@ -318,9 +353,10 @@ void TemporalCaptureMode::Run(
                     m_ring.Published());
             }
         } else {
-            // pull/lk are append-only: effective latency = lag + pull (a bounded sawtooth
-            // at lock); lk=-1 marks the lock feature disabled entirely.
-            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d",
+            // pull/lk/mark are append-only: effective latency = lag + pull (a bounded
+            // sawtooth at lock); lk=-1 marks the lock feature disabled entirely; mark=-1
+            // marks the frame marker disabled (video-to-log join key otherwise).
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((bracket.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
@@ -330,7 +366,8 @@ void TemporalCaptureMode::Run(
                 (long long)(presentDelta * usPerTick),
                 lagUs,
                 (long long)(m_phasePullQpc * usPerTick),
-                (m_combQpc > 0) ? (m_lockEngaged ? 1 : 0) : -1);
+                (m_combQpc > 0) ? (m_lockEngaged ? 1 : 0) : -1,
+                markN);
             if (!bracket.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }

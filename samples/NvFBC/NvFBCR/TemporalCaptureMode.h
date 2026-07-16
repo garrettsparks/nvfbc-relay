@@ -3,6 +3,7 @@
 #include "IFrameCaptureMode.h"
 #include "PresentScheduler.h"
 #include "CaptureRing.h"
+#include "FrameMarker.h"
 
 // Temporal capture mode — nearest-frame selection for smooth fixed-rate capture of a
 // (possibly variable-rate) source.
@@ -41,6 +42,7 @@ private:
     bool m_phaseSeeded;             // errEma holds a sample (0 is a legal EMA value)
     bool m_lockEngaged;             // stability-gate state at the last pull update
     bool m_lock;                    // -lock: opt in to the comb lock (needs -src); default off
+    bool m_mark;                    // -mark: burn the frame-counter marker (debug); default off
     bool m_lastPickAfter;           // Schmitt state: which bracket side the last pick took
     bool m_advGateOpen;             // Schmitt state: last advance-gate decision (see ADVANCE GATE)
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
@@ -48,6 +50,7 @@ private:
     float m_targetFramerate;
     float m_srcRateHint;            // declared source fps (-src); 0 = unset, assume >= 60
     IDirect3DDevice9Ex* m_device;
+    FrameMarker m_marker;           // per-present provenance burn-in (inert unless -mark)
 
     // The one lag-sizing rule: 1.25x the source period for bracketing headroom, floored at
     // the present period. Setup sizes the operative lag with it; telemetry sizes suggestions.
@@ -61,7 +64,7 @@ private:
 
 public:
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
-                        bool lock = false);
+                        bool lock = false, bool mark = false);
 
     virtual UINT GetPresentationInterval() const override;
     virtual bool Setup() override;

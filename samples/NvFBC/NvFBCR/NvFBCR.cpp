@@ -82,6 +82,10 @@ float g_srcRateHint = 0.0f;
 // Needs -src to derive the comb, so -lock without -src is inert.
 bool g_lock = false;
 
+// Burn the frame-counter marker into every present (-mark, debug builds/tests only):
+// the exact video-to-log join key. See docs/frame-marker-spec.md.
+bool g_mark = false;
+
 // Single fps validation policy for every entry point that accepts a rate (mode strings,
 // -src): accept (0, 1000].
 static bool ParseFps(const string& value, float* outFps) {
@@ -105,14 +109,14 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     // fullscreen game on the source — the production case). Nominal 60 fps drives the
     // bracketing lag; the actual present rate is DWM's delivery.
     if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0) {
-        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock);
+        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock, g_mark);
     }
 
     // Temporal selection + QPC-timer present (t:60 format).
     if (modeStr.length() > 2 && modeStr[0] == 't' && modeStr[1] == ':') {
         float framerate;
         if (ParseFps(modeStr.substr(2), &framerate)) {
-            return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock);
+            return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock, g_mark);
         }
     }
 
@@ -144,6 +148,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("Options:");
     LOGERR("  -src 30        - Declared source fps; sizes the static temporal lag (default: assume >= 60)");
     LOGERR("  -lock          - Enable the phase comb lock (needs -src for the rate); off by default");
+    LOGERR("  -mark          - Burn the frame-counter marker (video-to-log alignment, debug); off by default");
     return NULL;
 }
 
@@ -395,6 +400,10 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         g_lock = true;
         return 1;
     }
+    if (tokens[i] == "-mark") {
+        g_mark = true;
+        return 1;
+    }
     if (tokens[i] == "-src" && i + 1 < tokens.size()) {
         float v;
         if (ParseFps(tokens[i + 1], &v)) g_srcRateHint = v;
@@ -484,6 +493,7 @@ void ConsoleUserInput(string* framerateStr) {
     cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
     cout << "  t:60 -src 30   - Mode plus options: -src <fps> declares the source rate (lag sizing)" << endl;
     cout << "  -lock          - Enable the phase comb lock (needs -src; off by default)" << endl;
+    cout << "  -mark          - Burn the frame-counter marker (video-to-log alignment, debug)" << endl;
     cout << endl;
     cout << "  diag, diag:vsync - Clock probes (DWM compose timing + card raster)" << endl;
     cout << endl;
@@ -506,6 +516,7 @@ void ConsoleUserInput(string* framerateStr) {
             }
             if (g_srcRateHint > 0.0f) cout << "Declared source rate: " << g_srcRateHint << " fps"
                 << (g_lock ? " (comb lock on)" : " (comb lock off)") << endl;
+            if (g_mark) cout << "Frame marker: on" << endl;
             cinString = cinString.substr(0, space);
         }
         *framerateStr = cinString;
