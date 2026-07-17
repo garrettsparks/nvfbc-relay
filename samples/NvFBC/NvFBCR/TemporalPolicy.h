@@ -1,0 +1,80 @@
+#pragma once
+
+#include <cstdint>
+
+// Pure temporal-selection policy (design: docs/policy-extraction-spec.md). The complete
+// DECISION logic of the temporal mode - nearest-frame selection with hysteresis, the
+// advance gate, and the comb-lock control step - as plain arithmetic over explicit state
+// structs. No windows.h, no d3d9.h, no clocks: fully deterministic, compiles anywhere,
+// asserted by PolicyTests.cpp. TemporalCaptureMode owns the wiring (timing waits, ring,
+// surfaces, present, logging) and consumes this layer; behavior is identical to the
+// pre-extraction inline code by construction (ops copied verbatim).
+
+namespace policy {
+
+// Values are FROZEN: they are the frame marker's 3-bit pick encoding (cells 34-36,
+// docs/frame-marker-spec.md) burned into every -mark recording.
+enum class Pick : int {
+    None      = 0,
+    Before    = 1,
+    After     = 2,
+    AfterAdv  = 3,   // only the after-frame was newer and the advance gate passed
+    BeforeAdv = 4,
+    Repeat    = 5,   // nothing newer than last shown: re-present it
+};
+
+// What FindBracket produced, D3D-free. Diffs are distances from the (already
+// pull-applied) selection target: beforeDiff = target - beforeTs, afterDiff =
+// afterTs - target, both >= 0 when the side exists.
+struct BracketInfo {
+    bool hasBefore = false;
+    bool hasAfter = false;
+    int64_t beforeTs = 0;
+    int64_t afterTs = 0;
+    int64_t beforeDiff = 0;
+    int64_t afterDiff = 0;
+};
+
+// Selection memory across presents. lastShownTs strictly advances except on Repeat;
+// the two bools are the Schmitt states (stickiness side, advance gate).
+struct SelectionState {
+    int64_t lastShownTs = 0;
+    bool lastPickAfter = false;
+    bool advGateOpen = true;
+};
+
+// Comb-lock control state. pull is the extra lag holding the target on the comb.
+struct PhaseLockState {
+    int64_t pullQpc = 0;
+    int64_t errEmaQpc = 0;
+    int64_t devEmaQpc = 0;
+    bool engaged = false;
+    bool seeded = false;
+};
+
+// Fixed at Setup. combQpc == 0 disables the lock entirely (selection then equals the
+// pre-lock v0.0.15 behavior). Units are whatever the caller's timestamps use; the
+// policy is unit-agnostic (QPC ticks in production, microseconds in tests/replay).
+struct PolicyConfig {
+    int64_t stickinessQpc = 0;
+    int64_t combQpc = 0;
+    int64_t phasePullSlewQpc = 0;
+};
+
+// The signed distance to the nearest point on a p-periodic timeline, in [-p/2, p/2).
+int64_t WrapHalf(int64_t d, int64_t p);
+
+// One comb-lock step, closed-loop: consumes THIS present's beforeDiff (measured at the
+// already-pulled target, so the pull is inside the error) and updates the pull for the
+// NEXT present. EMA filter, stability gate, symmetric bounded slew, wrap modulo the
+// comb behind a hysteresis band. Call only with a complete bracket (both sides): the
+// pull freezes across gaps rather than integrating a one-sided error.
+void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeDiff);
+
+// The per-present selection decision: nearest-to-target among frames NEWER than the
+// last shown (monotonic output), stickiness Schmitt band at the bracket midpoint,
+// advance gate in the afterNew-only arm. Updates state; the caller maps the Pick to a
+// surface (Repeat means the last shown surface, which only the caller holds).
+Pick SelectFrame(const BracketInfo& b, SelectionState& s, const PolicyConfig& cfg);
+
+}  // namespace policy

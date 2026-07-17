@@ -24,34 +24,26 @@ static const char* const kPickAfterAdv  = "after-adv";    // only the after-fram
 static const char* const kPickBeforeAdv = "before-adv";
 static const char* const kPickRepeat    = "repeat";       // nothing newer than last shown — genuine stall
 
-// The marker's 3-bit pick encoding (FrameMarker cell layout). Pointer identity is
-// sufficient: pick labels are only ever the kPick* constants above.
-static int PickCodeForLabel(const char* pick) {
-    if (pick == kPickBefore)    return 1;
-    if (pick == kPickAfter)     return 2;
-    if (pick == kPickAfterAdv)  return 3;
-    if (pick == kPickBeforeAdv) return 4;
-    if (pick == kPickRepeat)    return 5;
-    return 0;
+// The policy enum's values are the marker's pick encoding; this maps them to the log's
+// stable pick= labels.
+static const char* PickLabel(policy::Pick p) {
+    switch (p) {
+        case policy::Pick::Before:    return kPickBefore;
+        case policy::Pick::After:     return kPickAfter;
+        case policy::Pick::AfterAdv:  return kPickAfterAdv;
+        case policy::Pick::BeforeAdv: return kPickBeforeAdv;
+        case policy::Pick::Repeat:    return kPickRepeat;
+        default:                      return kPickNone;
+    }
 }
 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
                                          bool mark)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
-    , m_stickinessQpc(0)
-    , m_combQpc(0)
-    , m_phasePullQpc(0)
-    , m_phaseErrEmaQpc(0)
-    , m_phaseDevEmaQpc(0)
-    , m_phasePullSlewQpc(0)
     , m_telemetryCountdown(0)
-    , m_phaseSeeded(false)
-    , m_lockEngaged(false)
     , m_lock(lock)
     , m_mark(mark)
-    , m_lastPickAfter(false)
-    , m_advGateOpen(true)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_srcRateHint(srcRateHint)
@@ -109,7 +101,7 @@ bool TemporalCaptureMode::Setup() {
     // (period-2 judder) every ~33.5 s. With the band, the pick holds one side through the dwell
     // and slips exactly once per sweep (a single 1-source-frame step — imperceptible). 1 ms:
     // comfortably above jitter, well below any source period we target (4.17 ms at 240 Hz).
-    m_stickinessQpc = m_scheduler.Freq() / 1000;
+    m_policyCfg.stickinessQpc = m_scheduler.Freq() / 1000;
 
     LOG("Temporal mode initialized - %s present (%.2f fps nominal), nearest-frame selection + hysteresis",
         m_vsyncPresent ? "vsync/vblank" : "QPC-timer", m_targetFramerate);
@@ -117,7 +109,7 @@ bool TemporalCaptureMode::Setup() {
         m_bracketingDelayQpc * 1000000 / m_scheduler.Freq(),
         (m_srcRateHint > 0.0f) ? "-src " : ">= ", assumedFps);
     LOG("Selection stickiness band: %lld us (anti flip-flop at bracket midpoint)",
-        m_stickinessQpc * 1000000 / m_scheduler.Freq());
+        m_policyCfg.stickinessQpc * 1000000 / m_scheduler.Freq());
 
     // PHASE COMB LOCK (see docs/phase-comb-lock-spec.md). Each present the target's phase
     // within a source interval advances by (presentP mod srcP); at a rational rate ratio
@@ -133,7 +125,7 @@ bool TemporalCaptureMode::Setup() {
     // effectively-irrational ratios. Latency: the pull adds a bounded slow sawtooth
     // (<= one comb spacing peak-to-peak, drift-rate ramp, one discrete step per beat),
     // accepted as a documented trade alongside the static lag (spec clause 4).
-    m_phasePullSlewQpc = m_scheduler.Freq() / 40000;   // 25 us per present
+    m_policyCfg.phasePullSlewQpc = m_scheduler.Freq() / 40000;   // 25 us per present
     if (m_lock && m_srcRateHint > 0.0f) {
         int combM = 1;
         bool combMatched = false;
@@ -144,61 +136,15 @@ bool TemporalCaptureMode::Setup() {
             const double frac = nm - (double)n;
             if (n >= 1 && frac > -0.02 && frac < 0.02) { combM = m; combMatched = true; break; }
         }
-        m_combQpc = m_assumedSrcPeriodQpc / combM;
+        m_policyCfg.combQpc = m_assumedSrcPeriodQpc / combM;
         LOG("Phase comb lock ACTIVE (-lock): modulus %lld us (ratio denominator M=%d%s); pull=/lk= on the temporal line",
-            m_combQpc * 1000000 / m_scheduler.Freq(), combM,
+            m_policyCfg.combQpc * 1000000 / m_scheduler.Freq(), combM,
             combMatched ? "" : ", no rational match: M=1 fallback, stability gate decides");
     } else {
         LOG("Phase comb lock off (%s); target rides the static lag alone",
             !m_lock ? "-lock not set" : "-lock set but no -src to derive the comb");
     }
     return true;
-}
-
-// Map a tick offset into [-p/2, p/2): the signed distance to the nearest point on a
-// p-periodic timeline. C++ % truncates toward zero, so negative remainders need folding up.
-static LONGLONG WrapHalf(LONGLONG d, LONGLONG p) {
-    LONGLONG m = (d + p / 2) % p;
-    if (m < 0) m += p;
-    return m - p / 2;
-}
-
-void TemporalCaptureMode::UpdatePhaseLock(LONGLONG beforeDiffQpc) {
-    // Closed loop: the pull is already inside the target this error was measured at, so
-    // want = pull + errEma converges instead of integrating. Error and EMAs live on the
-    // circular comb domain; a linear controller here saturates against clock skew and
-    // drains through a disengaged sweep every beat (measured - see the spec).
-    const LONGLONG err = WrapHalf(beforeDiffQpc, m_combQpc);
-    if (!m_phaseSeeded) {
-        m_phaseErrEmaQpc = err;
-        m_phaseSeeded = true;
-    } else {
-        m_phaseErrEmaQpc += WrapHalf(err - m_phaseErrEmaQpc, m_combQpc) / 16;
-        m_phaseErrEmaQpc = WrapHalf(m_phaseErrEmaQpc, m_combQpc);
-    }
-    LONGLONG dev = WrapHalf(err - m_phaseErrEmaQpc, m_combQpc);
-    if (dev < 0) dev = -dev;
-    m_phaseDevEmaQpc = (m_phaseDevEmaQpc * 15 + dev) / 16;
-
-    // Stability gate: stable phase = near-rational ratio, lock possible; sweeping phase =
-    // genuine rate conversion, the pull decays to zero and selection proceeds unlocked.
-    // Deliberately a bare comparator, no hysteresis: every lockable ratio holds devEma far
-    // below the gate, so engage/disengage chatter requires a declared -src about a percent
-    // off the true rate (steady-state dev parks at the threshold). If in-regime lk flapping
-    // ever shows up in real logs, give this the selection-stickiness Schmitt treatment
-    // (engage below comb/8, release above comb/6) rather than tightening the -src tolerance.
-    m_lockEngaged = m_phaseDevEmaQpc < m_combQpc / 8;
-    const LONGLONG want = m_lockEngaged ? m_phasePullQpc + m_phaseErrEmaQpc : 0;
-    LONGLONG delta = want - m_phasePullQpc;
-    if (delta > m_phasePullSlewQpc) delta = m_phasePullSlewQpc;
-    else if (delta < -m_phasePullSlewQpc) delta = -m_phasePullSlewQpc;
-    m_phasePullQpc += delta;
-
-    // Wrap hysteresis: the pull may overshoot the [0, comb) domain by a band before
-    // wrapping, so jitter-scale wander at the boundary cannot chatter one-frame slips.
-    const LONGLONG band = m_combQpc / 16;
-    if (m_phasePullQpc < -band) m_phasePullQpc += m_combQpc;
-    else if (m_phasePullQpc >= m_combQpc + band) m_phasePullQpc -= m_combQpc;
 }
 
 void TemporalCaptureMode::Run(
@@ -220,7 +166,6 @@ void TemporalCaptureMode::Run(
     MSG msg = {};
     RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
     LONGLONG lastPresentQpc = 0;
-    LONGLONG lastShownTs = 0;   // hysteresis: QPC of the last presented frame (strictly advances)
     IDirect3DSurface9* lastShownSurface = NULL;   // what pick=repeat must re-present
     m_scheduler.Seed();
 
@@ -243,77 +188,51 @@ void TemporalCaptureMode::Run(
         // Comb lock applies the pull as extra lag; zero when disabled or disengaged. The
         // pull was computed from LAST present's bracket (closed loop, one-present latency
         // in the control path - negligible at 25 us/present slew).
-        const LONGLONG target = deadline - (m_bracketingDelayQpc + m_phasePullQpc);
+        const LONGLONG target = deadline - (m_bracketingDelayQpc + m_lockState.pullQpc);
 
-        // Select: nearest-to-target frame, with HYSTERESIS — present frames in strictly
-        // increasing timestamp order. Among the bracket frames NEWER than the last presented
-        // one, pick the nearest to target. If neither is newer (capture produced no new frame
-        // this period — the genuine rate-matching stall at the drift boundary), repeat the
-        // last frame: that is the one unavoidable dupe per drift sweep (~6/5min at 60->60).
-        // This removes the boundary wobble where plain nearest-pick re-shows a frame ~14 times
-        // over the ~1s the phase lingers at the alignment point.
-        //
-        // STICKINESS BAND (Schmitt trigger): when both frames are candidates, the threshold
-        // depends on which side the LAST pick took — stay on that side unless the other frame
-        // is closer by more than m_stickinessQpc. Plain nearest-pick lets ±300 µs capture
-        // jitter flip the choice every present while the target dwells near the bracket
-        // midpoint — at 240→60 that alternates the stride (3/5 instead of 4) for the several
-        // seconds the dwell lasts, a visible period-2 judder window every drift sweep. The
-        // state bit is what makes this hysteresis: jitter would have to cross the full 2·band
-        // gap to flip the pick (a memoryless bias just relocates the flip-flop boundary —
-        // measured, it did not shrink the windows), while slow drift still crosses the gap
-        // exactly once per sweep: one clean single-frame slip instead of seconds of judder.
         FrameBracket bracket;
         m_ring.FindBracket(target, &bracket);
 
         // Update the comb-lock pull for the next present. Skipped when the bracket is
         // incomplete (startup, stalls): the pull freezes rather than integrating on a
         // one-sided error, and the frozen value stays bounded by construction.
-        if (m_combQpc > 0 && bracket.hasBefore && bracket.hasAfter) {
-            UpdatePhaseLock(bracket.beforeDiff);
+        if (m_policyCfg.combQpc > 0 && bracket.hasBefore && bracket.hasAfter) {
+            policy::UpdatePhaseLock(m_lockState, m_policyCfg, bracket.beforeDiff);
         }
 
-        bool beforeNew = bracket.hasBefore && bracket.beforeTs > lastShownTs;
-        bool afterNew  = bracket.hasAfter  && bracket.afterTs  > lastShownTs;
-
-        // ADVANCE GATE (Schmitt): when only the after-frame is newer than the last shown,
-        // advance UNLESS the target is still on the shown frame (beforeDiff inside the band).
-        // The ungated advance boundary sits exactly where before == lastShown begins (w = 0);
-        // the clock beat parks the target phase there periodically and arrival jitter
-        // flip-flops the crossing, early-advancing a full source period each flip. Healthy
-        // operating points keep beforeDiff far above the band in every regime, so the gate is
-        // inert outside the crossing; the state bit widens the reopen threshold so a crossing
-        // costs one clean flip. A midpoint comparison is WRONG here: matched-rate steady
-        // state operates at the midpoint, and any threshold at the operating point
-        // flip-flops on jitter regardless of margin (the stickiness-band lesson).
-        bool advance = afterNew;
-        if (advance && bracket.hasBefore && !beforeNew) {
-            const LONGLONG reopen = m_advGateOpen ? m_stickinessQpc : 2 * m_stickinessQpc;
-            m_advGateOpen = bracket.beforeDiff >= reopen;
-            advance = m_advGateOpen;
-        }
+        // The DECISION is pure policy (TemporalPolicy.cpp: selection hysteresis, advance
+        // gate - the mechanism rationale lives there with the code). This loop owns the
+        // wiring: mapping the pick to a surface, the copy, the present, and the log.
+        policy::BracketInfo binfo;
+        binfo.hasBefore = bracket.hasBefore;
+        binfo.hasAfter = bracket.hasAfter;
+        binfo.beforeTs = bracket.beforeTs;
+        binfo.afterTs = bracket.afterTs;
+        binfo.beforeDiff = bracket.beforeDiff;
+        binfo.afterDiff = bracket.afterDiff;
+        const policy::Pick pickChoice = policy::SelectFrame(binfo, m_selState, m_policyCfg);
+        const char* pick = PickLabel(pickChoice);
 
         IDirect3DSurface9* chosen = NULL;
-        const char* pick = kPickNone;
-        if (beforeNew && afterNew) {
-            const LONGLONG bias = m_lastPickAfter ? -m_stickinessQpc : m_stickinessQpc;
-            if (bracket.beforeDiff <= bracket.afterDiff + bias) { chosen = bracket.beforeSurface; pick = kPickBefore; lastShownTs = bracket.beforeTs; m_lastPickAfter = false; }
-            else { chosen = bracket.afterSurface; pick = kPickAfter; lastShownTs = bracket.afterTs; m_lastPickAfter = true; }
-        } else if (advance) {
-            chosen = bracket.afterSurface; pick = kPickAfterAdv; lastShownTs = bracket.afterTs; m_lastPickAfter = true;
-        } else if (beforeNew) {
-            chosen = bracket.beforeSurface; pick = kPickBeforeAdv; lastShownTs = bracket.beforeTs; m_lastPickAfter = false;
-        } else {
-            // Nothing eligible to advance to: either a genuine stall (no frame newer than the
-            // last shown) or a newer after-frame the target has not reached yet. Repeat.
-            // Repeat must re-present the last SHOWN frame, and bracket.before is not always
-            // it. After an after-pick the target can still trail the shown frame (lag > one
-            // source period at sub-rate sources), leaving before one frame BEHIND the
-            // screen, so fetching it steps the display backward.
-            chosen = lastShownSurface;
-            if (!chosen && bracket.hasBefore) chosen = bracket.beforeSurface;
-            if (!chosen && bracket.hasAfter)  chosen = bracket.afterSurface;
-            pick = kPickRepeat;
+        switch (pickChoice) {
+            case policy::Pick::Before:
+            case policy::Pick::BeforeAdv:
+                chosen = bracket.beforeSurface;
+                break;
+            case policy::Pick::After:
+            case policy::Pick::AfterAdv:
+                chosen = bracket.afterSurface;
+                break;
+            default:
+                // Repeat re-presents the last SHOWN surface, and bracket.before is not
+                // always it: after an after-pick the target can still trail the shown
+                // frame (lag > one source period at sub-rate sources), leaving before one
+                // frame BEHIND the screen. The surface fallback chain covers startup,
+                // before any frame has been shown.
+                chosen = lastShownSurface;
+                if (!chosen && bracket.hasBefore) chosen = bracket.beforeSurface;
+                if (!chosen && bracket.hasAfter)  chosen = bracket.afterSurface;
+                break;
         }
 
         if (chosen) {
@@ -328,7 +247,7 @@ void TemporalCaptureMode::Run(
         long long markN = -1;
         if (m_mark) {
             const int weightQ = bracket.hasBefore ? (int)(bracket.weight * 15.0 + 0.5) : 0;
-            markN = (long long)m_marker.Burn(g_backbuffer, PickCodeForLabel(pick), weightQ);
+            markN = (long long)m_marker.Burn(g_backbuffer, (int)pickChoice, weightQ);
         }
 
         LARGE_INTEGER beforePresent;
@@ -365,8 +284,8 @@ void TemporalCaptureMode::Run(
                 (long long)((beforePresent.QuadPart - deadline) * usPerTick),
                 (long long)(presentDelta * usPerTick),
                 lagUs,
-                (long long)(m_phasePullQpc * usPerTick),
-                (m_combQpc > 0) ? (m_lockEngaged ? 1 : 0) : -1,
+                (long long)(m_lockState.pullQpc * usPerTick),
+                (m_policyCfg.combQpc > 0) ? (m_lockState.engaged ? 1 : 0) : -1,
                 markN);
             if (!bracket.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");

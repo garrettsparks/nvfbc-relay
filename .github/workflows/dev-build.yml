@@ -4,6 +4,19 @@ on:
   workflow_dispatch:
 
 jobs:
+  policy-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Build and run policy tests
+      run: |
+        g++ -std=c++17 -O2 -Wall -o policytests \
+          samples/NvFBC/NvFBCR/PolicyTests.cpp samples/NvFBC/NvFBCR/TemporalPolicy.cpp
+        ./policytests
+
   build:
     runs-on: windows-latest
 
