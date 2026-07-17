@@ -15,28 +15,6 @@ static const int kTelemetryPeriodPresents = 600;
 // configuration, at any present rate. Slower sources need an explicit -src.
 static const float kDefaultAssumedSrcFps = 60.0f;
 
-// Selection-outcome labels for the per-present "pick=" log field. The temporal log line is a
-// stable format consumed by offline analysis — change values only deliberately.
-static const char* const kPickNone      = "none";
-static const char* const kPickBefore    = "before";
-static const char* const kPickAfter     = "after";
-static const char* const kPickAfterAdv  = "after-adv";    // only the after-frame is newer than last shown
-static const char* const kPickBeforeAdv = "before-adv";
-static const char* const kPickRepeat    = "repeat";       // nothing newer than last shown — genuine stall
-
-// The policy enum's values are the marker's pick encoding; this maps them to the log's
-// stable pick= labels.
-static const char* PickLabel(policy::Pick p) {
-    switch (p) {
-        case policy::Pick::Before:    return kPickBefore;
-        case policy::Pick::After:     return kPickAfter;
-        case policy::Pick::AfterAdv:  return kPickAfterAdv;
-        case policy::Pick::BeforeAdv: return kPickBeforeAdv;
-        case policy::Pick::Repeat:    return kPickRepeat;
-        default:                      return kPickNone;
-    }
-}
-
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
                                          bool mark)
     : m_bracketingDelayQpc(0)
@@ -211,7 +189,7 @@ void TemporalCaptureMode::Run(
         binfo.beforeDiff = bracket.beforeDiff;
         binfo.afterDiff = bracket.afterDiff;
         const policy::Pick pickChoice = policy::SelectFrame(binfo, m_selState, m_policyCfg);
-        const char* pick = PickLabel(pickChoice);
+        const char* pick = policy::PickLabel(pickChoice);
 
         IDirect3DSurface9* chosen = NULL;
         switch (pickChoice) {
@@ -275,6 +253,10 @@ void TemporalCaptureMode::Run(
             // pull/lk/mark are append-only: effective latency = lag + pull (a bounded
             // sawtooth at lock); lk=-1 marks the lock feature disabled entirely; mark=-1
             // marks the frame marker disabled (video-to-log join key otherwise).
+            int lkField = -1;
+            if (m_policyCfg.combQpc > 0) {
+                lkField = m_lockState.engaged ? 1 : 0;
+            }
             LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
@@ -285,7 +267,7 @@ void TemporalCaptureMode::Run(
                 (long long)(presentDelta * usPerTick),
                 lagUs,
                 (long long)(m_lockState.pullQpc * usPerTick),
-                (m_policyCfg.combQpc > 0) ? (m_lockState.engaged ? 1 : 0) : -1,
+                lkField,
                 markN);
             if (!bracket.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");

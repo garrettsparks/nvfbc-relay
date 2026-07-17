@@ -2,6 +2,17 @@
 
 namespace policy {
 
+const char* PickLabel(Pick p) {
+    switch (p) {
+        case Pick::Before:    return "before";
+        case Pick::After:     return "after";
+        case Pick::AfterAdv:  return "after-adv";
+        case Pick::BeforeAdv: return "before-adv";
+        case Pick::Repeat:    return "repeat";
+        default:              return "none";
+    }
+}
+
 // Map a tick offset into [-p/2, p/2): the signed distance to the nearest point on a
 // p-periodic timeline. C++ % truncates toward zero, so negative remainders need folding up.
 int64_t WrapHalf(int64_t d, int64_t p) {

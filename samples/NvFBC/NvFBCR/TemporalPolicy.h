@@ -5,10 +5,10 @@
 // Pure temporal-selection policy (design: docs/policy-extraction-spec.md). The complete
 // DECISION logic of the temporal mode - nearest-frame selection with hysteresis, the
 // advance gate, and the comb-lock control step - as plain arithmetic over explicit state
-// structs. No windows.h, no d3d9.h, no clocks: fully deterministic, compiles anywhere,
-// asserted by PolicyTests.cpp. TemporalCaptureMode owns the wiring (timing waits, ring,
-// surfaces, present, logging) and consumes this layer; behavior is identical to the
-// pre-extraction inline code by construction (ops copied verbatim).
+// structs. No windows.h, no d3d9.h, no clocks: fully deterministic and compiles anywhere.
+// TemporalCaptureMode owns the wiring (timing waits, ring, surfaces, present, logging)
+// and consumes this layer; behavior is identical to the pre-extraction inline code by
+// construction (ops copied verbatim).
 
 namespace policy {
 
@@ -22,6 +22,15 @@ enum class Pick : int {
     BeforeAdv = 4,
     Repeat    = 5,   // nothing newer than last shown: re-present it
 };
+
+static_assert((int)Pick::None == 0 && (int)Pick::Before == 1 && (int)Pick::After == 2 &&
+              (int)Pick::AfterAdv == 3 && (int)Pick::BeforeAdv == 4 && (int)Pick::Repeat == 5,
+              "Pick values are the frozen frame-marker pick encoding (cells 34-36): "
+              "recordings already exist, so new outcomes may only append");
+
+// The log's stable pick= label for each value (the temporal line's pick= field is a
+// frozen format consumed by offline analysis).
+const char* PickLabel(Pick p);
 
 // What FindBracket produced, D3D-free. Diffs are distances from the (already
 // pull-applied) selection target: beforeDiff = target - beforeTs, afterDiff =

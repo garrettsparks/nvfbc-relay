@@ -16,7 +16,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
-#include <string>
 #include <vector>
 
 using policy::BracketInfo;
@@ -36,6 +35,12 @@ static int g_failures = 0;
             std::printf("\n");                                        \
         }                                                             \
     } while (0)
+
+// The microsecond-domain test convention for the policy config: production sizes these
+// from the QPC frequency (Freq()/1000 and Freq()/40000); every synthetic suite and the
+// replay must run the same convention or the suite validates an inconsistent config.
+static const int64_t kStickinessUs = 1000;
+static const int64_t kSlewUs = 25;
 
 // Deterministic LCG so every run exercises identical timelines.
 static uint64_t g_rng = 0x2545F4914F6CDD1Dull;
@@ -73,9 +78,9 @@ struct SimParams {
 
 static SimResult Simulate(const SimParams& p) {
     PolicyConfig cfg;
-    cfg.stickinessQpc = 1000;
+    cfg.stickinessQpc = kStickinessUs;
     cfg.combQpc = p.combQpc;
-    cfg.phasePullSlewQpc = 25;
+    cfg.phasePullSlewQpc = kSlewUs;
 
     int64_t lag = p.srcPeriod + p.srcPeriod / 4;
     if (lag < p.presentPeriod) lag = p.presentPeriod;
@@ -188,7 +193,7 @@ static void test_lock_off_matches_v15() {
     // Differential over jittered mismatched-rate brackets: every pick and every state
     // field identical to the v15 reference when combQpc == 0.
     PolicyConfig cfg;
-    cfg.stickinessQpc = 1000;
+    cfg.stickinessQpc = kStickinessUs;
     SelectionState a, b;
     int64_t src = 16672, present = 16667, t = 0, arrival = 0;
     for (int k = 0; k < 200000; k++) {
@@ -352,33 +357,34 @@ static bool ParseTemporalLine(const char* line, LogLine* out) {
     return true;
 }
 
-static const char* PickName(Pick p) {
-    switch (p) {
-        case Pick::Before: return "before";
-        case Pick::After: return "after";
-        case Pick::AfterAdv: return "after-adv";
-        case Pick::BeforeAdv: return "before-adv";
-        case Pick::Repeat: return "repeat";
-        default: return "none";
-    }
-}
-
 static int Replay(const char* path, int64_t combUs) {
     std::FILE* f = std::fopen(path, "r");
     if (!f) { std::printf("cannot open %s\n", path); return 1; }
     std::vector<LogLine> lines;
+    // Presents whose target fell off the ring back emit only an error line: production
+    // selection state still advanced on them, so replay can desync past such a gap.
+    size_t unloggedGaps = 0;
     char buf[1024];
     while (std::fgets(buf, sizeof(buf), f)) {
         LogLine l;
         if (ParseTemporalLine(buf, &l)) lines.push_back(l);
+        else if (std::strstr(buf, "target older than ring window")) unloggedGaps++;
     }
     std::fclose(f);
     std::printf("replay %s: %zu temporal lines\n", path, lines.size());
-    if (lines.empty()) return 1;
+    if (unloggedGaps) {
+        std::printf("  WARNING: %zu ring-underrun present(s) with no temporal line;"
+                    " selection state may desync at the gap\n", unloggedGaps);
+    }
+    if (lines.empty()) {
+        std::printf("  no parseable temporal lines: not a temporal-mode log, or the"
+                    " format predates the pull=/lk= fields\n");
+        return 1;
+    }
 
     PolicyConfig cfg;
-    cfg.stickinessQpc = 1000;   // microsecond domain
-    cfg.phasePullSlewQpc = 25;
+    cfg.stickinessQpc = kStickinessUs;
+    cfg.phasePullSlewQpc = kSlewUs;
     SelectionState sel;
     const size_t warmup = 60;
     size_t mismatches = 0, firstMismatch = 0;
@@ -391,12 +397,22 @@ static int Replay(const char* path, int64_t combUs) {
         b.hasAfter = l.after >= 0;
         b.afterTs = l.after;
         b.afterDiff = l.after - l.tgt;
+        const bool prevAfter = sel.lastPickAfter;
         const Pick p = policy::SelectFrame(b, sel, cfg);
-        if (i >= warmup && std::strcmp(PickName(p), l.pick) != 0) {
+        if (i >= warmup && std::strcmp(policy::PickLabel(p), l.pick) != 0) {
             if (!mismatches) firstMismatch = i;
+            if (mismatches < 5) {
+                // Production decided in QPC ticks; the log's fields are rounded to whole
+                // microseconds. A band margin within a few us of zero means the decision
+                // sat on the stickiness-band edge and the rounding flipped it: log
+                // quantization, not a policy divergence.
+                const int64_t bias = prevAfter ? -cfg.stickinessQpc : cfg.stickinessQpc;
+                const int64_t margin = b.beforeDiff - (b.afterDiff + bias);
+                std::printf("  MISMATCH line %zu: policy %s, log %s, band margin %" PRId64 " us\n",
+                            i, policy::PickLabel(p), l.pick, margin);
+            }
             mismatches++;
         }
-        if (p == Pick::Repeat && i >= warmup) sel.lastShownTs = sel.lastShownTs;  // no-op, clarity
     }
     std::printf("  selection: %zu/%zu picks match after %zu-line warmup",
                 lines.size() - warmup - mismatches, lines.size() - warmup, warmup);
