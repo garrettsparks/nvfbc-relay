@@ -13,7 +13,7 @@ jobs:
 
     - name: Build and run policy tests
       run: |
-        g++ -std=c++17 -O2 -Wall -o policytests \
+        g++ -std=c++17 -O2 -Wall -Werror -o policytests \
           samples/NvFBC/NvFBCR/PolicyTests.cpp samples/NvFBC/NvFBCR/TemporalPolicy.cpp
         ./policytests
 

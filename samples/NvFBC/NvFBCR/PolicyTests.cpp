@@ -346,8 +346,8 @@ static bool ParseTemporalLine(const char* line, LogLine* out) {
     long long tgt, before, after, pull;
     int lk;
     char pick[16];
-    if (std::sscanf(t, "temporal dl=%*lldus tgt=%lldus before=%lldus(d%*d) after=%lldus"
-                       " w=%*f pick=%15s jit=%*lldus pdt=%*lldus lag=%*lldus pull=%lldus lk=%d",
+    if (std::sscanf(t, "temporal dl=%*dus tgt=%lldus before=%lldus(d%*d) after=%lldus"
+                       " w=%*f pick=%15s jit=%*dus pdt=%*dus lag=%*dus pull=%lldus lk=%d",
                     &tgt, &before, &after, pick, &pull, &lk) != 6) {
         return false;
     }
