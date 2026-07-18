@@ -128,7 +128,7 @@ const char* CompositeLabel(CompositeOp op) {
     switch (op) {
         case CompositeOp::PassthroughBefore: return "pass-before";
         case CompositeOp::PassthroughAfter:  return "pass-after";
-        case CompositeOp::Blend:             return "blend";
+        case CompositeOp::Synthesize:        return "synth";
         default:                             return "hold";
     }
 }
@@ -173,10 +173,10 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
         passAfter = true;
     } else if (b.hasBefore && b.hasAfter) {
         // No real frame near the target but both endpoints exist: synthesize at the
-        // target time (blend is constant-latency by construction). Holes classify
+        // target time (synthesis is constant-latency by construction). Holes classify
         // here with no detection needed: a dropped source frame widens the bracket,
         // the hole present reads mid-w, and neighbors are untouched.
-        d.op = CompositeOp::Blend;
+        d.op = CompositeOp::Synthesize;
         const int64_t span = b.beforeDiff + b.afterDiff;
         if (span > 0) {
             d.weight = (double)b.beforeDiff / (double)span;

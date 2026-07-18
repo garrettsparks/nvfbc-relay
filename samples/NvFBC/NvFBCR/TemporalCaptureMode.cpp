@@ -18,13 +18,13 @@ static const int kTelemetryPeriodPresents = 600;
 static const float kDefaultAssumedSrcFps = 60.0f;
 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
-                                         bool blend, bool mark)
+                                         CompositorKind compositor, bool mark)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_compositor(NULL)
     , m_telemetryCountdown(0)
+    , m_compositorKind(compositor)
     , m_lock(lock)
-    , m_blend(blend)
     , m_mark(mark)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
@@ -131,21 +131,28 @@ bool TemporalCaptureMode::Setup() {
             !m_lock ? "-lock not set" : "-lock set but no -src to derive the comb");
     }
 
-    // COMPOSITOR: nearest keeps the validated selection path; blend passes a real
-    // frame through sharp whenever one sits within the passthrough threshold of the
-    // target and lerps the bracket otherwise. The threshold floors at the present
-    // period so an oversampling source (whose frames are always within half a source
-    // period of any target) passes through free; at-rate and slower sources get a
-    // quarter source period, far above the locked operating point and far below the
-    // mid-gap distance of a hole, so the gate cannot chatter.
-    if (m_blend) {
+    // COMPOSITOR: nearest keeps the validated selection path; the synthesizing
+    // compositors (blend, interp) pass a real frame through sharp whenever one sits
+    // within the passthrough threshold of the target and synthesize at the bracket
+    // weight otherwise. The threshold floors at the present period so an oversampling
+    // source (whose frames are always within half a source period of any target)
+    // passes through free; at-rate and slower sources get a quarter source period,
+    // far above the locked operating point and far below the mid-gap distance of a
+    // hole, so the gate cannot chatter.
+    if (m_compositorKind != kCompositorNearest) {
         const LONGLONG thresholdBase =
             (m_assumedSrcPeriodQpc > m_scheduler.PeriodQpc()) ? m_assumedSrcPeriodQpc
                                                               : m_scheduler.PeriodQpc();
         m_policyCfg.passthroughQpc = thresholdBase / 4;
-        m_compositor = new BlendCompositor(&m_policyCfg);
-        LOG("Blend compositor ACTIVE (b mode): passthrough threshold %lld us; op=/bw= on the temporal line",
-            m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq());
+        if (m_compositorKind == kCompositorInterp) {
+            m_compositor = new InterpCompositor(&m_policyCfg);
+            LOG("Interp compositor ACTIVE (o mode): passthrough threshold %lld us; op=/bw=/pt= on the temporal line",
+                m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq());
+        } else {
+            m_compositor = new BlendCompositor(&m_policyCfg);
+            LOG("Blend compositor ACTIVE (b mode): passthrough threshold %lld us; op=/bw= on the temporal line",
+                m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq());
+        }
     } else {
         m_compositor = new NearestCompositor(&m_policyCfg);
     }
@@ -169,6 +176,15 @@ void TemporalCaptureMode::Run(
     // Note: Start releases nvfbcDx9 (the session bound to the present device) and rebinds
     // NvFBC to the ring's private capture device. nvfbcDx9 must not be used after this call.
     if (!m_ring.Start(nvfbcDx9, grabParams, m_baseQpc, hwnd)) {
+        return;
+    }
+
+    // Capture-side compositor resources (the interp sidecar opens ring slot shared
+    // handles, which exist only now). A compositor that cannot finish initializing
+    // refuses the mode instead of silently running a different one.
+    if (!m_compositor->OnCaptureStarted(&m_ring, m_baseQpc, m_scheduler.Freq())) {
+        LOGERR("Compositor capture-side init failed - refusing the mode");
+        m_ring.Stop();
         return;
     }
 
@@ -254,10 +270,13 @@ void TemporalCaptureMode::Run(
             if (m_policyCfg.combQpc > 0) {
                 lkField = m_lockState.engaged ? 1 : 0;
             }
-            char opFields[48] = "";
+            char opFields[64] = "";
             if (outcome.opLabel) {
-                snprintf(opFields, sizeof(opFields), " op=%s bw=%.3f",
-                         outcome.opLabel, outcome.opWeight);
+                int n = snprintf(opFields, sizeof(opFields), " op=%s bw=%.3f",
+                                 outcome.opLabel, outcome.opWeight);
+                if (outcome.synthUs >= 0 && n > 0 && (size_t)n < sizeof(opFields)) {
+                    snprintf(opFields + n, sizeof(opFields) - n, " pt=%lld", outcome.synthUs);
+                }
             }
             LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld%s",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
@@ -316,5 +335,7 @@ void TemporalCaptureMode::Run(
 }
 
 const char* TemporalCaptureMode::GetModeName() const {
-    return m_blend ? "Temporal blend" : "Temporal";
+    if (m_compositorKind == kCompositorInterp) return "Temporal interp";
+    if (m_compositorKind == kCompositorBlend) return "Temporal blend";
+    return "Temporal";
 }

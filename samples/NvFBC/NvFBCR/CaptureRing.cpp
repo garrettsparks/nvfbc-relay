@@ -32,6 +32,7 @@ CaptureRing::CaptureRing()
         m_ring[i].capSurface = NULL;
         m_ring[i].mainTexture = NULL;
         m_ring[i].mainSurface = NULL;
+        m_ring[i].sharedHandle = NULL;
         m_ring[i].valid = false;
         m_ring[i].timestamp.QuadPart = 0;
     }
@@ -131,6 +132,7 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
             LOGERR("CaptureRing: failed to create shared ring texture %d (error: 0x%08x)", i, hr);
             return false;
         }
+        m_ring[i].sharedHandle = shared;
         hr = m_ring[i].capTexture->GetSurfaceLevel(0, &m_ring[i].capSurface);
         if (FAILED(hr)) {
             LOGERR("CaptureRing: failed to get capture-side ring surface %d (error: 0x%08x)", i, hr);
@@ -334,6 +336,7 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, FrameBracket* out) const {
                 out->info.beforeTs = ts;
                 out->info.beforeDiff = diff;
                 out->beforeDepth = (int)(p - 1 - i);
+                out->beforeSlot = slot;
             }
         } else {
             if (-diff < bestAfterDiff) {
@@ -343,6 +346,7 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, FrameBracket* out) const {
                 out->afterTexture = m_ring[slot].mainTexture;
                 out->info.afterTs = ts;
                 out->info.afterDiff = -diff;
+                out->afterSlot = slot;
             }
         }
     }

@@ -107,7 +107,9 @@ enum class CompositeOp : int {
     Hold = 0,               // nothing presentable at the target: re-present last output
     PassthroughBefore = 1,  // the real before-frame is on target: present it sharp
     PassthroughAfter = 2,
-    Blend = 3,              // no real frame near the target: lerp(before, after, weight)
+    Synthesize = 3,         // no real frame near the target: make one there from the
+                            // bracket pair at the bracket weight (lerp, flow warp - the
+                            // executor is the compositor's business, not the policy's)
 };
 
 // The log's stable op= label for each value.
@@ -115,7 +117,7 @@ const char* CompositeLabel(CompositeOp op);
 
 struct CompositeDecision {
     CompositeOp op = CompositeOp::Hold;
-    double weight = 0.0;    // blend weight; meaningful only when op == Blend
+    double weight = 0.0;    // synthesis weight; meaningful only when op == Synthesize
 };
 
 // Composite memory across presents. lastOutputTs is the content time of the last
@@ -133,7 +135,7 @@ struct CompositeState {
 // band, because bare nearest-pick lets capture jitter flip the side every present
 // while the target dwells at the bracket midpoint, and when the source oversamples
 // the present both frames are always eligible, making that dwell permanent.
-// Otherwise a complete bracket BLENDS at the bracket weight; an incomplete one HOLDS
+// Otherwise a complete bracket SYNTHESIZES at the bracket weight; an incomplete one HOLDS
 // (the hole-recovery depth contract: a hole present interpolates only once its after
 // endpoint has arrived). A candidate whose output time would regress on the last
 // output (pull wraps, pathological ratios) demotes to Hold: output content time is
