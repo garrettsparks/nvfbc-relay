@@ -1,5 +1,7 @@
 #include "TemporalCaptureMode.h"
+#include "FrameCompositors.h"
 #include <SimpleLogger.h>
+#include <cstdio>
 
 // External global variables
 extern IDirect3DDevice9Ex* g_pD3D9Device;
@@ -16,11 +18,13 @@ static const int kTelemetryPeriodPresents = 600;
 static const float kDefaultAssumedSrcFps = 60.0f;
 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
-                                         bool mark)
+                                         bool blend, bool mark)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
+    , m_compositor(NULL)
     , m_telemetryCountdown(0)
     , m_lock(lock)
+    , m_blend(blend)
     , m_mark(mark)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
@@ -28,6 +32,10 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_device(NULL)
 {
     m_baseQpc.QuadPart = 0;
+}
+
+TemporalCaptureMode::~TemporalCaptureMode() {
+    delete m_compositor;
 }
 
 LONGLONG TemporalCaptureMode::LagForSourcePeriod(LONGLONG srcPeriodQpc) const {
@@ -122,6 +130,29 @@ bool TemporalCaptureMode::Setup() {
         LOG("Phase comb lock off (%s); target rides the static lag alone",
             !m_lock ? "-lock not set" : "-lock set but no -src to derive the comb");
     }
+
+    // COMPOSITOR: nearest keeps the validated selection path; blend passes a real
+    // frame through sharp whenever one sits within the passthrough threshold of the
+    // target and lerps the bracket otherwise. The threshold floors at the present
+    // period so an oversampling source (whose frames are always within half a source
+    // period of any target) passes through free; at-rate and slower sources get a
+    // quarter source period, far above the locked operating point and far below the
+    // mid-gap distance of a hole, so the gate cannot chatter.
+    if (m_blend) {
+        const LONGLONG thresholdBase =
+            (m_assumedSrcPeriodQpc > m_scheduler.PeriodQpc()) ? m_assumedSrcPeriodQpc
+                                                              : m_scheduler.PeriodQpc();
+        m_policyCfg.passthroughQpc = thresholdBase / 4;
+        m_compositor = new BlendCompositor(&m_policyCfg);
+        LOG("Blend compositor ACTIVE (b mode): passthrough threshold %lld us; op=/bw= on the temporal line",
+            m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq());
+    } else {
+        m_compositor = new NearestCompositor(&m_policyCfg);
+    }
+    if (!m_compositor->Setup(m_device, BUF_WIDTH, BUF_HEIGHT)) {
+        LOGERR("Compositor setup failed - refusing the mode");
+        return false;
+    }
     return true;
 }
 
@@ -142,9 +173,7 @@ void TemporalCaptureMode::Run(
     }
 
     MSG msg = {};
-    RECT srcRect = { 0, 0, (LONG)BUF_WIDTH, (LONG)BUF_HEIGHT };
     LONGLONG lastPresentQpc = 0;
-    IDirect3DSurface9* lastShownSurface = NULL;   // what pick=repeat must re-present
     m_scheduler.Seed();
 
     while (TRUE)
@@ -174,49 +203,15 @@ void TemporalCaptureMode::Run(
         // Update the comb-lock pull for the next present. Skipped when the bracket is
         // incomplete (startup, stalls): the pull freezes rather than integrating on a
         // one-sided error, and the frozen value stays bounded by construction.
-        if (m_policyCfg.combQpc > 0 && bracket.hasBefore && bracket.hasAfter) {
-            policy::UpdatePhaseLock(m_lockState, m_policyCfg, bracket.beforeDiff);
+        if (m_policyCfg.combQpc > 0 && bracket.info.hasBefore && bracket.info.hasAfter) {
+            policy::UpdatePhaseLock(m_lockState, m_policyCfg, bracket.info.beforeDiff);
         }
 
-        // The DECISION is pure policy (TemporalPolicy.cpp: selection hysteresis, advance
-        // gate - the mechanism rationale lives there with the code). This loop owns the
-        // wiring: mapping the pick to a surface, the copy, the present, and the log.
-        policy::BracketInfo binfo;
-        binfo.hasBefore = bracket.hasBefore;
-        binfo.hasAfter = bracket.hasAfter;
-        binfo.beforeTs = bracket.beforeTs;
-        binfo.afterTs = bracket.afterTs;
-        binfo.beforeDiff = bracket.beforeDiff;
-        binfo.afterDiff = bracket.afterDiff;
-        const policy::Pick pickChoice = policy::SelectFrame(binfo, m_selState, m_policyCfg);
-        const char* pick = policy::PickLabel(pickChoice);
-
-        IDirect3DSurface9* chosen = NULL;
-        switch (pickChoice) {
-            case policy::Pick::Before:
-            case policy::Pick::BeforeAdv:
-                chosen = bracket.beforeSurface;
-                break;
-            case policy::Pick::After:
-            case policy::Pick::AfterAdv:
-                chosen = bracket.afterSurface;
-                break;
-            default:
-                // Repeat re-presents the last SHOWN surface, and bracket.before is not
-                // always it: after an after-pick the target can still trail the shown
-                // frame (lag > one source period at sub-rate sources), leaving before one
-                // frame BEHIND the screen. The surface fallback chain covers startup,
-                // before any frame has been shown.
-                chosen = lastShownSurface;
-                if (!chosen && bracket.hasBefore) chosen = bracket.beforeSurface;
-                if (!chosen && bracket.hasAfter)  chosen = bracket.afterSurface;
-                break;
-        }
-
-        if (chosen) {
-            m_device->StretchRect(chosen, &srcRect, g_backbuffer, &srcRect, D3DTEXF_NONE);
-            lastShownSurface = chosen;
-        }
+        // The DECISION is pure policy (selection or composite, in TemporalPolicy.cpp
+        // with the mechanism rationale); the compositor executes it onto the
+        // backbuffer. This loop owns the timing, the present, and the log.
+        CompositeOutcome outcome;
+        m_compositor->Compose(bracket, g_backbuffer, &outcome);
 
         // Burn the marker over the composed backbuffer, once per present (repeats
         // included: the counter identifies presented frames, not source frames).
@@ -224,8 +219,8 @@ void TemporalCaptureMode::Run(
         // A/B measures it.
         long long markN = -1;
         if (m_mark) {
-            const int weightQ = bracket.hasBefore ? (int)(bracket.weight * 15.0 + 0.5) : 0;
-            markN = (long long)m_marker.Burn(g_backbuffer, (int)pickChoice, weightQ);
+            markN = (long long)m_marker.Burn(g_backbuffer, outcome.pickCode, outcome.weightQ,
+                                             outcome.synthesized, m_compositor->Id());
         }
 
         LARGE_INTEGER beforePresent;
@@ -242,7 +237,7 @@ void TemporalCaptureMode::Run(
 
         // Logging: bracket timestamps double as the source timeline; w is what blend would use;
         // jit is actual-present vs scheduled deadline; pdt is the actual inter-present gap.
-        if (!bracket.hasBefore) {
+        if (!bracket.info.hasBefore) {
             // Benign while the ring is still filling at startup; once it has wrapped at least
             // once it means the target fell off the back of the ring.
             if (m_ring.Published() >= CaptureRing::RING_SIZE) {
@@ -253,23 +248,31 @@ void TemporalCaptureMode::Run(
             // pull/lk/mark are append-only: effective latency = lag + pull (a bounded
             // sawtooth at lock); lk=-1 marks the lock feature disabled entirely; mark=-1
             // marks the frame marker disabled (video-to-log join key otherwise).
+            // op=/bw= append only in blend mode (what the compositor did and at what
+            // weight); nearest lines carry no new fields.
             int lkField = -1;
             if (m_policyCfg.combQpc > 0) {
                 lkField = m_lockState.engaged ? 1 : 0;
             }
-            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld",
+            char opFields[48] = "";
+            if (outcome.opLabel) {
+                snprintf(opFields, sizeof(opFields), " op=%s bw=%.3f",
+                         outcome.opLabel, outcome.opWeight);
+            }
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld%s",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
-                (long long)((bracket.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
-                bracket.hasAfter ? (long long)((bracket.afterTs - m_baseQpc.QuadPart) * usPerTick) : -1LL,
-                bracket.weight, pick,
+                (long long)((bracket.info.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
+                bracket.info.hasAfter ? (long long)((bracket.info.afterTs - m_baseQpc.QuadPart) * usPerTick) : -1LL,
+                bracket.weight, outcome.pickLabel,
                 (long long)((beforePresent.QuadPart - deadline) * usPerTick),
                 (long long)(presentDelta * usPerTick),
                 lagUs,
                 (long long)(m_lockState.pullQpc * usPerTick),
                 lkField,
-                markN);
-            if (!bracket.hasAfter) {
+                markN,
+                opFields);
+            if (!bracket.info.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }
         }
@@ -313,5 +316,5 @@ void TemporalCaptureMode::Run(
 }
 
 const char* TemporalCaptureMode::GetModeName() const {
-    return "Temporal";
+    return m_blend ? "Temporal blend" : "Temporal";
 }

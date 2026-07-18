@@ -124,4 +124,87 @@ Pick SelectFrame(const BracketInfo& b, SelectionState& s, const PolicyConfig& cf
     return Pick::Repeat;
 }
 
+const char* CompositeLabel(CompositeOp op) {
+    switch (op) {
+        case CompositeOp::PassthroughBefore: return "pass-before";
+        case CompositeOp::PassthroughAfter:  return "pass-after";
+        case CompositeOp::Blend:             return "blend";
+        default:                             return "hold";
+    }
+}
+
+CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
+                                  const PolicyConfig& cfg) {
+    // PASSTHROUGH ELIGIBILITY: a real frame strictly inside the threshold is close
+    // enough that blending would only trade sharpness for sub-frame timing. The
+    // threshold placement is what keeps this gate chatter-free at every operating
+    // point: locked presents sit well under the threshold and hole/mid-gap presents
+    // well over it, so instantaneous-w jitter never reaches the output.
+    const bool eligibleBefore = b.hasBefore && b.beforeDiff < cfg.passthroughQpc;
+    const bool eligibleAfter  = b.hasAfter  && b.afterDiff  < cfg.passthroughQpc;
+
+    CompositeDecision d;
+    int64_t outputTs = 0;
+    bool passAfter = s.lastPassAfter;
+    if (eligibleBefore && eligibleAfter) {
+        // Both real frames are on target (the normal case when the source oversamples
+        // the present: the bracket spans less than two thresholds). Side choice holds
+        // a Schmitt band exactly like selection stickiness: bare nearest-pick lets
+        // capture jitter flip the side every present while the target dwells at the
+        // bracket midpoint (period-2 judder), while the band costs one clean slip
+        // per sweep crossing.
+        const int64_t bias = s.lastPassAfter ? -cfg.stickinessQpc : cfg.stickinessQpc;
+        if (b.beforeDiff <= b.afterDiff + bias) {
+            d.op = CompositeOp::PassthroughBefore;
+            outputTs = b.beforeTs;
+            passAfter = false;
+        } else {
+            d.op = CompositeOp::PassthroughAfter;
+            outputTs = b.afterTs;
+            passAfter = true;
+        }
+    } else if (eligibleBefore) {
+        d.op = CompositeOp::PassthroughBefore;
+        outputTs = b.beforeTs;
+        passAfter = false;
+    } else if (eligibleAfter) {
+        d.op = CompositeOp::PassthroughAfter;
+        outputTs = b.afterTs;
+        passAfter = true;
+    } else if (b.hasBefore && b.hasAfter) {
+        // No real frame near the target but both endpoints exist: synthesize at the
+        // target time (blend is constant-latency by construction). Holes classify
+        // here with no detection needed: a dropped source frame widens the bracket,
+        // the hole present reads mid-w, and neighbors are untouched.
+        d.op = CompositeOp::Blend;
+        const int64_t span = b.beforeDiff + b.afterDiff;
+        if (span > 0) {
+            d.weight = (double)b.beforeDiff / (double)span;
+        } else {
+            d.weight = 0.0;
+        }
+        outputTs = b.beforeTs + b.beforeDiff;
+    } else {
+        // One-sided bracket with the lone frame off target: the after endpoint of a
+        // hole has not arrived yet (recovery depth is what the lag buys) or the
+        // target fell off the ring. Re-present the last output.
+        return d;
+    }
+
+    // MONOTONE OUTPUT GUARD: the composite counterpart of SelectFrame's newer-than-
+    // lastShown constraint. Output content time (frame ts for a passthrough, target
+    // for a blend) may repeat - a pull wrap legitimately re-presents one instant per
+    // beat, the same slip nearest mode pays - but never regress. Passthrough
+    // quantizes output time by up to the threshold, so a threshold wider than the
+    // present period (sub-quarter-rate sources) could otherwise step backward.
+    if (outputTs < s.lastOutputTs) {
+        d.op = CompositeOp::Hold;
+        d.weight = 0.0;
+        return d;
+    }
+    s.lastOutputTs = outputTs;
+    s.lastPassAfter = passAfter;
+    return d;
+}
+
 }  // namespace policy

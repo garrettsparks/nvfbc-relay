@@ -4,11 +4,12 @@
 
 // Pure temporal-selection policy (design: docs/policy-extraction-spec.md). The complete
 // DECISION logic of the temporal mode - nearest-frame selection with hysteresis, the
-// advance gate, and the comb-lock control step - as plain arithmetic over explicit state
-// structs. No windows.h, no d3d9.h, no clocks: fully deterministic and compiles anywhere.
-// TemporalCaptureMode owns the wiring (timing waits, ring, surfaces, present, logging)
-// and consumes this layer; behavior is identical to the pre-extraction inline code by
-// construction (ops copied verbatim).
+// advance gate, the comb-lock control step, and the blend-mode composite decision - as
+// plain arithmetic over explicit state structs. No windows.h, no d3d9.h, no clocks:
+// fully deterministic and compiles anywhere. TemporalCaptureMode owns the wiring
+// (timing waits, ring, surfaces, present, logging) and consumes this layer; nearest
+// behavior is identical to the pre-extraction inline code by construction (ops copied
+// verbatim), and blend mode adds DecideComposite alongside without touching it.
 
 namespace policy {
 
@@ -62,12 +63,15 @@ struct PhaseLockState {
 };
 
 // Fixed at Setup. combQpc == 0 disables the lock entirely (selection then equals the
-// pre-lock v0.0.15 behavior). Units are whatever the caller's timestamps use; the
-// policy is unit-agnostic (QPC ticks in production, microseconds in tests/replay).
+// pre-lock v0.0.15 behavior). passthroughQpc is the blend-mode passthrough threshold
+// (read only by DecideComposite; nearest selection never sees it). Units are whatever
+// the caller's timestamps use; the policy is unit-agnostic (QPC ticks in production,
+// microseconds in tests/replay).
 struct PolicyConfig {
     int64_t stickinessQpc = 0;
     int64_t combQpc = 0;
     int64_t phasePullSlewQpc = 0;
+    int64_t passthroughQpc = 0;
 };
 
 // The signed distance to the nearest point on a p-periodic timeline, in [-p/2, p/2).
@@ -85,5 +89,57 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
 // advance gate in the afterNew-only arm. Updates state; the caller maps the Pick to a
 // surface (Repeat means the last shown surface, which only the caller holds).
 Pick SelectFrame(const BracketInfo& b, SelectionState& s, const PolicyConfig& cfg);
+
+// ---------------------------------------------------------------------------------
+// Blend-mode composite decision.
+// Runs ALONGSIDE SelectFrame, never on top of it: blend mode calls DecideComposite
+// and nearest mode calls SelectFrame, sharing only the bracket and the lock. Layering
+// the composite on SelectFrame's pick was rejected because SelectFrame's monotonic
+// lastShownTs advances on a blend present too, which reclassifies the recovery
+// present after every hole as Repeat (a forced re-present of the synthesized frame:
+// one output dupe per hole, where a real frame sits at the target and should pass
+// through sharp). Values are NOT marker-encoded (provenance rides the marker's
+// interp-flag and compositor-ID cells); the log's op= labels are append-only once
+// shipped.
+// ---------------------------------------------------------------------------------
+
+enum class CompositeOp : int {
+    Hold = 0,               // nothing presentable at the target: re-present last output
+    PassthroughBefore = 1,  // the real before-frame is on target: present it sharp
+    PassthroughAfter = 2,
+    Blend = 3,              // no real frame near the target: lerp(before, after, weight)
+};
+
+// The log's stable op= label for each value.
+const char* CompositeLabel(CompositeOp op);
+
+struct CompositeDecision {
+    CompositeOp op = CompositeOp::Hold;
+    double weight = 0.0;    // blend weight; meaningful only when op == Blend
+};
+
+// Composite memory across presents. lastOutputTs is the content time of the last
+// composed output (frame timestamp for a passthrough, target for a blend); INT64_MIN
+// until the first output so early sim/replay timelines with negative timestamps
+// cannot false-Hold. lastPassAfter is the passthrough side-choice Schmitt state.
+struct CompositeState {
+    int64_t lastOutputTs = INT64_MIN;
+    bool lastPassAfter = false;
+};
+
+// The per-present composite decision for blend mode. A real frame within
+// cfg.passthroughQpc of the target is presented sharp (PASSTHROUGH); with both
+// bracket frames inside the threshold the side choice holds a stickiness Schmitt
+// band, because bare nearest-pick lets capture jitter flip the side every present
+// while the target dwells at the bracket midpoint, and when the source oversamples
+// the present both frames are always eligible, making that dwell permanent.
+// Otherwise a complete bracket BLENDS at the bracket weight; an incomplete one HOLDS
+// (the hole-recovery depth contract: a hole present interpolates only once its after
+// endpoint has arrived). A candidate whose output time would regress on the last
+// output (pull wraps, pathological ratios) demotes to Hold: output content time is
+// non-decreasing by construction, the composite counterpart of SelectFrame's
+// monotonic lastShownTs.
+CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
+                                  const PolicyConfig& cfg);
 
 }  // namespace policy

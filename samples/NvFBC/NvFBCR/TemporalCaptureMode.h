@@ -1,6 +1,7 @@
 #pragma once
 
 #include "IFrameCaptureMode.h"
+#include "IFrameCompositor.h"
 #include "PresentScheduler.h"
 #include "CaptureRing.h"
 #include "FrameMarker.h"
@@ -21,23 +22,21 @@
 //                                         composes only the card's display and the present
 //                                         becomes card-locked 60 Hz — the production use case
 //                                         (spec Rounds 5-10).
-//   This mode        — each present: select the ring frame nearest a content target lagged a
-//                      fixed bracketing delay behind, with hysteresis (monotonic), copy to
-//                      backbuffer, present.
-//
-// Blend mode will differ only in the last step (blend the bracketing pair instead of picking
-// one); optical flow later replaces that step again.
+//   This mode        — each present: aim a content target lagged a fixed bracketing delay
+//                      behind, bracket it in the ring, hand the bracket to the compositor
+//                      (nearest copies one real frame; blend lerps the pair), present.
 class TemporalCaptureMode : public IFrameCaptureMode {
 private:
     PresentScheduler m_scheduler;
     CaptureRing m_ring;
     LONGLONG m_bracketingDelayQpc;  // present-target lag; static: max(present period, 1.25 x assumed source period)
     LONGLONG m_assumedSrcPeriodQpc; // declared/default source period the lag was sized for
-    policy::PolicyConfig m_policyCfg;    // stickiness band, comb spacing (0 = lock off), pull slew
+    policy::PolicyConfig m_policyCfg;    // stickiness band, comb spacing (0 = lock off), pull slew, passthrough gate
     policy::PhaseLockState m_lockState;  // comb-lock pull/EMAs/gate (pure policy state)
-    policy::SelectionState m_selState;   // lastShownTs + the two Schmitt state bits
+    IFrameCompositor* m_compositor; // owned; picked at Setup from m_blend
     int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
     bool m_lock;                    // -lock: opt in to the comb lock (needs -src); default off
+    bool m_blend;                   // b modes: interpolating compositor; t modes: nearest
     bool m_mark;                    // -mark: burn the frame-counter marker (debug); default off
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
     LARGE_INTEGER m_baseQpc;        // logging time origin
@@ -52,7 +51,8 @@ private:
 
 public:
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
-                        bool lock = false, bool mark = false);
+                        bool lock = false, bool blend = false, bool mark = false);
+    virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;
     virtual bool Setup() override;
