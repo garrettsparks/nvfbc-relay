@@ -191,6 +191,7 @@
   <ItemGroup>
     <ClCompile Include="DiagCaptureMode.cpp" />
     <ClCompile Include="TemporalCaptureMode.cpp" />
+    <ClCompile Include="TemporalPolicy.cpp" />
     <ClCompile Include="FrameMarker.cpp" />
     <ClCompile Include="CaptureRing.cpp" />
     <ClCompile Include="NvFBCR.cpp" />
@@ -204,6 +205,7 @@
     <ClInclude Include="FrameMarker.h" />
     <ClInclude Include="DiagCaptureMode.h" />
     <ClInclude Include="TemporalCaptureMode.h" />
+    <ClInclude Include="TemporalPolicy.h" />
     <ClInclude Include="IFrameCaptureMode.h" />
     <ClInclude Include="PresentScheduler.h" />
     <ClInclude Include="TimerCaptureMode.h" />
