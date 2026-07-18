@@ -85,6 +85,11 @@ bool g_lock = false;
 // the exact video-to-log join key. See docs/frame-marker-spec.md.
 bool g_mark = false;
 
+// Interp compositor backend for o:* modes (-interp flow|fruc). Flow (raw NVOFA + our
+// warp) is the default: the only runtime dependency is the driver's nvofapi64.dll,
+// while FRUC needs the SDK's NvOFFRUC.dll beside the exe.
+int g_interpBackend = 1;
+
 // Single fps validation policy for every entry point that accepts a rate (mode strings,
 // -src): accept (0, 1000].
 static bool ParseFps(const string& value, float* outFps) {
@@ -103,25 +108,31 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         return new VsyncCaptureMode();
     }
 
-    // Temporal modes (t = nearest selection, b = blend compositor), vsync present
-    // (t:vsync / b:vsync or the bare letter): CaptureRing-based temporal mode, present
-    // blocked on DWM's compose clock (windowed INTERVAL_ONE; card-locked 60 Hz under a
-    // fullscreen game on the source — the production case). Nominal 60 fps drives the
-    // bracketing lag; the actual present rate is DWM's delivery.
+    // Temporal modes (t = nearest selection, b = blend compositor, o = optical-flow
+    // interp compositor), vsync present (t:vsync / b:vsync / o:vsync or the bare
+    // letter): CaptureRing-based temporal mode, present blocked on DWM's compose clock
+    // (windowed INTERVAL_ONE; card-locked 60 Hz under a fullscreen game on the source —
+    // the production case). Nominal 60 fps drives the bracketing lag; the actual
+    // present rate is DWM's delivery.
     {
-        const bool blendSel = (modeStr[0] == 'b' || modeStr[0] == 'B');
+        char c0 = modeStr[0];
+        if (c0 >= 'A' && c0 <= 'Z') c0 = (char)(c0 - 'A' + 'a');
+        CompositorKind kind = kCompositorNearest;
+        if (c0 == 'b') kind = kCompositorBlend;
+        else if (c0 == 'o') kind = kCompositorInterp;
         if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0 ||
-            _stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0) {
+            _stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0 ||
+            _stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
-                                           blendSel, g_mark);
+                                           kind, g_mark);
         }
 
-        // QPC-timer present (t:60 / b:60 format).
-        if (modeStr.length() > 2 && (modeStr[0] == 't' || modeStr[0] == 'b') && modeStr[1] == ':') {
+        // QPC-timer present (t:60 / b:60 / o:60 format).
+        if (modeStr.length() > 2 && (c0 == 't' || c0 == 'b' || c0 == 'o') && modeStr[1] == ':') {
             float framerate;
             if (ParseFps(modeStr.substr(2), &framerate)) {
                 return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
-                                               blendSel, g_mark);
+                                               kind, g_mark);
             }
         }
     }
@@ -150,11 +161,13 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)");
     LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
     LOGERR("  b, b:vsync, b:60 - Temporal blend compositor (sharp passthrough at the target, lerp otherwise)");
+    LOGERR("  o, o:vsync, o:60 - Temporal interp compositor (NVOFA motion-compensated synthesis)");
     LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
     LOGERR("Options:");
     LOGERR("  -src 30        - Declared source fps; sizes the static temporal lag (default: assume >= 60)");
     LOGERR("  -lock          - Enable the phase comb lock (needs -src for the rate); off by default");
+    LOGERR("  -interp flow|fruc - o:* synthesis engine (default flow = raw NVOFA + warp)");
     LOGERR("  -mark          - Burn the frame-counter marker (video-to-log alignment, debug); off by default");
     return NULL;
 }
@@ -417,6 +430,12 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         else LOGERR("-src value '%s' invalid (1-1000) - ignored", tokens[i + 1].c_str());
         return 2;
     }
+    if (tokens[i] == "-interp" && i + 1 < tokens.size()) {
+        if (tokens[i + 1] == "flow")      g_interpBackend = 1;
+        else if (tokens[i + 1] == "fruc") g_interpBackend = 0;
+        else LOGERR("-interp value '%s' invalid (flow|fruc) - keeping default", tokens[i + 1].c_str());
+        return 2;
+    }
     return 0;
 }
 
@@ -499,8 +518,10 @@ void ConsoleUserInput(string* framerateStr) {
     cout << "  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)" << endl;
     cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
     cout << "  b, b:vsync, b:60 - Temporal blend compositor (sharp passthrough at the target, lerp otherwise)" << endl;
+    cout << "  o, o:vsync, o:60 - Temporal interp compositor (NVOFA motion-compensated synthesis)" << endl;
     cout << "  t:60 -src 30   - Mode plus options: -src <fps> declares the source rate (lag sizing)" << endl;
     cout << "  -lock          - Enable the phase comb lock (needs -src; off by default)" << endl;
+    cout << "  -interp flow|fruc - o:* synthesis engine (default flow = raw NVOFA + warp)" << endl;
     cout << "  -mark          - Burn the frame-counter marker (video-to-log alignment, debug)" << endl;
     cout << endl;
     cout << "  diag, diag:vsync - Clock probes (DWM compose timing + card raster)" << endl;

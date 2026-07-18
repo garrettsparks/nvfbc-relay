@@ -14,6 +14,7 @@ struct CompositeOutcome {
     int weightQ;             // marker weight cells, quantized 0-15
     bool synthesized;        // marker interp cell: output pixels are not one real frame
     double opWeight;         // bw= value when opLabel is set
+    long long synthUs;       // pt= value: engine time of this synthesis; -1 = no field
 };
 
 // Per-present composition: turn the bracket into backbuffer pixels. One implementation
@@ -27,8 +28,14 @@ public:
     // degrade silently.
     virtual bool Setup(IDirect3DDevice9Ex* device, int width, int height) = 0;
 
-    // Marker compositor-ID cell value (0 nearest, 1 blend).
+    // Marker compositor-ID cell value (0 nearest, 1 blend, 2 fruc, 3 flow-warp).
     virtual int Id() const = 0;
+
+    // Late init for compositors needing capture-side resources that exist only after
+    // CaptureRing::Start (slot shared handles). Default no-op; a false return refuses
+    // the mode rather than running a different compositor than the one asked for.
+    virtual bool OnCaptureStarted(CaptureRing*, LARGE_INTEGER /*baseQpc*/,
+                                  LONGLONG /*freqQpc*/) { return true; }
 
     // Compose this present's output onto the backbuffer and fill the outcome. When
     // nothing is presentable yet (startup, before any frame exists) the backbuffer is

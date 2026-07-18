@@ -191,7 +191,9 @@
   <ItemGroup>
     <ClCompile Include="BlendRenderer.cpp" />
     <ClCompile Include="DiagCaptureMode.cpp" />
+    <ClCompile Include="FlowWarpEngine.cpp" />
     <ClCompile Include="FrameCompositors.cpp" />
+    <ClCompile Include="InterpSidecar.cpp" />
     <ClCompile Include="TemporalCaptureMode.cpp" />
     <ClCompile Include="TemporalPolicy.cpp" />
     <ClCompile Include="FrameMarker.cpp" />
@@ -205,9 +207,11 @@
     <ClInclude Include="..\..\..\inc\NvFBC\NvFBCToDx9vid.h" />
     <ClInclude Include="BlendRenderer.h" />
     <ClInclude Include="CaptureRing.h" />
+    <ClInclude Include="FlowWarpEngine.h" />
     <ClInclude Include="FrameCompositors.h" />
     <ClInclude Include="FrameMarker.h" />
     <ClInclude Include="IFrameCompositor.h" />
+    <ClInclude Include="InterpSidecar.h" />
     <ClInclude Include="DiagCaptureMode.h" />
     <ClInclude Include="TemporalCaptureMode.h" />
     <ClInclude Include="TemporalPolicy.h" />

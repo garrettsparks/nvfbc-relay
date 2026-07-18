@@ -24,7 +24,16 @@
 //                                         (spec Rounds 5-10).
 //   This mode        — each present: aim a content target lagged a fixed bracketing delay
 //                      behind, bracket it in the ring, hand the bracket to the compositor
-//                      (nearest copies one real frame; blend lerps the pair), present.
+//                      (nearest copies one real frame; blend lerps the pair; interp
+//                      motion-compensates the pair), present.
+
+// Which compositor the mode letter selected (t nearest, b blend, o interp).
+enum CompositorKind {
+    kCompositorNearest = 0,
+    kCompositorBlend = 1,
+    kCompositorInterp = 2,
+};
+
 class TemporalCaptureMode : public IFrameCaptureMode {
 private:
     PresentScheduler m_scheduler;
@@ -33,10 +42,10 @@ private:
     LONGLONG m_assumedSrcPeriodQpc; // declared/default source period the lag was sized for
     policy::PolicyConfig m_policyCfg;    // stickiness band, comb spacing (0 = lock off), pull slew, passthrough gate
     policy::PhaseLockState m_lockState;  // comb-lock pull/EMAs/gate (pure policy state)
-    IFrameCompositor* m_compositor; // owned; picked at Setup from m_blend
+    IFrameCompositor* m_compositor; // owned; picked at Setup from m_compositorKind
     int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
+    CompositorKind m_compositorKind;
     bool m_lock;                    // -lock: opt in to the comb lock (needs -src); default off
-    bool m_blend;                   // b modes: interpolating compositor; t modes: nearest
     bool m_mark;                    // -mark: burn the frame-counter marker (debug); default off
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
     LARGE_INTEGER m_baseQpc;        // logging time origin
@@ -51,7 +60,8 @@ private:
 
 public:
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
-                        bool lock = false, bool blend = false, bool mark = false);
+                        bool lock = false, CompositorKind compositor = kCompositorNearest,
+                        bool mark = false);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

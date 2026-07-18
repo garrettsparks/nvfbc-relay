@@ -408,7 +408,7 @@ static void test_composite_passthrough_at_lock() {
         total++;
         if (r.engaged[i]) engagedN++;
         if (IsPass(r.ops[i])) pass++;
-        else if (r.ops[i] == policy::CompositeOp::Blend) blend++;
+        else if (r.ops[i] == policy::CompositeOp::Synthesize) blend++;
         else hold++;
     }
     CHECK(engagedN >= total * 99 / 100, "lock engaged only %d/%d post-warmup", engagedN, total);
@@ -471,7 +471,7 @@ static void test_composite_hole_classification() {
     for (size_t i = warmup; i < r.ops.size(); i++) {
         if (!r.engaged[i]) engagedAll = 0;
         if (r.ops[i] == policy::CompositeOp::Hold) holds++;
-        if (r.ops[i] != policy::CompositeOp::Blend) continue;
+        if (r.ops[i] != policy::CompositeOp::Synthesize) continue;
         blends++;
         if (r.weights[i] < wLo) wLo = r.weights[i];
         if (r.weights[i] > wHi) wHi = r.weights[i];
@@ -511,7 +511,7 @@ static void test_composite_two_frame_hole() {
           "%zu non-pass presents for a two-frame hole", nonPass.size());
     if (!nonPass.empty()) {
         const size_t last = nonPass.back();
-        CHECK(r.ops[last] == policy::CompositeOp::Blend,
+        CHECK(r.ops[last] == policy::CompositeOp::Synthesize,
               "two-frame hole did not end in a recovery blend");
         CHECK(r.weights[last] >= 0.55 && r.weights[last] <= 0.78,
               "recovery blend w=%.3f not near 2/3", r.weights[last]);
@@ -606,7 +606,7 @@ static void test_composite_unlocked_sweep() {
     for (size_t i = warmup; i < r.ops.size(); i++) {
         total++;
         if (IsPass(r.ops[i])) pass++;
-        if (r.ops[i] == policy::CompositeOp::Blend) blend++;
+        if (r.ops[i] == policy::CompositeOp::Synthesize) blend++;
         if (i > warmup && IsPass(r.ops[i]) != IsPass(r.ops[i - 1])) transitions++;
     }
     CHECK(pass >= total * 35 / 100 && pass <= total * 65 / 100,

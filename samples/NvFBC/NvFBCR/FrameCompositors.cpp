@@ -1,6 +1,8 @@
 #include "FrameCompositors.h"
 #include <SimpleLogger.h>
 
+extern int g_interpBackend;   // NvFBCR.cpp: -interp flow|fruc
+
 // ---------------------------------------------------------------------------------
 // NearestCompositor
 // ---------------------------------------------------------------------------------
@@ -63,56 +65,54 @@ void NearestCompositor::Compose(const FrameBracket& bracket, IDirect3DSurface9* 
     out->weightQ = bracket.info.hasBefore ? (int)(bracket.weight * 15.0 + 0.5) : 0;
     out->synthesized = false;
     out->opWeight = 0.0;
+    out->synthUs = -1;
 }
 
 // ---------------------------------------------------------------------------------
-// BlendCompositor
+// SynthCompositorBase
 // ---------------------------------------------------------------------------------
 
-BlendCompositor::BlendCompositor(const policy::PolicyConfig* cfg)
+SynthCompositorBase::SynthCompositorBase(const policy::PolicyConfig* cfg)
     : m_cfg(cfg)
     , m_device(NULL)
     , m_holdSurface(NULL)
     , m_lastOutput(NULL)
     , m_lastSynthesized(false)
+    , m_lastSynthUs(-1)
 {
     m_rect.left = m_rect.top = m_rect.right = m_rect.bottom = 0;
 }
 
-BlendCompositor::~BlendCompositor() {
+SynthCompositorBase::~SynthCompositorBase() {
     if (m_holdSurface) m_holdSurface->Release();
 }
 
-bool BlendCompositor::Setup(IDirect3DDevice9Ex* device, int width, int height) {
+bool SynthCompositorBase::Setup(IDirect3DDevice9Ex* device, int width, int height) {
     m_device = device;
     m_rect.left = 0;
     m_rect.top = 0;
     m_rect.right = width;
     m_rect.bottom = height;
 
-    if (!m_blender.Setup(device)) {
+    if (!SetupResources()) {
         return false;
     }
-    // Hold snapshot in the backbuffer's format: a blended output exists nowhere else
-    // (ring frames stay real), so a stall/hole present that must re-show it needs a
-    // surface with stable ownership. Flip-model backbuffer contents are not reusable
+    // Hold snapshot in the backbuffer's format: a synthesized output exists nowhere
+    // else (ring frames stay real), so a stall/hole present that must re-show it needs
+    // a surface with stable ownership. Flip-model backbuffer contents are not reusable
     // after present.
     HRESULT hr = device->CreateRenderTarget(width, height, D3DFMT_A2R10G10B10,
                                             D3DMULTISAMPLE_NONE, 0, FALSE,
                                             &m_holdSurface, NULL);
     if (FAILED(hr)) {
-        LOGERR("BlendCompositor: hold surface creation failed (hr=0x%08lx)", (unsigned long)hr);
+        LOGERR("compositor: hold surface creation failed (hr=0x%08lx)", (unsigned long)hr);
         return false;
     }
     return true;
 }
 
-int BlendCompositor::Id() const {
-    return 1;
-}
-
-void BlendCompositor::Compose(const FrameBracket& bracket, IDirect3DSurface9* backbuffer,
-                              CompositeOutcome* out) {
+void SynthCompositorBase::Compose(const FrameBracket& bracket, IDirect3DSurface9* backbuffer,
+                                  CompositeOutcome* out) {
     const policy::CompositeDecision d = policy::DecideComposite(bracket.info, m_compState, *m_cfg);
 
     out->pickLabel = policy::PickLabel(policy::Pick::None);
@@ -121,6 +121,7 @@ void BlendCompositor::Compose(const FrameBracket& bracket, IDirect3DSurface9* ba
     out->weightQ = 0;
     out->synthesized = false;
     out->opWeight = 0.0;
+    out->synthUs = -1;
 
     switch (d.op) {
         case policy::CompositeOp::PassthroughBefore:
@@ -138,8 +139,9 @@ void BlendCompositor::Compose(const FrameBracket& bracket, IDirect3DSurface9* ba
             m_lastSynthesized = false;
             break;
         }
-        case policy::CompositeOp::Blend: {
-            if (m_blender.Blend(bracket.beforeTexture, bracket.afterTexture, (float)d.weight)) {
+        case policy::CompositeOp::Synthesize: {
+            m_lastSynthUs = -1;
+            if (RenderSynthesis(bracket, d.weight, backbuffer)) {
                 // Snapshot before the marker burn so a later hold re-presents clean
                 // content and burns its own fresh marker.
                 m_device->StretchRect(backbuffer, &m_rect, m_holdSurface, &m_rect, D3DTEXF_NONE);
@@ -148,12 +150,13 @@ void BlendCompositor::Compose(const FrameBracket& bracket, IDirect3DSurface9* ba
                 out->synthesized = true;
                 out->weightQ = (int)(d.weight * 15.0 + 0.5);
                 out->opWeight = d.weight;
+                out->synthUs = m_lastSynthUs;
             } else {
-                // Emergency passthrough of the nearer real frame: a failed draw must
-                // not present whatever the flip queue left in the backbuffer.
+                // Emergency passthrough of the nearer real frame: a failed synthesis
+                // must not present whatever the flip queue left in the backbuffer.
                 IDirect3DSurface9* chosen = bracket.beforeSurface;
                 if (bracket.info.afterDiff < bracket.info.beforeDiff) chosen = bracket.afterSurface;
-                LOGERR("BlendCompositor: lerp draw failed - passing through a real frame");
+                LOGERR("compositor: synthesis failed - passing through a real frame");
                 m_device->StretchRect(chosen, &m_rect, backbuffer, &m_rect, D3DTEXF_NONE);
                 m_lastOutput = chosen;
                 m_lastSynthesized = false;
@@ -175,4 +178,70 @@ void BlendCompositor::Compose(const FrameBracket& bracket, IDirect3DSurface9* ba
             break;
         }
     }
+}
+
+// ---------------------------------------------------------------------------------
+// BlendCompositor
+// ---------------------------------------------------------------------------------
+
+BlendCompositor::BlendCompositor(const policy::PolicyConfig* cfg)
+    : SynthCompositorBase(cfg)
+{
+}
+
+int BlendCompositor::Id() const {
+    return 1;
+}
+
+bool BlendCompositor::SetupResources() {
+    return m_blender.Setup(m_device);
+}
+
+bool BlendCompositor::RenderSynthesis(const FrameBracket& bracket, double weight,
+                                      IDirect3DSurface9* /*backbuffer*/) {
+    // BlendRenderer draws over the device's current render target, which is the
+    // backbuffer here (nothing else in the present path changes it).
+    return m_blender.Blend(bracket.beforeTexture, bracket.afterTexture, (float)weight);
+}
+
+// ---------------------------------------------------------------------------------
+// InterpCompositor
+// ---------------------------------------------------------------------------------
+
+InterpCompositor::InterpCompositor(const policy::PolicyConfig* cfg)
+    : SynthCompositorBase(cfg)
+    , m_backend(g_interpBackend)
+{
+}
+
+int InterpCompositor::Id() const {
+    if (m_backend == kInterpBackendFlow) return 3;   // flow-warp marker compositor ID
+    return 2;                                        // fruc
+}
+
+bool InterpCompositor::SetupResources() {
+    // The lerp fallback must be ready before the sidecar exists (the sidecar arrives
+    // in OnCaptureStarted); the sidecar's own setup failing refuses the mode instead.
+    return m_blender.Setup(m_device);
+}
+
+bool InterpCompositor::OnCaptureStarted(CaptureRing* ring, LARGE_INTEGER baseQpc,
+                                        LONGLONG freqQpc) {
+    return m_sidecar.Setup(m_device, ring, m_rect.right, m_rect.bottom, baseQpc, freqQpc);
+}
+
+bool InterpCompositor::RenderSynthesis(const FrameBracket& bracket, double weight,
+                                       IDirect3DSurface9* backbuffer) {
+    if (m_sidecar.Enabled()) {
+        const LONGLONG target = bracket.info.beforeTs + bracket.info.beforeDiff;
+        if (m_sidecar.Interpolate(bracket, target)) {
+            m_device->StretchRect(m_sidecar.OutputSurface9(), &m_rect, backbuffer, &m_rect,
+                                  D3DTEXF_NONE);
+            m_lastSynthUs = m_sidecar.LastProcessUs();
+            return true;
+        }
+    }
+    // Lerp fallback keeps the output synthesized-at-target when the engine cannot
+    // deliver; these presents log op=synth without pt=.
+    return m_blender.Blend(bracket.beforeTexture, bracket.afterTexture, (float)weight);
 }
