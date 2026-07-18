@@ -44,7 +44,6 @@
 #include <iostream>
 #include <assert.h>
 #include <d3d9.h>
-#include <d3dcompiler.h>
 #include <vector>
 
 #include <NvFBCLibrary.h>
@@ -104,19 +103,26 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         return new VsyncCaptureMode();
     }
 
-    // Temporal selection + vsync present (t:vsync or just t): CaptureRing-based temporal mode,
-    // present blocked on DWM's compose clock (windowed INTERVAL_ONE; card-locked 60 Hz under a
+    // Temporal modes (t = nearest selection, b = blend compositor), vsync present
+    // (t:vsync / b:vsync or the bare letter): CaptureRing-based temporal mode, present
+    // blocked on DWM's compose clock (windowed INTERVAL_ONE; card-locked 60 Hz under a
     // fullscreen game on the source — the production case). Nominal 60 fps drives the
     // bracketing lag; the actual present rate is DWM's delivery.
-    if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0) {
-        return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock, g_mark);
-    }
+    {
+        const bool blendSel = (modeStr[0] == 'b' || modeStr[0] == 'B');
+        if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0 ||
+            _stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0) {
+            return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
+                                           blendSel, g_mark);
+        }
 
-    // Temporal selection + QPC-timer present (t:60 format).
-    if (modeStr.length() > 2 && modeStr[0] == 't' && modeStr[1] == ':') {
-        float framerate;
-        if (ParseFps(modeStr.substr(2), &framerate)) {
-            return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock, g_mark);
+        // QPC-timer present (t:60 / b:60 format).
+        if (modeStr.length() > 2 && (modeStr[0] == 't' || modeStr[0] == 'b') && modeStr[1] == ':') {
+            float framerate;
+            if (ParseFps(modeStr.substr(2), &framerate)) {
+                return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
+                                               blendSel, g_mark);
+            }
         }
     }
 
@@ -143,6 +149,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  vsync          - VSync-driven presentation");
     LOGERR("  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)");
     LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
+    LOGERR("  b, b:vsync, b:60 - Temporal blend compositor (sharp passthrough at the target, lerp otherwise)");
     LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
     LOGERR("Options:");
@@ -491,6 +498,7 @@ void ConsoleUserInput(string* framerateStr) {
     cout << endl;
     cout << "  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)" << endl;
     cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
+    cout << "  b, b:vsync, b:60 - Temporal blend compositor (sharp passthrough at the target, lerp otherwise)" << endl;
     cout << "  t:60 -src 30   - Mode plus options: -src <fps> declares the source rate (lag sizing)" << endl;
     cout << "  -lock          - Enable the phase comb lock (needs -src; off by default)" << endl;
     cout << "  -mark          - Burn the frame-counter marker (video-to-log alignment, debug)" << endl;
@@ -544,18 +552,6 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     int nCmdShow)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-
-    // No-op shader compile whose only purpose is keeping the d3dcompiler.dll import in the
-    // binary. The blend modes were the only real D3DCompile callers; deleting them dropped the
-    // import and the next build tripped a Defender Wacatac.B!ml false positive (old build clean,
-    // new build flagged, same-day scans). Experiment: restore the import, observe the verdict.
-    // Blend mode will reintroduce a real D3DCompile call later; remove this shim then.
-    {
-        ID3DBlob* nopBlob = NULL;
-        const char* nopShader = "float4 main() : COLOR0 { return 0; }";
-        D3DCompile(nopShader, strlen(nopShader), NULL, NULL, NULL, "main", "ps_3_0", 0, 0, &nopBlob, NULL);
-        if (nopBlob) nopBlob->Release();
-    }
 
     if (!InitDisplays()) {
         LOGERR("Unable to enumerate display adapters");

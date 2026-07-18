@@ -328,28 +328,29 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, FrameBracket* out) const {
         if (diff >= 0) {
             if (diff < bestBeforeDiff) {
                 bestBeforeDiff = diff;
-                out->hasBefore = true;
+                out->info.hasBefore = true;
                 out->beforeSurface = m_ring[slot].mainSurface;
                 out->beforeTexture = m_ring[slot].mainTexture;
-                out->beforeTs = ts;
-                out->beforeDiff = diff;
+                out->info.beforeTs = ts;
+                out->info.beforeDiff = diff;
                 out->beforeDepth = (int)(p - 1 - i);
             }
         } else {
             if (-diff < bestAfterDiff) {
                 bestAfterDiff = -diff;
-                out->hasAfter = true;
+                out->info.hasAfter = true;
                 out->afterSurface = m_ring[slot].mainSurface;
                 out->afterTexture = m_ring[slot].mainTexture;
-                out->afterTs = ts;
-                out->afterDiff = -diff;
+                out->info.afterTs = ts;
+                out->info.afterDiff = -diff;
             }
         }
     }
 
-    if (out->hasBefore && out->hasAfter) {
-        out->weight = (double)out->beforeDiff / (double)(out->beforeDiff + out->afterDiff);
-    } else if (out->hasBefore) {
+    if (out->info.hasBefore && out->info.hasAfter) {
+        out->weight = (double)out->info.beforeDiff /
+                      (double)(out->info.beforeDiff + out->info.afterDiff);
+    } else if (out->info.hasBefore) {
         out->weight = 1.0;  // target is past the newest frame; nothing to interpolate toward
     } else {
         out->weight = 0.0;

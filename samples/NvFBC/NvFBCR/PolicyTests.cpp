@@ -65,6 +65,11 @@ struct SimResult {
     std::vector<int64_t> beforeDiff;  // at the pulled target (when hasBefore)
     std::vector<size_t> wrapAt;       // present indices where the pull wrapped
     int wraps = 0;
+    // Composite decision alongside (recorded when passthroughQpc > 0).
+    std::vector<policy::CompositeOp> ops;
+    std::vector<double> weights;
+    std::vector<int64_t> outTs;       // composite output content time (Hold carries forward)
+    std::vector<int64_t> minDiff;     // nearest-real-frame distance at the target (-1 if none)
 };
 
 struct SimParams {
@@ -74,6 +79,8 @@ struct SimParams {
     int64_t combQpc;         // 0 = lock off
     int64_t presents;
     int64_t phaseOffset;     // shifts arrival phase vs deadlines
+    int64_t passthroughQpc;  // 0 = composite decision off
+    std::vector<int64_t> drops;  // sorted arrival indices to drop (hole injection)
 };
 
 static SimResult Simulate(const SimParams& p) {
@@ -81,20 +88,33 @@ static SimResult Simulate(const SimParams& p) {
     cfg.stickinessQpc = kStickinessUs;
     cfg.combQpc = p.combQpc;
     cfg.phasePullSlewQpc = kSlewUs;
+    cfg.passthroughQpc = p.passthroughQpc;
 
     int64_t lag = p.srcPeriod + p.srcPeriod / 4;
     if (lag < p.presentPeriod) lag = p.presentPeriod;
 
-    // Pre-generate arrivals covering the whole run.
+    // Pre-generate arrivals covering the whole run. Drops are filtered after
+    // generation so the jitter stream (and every surviving arrival) is identical
+    // with and without hole injection.
     std::vector<int64_t> arrivals;
     const int64_t horizon = (p.presents + 4) * p.presentPeriod;
     for (int64_t t = p.phaseOffset, i = 0; t < horizon; i++) {
         arrivals.push_back(t + JitterUs(p.arrivalJitter));
         t = p.phaseOffset + (i + 1) * p.srcPeriod;
     }
+    if (!p.drops.empty()) {
+        std::vector<int64_t> kept;
+        size_t di = 0;
+        for (size_t i = 0; i < arrivals.size(); i++) {
+            if (di < p.drops.size() && (int64_t)i == p.drops[di]) { di++; continue; }
+            kept.push_back(arrivals[i]);
+        }
+        arrivals.swap(kept);
+    }
 
     SelectionState sel;
     PhaseLockState lock;
+    policy::CompositeState comp;
     SimResult r;
     size_t cursor = 0;
     int64_t prevPull = 0;
@@ -109,7 +129,12 @@ static SimResult Simulate(const SimParams& p) {
             b.beforeTs = arrivals[cursor];
             b.beforeDiff = target - b.beforeTs;
         }
-        b.hasAfter = cursor + 1 < arrivals.size();
+        // A frame is in the bracket only once it has ARRIVED by pick time (the ring
+        // can't contain the future). Inert for hole-free timelines - the lag sizing
+        // guarantees the after frame preceded the deadline - but load-bearing for
+        // hole recovery depth: a widened bracket's after endpoint may not have
+        // arrived yet, and those presents must hold, not blend.
+        b.hasAfter = cursor + 1 < arrivals.size() && arrivals[cursor + 1] <= deadline;
         if (b.hasAfter) {
             b.afterTs = arrivals[cursor + 1];
             b.afterDiff = b.afterTs - target;
@@ -130,8 +155,24 @@ static SimResult Simulate(const SimParams& p) {
         r.pull.push_back(lock.pullQpc);
         r.engaged.push_back(lock.engaged);
         r.beforeDiff.push_back(b.hasBefore ? b.beforeDiff : -1);
+
+        int64_t md = -1;
+        if (b.hasBefore) md = b.beforeDiff;
+        if (b.hasAfter && (md < 0 || b.afterDiff < md)) md = b.afterDiff;
+        r.minDiff.push_back(md);
+        if (cfg.passthroughQpc > 0) {
+            const policy::CompositeDecision cd = policy::DecideComposite(b, comp, cfg);
+            r.ops.push_back(cd.op);
+            r.weights.push_back(cd.weight);
+            r.outTs.push_back(comp.lastOutputTs);
+        }
     }
     return r;
+}
+
+static bool IsPass(policy::CompositeOp op) {
+    return op == policy::CompositeOp::PassthroughBefore ||
+           op == policy::CompositeOp::PassthroughAfter;
 }
 
 // Gate-excursion signature: a Repeat whose recovery jumps the shown timestamp by well
@@ -331,6 +372,296 @@ static void test_no_excursion_while_locked() {
 }
 
 // ---------------------------------------------------------------------------------
+// Composite (blend-mode) suites. All run AFTER the selection suites: the shared LCG
+// stream means the selection suites' timelines stay byte-identical only if nothing
+// before them draws jitter.
+//
+// The threshold convention mirrors the production Setup rule
+// T = max(assumed srcP, presentP) / 4. The presentP floor covers the oversampling
+// regime: when the source outpaces the present, a real frame is always within
+// srcP/2 of the target, so the threshold must exceed srcP/2 for passthrough to
+// dominate; at-rate and sub-rate sources get srcP/4.
+// ---------------------------------------------------------------------------------
+
+static int64_t ThresholdUs(int64_t srcPeriod, int64_t presentPeriod) {
+    const int64_t base = srcPeriod > presentPeriod ? srcPeriod : presentPeriod;
+    return base / 4;
+}
+
+// The production corner the lock exists for: 60-in-60-out with a slow beat. Locked,
+// nearly every present has a real frame at the target and passes through sharp.
+static void test_composite_passthrough_at_lock() {
+    SimParams p{};
+    p.srcPeriod = 16672;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 300;
+    p.combQpc = 16672;
+    p.presents = 12000;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    SimResult r = Simulate(p);
+    const size_t warmup = 3000;   // covers worst-case lock acquisition (~40 s)
+    CHECK(r.ops.size() == (size_t)p.presents,
+          "composite decisions not recorded (%zu of %lld presents)",
+          r.ops.size(), (long long)p.presents);
+    int pass = 0, blend = 0, hold = 0, engagedN = 0, total = 0;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        total++;
+        if (r.engaged[i]) engagedN++;
+        if (IsPass(r.ops[i])) pass++;
+        else if (r.ops[i] == policy::CompositeOp::Blend) blend++;
+        else hold++;
+    }
+    CHECK(engagedN >= total * 99 / 100, "lock engaged only %d/%d post-warmup", engagedN, total);
+    CHECK(pass >= total * 98 / 100, "passthrough %d/%d post-warmup (< 98%%)", pass, total);
+    CHECK(blend <= total / 100, "%d blends at lock (> 1%%)", blend);
+    CHECK(hold <= 5, "%d holds at lock", hold);
+}
+
+// Gate placement: at locked operating points the nearest-real-frame distance sits
+// far below the threshold, so the pass/blend boundary is unreachable and the
+// composition cannot flip-flop; the gate needs no hysteresis because placement
+// keeps every operating point away from it.
+static void test_composite_gate_placement() {
+    SimParams p{};
+    p.srcPeriod = 16672;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 300;
+    p.combQpc = 16672;
+    p.presents = 12000;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    SimResult r = Simulate(p);
+    const size_t warmup = 3000;
+    const int64_t T = p.passthroughQpc;
+    int nearBoundary = 0, alternations = 0;
+    bool prevPass = true;
+    int flips = 0;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        if (!r.engaged[i]) continue;
+        if (r.minDiff[i] >= T / 2 && r.minDiff[i] < T + T / 2) nearBoundary++;
+        const bool isPass = IsPass(r.ops[i]);
+        if (i > warmup && isPass != prevPass) {
+            flips++;
+            if (flips >= 2) alternations++;
+        } else if (isPass == prevPass) {
+            flips = 0;
+        }
+        prevPass = isPass;
+    }
+    CHECK(nearBoundary == 0, "%d engaged presents inside the threshold boundary band", nearBoundary);
+    CHECK(alternations == 0, "%d pass/blend alternation windows while locked", alternations);
+}
+
+// Dropped source frames need no detection. Each isolated drop widens one bracket;
+// that present blends at w ~= 0.5, neighbors stay sharp, and the lock never notices
+// (the wrapped error is invariant modulo the comb).
+static void test_composite_hole_classification() {
+    SimParams p{};
+    p.srcPeriod = 16672;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 300;
+    p.combQpc = 16672;
+    p.presents = 12000;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    const int kHoles = 25;
+    for (int i = 0; i < kHoles; i++) p.drops.push_back(3000 + 100 * (int64_t)i);
+    SimResult r = Simulate(p);
+    const size_t warmup = 2900;
+    int blends = 0, holds = 0, isolated = 0, engagedAll = 1;
+    double wLo = 1.0, wHi = 0.0;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        if (!r.engaged[i]) engagedAll = 0;
+        if (r.ops[i] == policy::CompositeOp::Hold) holds++;
+        if (r.ops[i] != policy::CompositeOp::Blend) continue;
+        blends++;
+        if (r.weights[i] < wLo) wLo = r.weights[i];
+        if (r.weights[i] > wHi) wHi = r.weights[i];
+        if (IsPass(r.ops[i - 1]) && i + 1 < r.ops.size() && IsPass(r.ops[i + 1])) isolated++;
+    }
+    CHECK(blends == kHoles, "%d blend presents for %d injected holes", blends, kHoles);
+    CHECK(isolated == blends, "%d/%d hole blends not isolated", blends - isolated, blends);
+    CHECK(holds == 0, "%d holds for single-frame holes (1.25x lag must recover them)", holds);
+    CHECK(engagedAll, "lock disturbed by hole injection");
+    CHECK(blends == 0 || (wLo >= 0.40 && wHi <= 0.60),
+          "hole blend weights [%.3f, %.3f] not centered", wLo, wHi);
+}
+
+// Recovery depth: at 1.25x lag a two-frame hole cannot fully recover. The in-gap
+// presents are at most one hold (after endpoint not yet arrived; more lookahead
+// only if the pull happens to sit high) followed by one deep blend near w = 2/3;
+// neighbors clean, lock undisturbed, output never regresses.
+static void test_composite_two_frame_hole() {
+    SimParams p{};
+    p.srcPeriod = 16672;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 300;
+    p.combQpc = 16672;
+    p.presents = 12000;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.drops.push_back(6000);
+    p.drops.push_back(6001);
+    SimResult r = Simulate(p);
+    const size_t warmup = 3000;
+    std::vector<size_t> nonPass;
+    int engagedAll = 1;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        if (!r.engaged[i]) engagedAll = 0;
+        if (!IsPass(r.ops[i])) nonPass.push_back(i);
+    }
+    CHECK(nonPass.size() >= 1 && nonPass.size() <= 2,
+          "%zu non-pass presents for a two-frame hole", nonPass.size());
+    if (!nonPass.empty()) {
+        const size_t last = nonPass.back();
+        CHECK(r.ops[last] == policy::CompositeOp::Blend,
+              "two-frame hole did not end in a recovery blend");
+        CHECK(r.weights[last] >= 0.55 && r.weights[last] <= 0.78,
+              "recovery blend w=%.3f not near 2/3", r.weights[last]);
+        for (size_t i = 0; i + 1 < nonPass.size(); i++) {
+            CHECK(nonPass[i] + 1 == nonPass[i + 1], "two-frame hole presents not contiguous");
+        }
+    }
+    CHECK(engagedAll, "lock disturbed by the two-frame hole");
+}
+
+// Oversampled source, no lock: the presentP-floored threshold exceeds srcP/2, so a
+// real frame is always eligible and passthrough is free. The side-choice Schmitt
+// band must reproduce the nearest-mode stride discipline (>= 99% stride-4, no
+// period-2 alternation window) with both frames permanently eligible.
+static void test_composite_oversampling() {
+    SimParams p{};
+    p.srcPeriod = 4168;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 150;
+    p.combQpc = 0;
+    p.presents = 7200;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    SimResult r = Simulate(p);
+    const size_t warmup = 100;
+    int pass = 0, total = 0;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        total++;
+        if (IsPass(r.ops[i])) pass++;
+    }
+    CHECK(pass >= total * 99 / 100, "passthrough %d/%d at 240->60 (< 99%%)", pass, total);
+    int off = 0, altWindow = 0, worstAltWindow = 0, strides = 0;
+    int prevStride = 4;
+    for (size_t i = warmup + 1; i < r.outTs.size(); i++) {
+        const int64_t delta = r.outTs[i] - r.outTs[i - 1];
+        if (delta == 0) continue;
+        const int s = (int)((delta + p.srcPeriod / 2) / p.srcPeriod);
+        strides++;
+        if (s != 4) {
+            off++;
+            if (prevStride != 4 && s != prevStride) {
+                altWindow++;
+                if (altWindow > worstAltWindow) worstAltWindow = altWindow;
+            }
+        } else {
+            altWindow = 0;
+        }
+        prevStride = s;
+    }
+    CHECK(off <= strides / 100, "%d/%d off-strides (>1%%)", off, strides);
+    CHECK(worstAltWindow <= 1, "period-2 output stride window of %d alternations", worstAltWindow);
+}
+
+// Refused ratio (144->60, M=5 comb under the jitter floor): the threshold keys off
+// the declared source period, not the comb, so it stays well-defined and the
+// oversampled geometry still passes real frames through sharp.
+static void test_composite_refusal_regime() {
+    SimParams p{};
+    p.srcPeriod = 6944;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 600;
+    p.combQpc = 6944 / 5;
+    p.presents = 6000;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    SimResult r = Simulate(p);
+    const size_t warmup = 100;
+    int pass = 0, hold = 0, total = 0;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        total++;
+        if (IsPass(r.ops[i])) pass++;
+        if (r.ops[i] == policy::CompositeOp::Hold) hold++;
+    }
+    CHECK(pass >= total * 95 / 100, "passthrough %d/%d at refused 144->60 (< 95%%)", pass, total);
+    CHECK(hold <= 5, "%d holds at refused 144->60", hold);
+}
+
+// Unlocked at-rate sweep: the target drifts through the bracket, so blend fires for
+// the mid-bracket half of every beat - the soft-output regime, deliberately (this is
+// the regime the lock exists to eliminate). The pass fraction tracks the threshold
+// geometry (T / (srcP/2) ~= 50%) and transitions stay a small minority of presents
+// (boundary chatter is confined to the two threshold crossings per beat).
+static void test_composite_unlocked_sweep() {
+    SimParams p{};
+    p.srcPeriod = 16672;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 300;
+    p.combQpc = 0;
+    p.presents = 12000;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    SimResult r = Simulate(p);
+    const size_t warmup = 100;
+    int pass = 0, blend = 0, transitions = 0, total = 0;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        total++;
+        if (IsPass(r.ops[i])) pass++;
+        if (r.ops[i] == policy::CompositeOp::Blend) blend++;
+        if (i > warmup && IsPass(r.ops[i]) != IsPass(r.ops[i - 1])) transitions++;
+    }
+    CHECK(pass >= total * 35 / 100 && pass <= total * 65 / 100,
+          "unlocked pass fraction %d/%d outside the geometric ~50%%", pass, total);
+    CHECK(blend >= total * 35 / 100, "unlocked blend fraction %d/%d (< 35%%)", blend, total);
+    CHECK(transitions <= total / 10, "%d pass/blend transitions (> 10%%)", transitions);
+}
+
+// Enabling the composite config must leave the nearest selection byte-identical:
+// the shared PolicyConfig is the only coupling surface between the two decision
+// paths, and this pins it.
+static void test_composite_v16_differential() {
+    SimParams p{};
+    p.srcPeriod = 16672;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 300;
+    p.combQpc = 16672;
+    p.presents = 12000;
+    const uint64_t seed = g_rng;
+    p.passthroughQpc = 0;
+    SimResult off = Simulate(p);
+    g_rng = seed;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    SimResult on = Simulate(p);
+    CHECK(off.picks.size() == on.picks.size(), "differential run sizes diverged");
+    for (size_t i = 0; i < off.picks.size() && i < on.picks.size(); i++) {
+        CHECK(off.picks[i] == on.picks[i] && off.shownTs[i] == on.shownTs[i] &&
+              off.pull[i] == on.pull[i],
+              "selection diverged at present %zu with composite config set", i);
+        if (g_failures) return;
+    }
+}
+
+// Composite output content time is non-decreasing across pull wraps (the monotone
+// guard), on a run long enough to contain several beats.
+static void test_composite_monotone_output() {
+    SimParams p{};
+    p.srcPeriod = 16672;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 300;
+    p.combQpc = 16672;
+    p.presents = 24000;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    SimResult r = Simulate(p);
+    CHECK(r.wraps >= 1, "no pull wrap in %lld presents; guard unexercised", (long long)p.presents);
+    for (size_t i = 1; i < r.outTs.size(); i++) {
+        if (r.outTs[i - 1] == INT64_MIN) continue;   // before the first output
+        CHECK(r.outTs[i] >= r.outTs[i - 1],
+              "composite output regressed at present %zu (%" PRId64 " -> %" PRId64 ")",
+              i, r.outTs[i - 1], r.outTs[i]);
+        if (g_failures) return;
+    }
+}
+
+// ---------------------------------------------------------------------------------
 // Real-log replay: regression pin against a captured NvFBCR.log
 // ---------------------------------------------------------------------------------
 
@@ -475,10 +806,20 @@ int main(int argc, char** argv) {
     test_advance_gate_no_excursion();
     test_no_excursion_while_locked();
 
+    test_composite_passthrough_at_lock();
+    test_composite_gate_placement();
+    test_composite_hole_classification();
+    test_composite_two_frame_hole();
+    test_composite_oversampling();
+    test_composite_refusal_regime();
+    test_composite_unlocked_sweep();
+    test_composite_v16_differential();
+    test_composite_monotone_output();
+
     if (g_failures) {
         std::printf("POLICY TESTS FAILED: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("POLICY TESTS PASSED (6 invariant suites)\n");
+    std::printf("POLICY TESTS PASSED (6 selection + 9 composite suites)\n");
     return 0;
 }

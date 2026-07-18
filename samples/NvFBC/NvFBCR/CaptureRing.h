@@ -7,20 +7,19 @@
 #include <atomic>
 #include <thread>
 
+#include "TemporalPolicy.h"
+
 // Result of a bracketing query: the captured frames immediately before and after a target
-// time, plus the interpolation weight a blending consumer would use. Surfaces/textures are
-// the PRESENT-device aliases of the shared ring slots (borrowed; do not Release).
+// time, plus the interpolation weight a blending consumer would use. The timestamp/diff
+// half lives in the embedded policy::BracketInfo so the policy layer consumes it without
+// a copy. Surfaces/textures are the PRESENT-device aliases of the shared ring slots
+// (borrowed; do not Release).
 struct FrameBracket {
-    bool hasBefore;
-    bool hasAfter;
+    policy::BracketInfo info;          // hasBefore/hasAfter, timestamps, diffs from target
     IDirect3DSurface9* beforeSurface;
     IDirect3DSurface9* afterSurface;
     IDirect3DTexture9* beforeTexture;
     IDirect3DTexture9* afterTexture;
-    LONGLONG beforeTs;                 // QPC of the before frame's arrival
-    LONGLONG afterTs;
-    LONGLONG beforeDiff;               // target - beforeTs (>= 0)
-    LONGLONG afterDiff;                // afterTs - target (> 0)
     int beforeDepth;                   // captures back from newest where the before frame sits
     double weight;                     // beforeDiff / (beforeDiff + afterDiff); 1.0 if no after
 };
