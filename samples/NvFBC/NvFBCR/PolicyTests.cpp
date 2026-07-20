@@ -3,9 +3,12 @@
 //
 //   g++ -std=c++17 -O2 -o policytests PolicyTests.cpp TemporalPolicy.cpp
 //   ./policytests                       run the synthetic invariant suite
-//   ./policytests --replay NvFBCR.log [--comb <us>]
-//                                       pin the policy against a real log's pick=
-//                                       sequence (and pull=/lk= when --comb is given)
+//   ./policytests --replay NvFBCR.log [--comb <us>] [--passthrough <us>]
+//                                       pin the policy against a real log: nearest-mode
+//                                       logs replay the pick= sequence, blend/interp
+//                                       logs replay op=/bw= (threshold self-configures
+//                                       from the Setup line; --passthrough overrides),
+//                                       and --comb adds the pull=/lk= lock pin
 //
 // All synthetic tests run in the microsecond domain; the policy is unit-agnostic.
 
@@ -41,6 +44,11 @@ static int g_failures = 0;
 // replay must run the same convention or the suite validates an inconsistent config.
 static const int64_t kStickinessUs = 1000;
 static const int64_t kSlewUs = 25;
+
+// Mirrors CaptureRing::RING_SIZE: the bracket sees only the newest kRingSlots arrivals,
+// so a target lagging more than the ring window behind loses its before-frame (the
+// production ring-underrun class).
+static const int kRingSlots = 8;
 
 // Deterministic LCG so every run exercises identical timelines.
 static uint64_t g_rng = 0x2545F4914F6CDD1Dull;
@@ -80,6 +88,7 @@ struct SimParams {
     int64_t presents;
     int64_t phaseOffset;     // shifts arrival phase vs deadlines
     int64_t passthroughQpc;  // 0 = composite decision off
+    int64_t lagOverride;     // 0 = size from srcPeriod as production does; else this lag
     std::vector<int64_t> drops;  // sorted arrival indices to drop (hole injection)
 };
 
@@ -92,6 +101,7 @@ static SimResult Simulate(const SimParams& p) {
 
     int64_t lag = p.srcPeriod + p.srcPeriod / 4;
     if (lag < p.presentPeriod) lag = p.presentPeriod;
+    if (p.lagOverride > 0) lag = p.lagOverride;   // a mis-declared source rate, in effect
 
     // Pre-generate arrivals covering the whole run. Drops are filtered after
     // generation so the jitter stream (and every surviving arrival) is identical
@@ -117,26 +127,38 @@ static SimResult Simulate(const SimParams& p) {
     policy::CompositeState comp;
     SimResult r;
     size_t cursor = 0;
+    size_t published = 0;
     int64_t prevPull = 0;
     for (int64_t k = 1; k <= p.presents; k++) {
         const int64_t deadline = k * p.presentPeriod;
         const int64_t target = deadline - (lag + lock.pullQpc);
 
+        // Frames visible to the bracket: arrived by pick time (the ring can't contain
+        // the future) AND still inside the ring window (each publish evicts the slot
+        // kRingSlots back). Both constraints are inert for well-configured timelines -
+        // the lag sizing keeps the bracket well inside the window - but load-bearing
+        // for hole recovery depth (a widened bracket's after endpoint may not have
+        // arrived yet: those presents must hold, not synthesize) and for underruns
+        // (a lag past the ring window loses the before-frame entirely).
+        while (published < arrivals.size() && arrivals[published] <= deadline) published++;
+        const size_t oldest = published > (size_t)kRingSlots ? published - kRingSlots : 0;
+
         while (cursor + 1 < arrivals.size() && arrivals[cursor + 1] <= target) cursor++;
         BracketInfo b;
-        b.hasBefore = arrivals[cursor] <= target;
+        b.hasBefore = cursor >= oldest && arrivals[cursor] <= target;
         if (b.hasBefore) {
             b.beforeTs = arrivals[cursor];
             b.beforeDiff = target - b.beforeTs;
         }
-        // A frame is in the bracket only once it has ARRIVED by pick time (the ring
-        // can't contain the future). Inert for hole-free timelines - the lag sizing
-        // guarantees the after frame preceded the deadline - but load-bearing for
-        // hole recovery depth: a widened bracket's after endpoint may not have
-        // arrived yet, and those presents must hold, not blend.
-        b.hasAfter = cursor + 1 < arrivals.size() && arrivals[cursor + 1] <= deadline;
+        // The after-frame is normally the arrival following the before; when the
+        // before was evicted, everything in the window is newer than the target and
+        // the nearest-after is the OLDEST visible frame (what production's bracket
+        // scan returns while the display is pinned at the ring's tail).
+        size_t afterIdx = cursor + 1;
+        if (cursor < oldest) afterIdx = oldest;
+        b.hasAfter = afterIdx < published;
         if (b.hasAfter) {
-            b.afterTs = arrivals[cursor + 1];
+            b.afterTs = arrivals[afterIdx];
             b.afterDiff = b.afterTs - target;
         }
 
@@ -640,6 +662,42 @@ static void test_composite_v16_differential() {
     }
 }
 
+// Permanent ring underrun: a declared source rate far below the actual one sizes the
+// lag past the ring window (240 fps actual against a 50 ms lag = 12 frames of depth on
+// an 8-slot ring), so every present's before-frame has been evicted. Selection must
+// keep showing the ring's oldest frame with monotone output (the "display pinned at
+// oldest frame" telemetry class), and the composite must hold - its nearest real frame
+// sits beyond the passthrough threshold and synthesis has no bracket.
+static void test_ring_underrun_graceful() {
+    SimParams p{};
+    p.srcPeriod = 4168;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 150;
+    p.combQpc = 0;
+    p.presents = 3000;
+    p.lagOverride = 50000;       // the lag a -src 25 declaration would size
+    p.passthroughQpc = 10000;    // max(assumed srcP, presentP)/4 for that declaration
+    SimResult r = Simulate(p);
+    const size_t warmup = 100;
+    int noBefore = 0, holds = 0, afterAdv = 0, total = 0;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        total++;
+        if (r.beforeDiff[i] < 0) noBefore++;
+        if (r.ops[i] == policy::CompositeOp::Hold) holds++;
+        if (r.picks[i] == Pick::AfterAdv) afterAdv++;
+    }
+    CHECK(noBefore >= total * 95 / 100,
+          "before-frame present on %d/%d presents (eviction not modeled?)", total - noBefore, total);
+    CHECK(holds >= total * 95 / 100, "composite held only %d/%d at underrun", holds, total);
+    CHECK(afterAdv >= total * 90 / 100,
+          "selection advanced on only %d/%d underrun presents", afterAdv, total);
+    for (size_t i = warmup + 1; i < r.shownTs.size(); i++) {
+        CHECK(r.shownTs[i] >= r.shownTs[i - 1],
+              "shown ts stepped back at underrun present %zu", i);
+        if (g_failures) return;
+    }
+}
+
 // Composite output content time is non-decreasing across pull wraps (the monotone
 // guard), on a run long enough to contain several beats.
 static void test_composite_monotone_output() {
@@ -669,6 +727,9 @@ struct LogLine {
     int64_t tgt, before, after, pull;
     int lk;
     char pick[16];
+    bool hasOp;      // blend/interp-mode line: op=/bw= present after mark=
+    char op[16];
+    double bw;
 };
 
 static bool ParseTemporalLine(const char* line, LogLine* out) {
@@ -685,21 +746,35 @@ static bool ParseTemporalLine(const char* line, LogLine* out) {
     out->tgt = tgt; out->before = before; out->after = after; out->pull = pull;
     out->lk = lk;
     std::snprintf(out->pick, sizeof(out->pick), "%s", pick);
+    out->hasOp = false;
+    out->op[0] = '\0';
+    out->bw = 0.0;
+    const char* o = std::strstr(t, " op=");
+    if (o && std::sscanf(o, " op=%15s bw=%lf", out->op, &out->bw) == 2) {
+        out->hasOp = true;
+    }
     return true;
 }
 
-static int Replay(const char* path, int64_t combUs) {
+static int Replay(const char* path, int64_t combUs, int64_t passUsArg) {
     std::FILE* f = std::fopen(path, "r");
     if (!f) { std::printf("cannot open %s\n", path); return 1; }
     std::vector<LogLine> lines;
     // Presents whose target fell off the ring back emit only an error line: production
     // selection state still advanced on them, so replay can desync past such a gap.
     size_t unloggedGaps = 0;
+    // Blend/interp logs announce their passthrough threshold at Setup; parsing it makes
+    // the composite replay self-configuring (--passthrough overrides).
+    long long loggedPassUs = 0;
     char buf[1024];
     while (std::fgets(buf, sizeof(buf), f)) {
         LogLine l;
         if (ParseTemporalLine(buf, &l)) lines.push_back(l);
         else if (std::strstr(buf, "target older than ring window")) unloggedGaps++;
+        else {
+            const char* pt = std::strstr(buf, "passthrough threshold ");
+            if (pt) loggedPassUs = std::atoll(pt + 22);
+        }
     }
     std::fclose(f);
     std::printf("replay %s: %zu temporal lines\n", path, lines.size());
@@ -716,39 +791,99 @@ static int Replay(const char* path, int64_t combUs) {
     PolicyConfig cfg;
     cfg.stickinessQpc = kStickinessUs;
     cfg.phasePullSlewQpc = kSlewUs;
-    SelectionState sel;
     const size_t warmup = 60;
     size_t mismatches = 0, firstMismatch = 0;
+
+    size_t opLines = 0;
     for (size_t i = 0; i < lines.size(); i++) {
-        const LogLine& l = lines[i];
-        BracketInfo b;
-        b.hasBefore = true;
-        b.beforeTs = l.before;
-        b.beforeDiff = l.tgt - l.before;
-        b.hasAfter = l.after >= 0;
-        b.afterTs = l.after;
-        b.afterDiff = l.after - l.tgt;
-        const bool prevAfter = sel.lastPickAfter;
-        const Pick p = policy::SelectFrame(b, sel, cfg);
-        if (i >= warmup && std::strcmp(policy::PickLabel(p), l.pick) != 0) {
-            if (!mismatches) firstMismatch = i;
-            if (mismatches < 5) {
-                // Production decided in QPC ticks; the log's fields are rounded to whole
-                // microseconds. A band margin within a few us of zero means the decision
-                // sat on the stickiness-band edge and the rounding flipped it: log
-                // quantization, not a policy divergence.
-                const int64_t bias = prevAfter ? -cfg.stickinessQpc : cfg.stickinessQpc;
-                const int64_t margin = b.beforeDiff - (b.afterDiff + bias);
-                std::printf("  MISMATCH line %zu: policy %s, log %s, band margin %" PRId64 " us\n",
-                            i, policy::PickLabel(p), l.pick, margin);
-            }
-            mismatches++;
-        }
+        if (lines[i].hasOp) opLines++;
     }
-    std::printf("  selection: %zu/%zu picks match after %zu-line warmup",
-                lines.size() - warmup - mismatches, lines.size() - warmup, warmup);
-    if (mismatches) std::printf("  FIRST MISMATCH at line %zu", firstMismatch);
-    std::printf("\n");
+
+    if (opLines == 0) {
+        // Nearest-mode log: pin the selection sequence.
+        SelectionState sel;
+        for (size_t i = 0; i < lines.size(); i++) {
+            const LogLine& l = lines[i];
+            BracketInfo b;
+            b.hasBefore = true;
+            b.beforeTs = l.before;
+            b.beforeDiff = l.tgt - l.before;
+            b.hasAfter = l.after >= 0;
+            b.afterTs = l.after;
+            b.afterDiff = l.after - l.tgt;
+            const bool prevAfter = sel.lastPickAfter;
+            const Pick p = policy::SelectFrame(b, sel, cfg);
+            if (i >= warmup && std::strcmp(policy::PickLabel(p), l.pick) != 0) {
+                if (!mismatches) firstMismatch = i;
+                if (mismatches < 5) {
+                    // Production decided in QPC ticks; the log's fields are rounded to whole
+                    // microseconds. A band margin within a few us of zero means the decision
+                    // sat on the stickiness-band edge and the rounding flipped it: log
+                    // quantization, not a policy divergence.
+                    const int64_t bias = prevAfter ? -cfg.stickinessQpc : cfg.stickinessQpc;
+                    const int64_t margin = b.beforeDiff - (b.afterDiff + bias);
+                    std::printf("  MISMATCH line %zu: policy %s, log %s, band margin %" PRId64 " us\n",
+                                i, policy::PickLabel(p), l.pick, margin);
+                }
+                mismatches++;
+            }
+        }
+        std::printf("  selection: %zu/%zu picks match after %zu-line warmup",
+                    lines.size() - warmup - mismatches, lines.size() - warmup, warmup);
+        if (mismatches) std::printf("  FIRST MISMATCH at line %zu", firstMismatch);
+        std::printf("\n");
+    } else {
+        // Blend/interp-mode log (pick=none throughout: selection never ran): pin the
+        // composite op sequence and, on synth lines, the weight.
+        cfg.passthroughQpc = (passUsArg > 0) ? passUsArg : loggedPassUs;
+        std::printf("  composite-mode log (%zu/%zu lines carry op=), threshold %" PRId64
+                    " us (%s)\n", opLines, lines.size(), cfg.passthroughQpc,
+                    (passUsArg > 0) ? "--passthrough" : "from the Setup line");
+        if (cfg.passthroughQpc <= 0) {
+            std::printf("  no threshold found: pass --passthrough <us> (the Setup line was"
+                        " not in this log)\n");
+            return 1;
+        }
+        policy::CompositeState comp;
+        size_t wMismatches = 0;
+        double wWorst = 0.0;
+        for (size_t i = 0; i < lines.size(); i++) {
+            const LogLine& l = lines[i];
+            BracketInfo b;
+            b.hasBefore = true;
+            b.beforeTs = l.before;
+            b.beforeDiff = l.tgt - l.before;
+            b.hasAfter = l.after >= 0;
+            b.afterTs = l.after;
+            b.afterDiff = l.after - l.tgt;
+            const policy::CompositeDecision d = policy::DecideComposite(b, comp, cfg);
+            if (i < warmup || !l.hasOp) continue;
+            if (std::strcmp(policy::CompositeLabel(d.op), l.op) != 0) {
+                if (!mismatches) firstMismatch = i;
+                if (mismatches < 5) {
+                    // The threshold comparison also ran in QPC ticks upstream; a margin
+                    // within a few us of zero is log quantization at the gate edge.
+                    int64_t md = b.beforeDiff;
+                    if (b.hasAfter && b.afterDiff < md) md = b.afterDiff;
+                    std::printf("  MISMATCH line %zu: policy %s, log %s, gate margin %" PRId64 " us\n",
+                                i, policy::CompositeLabel(d.op), l.op,
+                                md - cfg.passthroughQpc);
+                }
+                mismatches++;
+            } else if (d.op == policy::CompositeOp::Synthesize) {
+                double dw = d.weight - l.bw;
+                if (dw < 0) dw = -dw;
+                if (dw > wWorst) wWorst = dw;
+                if (dw > 0.005) wMismatches++;
+            }
+        }
+        std::printf("  composite: %zu/%zu ops match after %zu-line warmup",
+                    opLines - warmup - mismatches, opLines - warmup, warmup);
+        if (mismatches) std::printf("  FIRST MISMATCH at line %zu", firstMismatch);
+        std::printf("\n  synth weights: %zu beyond 0.005 of bw=, worst |dw|=%.4f\n",
+                    wMismatches, wWorst);
+        mismatches += wMismatches;
+    }
 
     if (combUs > 0) {
         PolicyConfig lcfg = cfg;
@@ -793,11 +928,13 @@ static int Replay(const char* path, int64_t combUs) {
 int main(int argc, char** argv) {
     const char* replayPath = nullptr;
     int64_t combUs = 0;
+    int64_t passUs = 0;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--replay") && i + 1 < argc) replayPath = argv[++i];
         else if (!std::strcmp(argv[i], "--comb") && i + 1 < argc) combUs = std::atoll(argv[++i]);
+        else if (!std::strcmp(argv[i], "--passthrough") && i + 1 < argc) passUs = std::atoll(argv[++i]);
     }
-    if (replayPath) return Replay(replayPath, combUs);
+    if (replayPath) return Replay(replayPath, combUs, passUs);
 
     test_lock_off_matches_v15();
     test_monotonic_and_pull_bounds_across_wrap();
@@ -815,11 +952,12 @@ int main(int argc, char** argv) {
     test_composite_unlocked_sweep();
     test_composite_v16_differential();
     test_composite_monotone_output();
+    test_ring_underrun_graceful();
 
     if (g_failures) {
         std::printf("POLICY TESTS FAILED: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("POLICY TESTS PASSED (6 selection + 9 composite suites)\n");
+    std::printf("POLICY TESTS PASSED (6 selection + 10 composite suites)\n");
     return 0;
 }
