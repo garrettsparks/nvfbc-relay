@@ -46,7 +46,8 @@ protected:
 
     // Render the synthesized frame for this bracket at the given weight onto the
     // backbuffer. On false the base passes the nearer real frame through instead.
-    // Set m_lastSynthUs when an engine time is worth logging (pt=).
+    // Set m_lastSynthExecCode to the executor that produced the pixels (always;
+    // success implies it) and m_lastSynthUs when an engine time is worth logging (pt=).
     virtual bool RenderSynthesis(const FrameBracket& bracket, double weight,
                                  IDirect3DSurface9* backbuffer) = 0;
 
@@ -56,8 +57,9 @@ protected:
     RECT m_rect;
     IDirect3DSurface9* m_holdSurface;   // owned render target: snapshot of the last synthesis
     IDirect3DSurface9* m_lastOutput;    // what Hold re-presents (ring alias or m_holdSurface)
-    bool m_lastSynthesized;             // whether m_lastOutput holds synthesized pixels
+    int m_lastOutputExec;               // executor code of m_lastOutput's pixels (0 = real)
     long long m_lastSynthUs;            // engine time of the current synthesis; -1 = none
+    int m_lastSynthExecCode;            // executor code of the current synthesis
 };
 
 // Blend composition: the synthesized frame is a ps_3_0 lerp of the bracket pair.

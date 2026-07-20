@@ -15,10 +15,12 @@ enum InterpBackend {
 };
 
 // D3D11 interpolation sidecar: reads ring slots via their shared handles, converts the
-// bracket frames to 8-bit BGRA (alpha forced to 1.0 - NvFBC's desktop alpha is
-// unspecified, and alpha-weighted math inside FRUC dims the output when that byte is
-// garbage), runs the selected engine on them, and exposes the interpolated result back
-// to the D3D9 present device as a shared surface.
+// bracket frames to 8-bit BGRA for the ENGINE inputs (alpha forced to 1.0 - NvFBC's
+// desktop alpha is unspecified, and alpha-weighted math inside FRUC dims the output
+// when that byte is garbage), and exposes the interpolated result back to the D3D9
+// present device as a shared surface. The flow backend's warp samples the original
+// 10-bit ring aliases and, driver permitting, renders through a 10-bit share, so its
+// 8-bit hop is confined to flow estimation; FRUC is 8-bit in and out by its API.
 //
 // The present stack stays D3D9; this device is a third participant in the existing
 // multi-device design, using the same manual coherency discipline (event query + flush)
@@ -52,6 +54,9 @@ private:
     bool CreateDeviceAndRingAliases(CaptureRing* ring);
     bool CreateConversionPipeline();
     bool CreateOutputShare(IDirect3DDevice9Ex* presentDevice);
+    bool TryCreateOutputShare(IDirect3DDevice9Ex* presentDevice, DXGI_FORMAT fmt11,
+                              D3DFORMAT fmt9);
+    void ReleaseOutputShare();
     bool CreateFruc();
     bool ConvertSlotToBgra(int ringSlot, int inputIdx);   // ring alias -> m_frucInput[inputIdx]
     void FlushD3D11();

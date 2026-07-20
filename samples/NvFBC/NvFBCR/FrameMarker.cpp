@@ -27,16 +27,16 @@ static unsigned int ChecksumNibbles(unsigned long long payload) {
 static const unsigned long long kExtSchema = 0;
 
 // Cell values for one frame. The payload is cells 1-39 packed LSB-first: counter in
-// bits 0-23, interp flag bit 24, weight bits 25-28, compositor bits 29-30,
-// provenance bits 31-32 (reserved, zero), pick code bits 33-35, extension schema
-// bits 36-38. The checksum covers exactly that span so the decoder's verify never
-// changes as reserved cells light up.
+// bits 0-23, interp flag bit 24, weight bits 25-28, compositor bits 29-30, synthesis
+// executor bits 31-32, pick code bits 33-35, extension schema bits 36-38. The
+// checksum covers exactly that span.
 static void BuildCells(unsigned int counter, int pickCode, int weightQ, bool interp,
-                       int compositorId, bool cells[/*kCells*/]) {
+                       int compositorId, int execCode, bool cells[/*kCells*/]) {
     unsigned long long payload = counter & 0xFFFFFFull;
     if (interp) payload |= 1ull << 24;
     payload |= (unsigned long long)(weightQ & 0xF) << 25;
     payload |= (unsigned long long)(compositorId & 0x3) << 29;
+    payload |= (unsigned long long)(execCode & 0x3) << 31;
     payload |= (unsigned long long)(pickCode & 0x7) << 33;
     payload |= (kExtSchema & 0x7) << 36;
     cells[0] = true;
@@ -142,7 +142,7 @@ bool FrameMarker::BurnColorFill(IDirect3DSurface9* backbuffer, const bool cells[
 }
 
 unsigned int FrameMarker::Burn(IDirect3DSurface9* backbuffer, int pickCode, int weightQ,
-                               bool interp, int compositorId) {
+                               bool interp, int compositorId, int execCode) {
     // The counter advances even when drawing is disabled or fails, so mark= in the
     // log stays a pure present count and a mid-run draw failure cannot shift the
     // video-to-log join for frames already recorded.
@@ -151,7 +151,7 @@ unsigned int FrameMarker::Burn(IDirect3DSurface9* backbuffer, int pickCode, int 
     if (!m_active || !backbuffer) return burned;
 
     bool cells[kCells];
-    BuildCells(burned, pickCode, weightQ, interp, compositorId, cells);
+    BuildCells(burned, pickCode, weightQ, interp, compositorId, execCode, cells);
 
     if (m_blitPathOk) {
         if (BurnBlit(backbuffer, cells)) return burned;

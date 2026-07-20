@@ -9,25 +9,30 @@
 // backbuffer after the content copy, never onto ring/capture surfaces (slots are
 // shared - repeats re-present them and blend will read them as before+after pairs).
 //
-// The marker burns the counter, the weight, the pick code, the interp flag, and the
-// compositor ID; source provenance stays reserved and drawn black so the cell layout
-// and the decoder never change. In nearest mode the weight is the bracket weight and
-// interp/compositor read black/0; in blend mode the weight is the composed blend
-// weight and the interp flag marks synthesized output. A downstream duplicate copies
-// the whole frame including the burned pick, while a relay repeat burns a fresh
-// marker with the repeat code, so repeat attribution is decidable from video alone.
+// The marker burns the counter, the weight, the pick code, the interp flag, the
+// compositor ID, and the synthesis executor. In nearest mode the weight is the
+// bracket weight and interp/compositor/executor read black/0; in synthesizing modes
+// the weight is the composed weight, the interp flag marks synthesized output, and
+// the executor cells name what made this frame's pixels (holds inherit the held
+// content's executor, exactly like the interp flag - the marker describes what is on
+// screen). A downstream duplicate copies the whole frame including the burned pick,
+// while a relay repeat burns a fresh marker with the repeat code, so repeat
+// attribution is decidable from video alone.
 //
 // Cell layout (LSB-first within each field). COMPATIBILITY CONTRACT: this core layout
 // is frozen - cells never move or change meaning. New data appends as extension
 // cells/rows (each with its own sync cell and checksum), declared by the extension
 // schema ID below, so decoders of any vintage read the core of any recording;
-// unknown schemas degrade to core-only.
+// unknown schemas degrade to core-only. (Cells 32-33 were re-assigned from the
+// never-implemented source-provenance reservation to the executor before any
+// recording used them; provenance, if ever built, goes to extension space.)
 //   0      sync, always white ("marker present")
 //   1-24   frame counter, 24-bit (wraps at 2^24, ~74 h at 60 fps)
 //   25     interp flag: white = synthesized output, black = one real frame's pixels
-//   26-29  weight, quantized w*15 (bracket weight in nearest mode; blend weight in blend mode)
-//   30-31  compositor ID: 0 nearest, 1 blend
-//   32-33  source provenance (reserved black)
+//   26-29  weight, quantized w*15 (bracket weight in nearest mode; synthesis weight otherwise)
+//   30-31  compositor ID: 0 nearest, 1 blend, 2 fruc, 3 flow-warp (the mode's pipeline)
+//   32-33  synthesis executor: 0 real pixels, 1 blend, 2 fruc, 3 flow-warp (this frame;
+//          always equals 0 exactly when the interp flag is black - a decoder sanity check)
 //   34-36  pick code: 0 none, 1 before, 2 after, 3 after-adv, 4 before-adv, 5 repeat
 //   37-39  extension schema ID: 0 = no extensions; nonzero defined by future schemas
 //   40-43  checksum, 4-bit XOR of the payload nibbles (cells 1-39)
@@ -44,10 +49,10 @@ public:
     // Draws the marker into the backbuffer corner and advances the counter. Call
     // between the content composition and PresentEx. weightQ is the quantized
     // weight (0-15), pickCode the 3-bit pick encoding, interp the synthesized-output
-    // flag, compositorId the compositor cell value (see the cell layout).
-    // Returns the counter value burned into this frame (the mark= log field).
+    // flag, compositorId and execCode the compositor/executor cell values (see the
+    // cell layout). Returns the counter value burned into this frame (mark=).
     unsigned int Burn(IDirect3DSurface9* backbuffer, int pickCode, int weightQ,
-                      bool interp, int compositorId);
+                      bool interp, int compositorId, int execCode);
 
 private:
     // Grid geometry: kTexelsPerCell texels per cell plus a one-cell quiet zone on
