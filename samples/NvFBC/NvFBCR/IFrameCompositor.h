@@ -15,6 +15,14 @@ struct CompositeOutcome {
     bool synthesized;        // marker interp cell: output pixels are not one real frame
     double opWeight;         // bw= value when opLabel is set
     long long synthUs;       // pt= value: engine time of this synthesis; -1 = no field
+    const char* synthExec;   // sx= value: WHAT synthesized this output ("flow-warp",
+                             // "fruc", "blend"; "none" when a failed synthesis shipped
+                             // a real frame instead); NULL = not a synthesis present.
+                             // A fallback needs no flag of its own: sx= naming a
+                             // different executor than the mode's primary is one.
+    int pixelExec;           // marker executor cells: what made THIS frame's pixels
+                             // (0 real, 1 blend, 2 fruc, 3 flow-warp; holds inherit
+                             // the held content's executor). synthesized == (pixelExec != 0).
 };
 
 // Per-present composition: turn the bracket into backbuffer pixels. One implementation

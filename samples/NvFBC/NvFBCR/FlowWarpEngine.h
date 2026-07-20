@@ -15,7 +15,8 @@
 // blend wearing a costume.
 //
 // Warp v1: single forward flow field F (before->after, 4x4 grid, S10.5 fixed point),
-// output(p) = lerp(before(p - w*F), after(p + (1-w)*F), w).
+// output(p) = lerp(before(p - w*F), after(p + (1-w)*F), w). The warp samples the
+// caller's SRVs at their native precision; only the flow engine's inputs are 8-bit.
 // Occlusion-blind: halos at disocclusions are the expected v1 artifact; v2 options are
 // backward flow (NV_OF_PRED_DIRECTION_BACKWARD / bwdOutputBuffer) and cost-buffer-weighted
 // blending.
@@ -32,7 +33,9 @@ public:
     bool Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int width, int height);
 
     // Compute flow before->after and render the warped blend at phase w into outRtv.
-    // beforeSrv/afterSrv are the sidecar's converted BGRA8 frames.
+    // beforeSrv/afterSrv are what the WARP samples (the 10-bit ring aliases);
+    // beforeTex/afterTex are what the FLOW ENGINE reads (the converted 8-bit pair,
+    // stable pointers for the session's lazy registration).
     bool Interpolate(ID3D11ShaderResourceView* beforeSrv, ID3D11ShaderResourceView* afterSrv,
                      ID3D11Texture2D* beforeTex, ID3D11Texture2D* afterTex,
                      float w, ID3D11RenderTargetView* outRtv);

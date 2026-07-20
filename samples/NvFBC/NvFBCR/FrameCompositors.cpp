@@ -3,6 +3,18 @@
 
 extern int g_interpBackend;   // NvFBCR.cpp: -interp flow|fruc
 
+// Synthesis executor codes: what actually produced a present's pixels. One vocabulary
+// across the log's sx= label and the marker's executor cells, matching the compositor
+// IDs (0 real/none, 1 blend, 2 fruc, 3 flow-warp); append-only once shipped.
+static const char* SynthExecLabel(int code) {
+    switch (code) {
+        case 1:  return "blend";
+        case 2:  return "fruc";
+        case 3:  return "flow-warp";
+        default: return "none";
+    }
+}
+
 // ---------------------------------------------------------------------------------
 // NearestCompositor
 // ---------------------------------------------------------------------------------
@@ -66,6 +78,8 @@ void NearestCompositor::Compose(const FrameBracket& bracket, IDirect3DSurface9* 
     out->synthesized = false;
     out->opWeight = 0.0;
     out->synthUs = -1;
+    out->synthExec = NULL;
+    out->pixelExec = 0;
 }
 
 // ---------------------------------------------------------------------------------
@@ -77,8 +91,9 @@ SynthCompositorBase::SynthCompositorBase(const policy::PolicyConfig* cfg)
     , m_device(NULL)
     , m_holdSurface(NULL)
     , m_lastOutput(NULL)
-    , m_lastSynthesized(false)
+    , m_lastOutputExec(0)
     , m_lastSynthUs(-1)
+    , m_lastSynthExecCode(0)
 {
     m_rect.left = m_rect.top = m_rect.right = m_rect.bottom = 0;
 }
@@ -122,6 +137,8 @@ void SynthCompositorBase::Compose(const FrameBracket& bracket, IDirect3DSurface9
     out->synthesized = false;
     out->opWeight = 0.0;
     out->synthUs = -1;
+    out->synthExec = NULL;
+    out->pixelExec = 0;
 
     switch (d.op) {
         case policy::CompositeOp::PassthroughBefore:
@@ -136,21 +153,24 @@ void SynthCompositorBase::Compose(const FrameBracket& bracket, IDirect3DSurface9
             }
             m_device->StretchRect(chosen, &m_rect, backbuffer, &m_rect, D3DTEXF_NONE);
             m_lastOutput = chosen;
-            m_lastSynthesized = false;
+            m_lastOutputExec = 0;
             break;
         }
         case policy::CompositeOp::Synthesize: {
             m_lastSynthUs = -1;
+            m_lastSynthExecCode = 0;
             if (RenderSynthesis(bracket, d.weight, backbuffer)) {
                 // Snapshot before the marker burn so a later hold re-presents clean
                 // content and burns its own fresh marker.
                 m_device->StretchRect(backbuffer, &m_rect, m_holdSurface, &m_rect, D3DTEXF_NONE);
                 m_lastOutput = m_holdSurface;
-                m_lastSynthesized = true;
+                m_lastOutputExec = m_lastSynthExecCode;
                 out->synthesized = true;
                 out->weightQ = (int)(d.weight * 15.0 + 0.5);
                 out->opWeight = d.weight;
                 out->synthUs = m_lastSynthUs;
+                out->synthExec = SynthExecLabel(m_lastSynthExecCode);
+                out->pixelExec = m_lastSynthExecCode;
             } else {
                 // Emergency passthrough of the nearer real frame: a failed synthesis
                 // must not present whatever the flip queue left in the backbuffer.
@@ -159,7 +179,8 @@ void SynthCompositorBase::Compose(const FrameBracket& bracket, IDirect3DSurface9
                 LOGERR("compositor: synthesis failed - passing through a real frame");
                 m_device->StretchRect(chosen, &m_rect, backbuffer, &m_rect, D3DTEXF_NONE);
                 m_lastOutput = chosen;
-                m_lastSynthesized = false;
+                m_lastOutputExec = 0;
+                out->synthExec = SynthExecLabel(0);
             }
             break;
         }
@@ -172,9 +193,10 @@ void SynthCompositorBase::Compose(const FrameBracket& bracket, IDirect3DSurface9
             if (src) {
                 m_device->StretchRect(src, &m_rect, backbuffer, &m_rect, D3DTEXF_NONE);
                 m_lastOutput = src;
-                m_lastSynthesized = (src == m_holdSurface) ? m_lastSynthesized : false;
+                if (src != m_holdSurface) m_lastOutputExec = 0;
             }
-            out->synthesized = m_lastSynthesized;
+            out->synthesized = m_lastOutputExec != 0;
+            out->pixelExec = m_lastOutputExec;
             break;
         }
     }
@@ -201,6 +223,7 @@ bool BlendCompositor::RenderSynthesis(const FrameBracket& bracket, double weight
                                       IDirect3DSurface9* /*backbuffer*/) {
     // BlendRenderer draws over the device's current render target, which is the
     // backbuffer here (nothing else in the present path changes it).
+    m_lastSynthExecCode = 1;
     return m_blender.Blend(bracket.beforeTexture, bracket.afterTexture, (float)weight);
 }
 
@@ -238,10 +261,12 @@ bool InterpCompositor::RenderSynthesis(const FrameBracket& bracket, double weigh
             m_device->StretchRect(m_sidecar.OutputSurface9(), &m_rect, backbuffer, &m_rect,
                                   D3DTEXF_NONE);
             m_lastSynthUs = m_sidecar.LastProcessUs();
+            m_lastSynthExecCode = (m_backend == kInterpBackendFlow) ? 3 : 2;
             return true;
         }
     }
     // Lerp fallback keeps the output synthesized-at-target when the engine cannot
-    // deliver; these presents log op=synth without pt=.
+    // deliver; sx= names the lerp on these presents, which is what marks a fallback.
+    m_lastSynthExecCode = 1;
     return m_blender.Blend(bracket.beforeTexture, bracket.afterTexture, (float)weight);
 }

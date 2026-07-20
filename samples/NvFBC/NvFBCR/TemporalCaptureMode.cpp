@@ -236,7 +236,8 @@ void TemporalCaptureMode::Run(
         long long markN = -1;
         if (m_mark) {
             markN = (long long)m_marker.Burn(g_backbuffer, outcome.pickCode, outcome.weightQ,
-                                             outcome.synthesized, m_compositor->Id());
+                                             outcome.synthesized, m_compositor->Id(),
+                                             outcome.pixelExec);
         }
 
         LARGE_INTEGER beforePresent;
@@ -270,10 +271,14 @@ void TemporalCaptureMode::Run(
             if (m_policyCfg.combQpc > 0) {
                 lkField = m_lockState.engaged ? 1 : 0;
             }
-            char opFields[64] = "";
+            char opFields[96] = "";
             if (outcome.opLabel) {
                 int n = snprintf(opFields, sizeof(opFields), " op=%s bw=%.3f",
                                  outcome.opLabel, outcome.opWeight);
+                if (outcome.synthExec && n > 0 && (size_t)n < sizeof(opFields)) {
+                    n += snprintf(opFields + n, sizeof(opFields) - n, " sx=%s",
+                                  outcome.synthExec);
+                }
                 if (outcome.synthUs >= 0 && n > 0 && (size_t)n < sizeof(opFields)) {
                     snprintf(opFields + n, sizeof(opFields) - n, " pt=%lld", outcome.synthUs);
                 }

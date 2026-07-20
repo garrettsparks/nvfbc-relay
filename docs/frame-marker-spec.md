@@ -60,8 +60,8 @@ a checksum + counter monotonicity instead.
 | 1-24 | frame counter | 24-bit binary, LSB-first; wraps at 2^24 (~74 h at 60 fps) |
 | 25 | interp flag (v2) | white = synthesized, black = passthrough real frame |
 | 26-29 | weight (LIVE in v1) | 4-bit binary, round(w*15): bracket w now, blend w in v2 |
-| 30-31 | compositor ID (v2) | 00 nearest, 01 blend, 10 fruc, 11 flow-warp (HOW the output was made) |
-| 32-33 | source provenance (v2+) | 00 real, 01 gen-believed, 10 unknown, 11 mixed (WHAT the input frame was) |
+| 30-31 | compositor ID (v2) | 00 nearest, 01 blend, 10 fruc, 11 flow-warp (the mode's pipeline) |
+| 32-33 | synthesis executor (v2) | 00 real pixels, 01 blend, 10 fruc, 11 flow-warp (WHAT made THIS frame's pixels; holds inherit; nonzero exactly when the interp flag is white — a decoder sanity check; an executor differing from the compositor ID marks a fallback frame) |
 | 34-36 | pick code (LIVE in v1) | 0 none, 1 before, 2 after, 3 after-adv, 4 before-adv, 5 repeat |
 | 37-39 | extension schema ID | 0 = core only (v1); 1-6 select future extension layouts; 7 reserved = "extended: true schema ID lives in the first extension row" (unbounded schema space) |
 | 40-43 | checksum | 4-bit XOR of the payload nibbles (cells 1-39; misread detection) |
@@ -88,7 +88,11 @@ declaration itself is reliable):
   100% checksum-valid core-only on the schema-0 decoder with the extension reported.
 
 Reserve the v2 cells in v1 too (fill black) so the format is stable and the reader never changes
-layout. **Compositor ID vs source provenance are distinct and both useful:** compositor ID says
+layout. (REVISION 2026-07-19, before any recording used cells 32-33: the source-provenance
+reservation moved out of the core to make room for the synthesis executor — a live field beats
+a speculative one in core cells. Provenance, if ever built, appends as an extension schema.
+The paragraph below is retained as the design record for that future field.)
+**Compositor ID vs source provenance are distinct and both useful:** compositor ID says
 how the OUTPUT frame was produced (passthrough / blend / warp); source provenance says what the
 INPUT frame was — but IT IS A TIMING-DERIVED BELIEF, NOT content-verified ground truth. The
 relay does NOT know gen vs real; it knows BURST POSITION (intra-batch vs batch-start) from

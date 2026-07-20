@@ -181,37 +181,84 @@ bool InterpSidecar::CreateConversionPipeline() {
 }
 
 bool InterpSidecar::CreateOutputShare(IDirect3DDevice9Ex* presentDevice) {
-    // FRUC output -> CopyResource -> this shared texture -> opened on the D3D9 present
-    // device. The copy decouples "texture FRUC writes" from "texture crossing the API
-    // boundary" (registering a MISC_SHARED texture with FRUC is an unnecessary unknown).
+    // The flow backend renders its warp straight into the share, so the share's
+    // format is the output precision: try 10-bit first and drop to 8-bit if the
+    // driver refuses the reverse-direction 10-bit open. FRUC writes 8-bit ARGB into
+    // its own registered texture and CopyResource into the share requires matching
+    // formats, so its share is 8-bit unconditionally.
+    if (m_backend == kInterpBackendFlow) {
+        if (TryCreateOutputShare(presentDevice, DXGI_FORMAT_R10G10B10A2_UNORM,
+                                 D3DFMT_A2B10G10R10)) {
+            LOG("InterpSidecar: output share R10G10B10A2 - warp output stays 10-bit");
+            return true;
+        }
+        LOGERR("InterpSidecar: 10-bit output share refused - warp output drops to 8-bit");
+    }
+    if (!TryCreateOutputShare(presentDevice, DXGI_FORMAT_B8G8R8A8_UNORM,
+                              D3DFMT_A8R8G8B8)) {
+        return false;
+    }
+    LOG("InterpSidecar: output share B8G8R8A8");
+    return true;
+}
+
+bool InterpSidecar::TryCreateOutputShare(IDirect3DDevice9Ex* presentDevice,
+                                         DXGI_FORMAT fmt11, D3DFORMAT fmt9) {
+    // Engine output -> this shared texture -> opened on the D3D9 present device (for
+    // FRUC via CopyResource; the flow warp renders into it directly). Cleans up after
+    // itself on failure so the caller can retry in another format.
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = m_width; td.Height = m_height; td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Format = fmt11;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;   // legacy share: D3D9-compatible, no keyed mutex
     HRESULT hr = m_dev11->CreateTexture2D(&td, NULL, &m_sharedOut11);
-    if (FAILED(hr)) { LOGERR("InterpSidecar: shared output create failed (0x%08x)", hr); return false; }
+    if (FAILED(hr)) {
+        LOGERR("InterpSidecar: shared output create failed (DXGI fmt %d, 0x%08x)", (int)fmt11, hr);
+        return false;
+    }
 
     IDXGIResource* res = NULL;
     HANDLE shared = NULL;
     hr = m_sharedOut11->QueryInterface(__uuidof(IDXGIResource), (void**)&res);
     if (SUCCEEDED(hr) && res) { res->GetSharedHandle(&shared); res->Release(); }
-    if (!shared) { LOGERR("InterpSidecar: no shared handle from output"); return false; }
+    if (!shared) {
+        LOGERR("InterpSidecar: no shared handle from output");
+        ReleaseOutputShare();
+        return false;
+    }
 
-    // Reverse-direction open (11-created -> 9-opened) is the other risky hand-off. Fail loud.
+    // Reverse-direction open (11-created -> 9-opened) is the other risky hand-off.
     hr = presentDevice->CreateTexture(m_width, m_height, 1, D3DUSAGE_RENDERTARGET,
-        D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &m_outTexture9, &shared);
+        fmt9, D3DPOOL_DEFAULT, &m_outTexture9, &shared);
     if (FAILED(hr)) {
-        LOGERR("InterpSidecar: opening shared output on D3D9 failed (0x%08x)", hr);
+        LOGERR("InterpSidecar: opening shared output on D3D9 failed (D3D9 fmt %d, 0x%08x)",
+            (int)fmt9, hr);
+        ReleaseOutputShare();
         return false;
     }
     hr = m_outTexture9->GetSurfaceLevel(0, &m_outSurface9);
-    if (FAILED(hr)) { LOGERR("InterpSidecar: output surface failed (0x%08x)", hr); return false; }
+    if (FAILED(hr)) {
+        LOGERR("InterpSidecar: output surface failed (0x%08x)", hr);
+        ReleaseOutputShare();
+        return false;
+    }
     hr = m_dev11->CreateRenderTargetView(m_sharedOut11, NULL, &m_sharedOutRtv);
-    if (FAILED(hr)) { LOGERR("InterpSidecar: shared output RTV failed (0x%08x)", hr); return false; }
+    if (FAILED(hr)) {
+        LOGERR("InterpSidecar: shared output RTV failed (0x%08x)", hr);
+        ReleaseOutputShare();
+        return false;
+    }
     return true;
+}
+
+void InterpSidecar::ReleaseOutputShare() {
+    if (m_sharedOutRtv) { m_sharedOutRtv->Release(); m_sharedOutRtv = NULL; }
+    if (m_outSurface9) { m_outSurface9->Release(); m_outSurface9 = NULL; }
+    if (m_outTexture9) { m_outTexture9->Release(); m_outTexture9 = NULL; }
+    if (m_sharedOut11) { m_sharedOut11->Release(); m_sharedOut11 = NULL; }
 }
 
 bool InterpSidecar::CreateFruc() {
@@ -297,13 +344,16 @@ bool InterpSidecar::Interpolate(const FrameBracket& bracket, LONGLONG targetQpc)
     if (!bracket.info.hasBefore || !bracket.info.hasAfter) return false;
 
     if (m_backend == kInterpBackendFlow) {
-        // Stateless per present: convert both bracket frames, flow + warp straight into the
-        // shared output, flush the cross-API boundary.
+        // Stateless per present: convert both bracket frames for the FLOW ENGINE (its
+        // inputs must be 8-bit), then flow + warp straight into the shared output and
+        // flush the cross-API boundary. The WARP samples the original 10-bit ring
+        // aliases directly: the 8-bit hop exists only inside flow estimation, where
+        // vector precision hides it, never in the output pixels.
         if (!ConvertSlotToBgra(bracket.beforeSlot, 0)) return false;
         if (!ConvertSlotToBgra(bracket.afterSlot, 1)) return false;
         LARGE_INTEGER t0, t1;
         QueryPerformanceCounter(&t0);
-        bool ok = m_flow.Interpolate(m_frucInputSrv[0], m_frucInputSrv[1],
+        bool ok = m_flow.Interpolate(m_ringSrv[bracket.beforeSlot], m_ringSrv[bracket.afterSlot],
                                      m_frucInput[0], m_frucInput[1],
                                      (float)bracket.weight, m_sharedOutRtv);
         QueryPerformanceCounter(&t1);
