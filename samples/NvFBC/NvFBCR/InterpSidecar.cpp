@@ -4,6 +4,19 @@
 #include "../../../third_party/NvOFSDK/NvOFFRUC.h"
 
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "NvOFFRUC.lib")
+
+// NvOFFRUC.h publishes pointer typedefs and GetProcAddress name macros only; these
+// prototypes mirror the typedefs so the entry points resolve as implicit imports.
+// The import library is generated from NvOFFRUC.def at build time, which makes
+// NvOFFRUC.dll a load-time requirement of the process.
+extern "C" {
+    NvOFFRUC_STATUS CALLBACK NvOFFRUCCreate(const NvOFFRUC_CREATE_PARAM*, NvOFFRUCHandle*);
+    NvOFFRUC_STATUS CALLBACK NvOFFRUCRegisterResource(NvOFFRUCHandle, const NvOFFRUC_REGISTER_RESOURCE_PARAM*);
+    NvOFFRUC_STATUS CALLBACK NvOFFRUCUnregisterResource(NvOFFRUCHandle, const NvOFFRUC_UNREGISTER_RESOURCE_PARAM*);
+    NvOFFRUC_STATUS CALLBACK NvOFFRUCProcess(NvOFFRUCHandle, const NvOFFRUC_PROCESS_IN_PARAMS*, const NvOFFRUC_PROCESS_OUT_PARAMS*);
+    NvOFFRUC_STATUS CALLBACK NvOFFRUCDestroy(NvOFFRUCHandle);
+}
 
 extern int g_interpBackend;   // NvFBCR.cpp: -interp fruc|flow
 
@@ -34,8 +47,7 @@ InterpSidecar::InterpSidecar()
     , m_frucOutput(NULL), m_sharedOutRtv(NULL), m_sharedOut11(NULL)
     , m_backend(0)
     , m_outTexture9(NULL), m_outSurface9(NULL)
-    , m_frucLib(NULL), m_frucHandle(NULL)
-    , m_fnCreate(NULL), m_fnRegister(NULL), m_fnUnregister(NULL), m_fnProcess(NULL), m_fnDestroy(NULL)
+    , m_frucHandle(NULL)
     , m_width(0), m_height(0), m_freqQpc(0)
     , m_inputIdx(0), m_lastFedTs(0)
     , m_consecutiveFailures(0), m_enabled(false), m_lastProcessUs(0)
@@ -46,10 +58,7 @@ InterpSidecar::InterpSidecar()
 }
 
 InterpSidecar::~InterpSidecar() {
-    if (m_frucHandle && m_fnDestroy) {
-        ((PtrToFuncNvOFFRUCDestroy)m_fnDestroy)((NvOFFRUCHandle)m_frucHandle);
-    }
-    if (m_frucLib) FreeLibrary(m_frucLib);
+    if (m_frucHandle) NvOFFRUCDestroy((NvOFFRUCHandle)m_frucHandle);
     if (m_outSurface9) m_outSurface9->Release();
     if (m_outTexture9) m_outTexture9->Release();
     if (m_sharedOutRtv) m_sharedOutRtv->Release();
@@ -262,27 +271,14 @@ void InterpSidecar::ReleaseOutputShare() {
 }
 
 bool InterpSidecar::CreateFruc() {
-    // Try app-local first (SDK redistributable beside the exe), then system paths
-    // (driver-shipped claims are unreliable; whichever loads, we log it).
-    m_frucLib = LoadLibraryA("NvOFFRUC.dll");
-    if (!m_frucLib) m_frucLib = LoadLibraryA("NvFRUC.dll");
-    if (!m_frucLib) {
-        LOGERR("InterpSidecar: FRUC library not found (NvOFFRUC.dll / NvFRUC.dll) - place the SDK redistributable beside the exe");
-        return false;
-    }
-    char path[MAX_PATH] = {};
-    GetModuleFileNameA(m_frucLib, path, MAX_PATH);
-    LOG("InterpSidecar: FRUC library loaded from %s", path);
-
-    m_fnCreate = (void*)GetProcAddress(m_frucLib, CreateProcName);
-    m_fnRegister = (void*)GetProcAddress(m_frucLib, RegisterResourceProcName);
-    m_fnUnregister = (void*)GetProcAddress(m_frucLib, UnregisterResourceProcName);
-    m_fnProcess = (void*)GetProcAddress(m_frucLib, ProcessProcName);
-    m_fnDestroy = (void*)GetProcAddress(m_frucLib, DestroyProcName);
-    if (!m_fnCreate || !m_fnRegister || !m_fnProcess || !m_fnDestroy) {
-        LOGERR("InterpSidecar: FRUC exports missing (create=%p reg=%p proc=%p destroy=%p)",
-            m_fnCreate, m_fnRegister, m_fnProcess, m_fnDestroy);
-        return false;
+    // The DLL is an implicit import resolved when the process loads (exe directory
+    // first in the loader search order), so reaching this code means it is present;
+    // log which copy won.
+    HMODULE frucMod = GetModuleHandleA("NvOFFRUC.dll");
+    if (frucMod) {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(frucMod, path, MAX_PATH);
+        LOG("InterpSidecar: FRUC library %s", path);
     }
 
     NvOFFRUC_CREATE_PARAM cp = {};
@@ -293,7 +289,7 @@ bool InterpSidecar::CreateFruc() {
     cp.eSurfaceFormat = ARGBSurface;
     cp.eCUDAResourceType = CudaResourceTypeUndefined;
     NvOFFRUCHandle h = NULL;
-    NvOFFRUC_STATUS st = ((PtrToFuncNvOFFRUCCreate)m_fnCreate)(&cp, &h);
+    NvOFFRUC_STATUS st = NvOFFRUCCreate(&cp, &h);
     if (st != NvOFFRUC_SUCCESS || !h) {
         LOGERR("InterpSidecar: NvOFFRUCCreate failed (status %d)", (int)st);
         return false;
@@ -306,7 +302,7 @@ bool InterpSidecar::CreateFruc() {
     rp.pArrResource[2] = m_frucOutput;
     rp.uiCount = 3;   // NvOFFRUC_MIN_RESOURCE
     rp.pD3D11FenceObj = NULL;
-    st = ((PtrToFuncNvOFFRUCRegisterResource)m_fnRegister)(h, &rp);
+    st = NvOFFRUCRegisterResource(h, &rp);
     if (st != NvOFFRUC_SUCCESS) {
         LOGERR("InterpSidecar: NvOFFRUCRegisterResource failed (status %d)", (int)st);
         return false;
@@ -385,7 +381,7 @@ bool InterpSidecar::Interpolate(const FrameBracket& bracket, LONGLONG targetQpc)
         in.stFrameDataInput.nTimeStamp = QpcToSeconds(bracket.info.beforeTs);
         in.stFrameDataInput.bHasFrameRepetitionOccurred = &repeated;
         in.bSkipWarp = 1;   // state update only; output comes with the after-feed
-        st = ((PtrToFuncNvOFFRUCProcess)m_fnProcess)((NvOFFRUCHandle)m_frucHandle, &in, &out);
+        st = NvOFFRUCProcess((NvOFFRUCHandle)m_frucHandle, &in, &out);
         if (st != NvOFFRUC_SUCCESS) goto fail;
         m_lastFedTs = bracket.info.beforeTs;
         m_inputIdx ^= 1;
@@ -405,7 +401,7 @@ bool InterpSidecar::Interpolate(const FrameBracket& bracket, LONGLONG targetQpc)
         in.stFrameDataInput.bHasFrameRepetitionOccurred = &repeated;
         out.stFrameDataOutput.pFrame = m_frucOutput;
         out.stFrameDataOutput.nTimeStamp = QpcToSeconds(targetQpc);
-        st = ((PtrToFuncNvOFFRUCProcess)m_fnProcess)((NvOFFRUCHandle)m_frucHandle, &in, &out);
+        st = NvOFFRUCProcess((NvOFFRUCHandle)m_frucHandle, &in, &out);
         QueryPerformanceCounter(&t1);
         m_lastProcessUs = (t1.QuadPart - t0.QuadPart) * 1000000 / m_freqQpc;
         if (st != NvOFFRUC_SUCCESS) goto fail;

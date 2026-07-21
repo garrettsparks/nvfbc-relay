@@ -7,7 +7,8 @@
 // compositor. We own the blend math (no dimming possible), the flow comes from the same
 // silicon FRUC uses, and the warp is upgradeable (occlusion handling, cost-buffer
 // confidence, 10-bit end-to-end later). The only NVIDIA runtime dependency is
-// nvofapi64.dll, which ships in the driver.
+// nvofapi64.dll, which ships in the driver and resolves as an implicit import when
+// the process loads.
 //
 // The D3D11 session-init declarations come from third_party/NvOFSDK/nvOpticalFlowD3D11.h,
 // picked up via __has_include; if that header is ever absent the engine constructs
@@ -63,7 +64,6 @@ private:
     ID3D11SamplerState* m_warpSampler;
 
     // OF session state (opaque here; real types live behind the header gate in the .cpp)
-    void* m_ofLib;
     void* m_ofHandle;
     void* m_ofFuncs;
     void* m_regBefore;

@@ -12,6 +12,9 @@
 #    include <d3d11.h>
 #    include "../../../third_party/NvOFSDK/nvOpticalFlowD3D11.h"
 #    define NVOF_D3D11_AVAILABLE 1
+     // Import library generated from nvofapi64.def at build time (NVIDIA ships none);
+     // the factory resolves through the import table when the process loads.
+#    pragma comment(lib, "nvofapi64.lib")
 #  endif
 #endif
 
@@ -48,7 +51,7 @@ FlowWarpEngine::FlowWarpEngine()
     : m_dev(NULL), m_ctx(NULL), m_width(0), m_height(0), m_gridSize(4)
     , m_flowTex(NULL), m_flowSrv(NULL)
     , m_warpVs(NULL), m_warpPs(NULL), m_warpCb(NULL), m_warpSampler(NULL)
-    , m_ofLib(NULL), m_ofHandle(NULL), m_ofFuncs(NULL)
+    , m_ofHandle(NULL), m_ofFuncs(NULL)
     , m_regBefore(NULL), m_regAfter(NULL), m_regFlow(NULL)
     , m_enabled(false)
 {
@@ -65,7 +68,6 @@ FlowWarpEngine::~FlowWarpEngine() {
         delete funcs;
     }
 #endif
-    if (m_ofLib) FreeLibrary((HMODULE)m_ofLib);
     if (m_warpSampler) m_warpSampler->Release();
     if (m_warpCb) m_warpCb->Release();
     if (m_warpPs) m_warpPs->Release();
@@ -140,20 +142,11 @@ bool FlowWarpEngine::CreateFlowSession() {
            "at build time - restore it and rebuild to enable the raw-flow path");
     return false;
 #else
-    m_ofLib = (void*)LoadLibraryA("nvofapi64.dll");
-    if (!m_ofLib) {
-        LOGERR("FlowWarpEngine: nvofapi64.dll not found (driver R455+ required)");
-        return false;
-    }
-    typedef NV_OF_STATUS(NVOFAPI* PFNCreateInstance)(uint32_t, NV_OF_D3D11_API_FUNCTION_LIST*);
-    PFNCreateInstance createInstance =
-        (PFNCreateInstance)GetProcAddress((HMODULE)m_ofLib, "NvOFAPICreateInstanceD3D11");
-    if (!createInstance) {
-        LOGERR("FlowWarpEngine: NvOFAPICreateInstanceD3D11 export missing (driver too old for D3D11 OF?)");
-        return false;
-    }
+    // nvofapi64.dll is an implicit import resolved at process launch, so reaching this
+    // code means the driver's library is present; a version rejection here is the
+    // remaining too-old-driver failure.
     NV_OF_D3D11_API_FUNCTION_LIST* funcs = new NV_OF_D3D11_API_FUNCTION_LIST{};
-    NV_OF_STATUS st = createInstance(NV_OF_API_VERSION, funcs);
+    NV_OF_STATUS st = NvOFAPICreateInstanceD3D11(NV_OF_API_VERSION, funcs);
     if (st != NV_OF_SUCCESS) {
         LOGERR("FlowWarpEngine: NvOFAPICreateInstanceD3D11 failed (status %d)", (int)st);
         delete funcs;

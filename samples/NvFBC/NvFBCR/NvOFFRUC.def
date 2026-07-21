@@ -1,0 +1,11 @@
+; Import library source for the FRUC redistributable. NVIDIA ships headers with
+; proc-name macros and no .lib, so the build generates an import library from this
+; file and the entry points resolve through the import table when the process loads.
+; That makes NvOFFRUC.dll (beside the exe) a launch requirement for every mode.
+LIBRARY NvOFFRUC.dll
+EXPORTS
+    NvOFFRUCCreate
+    NvOFFRUCRegisterResource
+    NvOFFRUCUnregisterResource
+    NvOFFRUCProcess
+    NvOFFRUCDestroy

@@ -9,6 +9,8 @@
 // Interp backend selection (-interp flow|fruc). Flow (raw NVOFA + our warp) is the
 // default: we own the blend math (no dimming possible) and the only runtime dependency
 // is the driver's nvofapi64.dll; FRUC needs the SDK's NvOFFRUC.dll beside the exe.
+// Both engines' entry points are implicit imports, so their DLLs must resolve when
+// the process loads, whichever backend a run selects.
 enum InterpBackend {
     kInterpBackendFruc = 0,
     kInterpBackendFlow = 1,
@@ -86,14 +88,8 @@ private:
     IDirect3DTexture9* m_outTexture9;
     IDirect3DSurface9* m_outSurface9;
 
-    // FRUC engine (loaded dynamically; see NvOFFRUC.h proc-name contract)
-    HMODULE m_frucLib;
+    // FRUC engine (entry points are implicit imports; see NvOFFRUC.def)
     void* m_frucHandle;             // NvOFFRUCHandle
-    void* m_fnCreate;
-    void* m_fnRegister;
-    void* m_fnUnregister;
-    void* m_fnProcess;
-    void* m_fnDestroy;
 
     int m_width;
     int m_height;
