@@ -123,18 +123,26 @@ struct CompositeDecision {
 // Composite memory across presents. lastOutputTs is the content time of the last
 // composed output (frame timestamp for a passthrough, target for a blend); INT64_MIN
 // until the first output so early sim/replay timelines with negative timestamps
-// cannot false-Hold. lastPassAfter is the passthrough side-choice Schmitt state.
+// cannot false-Hold. lastPassAfter is the passthrough side-choice Schmitt state;
+// lastSynth is the pass/synth gate Schmitt state (see DecideComposite).
 struct CompositeState {
     int64_t lastOutputTs = INT64_MIN;
     bool lastPassAfter = false;
+    bool lastSynth = false;
 };
 
-// The per-present composite decision for blend mode. A real frame within
-// cfg.passthroughQpc of the target is presented sharp (PASSTHROUGH); with both
-// bracket frames inside the threshold the side choice holds a stickiness Schmitt
-// band, because bare nearest-pick lets capture jitter flip the side every present
-// while the target dwells at the bracket midpoint, and when the source oversamples
-// the present both frames are always eligible, making that dwell permanent.
+// The per-present composite decision for blend mode. A real frame within the
+// passthrough gate of the target is presented sharp (PASSTHROUGH). The gate is
+// cfg.passthroughQpc held in a ONE-SIDED stickiness Schmitt band (passing is
+// surrendered only a full band beyond the threshold, and resumes at the bare
+// threshold): an unlocked source whose clock is coherent with the present clock
+// parks at an arbitrary phase, and parked within jitter of a bare threshold the
+// decision flips on jitter tails - isolated synths in a sharp stream, one timing
+// hitch per flip. With both bracket frames inside the gate the side choice holds
+// its own band, because bare nearest-pick lets capture jitter flip the side every
+// present while the target dwells at the bracket midpoint, and when the source
+// oversamples the present both frames are always eligible, making that dwell
+// permanent.
 // Otherwise a complete bracket SYNTHESIZES at the bracket weight; an incomplete one HOLDS
 // (the hole-recovery depth contract: a hole present interpolates only once its after
 // endpoint has arrived). A candidate whose output time would regress on the last

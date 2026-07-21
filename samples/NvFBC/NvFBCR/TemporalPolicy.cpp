@@ -135,17 +135,31 @@ const char* CompositeLabel(CompositeOp op) {
 
 CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
                                   const PolicyConfig& cfg) {
-    // PASSTHROUGH ELIGIBILITY: a real frame strictly inside the threshold is close
-    // enough that blending would only trade sharpness for sub-frame timing. The
-    // threshold placement is what keeps this gate chatter-free at every operating
-    // point: locked presents sit well under the threshold and hole/mid-gap presents
-    // well over it, so instantaneous-w jitter never reaches the output.
-    const bool eligibleBefore = b.hasBefore && b.beforeDiff < cfg.passthroughQpc;
-    const bool eligibleAfter  = b.hasAfter  && b.afterDiff  < cfg.passthroughQpc;
+    // PASSTHROUGH ELIGIBILITY: a real frame close enough to the target that blending
+    // would only trade sharpness for sub-frame timing. The gate is a Schmitt trigger,
+    // not a bare compare. Threshold placement alone covers the designed operating
+    // points (locked presents sit well under it, hole/mid-gap presents well over it),
+    // but an unlocked source whose clock is coherent with the present clock PARKS at
+    // an arbitrary phase; parked within jitter of the threshold, a memoryless gate
+    // flips on jitter tails - isolated synths in a sharp stream, one content-time
+    // hitch per flip. The band is one-sided, widening only the hold-onto-passthrough
+    // exit: killing the chatter loop needs a single widened edge, and widening the
+    // synth side instead would make a parked phase's stable regime depend on which
+    // state the startup transient happened to visit last (soft lock-in at phases
+    // where the frame is genuinely inside the threshold). Passing resumes at the
+    // bare threshold; it is surrendered only a full band beyond it. The band reuses
+    // the side-choice stickiness, clamped for thresholds too small to hold the loop.
+    const int64_t band = (cfg.stickinessQpc < cfg.passthroughQpc / 4)
+                             ? cfg.stickinessQpc : cfg.passthroughQpc / 4;
+    const int64_t gate = s.lastSynth ? cfg.passthroughQpc
+                                     : cfg.passthroughQpc + band;
+    const bool eligibleBefore = b.hasBefore && b.beforeDiff < gate;
+    const bool eligibleAfter  = b.hasAfter  && b.afterDiff  < gate;
 
     CompositeDecision d;
     int64_t outputTs = 0;
     bool passAfter = s.lastPassAfter;
+    bool synth = false;
     if (eligibleBefore && eligibleAfter) {
         // Both real frames are on target (the normal case when the source oversamples
         // the present: the bracket spans less than two thresholds). Side choice holds
@@ -177,6 +191,7 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
         // here with no detection needed: a dropped source frame widens the bracket,
         // the hole present reads mid-w, and neighbors are untouched.
         d.op = CompositeOp::Synthesize;
+        synth = true;
         const int64_t span = b.beforeDiff + b.afterDiff;
         if (span > 0) {
             d.weight = (double)b.beforeDiff / (double)span;
@@ -204,6 +219,7 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
     }
     s.lastOutputTs = outputTs;
     s.lastPassAfter = passAfter;
+    s.lastSynth = synth;
     return d;
 }
 
