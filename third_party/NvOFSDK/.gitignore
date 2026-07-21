@@ -1,4 +1,5 @@
 # FRUC runtime library: place the SDK redistributable beside the built exe; never commit it.
 NvOFFRUC.dll
 NvFRUC.dll
+cudart64_110.dll
 *.dll
