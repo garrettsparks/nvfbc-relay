@@ -637,6 +637,50 @@ static void test_composite_unlocked_sweep() {
     CHECK(transitions <= total / 10, "%d pass/blend transitions (> 10%%)", transitions);
 }
 
+// Parked phase at the gate: an unlocked source whose clock is coherent with the
+// present clock does not sweep - it parks at whatever phase startup handed it,
+// indefinitely. Parked within jitter of the threshold, a memoryless gate flips on
+// jitter tails (isolated one-present synths in a sharp stream, each a content-time
+// hitch). The gate Schmitt band must pin every parking spot to one stable regime:
+// zero pass/synth transitions wherever the phase lands.
+static void test_composite_gate_hysteresis() {
+    // srcPeriod == presentPeriod exactly: zero skew, the phase parks. With the
+    // production lag (srcP + srcP/4) the target sits 3/4 into a source interval, so
+    // phaseOffset places the after-frame against the 4166 us threshold: 0 lands
+    // exactly on it, -1500 well inside (sharp regime), +1500 well outside (soft
+    // regime). Jitter 300 us spans the bare threshold in the parked-on-it case.
+    struct { int64_t offset; bool expectPass; const char* label; } cases[] = {
+        { 0,     true,  "parked on the threshold" },
+        { -1500, true,  "parked inside" },
+        { 1500,  false, "parked outside" },
+    };
+    for (const auto& c : cases) {
+        SimParams p{};
+        p.srcPeriod = 16667;
+        p.presentPeriod = 16667;
+        p.arrivalJitter = 300;
+        p.combQpc = 0;
+        p.presents = 6000;
+        p.phaseOffset = c.offset;
+        p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+        SimResult r = Simulate(p);
+        const size_t warmup = 100;
+        int transitions = 0, pass = 0, total = 0;
+        for (size_t i = warmup; i < r.ops.size(); i++) {
+            total++;
+            if (IsPass(r.ops[i])) pass++;
+            if (i > warmup && IsPass(r.ops[i]) != IsPass(r.ops[i - 1])) transitions++;
+        }
+        CHECK(transitions == 0, "%s: %d pass/synth transitions (gate chatter)",
+              c.label, transitions);
+        if (c.expectPass) {
+            CHECK(pass == total, "%s: %d/%d pass (expected all)", c.label, pass, total);
+        } else {
+            CHECK(pass == 0, "%s: %d/%d pass (expected none)", c.label, pass, total);
+        }
+    }
+}
+
 // Enabling the composite config must leave the nearest selection byte-identical:
 // the shared PolicyConfig is the only coupling surface between the two decision
 // paths, and this pins it.
@@ -950,6 +994,7 @@ int main(int argc, char** argv) {
     test_composite_oversampling();
     test_composite_refusal_regime();
     test_composite_unlocked_sweep();
+    test_composite_gate_hysteresis();
     test_composite_v16_differential();
     test_composite_monotone_output();
     test_ring_underrun_graceful();
@@ -958,6 +1003,6 @@ int main(int argc, char** argv) {
         std::printf("POLICY TESTS FAILED: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("POLICY TESTS PASSED (6 selection + 10 composite suites)\n");
+    std::printf("POLICY TESTS PASSED (6 selection + 11 composite suites)\n");
     return 0;
 }
