@@ -90,6 +90,10 @@ struct SimParams {
     int64_t passthroughQpc;  // 0 = composite decision off
     int64_t lagOverride;     // 0 = size from srcPeriod as production does; else this lag
     std::vector<int64_t> drops;  // sorted arrival indices to drop (hole injection)
+    // Non-empty: arrival gaps cycle this list instead of srcPeriod (display-quantized
+    // cadences, e.g. a fixed-refresh 240 Hz panel flipping a 90 fps source 2-3-3);
+    // srcPeriod stays the DECLARED rate that sizes lag/threshold/comb.
+    std::vector<int64_t> periodPattern;
 };
 
 static SimResult Simulate(const SimParams& p) {
@@ -110,7 +114,11 @@ static SimResult Simulate(const SimParams& p) {
     const int64_t horizon = (p.presents + 4) * p.presentPeriod;
     for (int64_t t = p.phaseOffset, i = 0; t < horizon; i++) {
         arrivals.push_back(t + JitterUs(p.arrivalJitter));
-        t = p.phaseOffset + (i + 1) * p.srcPeriod;
+        if (p.periodPattern.empty()) {
+            t = p.phaseOffset + (i + 1) * p.srcPeriod;
+        } else {
+            t += p.periodPattern[(size_t)(i % (int64_t)p.periodPattern.size())];
+        }
     }
     if (!p.drops.empty()) {
         std::vector<int64_t> kept;
@@ -396,7 +404,10 @@ static void test_no_excursion_while_locked() {
 // ---------------------------------------------------------------------------------
 // Composite (blend-mode) suites. All run AFTER the selection suites: the shared LCG
 // stream means the selection suites' timelines stay byte-identical only if nothing
-// before them draws jitter.
+// before them draws jitter. NEW SUITES APPEND AT THE END of the composite list for
+// the same reason: the exact census pins below are constants of the policy AND of
+// the stream position, so inserting a jitter-drawing suite mid-list shifts every
+// pinned number after it.
 //
 // The threshold convention mirrors the production Setup rule
 // T = max(assumed srcP, presentP) / 4. The presentP floor covers the oversampling
@@ -408,6 +419,29 @@ static void test_no_excursion_while_locked() {
 static int64_t ThresholdUs(int64_t srcPeriod, int64_t presentPeriod) {
     const int64_t base = srcPeriod > presentPeriod ? srcPeriod : presentPeriod;
     return base / 4;
+}
+
+// Exact op census pin. The LCG is seeded and every suite timeline deterministic, so
+// these counts are constants of the policy; any behavioral drift anywhere in a
+// regime forces a conscious look, including drift that stays inside the contract
+// tolerances asserted beside it. Update a pin only with its diff understood - the
+// new number then documents the behavioral change in the commit.
+static void PinCensus(const SimResult& r, size_t warmup, int wantPass, int wantSynth,
+                      int wantHold, int wantTransitions, const char* suite) {
+    int pass = 0, synth = 0, hold = 0, transitions = 0;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        if (IsPass(r.ops[i])) pass++;
+        else if (r.ops[i] == policy::CompositeOp::Synthesize) synth++;
+        else hold++;
+        if (i > warmup && IsPass(r.ops[i]) != IsPass(r.ops[i - 1])) transitions++;
+    }
+    if (pass != wantPass || synth != wantSynth || hold != wantHold ||
+        transitions != wantTransitions) {
+        g_failures++;
+        std::printf("FAIL %s census: pass %d synth %d hold %d transitions %d"
+                    " (pinned %d/%d/%d/%d)\n", suite, pass, synth, hold, transitions,
+                    wantPass, wantSynth, wantHold, wantTransitions);
+    }
 }
 
 // The production corner the lock exists for: 60-in-60-out with a slow beat. Locked,
@@ -437,12 +471,14 @@ static void test_composite_passthrough_at_lock() {
     CHECK(pass >= total * 98 / 100, "passthrough %d/%d post-warmup (< 98%%)", pass, total);
     CHECK(blend <= total / 100, "%d blends at lock (> 1%%)", blend);
     CHECK(hold <= 5, "%d holds at lock", hold);
+    PinCensus(r, warmup, 9000, 0, 0, 0, "passthrough_at_lock");
 }
 
 // Gate placement: at locked operating points the nearest-real-frame distance sits
 // far below the threshold, so the pass/blend boundary is unreachable and the
-// composition cannot flip-flop; the gate needs no hysteresis because placement
-// keeps every operating point away from it.
+// composition cannot flip-flop. Placement covers the LOCKED regime only - an
+// unlocked coherent-clock source can park ON the boundary, which is why the gate
+// also carries its one-sided Schmitt band (see test_composite_gate_hysteresis).
 static void test_composite_gate_placement() {
     SimParams p{};
     p.srcPeriod = 16672;
@@ -471,6 +507,7 @@ static void test_composite_gate_placement() {
     }
     CHECK(nearBoundary == 0, "%d engaged presents inside the threshold boundary band", nearBoundary);
     CHECK(alternations == 0, "%d pass/blend alternation windows while locked", alternations);
+    PinCensus(r, warmup, 9000, 0, 0, 0, "gate_placement");
 }
 
 // Dropped source frames need no detection. Each isolated drop widens one bracket;
@@ -505,6 +542,7 @@ static void test_composite_hole_classification() {
     CHECK(engagedAll, "lock disturbed by hole injection");
     CHECK(blends == 0 || (wLo >= 0.40 && wHi <= 0.60),
           "hole blend weights [%.3f, %.3f] not centered", wLo, wHi);
+    PinCensus(r, warmup, 9075, 25, 0, 50, "hole_classification");
 }
 
 // Recovery depth: at 1.25x lag a two-frame hole cannot fully recover. The in-gap
@@ -542,6 +580,7 @@ static void test_composite_two_frame_hole() {
         }
     }
     CHECK(engagedAll, "lock disturbed by the two-frame hole");
+    PinCensus(r, warmup, 8998, 1, 1, 2, "two_frame_hole");
 }
 
 // Oversampled source, no lock: the presentP-floored threshold exceeds srcP/2, so a
@@ -584,6 +623,7 @@ static void test_composite_oversampling() {
     }
     CHECK(off <= strides / 100, "%d/%d off-strides (>1%%)", off, strides);
     CHECK(worstAltWindow <= 1, "period-2 output stride window of %d alternations", worstAltWindow);
+    PinCensus(r, warmup, 7100, 0, 0, 0, "oversampling");
 }
 
 // Refused ratio (144->60, M=5 comb under the jitter floor): the threshold keys off
@@ -607,6 +647,7 @@ static void test_composite_refusal_regime() {
     }
     CHECK(pass >= total * 95 / 100, "passthrough %d/%d at refused 144->60 (< 95%%)", pass, total);
     CHECK(hold <= 5, "%d holds at refused 144->60", hold);
+    PinCensus(r, warmup, 5900, 0, 0, 0, "refusal_regime");
 }
 
 // Unlocked at-rate sweep: the target drifts through the bracket, so blend fires for
@@ -635,6 +676,7 @@ static void test_composite_unlocked_sweep() {
           "unlocked pass fraction %d/%d outside the geometric ~50%%", pass, total);
     CHECK(blend >= total * 35 / 100, "unlocked blend fraction %d/%d (< 35%%)", blend, total);
     CHECK(transitions <= total / 10, "%d pass/blend transitions (> 10%%)", transitions);
+    PinCensus(r, warmup, 6037, 5863, 0, 8, "unlocked_sweep");
 }
 
 // Parked phase at the gate: an unlocked source whose clock is coherent with the
@@ -740,6 +782,7 @@ static void test_ring_underrun_graceful() {
               "shown ts stepped back at underrun present %zu", i);
         if (g_failures) return;
     }
+    PinCensus(r, warmup, 0, 0, 2900, 0, "ring_underrun");
 }
 
 // Composite output content time is non-decreasing across pull wraps (the monotone
@@ -761,6 +804,73 @@ static void test_composite_monotone_output() {
               i, r.outTs[i - 1], r.outTs[i]);
         if (g_failures) return;
     }
+    PinCensus(r, 100, 23900, 0, 0, 0, "monotone_output");
+}
+
+// Lock acquisition traverses the gate band. Parked outside the threshold with the
+// lock armed, the pull walks the target onto the comb at the slew rate, so the
+// nearest-frame distance migrates through [threshold + band, threshold, operating
+// point] while the gate sits in synth state. The one-sided band makes that regime
+// change monotone: passing resumes at the bare threshold and, with the mean
+// distance still falling, jitter cannot reach the surrender edge a full band
+// above - exactly one pass/synth transition for the whole traverse, then a locked
+// passing steady state.
+static void test_composite_lock_acquisition() {
+    SimParams p{};
+    p.srcPeriod = 16667;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 300;
+    p.combQpc = 16667;
+    p.presents = 6000;
+    p.phaseOffset = 2000;   // unpulled target starts ~6.2 ms from the nearest frame
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    SimResult r = Simulate(p);
+    const size_t warmup = 10;   // ring fill only: the traverse itself is under test
+    int transitions = 0;
+    for (size_t i = warmup + 1; i < r.ops.size(); i++) {
+        if (IsPass(r.ops[i]) != IsPass(r.ops[i - 1])) transitions++;
+    }
+    CHECK(transitions == 1, "%d pass/synth transitions across lock acquisition", transitions);
+    int tailPass = 0;
+    for (size_t i = r.ops.size() - 1000; i < r.ops.size(); i++) {
+        if (IsPass(r.ops[i])) tailPass++;
+    }
+    CHECK(tailPass == 1000, "steady state after acquisition: %d/1000 pass", tailPass);
+    CHECK(r.engaged.back(), "lock not engaged at the end of the acquisition run");
+    PinCensus(r, warmup, 5923, 67, 0, 1, "lock_acquisition");
+}
+
+// Display-quantized arrivals: a 90 fps source on a FIXED-REFRESH 240 Hz panel flips
+// on the refresh grid, so arrival gaps cycle 2-3-3 refresh periods (8.3/12.5/12.5 ms)
+// around the 11.1 ms mean. The quantization does NOT break the M=2 comb: the lock
+// engages and holds, and the composite settles into the strict period-2 regime the
+// 3:2 geometry forces - alternating pass/synth with weights at the comb midpoint.
+// (A VRR panel presents the smooth cadence instead; this pins the harder half.)
+static void test_composite_quantized_arrivals() {
+    SimParams p{};
+    p.srcPeriod = 11111;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 100;
+    p.combQpc = 11111 / 2;   // the M=2 comb the production ratio scan derives for 90:60
+    p.presents = 6000;
+    p.periodPattern = {8333, 12500, 12500};
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    SimResult r = Simulate(p);
+    const size_t warmup = 100;
+    int engagedN = 0, total = 0;
+    double wLo = 1.0, wHi = 0.0;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        total++;
+        if (r.engaged[i]) engagedN++;
+        if (r.ops[i] != policy::CompositeOp::Synthesize) continue;
+        if (r.weights[i] < wLo) wLo = r.weights[i];
+        if (r.weights[i] > wHi) wHi = r.weights[i];
+    }
+    CHECK(engagedN >= total * 95 / 100,
+          "M=2 lock engaged only %d/%d on the quantized cadence", engagedN, total);
+    CHECK(wLo >= 0.40 && wHi <= 0.65,
+          "quantized synth weights [%.3f, %.3f] not near the comb midpoint", wLo, wHi);
+    PinCensus(r, warmup, 2950, 2950, 0, 5899, "quantized_arrivals");
 }
 
 // ---------------------------------------------------------------------------------
@@ -998,11 +1108,13 @@ int main(int argc, char** argv) {
     test_composite_v16_differential();
     test_composite_monotone_output();
     test_ring_underrun_graceful();
+    test_composite_lock_acquisition();
+    test_composite_quantized_arrivals();
 
     if (g_failures) {
         std::printf("POLICY TESTS FAILED: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("POLICY TESTS PASSED (6 selection + 11 composite suites)\n");
+    std::printf("POLICY TESTS PASSED (6 selection + 13 composite suites)\n");
     return 0;
 }
