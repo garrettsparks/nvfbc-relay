@@ -150,7 +150,8 @@ either. It is also simpler (assemble a tiny bitmap, blit it):
   StretchRect/UpdateSurface have pool/format/render-target constraints; the ARGB10 backbuffer is
   the dest). ColorFill-per-cell remains a valid fallback for the minimal marker if the blit path
   hits a driver constraint.
-- Gate behind a **`-mark` flag** (minimal) / **`-mark:full`** (rich tier) — shares the
+- Gate behind a **`-mark [N]` flag** (minimal; optional N limits the burn to the first N presents
+  for stream alignment, omitted = every present) / **`-mark:full`** (rich tier) — shares the
   ApplyOption dispatch (one place, cmdline + prompt). Off by default; never ships enabled.
 - **Log the counter on the temporal line**: append `mark=<N>` (append-only, parser-safe). Now
   video↔log is `read N off the frame → grep mark=N`. The counter increments once per present.
@@ -167,6 +168,54 @@ SCOPE LIMIT: this reconstructs the TEMPORAL lines only, not the whole log — ca
 have nowhere to hang. "Almost the log" = the temporal lines, which is most of what analysis uses.
 The rich grid needs more error correction than the minimal marker (more cells = more misread
 surface); use the checksum plus, if measured necessary, a parity row.
+
+### Optional duration on `-mark` (`-mark [N]`) — a head burst for stream alignment
+
+Rather than a separate flag, `-mark` takes an OPTIONAL frame count: `-mark` alone marks every
+present (the existing behavior, unchanged), `-mark N` marks only the first N presents then reverts
+to clean output. Same tier, same cells, same decoder; the only change is a gate on the burn.
+Alignment does not need every frame: the counter is self-identifying, so ONE cleanly-decoded marked
+frame fixes the exact video-to-log offset. `-mark N` is what makes a real STREAM VOD alignable
+without polluting watched gameplay (the marker is gone by the time anyone tunes in).
+
+This closes the gap that currently forces offset-guessing on unmarked stream VODs (good only to
+~seconds by matching scene events, and demonstrably error-prone at that) down to a deterministic
+~1-frame residual, at the cost of an N-frame marker burst over the stream intro.
+
+- **Parameter is a frame count; omitted = unlimited.** `-mark` = mark forever (backward
+  compatible); `-mark N` (N>=1) = mark the first N presents. Parsed in the existing ApplyOption
+  dispatch: after `-mark`, peek the next token and consume it as the count only if it is a
+  non-negative integer, else treat as unlimited (so a trailing `-mark` and `-mark -lock` both mean
+  forever). The burn gate is `markFrames == 0 || counter < markFrames` in the present loop, right
+  where the counter already lives.
+- **Value to reach for on stream captures: N = 120** (~2s at 60fps). The flag default stays
+  unlimited; 120 is just the recommended head-burst length when you do pass a count.
+- **Why a burst and not a single frame.** Accuracy needs only one clean frame; robustness wants a
+  margin. The marker's on-to-off edge can yield a half-marked frame if the record or transcode
+  chain rate-converts or predicts across the boundary, and a live stream can drop a frame outright.
+  The decoder already keeps only checksum-valid, counter-monotonic frames and discards the rest, so
+  a burst yields many independent survivors; 120 leaves ample clean anchors after boundary and drop
+  losses, and lets the decoder confirm the counter increments 1:1 across them.
+- **Offset validity across the file.** The present clock holds ~60Hz (measured 99.2% on-beat, 53
+  misses in 80 min on a real capture), so a single head anchor sets an offset that is constant in
+  TIME for the whole recording: a missed present repeats a frame on screen but does not shift the
+  time base. Frame-exact from the anchor forward.
+- **What a head burst cannot measure: cross-machine clock drift.** The relay's present clock
+  (gaming PC) and OBS's record clock (separate streaming PC) are independent oscillators, so over a
+  long VOD they skew by up to a few frames (tens of ppm). Frame-exact alignment at the END of a
+  long session would need a second anchor over the "ending" screen; under the single-parameter
+  `-mark N` that is a FUTURE extension (a tail count), deliberately deferred since head-only serves
+  the primary need. When added, two anchors let the decoder fit a linear counter-to-offset map and
+  absorb the drift.
+- **Decode is the existing pipeline, unchanged.** Marked head frames carry the cell-0 sync white;
+  unmarked frames fail the presence check at decode step 1 and bail cleanly. For each clean
+  survivor, offset = the video frame's timestamp minus the matched `mark=<counter>` log line's
+  `dl=`.
+- **Log side keeps a continuous counter.** While `-mark` is active WITH OR WITHOUT N, every
+  temporal line still carries `mark=<counter>` (the counter always advances and is always logged; N
+  gates only the visual burn, not the log field). `mark=-1` still means the flag is off entirely.
+  So the log stays fully joinable and the video carries markers only on the first N frames; the
+  join stays `read counter off the frame, grep mark=<counter>`.
 
 ## Analysis tool (frame-drop-analysis) — co-designed with the encoder
 

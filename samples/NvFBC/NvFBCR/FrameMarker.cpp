@@ -54,6 +54,7 @@ FrameMarker::FrameMarker()
     , m_sysmem(NULL)
     , m_vram(NULL)
     , m_counter(0)
+    , m_maxFrames(0)
     , m_active(false)
     , m_blitPathOk(true)
 {
@@ -65,8 +66,9 @@ FrameMarker::~FrameMarker() {
     if (m_vram) m_vram->Release();
 }
 
-bool FrameMarker::Init(IDirect3DDevice9Ex* device, int bufWidth, int bufHeight) {
+bool FrameMarker::Init(IDirect3DDevice9Ex* device, int bufWidth, int bufHeight, unsigned int maxFrames) {
     m_device = device;
+    m_maxFrames = maxFrames;
 
     // The marker region scales off the WIDTH alone (square cells), so the decoder can
     // derive the full geometry from any recording's width. MulDiv rather than a
@@ -96,8 +98,12 @@ bool FrameMarker::Init(IDirect3DDevice9Ex* device, int bufWidth, int bufHeight) 
     }
 
     m_active = true;
-    LOG("Frame marker ACTIVE (-mark): %d cells, %ldx%ld px strip at top-left; mark= on the temporal line",
-        kCells, m_destRect.right, m_destRect.bottom);
+    if (m_maxFrames)
+        LOG("Frame marker ACTIVE (-mark %u): %d cells, %ldx%ld px strip at top-left; burning the first %u presents, mark= on the temporal line",
+            m_maxFrames, kCells, m_destRect.right, m_destRect.bottom, m_maxFrames);
+    else
+        LOG("Frame marker ACTIVE (-mark): %d cells, %ldx%ld px strip at top-left; mark= on the temporal line",
+            kCells, m_destRect.right, m_destRect.bottom);
     return true;
 }
 
@@ -149,6 +155,9 @@ unsigned int FrameMarker::Burn(IDirect3DSurface9* backbuffer, int pickCode, int 
     const unsigned int burned = m_counter;
     m_counter = (m_counter + 1) & 0xFFFFFF;
     if (!m_active || !backbuffer) return burned;
+    // -mark N: draw only the first N presents, then run clean; the counter above still
+    // advanced so mark= stays a continuous present count for the whole session.
+    if (m_maxFrames != 0 && burned >= m_maxFrames) return burned;
 
     bool cells[kCells];
     BuildCells(burned, pickCode, weightQ, interp, compositorId, execCode, cells);

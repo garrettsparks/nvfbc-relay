@@ -18,7 +18,7 @@ static const int kTelemetryPeriodPresents = 600;
 static const float kDefaultAssumedSrcFps = 60.0f;
 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
-                                         CompositorKind compositor, bool mark)
+                                         CompositorKind compositor, bool mark, unsigned int markFrames)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_compositor(NULL)
@@ -26,6 +26,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_compositorKind(compositor)
     , m_lock(lock)
     , m_mark(mark)
+    , m_markFrames(markFrames)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_srcRateHint(srcRateHint)
@@ -65,7 +66,7 @@ bool TemporalCaptureMode::Setup() {
     // Marker resources live on the PRESENT device (the burn is a backbuffer overlay,
     // never a ring-surface write). A failed Init disables the marker, not the relay.
     if (m_mark) {
-        m_marker.Init(m_device, BUF_WIDTH, BUF_HEIGHT);
+        m_marker.Init(m_device, BUF_WIDTH, BUF_HEIGHT, m_markFrames);
     }
     // STATIC BRACKETING LAG: max(present period, 1.25 x assumed source period). The lag
     // exists so that a frame newer than the target has already arrived at pick time; the
