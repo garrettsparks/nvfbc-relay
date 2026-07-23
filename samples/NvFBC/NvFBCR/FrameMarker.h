@@ -43,8 +43,11 @@ public:
 
     // Creates the cell-strip surfaces on the PRESENT device. On failure the marker
     // disables itself (Burn keeps counting but draws nothing): the relay runs
-    // unmarked rather than not at all.
-    bool Init(IDirect3DDevice9Ex* device, int bufWidth, int bufHeight);
+    // unmarked rather than not at all. maxFrames > 0 burns only the first maxFrames
+    // presents (a head burst for aligning a stream VOD without marking watched
+    // gameplay); 0 = every present. The counter still advances and mark= is still
+    // logged past the limit, so the video-to-log join is unaffected.
+    bool Init(IDirect3DDevice9Ex* device, int bufWidth, int bufHeight, unsigned int maxFrames = 0);
 
     // Draws the marker into the backbuffer corner and advances the counter. Call
     // between the content composition and PresentEx. weightQ is the quantized
@@ -86,6 +89,7 @@ private:
     IDirect3DSurface9* m_vram;     // default-pool copy StretchRect can source from
     RECT m_destRect;               // marker region on the backbuffer
     unsigned int m_counter;        // 24-bit present counter, wraps
+    unsigned int m_maxFrames;      // -mark N: burn only the first N presents; 0 = every present
     bool m_active;                 // false: Init failed or both draw paths failed
     bool m_blitPathOk;             // false: fell back to per-cell ColorFill
 };

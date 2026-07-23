@@ -85,6 +85,11 @@ bool g_lock = false;
 // the exact video-to-log join key. See docs/frame-marker-spec.md.
 bool g_mark = false;
 
+// Optional count for -mark: burn only the first N presents (a head burst that aligns a
+// stream VOD without marking watched gameplay), then run clean. 0 = every present (the
+// bare -mark). The counter keeps advancing past N so mark= stays a continuous present count.
+unsigned int g_markFrames = 0;
+
 // Interp compositor backend for o:* modes (-interp flow|fruc). Flow (raw NVOFA + our
 // warp) is the default: the only runtime dependency is the driver's nvofapi64.dll,
 // while FRUC needs the SDK's NvOFFRUC.dll beside the exe.
@@ -124,7 +129,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             _stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0 ||
             _stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
-                                           kind, g_mark);
+                                           kind, g_mark, g_markFrames);
         }
 
         // QPC-timer present (t:60 / b:60 / o:60 format).
@@ -132,7 +137,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             float framerate;
             if (ParseFps(modeStr.substr(2), &framerate)) {
                 return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
-                                               kind, g_mark);
+                                               kind, g_mark, g_markFrames);
             }
         }
     }
@@ -168,7 +173,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  -src 30        - Declared source fps; sizes the static temporal lag (default: assume >= 60)");
     LOGERR("  -lock          - Enable the phase comb lock (needs -src for the rate); off by default");
     LOGERR("  -interp flow|fruc - o:* synthesis engine (default flow = raw NVOFA + warp)");
-    LOGERR("  -mark          - Burn the frame-counter marker (video-to-log alignment, debug); off by default");
+    LOGERR("  -mark [N]      - Burn the frame-counter marker (video-to-log alignment, debug); off by default. N = first N presents only (stream head anchor), else every present");
     return NULL;
 }
 
@@ -422,6 +427,13 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
     }
     if (tokens[i] == "-mark") {
         g_mark = true;
+        // Optional frame count: consume the next token as N only if it is all digits, so
+        // a bare -mark (or -mark followed by another flag) keeps marking every present.
+        if (i + 1 < tokens.size() && !tokens[i + 1].empty() &&
+            tokens[i + 1].find_first_not_of("0123456789") == string::npos) {
+            g_markFrames = (unsigned int)strtoul(tokens[i + 1].c_str(), NULL, 10);
+            return 2;
+        }
         return 1;
     }
     if (tokens[i] == "-src" && i + 1 < tokens.size()) {
@@ -522,7 +534,7 @@ void ConsoleUserInput(string* framerateStr) {
     cout << "  t:60 -src 30   - Mode plus options: -src <fps> declares the source rate (lag sizing)" << endl;
     cout << "  -lock          - Enable the phase comb lock (needs -src; off by default)" << endl;
     cout << "  -interp flow|fruc - o:* synthesis engine (default flow = raw NVOFA + warp)" << endl;
-    cout << "  -mark          - Burn the frame-counter marker (video-to-log alignment, debug)" << endl;
+    cout << "  -mark [N]      - Burn the frame-counter marker (video-to-log alignment, debug); N = first N presents only" << endl;
     cout << endl;
     cout << "  diag, diag:vsync - Clock probes (DWM compose timing + card raster)" << endl;
     cout << endl;
@@ -545,7 +557,8 @@ void ConsoleUserInput(string* framerateStr) {
             }
             if (g_srcRateHint > 0.0f) cout << "Declared source rate: " << g_srcRateHint << " fps"
                 << (g_lock ? " (comb lock on)" : " (comb lock off)") << endl;
-            if (g_mark) cout << "Frame marker: on" << endl;
+            if (g_mark && g_markFrames) cout << "Frame marker: on (first " << g_markFrames << " presents)" << endl;
+            else if (g_mark)            cout << "Frame marker: on" << endl;
             cinString = cinString.substr(0, space);
         }
         *framerateStr = cinString;
@@ -617,6 +630,14 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     LOG("Target display: [%d] %s (%s)", target.dxAdapterIndex, target.friendlyName.c_str(), target.deviceName);
     g_targetAdapterIndex = target.dxAdapterIndex;
     LOG("Capture mode: %s", captureMode->GetModeName());
+    // Echo resolved options so console-entered config is recoverable from the log, not just argv.
+    char markDesc[48];
+    if (!g_mark)           snprintf(markDesc, sizeof(markDesc), "off");
+    else if (g_markFrames) snprintf(markDesc, sizeof(markDesc), "on (first %u presents)", g_markFrames);
+    else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
+    LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s",
+        g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
+        g_lock ? "on" : "off", markDesc);
 
     BUF_WIDTH = target.position.right - target.position.left;
     BUF_HEIGHT = target.position.bottom - target.position.top;
