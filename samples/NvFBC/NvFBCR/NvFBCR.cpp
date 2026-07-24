@@ -85,6 +85,12 @@ bool g_lock = false;
 // the exact video-to-log join key. See docs/frame-marker-spec.md.
 bool g_mark = false;
 
+// Stamp a coloured border on every synthesized (blended) frame (-tint, debug only) so
+// blends are obvious while watching a capture at speed, without log-to-video alignment.
+// Rides the blend shader's existing pass, so it costs no extra draw and leaves
+// passthrough frames untouched.
+bool g_tint = false;
+
 // Optional count for -mark: burn only the first N presents (a head burst that aligns a
 // stream VOD without marking watched gameplay), then run clean. 0 = every present (the
 // bare -mark). The counter keeps advancing past N so mark= stays a continuous present count.
@@ -129,7 +135,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             _stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0 ||
             _stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
-                                           kind, g_mark, g_markFrames);
+                                           kind, g_mark, g_markFrames, g_tint);
         }
 
         // QPC-timer present (t:60 / b:60 / o:60 format).
@@ -137,7 +143,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             float framerate;
             if (ParseFps(modeStr.substr(2), &framerate)) {
                 return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
-                                               kind, g_mark, g_markFrames);
+                                               kind, g_mark, g_markFrames, g_tint);
             }
         }
     }
@@ -174,6 +180,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  -lock          - Enable the phase comb lock (needs -src for the rate); off by default");
     LOGERR("  -interp flow|fruc - o:* synthesis engine (default flow = raw NVOFA + warp)");
     LOGERR("  -mark [N]      - Burn the frame-counter marker (video-to-log alignment, debug); off by default. N = first N presents only (stream head anchor), else every present");
+    LOGERR("  -tint          - Border-tint synthesized frames red (blend mode, debug); off by default");
     return NULL;
 }
 
@@ -425,6 +432,10 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         g_lock = true;
         return 1;
     }
+    if (tokens[i] == "-tint") {
+        g_tint = true;
+        return 1;
+    }
     if (tokens[i] == "-mark") {
         g_mark = true;
         // Optional frame count: consume the next token as N only if it is all digits, so
@@ -535,6 +546,7 @@ void ConsoleUserInput(string* framerateStr) {
     cout << "  -lock          - Enable the phase comb lock (needs -src; off by default)" << endl;
     cout << "  -interp flow|fruc - o:* synthesis engine (default flow = raw NVOFA + warp)" << endl;
     cout << "  -mark [N]      - Burn the frame-counter marker (video-to-log alignment, debug); N = first N presents only" << endl;
+    cout << "  -tint          - Border-tint synthesized frames red (blend mode, debug)" << endl;
     cout << endl;
     cout << "  diag, diag:vsync - Clock probes (DWM compose timing + card raster)" << endl;
     cout << endl;
@@ -557,6 +569,7 @@ void ConsoleUserInput(string* framerateStr) {
             }
             if (g_srcRateHint > 0.0f) cout << "Declared source rate: " << g_srcRateHint << " fps"
                 << (g_lock ? " (comb lock on)" : " (comb lock off)") << endl;
+            if (g_tint) cout << "Blend tint: on (synthesized frames bordered)" << endl;
             if (g_mark && g_markFrames) cout << "Frame marker: on (first " << g_markFrames << " presents)" << endl;
             else if (g_mark)            cout << "Frame marker: on" << endl;
             cinString = cinString.substr(0, space);
@@ -635,9 +648,9 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     if (!g_mark)           snprintf(markDesc, sizeof(markDesc), "off");
     else if (g_markFrames) snprintf(markDesc, sizeof(markDesc), "on (first %u presents)", g_markFrames);
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
-    LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s",
+    LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s",
         g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
-        g_lock ? "on" : "off", markDesc);
+        g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off");
 
     BUF_WIDTH = target.position.right - target.position.left;
     BUF_HEIGHT = target.position.bottom - target.position.top;

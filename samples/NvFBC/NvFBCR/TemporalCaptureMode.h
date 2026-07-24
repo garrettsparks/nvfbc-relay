@@ -48,6 +48,7 @@ private:
     bool m_lock;                    // -lock: opt in to the comb lock (needs -src); default off
     bool m_mark;                    // -mark: burn the frame-counter marker (debug); default off
     unsigned int m_markFrames;      // -mark N: burn only the first N presents; 0 = all (unset)
+    bool m_tint;                    // -tint: border-tint synthesized frames (blend mode, debug)
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
     LARGE_INTEGER m_baseQpc;        // logging time origin
     float m_targetFramerate;
@@ -62,7 +63,7 @@ private:
 public:
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
                         bool lock = false, CompositorKind compositor = kCompositorNearest,
-                        bool mark = false, unsigned int markFrames = 0);
+                        bool mark = false, unsigned int markFrames = 0, bool tint = false);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

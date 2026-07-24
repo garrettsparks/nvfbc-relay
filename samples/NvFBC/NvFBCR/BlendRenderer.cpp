@@ -16,6 +16,7 @@ BlendRenderer::BlendRenderer()
     : m_device(NULL)
     , m_vertexShader(NULL)
     , m_pixelShader(NULL)
+    , m_tintPixelShader(NULL)
     , m_vertexDeclaration(NULL)
     , m_quadVertexBuffer(NULL)
 {
@@ -24,11 +25,12 @@ BlendRenderer::BlendRenderer()
 BlendRenderer::~BlendRenderer() {
     if (m_quadVertexBuffer) { m_quadVertexBuffer->Release(); m_quadVertexBuffer = NULL; }
     if (m_vertexDeclaration) { m_vertexDeclaration->Release(); m_vertexDeclaration = NULL; }
+    if (m_tintPixelShader) { m_tintPixelShader->Release(); m_tintPixelShader = NULL; }
     if (m_pixelShader) { m_pixelShader->Release(); m_pixelShader = NULL; }
     if (m_vertexShader) { m_vertexShader->Release(); m_vertexShader = NULL; }
 }
 
-bool BlendRenderer::Setup(IDirect3DDevice9Ex* device) {
+bool BlendRenderer::Setup(IDirect3DDevice9Ex* device, bool tint) {
     m_device = device;
 
     ID3DBlob* vsBlob = NULL;
@@ -64,6 +66,24 @@ bool BlendRenderer::Setup(IDirect3DDevice9Ex* device) {
         "    return lerp(colorBefore, colorAfter, blendWeight);\n"
         "}\n";
 
+    // Debug variant: same lerp, plus a border stamped in the frame's own margin. The
+    // border rides this existing pass, so an enabled tint costs no extra draw or fill;
+    // uv is already interpolated, and min(uv, 1-uv) is the distance to the nearest edge.
+    const char* tintPixelShaderCode =
+        "sampler2D texBefore : register(s0);\n"
+        "sampler2D texAfter : register(s1);\n"
+        "float blendWeight : register(c0);\n"
+        "float4 tintColor : register(c1);\n"
+        "struct PS_INPUT {\n"
+        "    float2 uv : TEXCOORD0;\n"
+        "};\n"
+        "float4 main(PS_INPUT input) : COLOR0 {\n"
+        "    float4 blended = lerp(tex2D(texBefore, input.uv), tex2D(texAfter, input.uv), blendWeight);\n"
+        "    float2 edge = min(input.uv, 1.0 - input.uv);\n"
+        "    float inBorder = (min(edge.x, edge.y) < tintColor.a) ? 1.0 : 0.0;\n"
+        "    return lerp(blended, float4(tintColor.rgb, blended.a), inBorder);\n"
+        "}\n";
+
     HRESULT hr = D3DCompile(vertexShaderCode, strlen(vertexShaderCode),
         "BlendVS", NULL, NULL, "main", "vs_3_0", 0, 0, &vsBlob, &errorBlob);
     if (FAILED(hr)) {
@@ -91,6 +111,28 @@ bool BlendRenderer::Setup(IDirect3DDevice9Ex* device) {
         vsBlob->Release(); psBlob->Release();
         return false;
     }
+    if (tint) {
+        ID3DBlob* tintBlob = NULL;
+        hr = D3DCompile(tintPixelShaderCode, strlen(tintPixelShaderCode),
+            "BlendTintPS", NULL, NULL, "main", "ps_3_0", 0, 0, &tintBlob, &errorBlob);
+        if (FAILED(hr)) {
+            if (errorBlob) {
+                LOGERR("BlendRenderer: tint shader compile error: %s", (char*)errorBlob->GetBufferPointer());
+                errorBlob->Release();
+                errorBlob = NULL;
+            }
+            vsBlob->Release(); psBlob->Release();
+            return false;
+        }
+        hr = m_device->CreatePixelShader((DWORD*)tintBlob->GetBufferPointer(), &m_tintPixelShader);
+        tintBlob->Release();
+        if (FAILED(hr)) {
+            LOGERR("BlendRenderer: failed to create tint pixel shader (error: 0x%08x)", hr);
+            vsBlob->Release(); psBlob->Release();
+            return false;
+        }
+    }
+
     hr = m_device->CreatePixelShader((DWORD*)psBlob->GetBufferPointer(), &m_pixelShader);
     if (FAILED(hr)) {
         LOGERR("BlendRenderer: failed to create pixel shader (error: 0x%08x)", hr);
@@ -144,12 +186,19 @@ bool BlendRenderer::Setup(IDirect3DDevice9Ex* device) {
     m_device->SetRenderState(D3DRS_LIGHTING, FALSE);
     m_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 
-    LOG("BlendRenderer initialized - ps_3_0 lerp compositor");
+    if (m_tintPixelShader) {
+        LOG("BlendRenderer initialized - ps_3_0 lerp compositor, DEBUG TINT on "
+            "(synthesized frames carry a coloured border)");
+    } else {
+        LOG("BlendRenderer initialized - ps_3_0 lerp compositor");
+    }
     return true;
 }
 
 bool BlendRenderer::Blend(IDirect3DTexture9* before, IDirect3DTexture9* after, float weight) {
     float w4[4] = { weight, 0.0f, 0.0f, 0.0f };
+    // Red border, 1.5% of each edge. Alpha carries the border width, not opacity.
+    const float tint4[4] = { 1.0f, 0.0f, 0.0f, 0.015f };
 
     HRESULT hr = m_device->BeginScene();
     if (FAILED(hr)) return false;
@@ -157,10 +206,11 @@ bool BlendRenderer::Blend(IDirect3DTexture9* before, IDirect3DTexture9* after, f
     m_device->SetVertexDeclaration(m_vertexDeclaration);
     m_device->SetStreamSource(0, m_quadVertexBuffer, 0, sizeof(QuadVertex));
     m_device->SetVertexShader(m_vertexShader);
-    m_device->SetPixelShader(m_pixelShader);
+    m_device->SetPixelShader(m_tintPixelShader ? m_tintPixelShader : m_pixelShader);
     m_device->SetTexture(0, before);
     m_device->SetTexture(1, after);
     m_device->SetPixelShaderConstantF(0, w4, 1);
+    if (m_tintPixelShader) m_device->SetPixelShaderConstantF(1, tint4, 1);
 
     hr = m_device->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 2);
 

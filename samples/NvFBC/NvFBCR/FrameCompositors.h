@@ -65,7 +65,9 @@ protected:
 // Blend composition: the synthesized frame is a ps_3_0 lerp of the bracket pair.
 class BlendCompositor : public SynthCompositorBase {
 public:
-    explicit BlendCompositor(const policy::PolicyConfig* cfg);
+    // tint: debug only, stamps a border on every synthesized frame so blends are visible
+    // at playback speed. It rides the existing lerp pass and never touches passthroughs.
+    explicit BlendCompositor(const policy::PolicyConfig* cfg, bool tint = false);
     virtual int Id() const override;
 
 protected:
@@ -75,6 +77,7 @@ protected:
 
 private:
     BlendRenderer m_blender;
+    bool m_tint;
 };
 
 // Interpolating composition: the synthesized frame comes from the D3D11 sidecar
