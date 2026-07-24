@@ -42,6 +42,7 @@ private:
     LONGLONG m_assumedSrcPeriodQpc; // declared/default source period the lag was sized for
     policy::PolicyConfig m_policyCfg;    // stickiness band, comb spacing (0 = lock off), pull slew, passthrough gate
     policy::PhaseLockState m_lockState;  // comb-lock pull/EMAs/gate (pure policy state)
+    int m_lockStallRun = 0;              // consecutive incomplete-bracket presents (source stall); a run triggers a pull re-seed on resume
     IFrameCompositor* m_compositor; // owned; picked at Setup from m_compositorKind
     int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
     CompositorKind m_compositorKind;
