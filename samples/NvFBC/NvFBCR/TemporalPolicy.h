@@ -60,6 +60,7 @@ struct PhaseLockState {
     int64_t devEmaQpc = 0;
     bool engaged = false;
     bool seeded = false;
+    int stallRun = 0;      // consecutive presents whose bracket carried no phase information
 };
 
 // Fixed at Setup. combQpc == 0 disables the lock entirely (selection then equals the
@@ -72,6 +73,7 @@ struct PolicyConfig {
     int64_t combQpc = 0;
     int64_t phasePullSlewQpc = 0;
     int64_t passthroughQpc = 0;
+    int64_t stallSpanQpc = 0;   // bracket width above which the source reads as stalled; 0 = off
 };
 
 // The signed distance to the nearest point on a p-periodic timeline, in [-p/2, p/2).
@@ -89,6 +91,21 @@ int64_t WrapHalf(int64_t d, int64_t p);
 // stall's own content discontinuity.
 void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeDiff,
                      bool resumedFromStall = false);
+
+// True when a bracket carries no usable phase information: one-sided, or spanning far
+// more than a source period. The wide case is what a frozen source produces, because the
+// capture API keeps re-delivering STALE frames at its grab timeout instead of starving
+// the ring, so the bracket stays complete while its endpoints straddle the freeze.
+bool BracketIsStalled(const BracketInfo& b, const PolicyConfig& cfg);
+
+// Advances the stall run and reports whether THIS present is the resume: the first
+// informative bracket after a stall. The distinction matters because the bracket that
+// first closes after a freeze still SPANS it (before-frame captured before, after-frame
+// after), so its beforeDiff describes the old phase and lands an exact multiple of the
+// comb, i.e. zero error and nothing to correct. Spending the one-shot re-seed there
+// leaves the pull stranded and slewing back at 25 us/present for seconds. Holding it
+// until both endpoints are post-resume frames is what makes the re-seed effective.
+bool UpdateStallRun(PhaseLockState& s, const PolicyConfig& cfg, const BracketInfo& b);
 
 // The per-present selection decision: nearest-to-target among frames NEWER than the
 // last shown (monotonic output), stickiness Schmitt band at the bracket midpoint,
