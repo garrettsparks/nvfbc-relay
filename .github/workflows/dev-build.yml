@@ -32,6 +32,9 @@ jobs:
     - name: Build Solution
       run: msbuild samples/NvFBC/NvFBCR/NvFBCR_2013.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
 
+    - name: Build DdProbe (DXGI Desktop Duplication diagnostic - Phase 0)
+      run: msbuild samples/NvFBC/DdProbe/DdProbe.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+
     - name: Upload build artifact
       uses: actions/upload-artifact@v6
       with:
