@@ -21,6 +21,33 @@ PresentMon does both:
 The relay gives the pixels; ETW gives the honest timeline and the identity. Joined, that is the
 data the relay has never had.
 
+### Correction (2026-07-24, from reading the PresentMon source)
+
+Half of the above is wrong for this hardware, and the correction changes what Phase 0 tests.
+
+- **Honest display timing: AVAILABLE, and upstream.** NVIDIA's flip-metering work was merged
+  into GameTechDev/PresentMon `main` (PR #440, 2025-06-13), so any release from v2.4.0 on has
+  it. The separate `PresentMon-2.3.1-x64-DLSS4.exe` bundled with RTSS is not needed. It adds
+  `PresentData/NvidiaTraceConsumer.*`, consuming the NVIDIA DisplayDriver provider
+  `{AE4F8626-8265-40D1-A70B-11B64240E8E9}`, single event `FlipRequest` (Id 1, level 0x04,
+  keyword 0x1000000000000000; fields `alloc`, `vidPnSourceId`, `ts`, `token`). It surfaces as
+  the `MsFlipDelay` column, and makes `MsBetweenDisplayChange` reflect real metered intervals.
+- **Real-vs-generated label: NOT AVAILABLE for Smooth Motion.** `FrameType` is an enum with no
+  NVIDIA member: `NotSet, Unspecified, Application, Repeated, Intel_XEFG, AMD_AFMF`, printed as
+  `Application` / `Repeated` / `Intel XeSS-FG` / `AMD AFMF`. `--track_frame_type` is documented
+  as requiring instrumentation via the Intel-PresentMon provider, which the NVIDIA driver does
+  not emit. On the 5080 the column will read `Application` for every row.
+- **But the label is recoverable structurally.** `NVTraceConsumer::ApplyFlipDelay` attaches the
+  metering delay to an EXISTING `PresentEvent`; it never manufactures a row. So PresentMon rows
+  are application presents only (~60/s under Smooth Motion), while the NvFBC ring wakes ~120/s.
+  Each present therefore draws ~2 captures, and the one sitting at the measured capture latency
+  is the real frame; the other is generated. The join becomes the labeller, which is exactly
+  what tests the ring's keep-real heuristic. This is what `etwjoin.py` measures.
+- **Epoch gap.** Relay log `arr=`/`dl=` are QPC minus `m_baseQpc` in microseconds - relative to
+  relay start. PresentMon's QPC is absolute. Closed without touching relay code by having
+  PresentMon also capture `NvFBCR.exe`: the relay's own presents are the same events in both
+  files, so aligning those two sequences pins the origin.
+
 ## The join key: QPC (answers "is the ETW stamp ours?")
 
 No - and it does not need to be. `QueryPerformanceCounter` is a SYSTEM-WIDE monotonic clock:
