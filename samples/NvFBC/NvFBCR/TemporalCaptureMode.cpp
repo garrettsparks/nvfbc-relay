@@ -18,7 +18,8 @@ static const int kTelemetryPeriodPresents = 600;
 static const float kDefaultAssumedSrcFps = 60.0f;
 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
-                                         CompositorKind compositor, bool mark, unsigned int markFrames)
+                                         CompositorKind compositor, bool mark, unsigned int markFrames,
+                                         bool tint)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_compositor(NULL)
@@ -27,6 +28,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_lock(lock)
     , m_mark(mark)
     , m_markFrames(markFrames)
+    , m_tint(tint)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_srcRateHint(srcRateHint)
@@ -154,7 +156,7 @@ bool TemporalCaptureMode::Setup() {
             LOG("Interp compositor ACTIVE (o mode): passthrough threshold %lld us; op=/bw=/pt= on the temporal line",
                 m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq());
         } else {
-            m_compositor = new BlendCompositor(&m_policyCfg);
+            m_compositor = new BlendCompositor(&m_policyCfg, m_tint);
             LOG("Blend compositor ACTIVE (b mode): passthrough threshold %lld us; op=/bw= on the temporal line",
                 m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq());
         }

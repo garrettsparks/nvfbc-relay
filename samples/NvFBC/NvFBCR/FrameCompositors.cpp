@@ -206,8 +206,9 @@ void SynthCompositorBase::Compose(const FrameBracket& bracket, IDirect3DSurface9
 // BlendCompositor
 // ---------------------------------------------------------------------------------
 
-BlendCompositor::BlendCompositor(const policy::PolicyConfig* cfg)
+BlendCompositor::BlendCompositor(const policy::PolicyConfig* cfg, bool tint)
     : SynthCompositorBase(cfg)
+    , m_tint(tint)
 {
 }
 
@@ -216,7 +217,7 @@ int BlendCompositor::Id() const {
 }
 
 bool BlendCompositor::SetupResources() {
-    return m_blender.Setup(m_device);
+    return m_blender.Setup(m_device, m_tint);
 }
 
 bool BlendCompositor::RenderSynthesis(const FrameBracket& bracket, double weight,
