@@ -21,6 +21,26 @@ int64_t WrapHalf(int64_t d, int64_t p) {
     return m - p / 2;
 }
 
+// A stall must last this many presents before the resume re-seeds the pull. Above the
+// normal one-dupe drift sweep, so steady-state tracking never triggers it.
+static const int kStallRunPresents = 3;
+
+bool BracketIsStalled(const BracketInfo& b, const PolicyConfig& cfg) {
+    if (!b.hasBefore || !b.hasAfter) return true;
+    if (cfg.stallSpanQpc <= 0) return false;
+    return (b.afterTs - b.beforeTs) > cfg.stallSpanQpc;
+}
+
+bool UpdateStallRun(PhaseLockState& s, const PolicyConfig& cfg, const BracketInfo& b) {
+    if (BracketIsStalled(b, cfg)) {
+        s.stallRun++;
+        return false;
+    }
+    const bool resumed = s.stallRun >= kStallRunPresents;
+    s.stallRun = 0;
+    return resumed;
+}
+
 void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeDiff,
                      bool resumedFromStall) {
     // Closed loop: the pull is already inside the target this error was measured at, so

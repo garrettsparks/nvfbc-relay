@@ -73,6 +73,8 @@ struct SimResult {
     std::vector<int64_t> beforeDiff;  // at the pulled target (when hasBefore)
     std::vector<size_t> wrapAt;       // present indices where the pull wrapped
     int wraps = 0;
+    std::vector<bool> snapped;        // presents the lock treated as a stall resume
+    std::vector<int64_t> span;        // bracket width (afterTs - beforeTs), -1 if one-sided
     // Composite decision alongside (recorded when passthroughQpc > 0).
     std::vector<policy::CompositeOp> ops;
     std::vector<double> weights;
@@ -90,6 +92,18 @@ struct SimParams {
     int64_t passthroughQpc;  // 0 = composite decision off
     int64_t lagOverride;     // 0 = size from srcPeriod as production does; else this lag
     std::vector<int64_t> drops;  // sorted arrival indices to drop (hole injection)
+    // A source stall, as the ring actually sees one: from arrival index stallAtArrival,
+    // stallArrivals arrivals come stallGap apart instead of srcPeriod. This is the shape a
+    // frozen game produces, because NvFBC's grab times out and re-delivers STALE content
+    // rather than starving the ring: the bracket stays COMPLETE and merely grows WIDE.
+    // Note a stall alone is often phase-neutral: 200 ms of frozen 60 fps source is exactly
+    // 12 frame periods, so the comb phase comes back where it left. What actually strands
+    // the pull is the source resuming on a NEW phase, because the game restarts its frame
+    // clock after the hitch. postStallPhase is that jump, applied once at the resume.
+    int64_t stallAtArrival = -1;
+    int64_t stallArrivals = 0;
+    int64_t stallGap = 0;
+    int64_t postStallPhase = 0;
     // Non-empty: arrival gaps cycle this list instead of srcPeriod (display-quantized
     // cadences, e.g. a fixed-refresh 240 Hz panel flipping a 90 fps source 2-3-3);
     // srcPeriod stays the DECLARED rate that sizes lag/threshold/comb.
@@ -102,6 +116,7 @@ static SimResult Simulate(const SimParams& p) {
     cfg.combQpc = p.combQpc;
     cfg.phasePullSlewQpc = kSlewUs;
     cfg.passthroughQpc = p.passthroughQpc;
+    cfg.stallSpanQpc = p.srcPeriod * 2;   // production sizes this from the declared source rate
 
     int64_t lag = p.srcPeriod + p.srcPeriod / 4;
     if (lag < p.presentPeriod) lag = p.presentPeriod;
@@ -112,10 +127,17 @@ static SimResult Simulate(const SimParams& p) {
     // with and without hole injection.
     std::vector<int64_t> arrivals;
     const int64_t horizon = (p.presents + 4) * p.presentPeriod;
+    int64_t stallShift = 0;   // accumulated delay the stall pushes onto later arrivals
     for (int64_t t = p.phaseOffset, i = 0; t < horizon; i++) {
         arrivals.push_back(t + JitterUs(p.arrivalJitter));
+        const bool inStall = p.stallAtArrival >= 0 && i >= p.stallAtArrival &&
+                             i < p.stallAtArrival + p.stallArrivals;
+        if (inStall) stallShift += p.stallGap - p.srcPeriod;
+        if (p.stallAtArrival >= 0 && i == p.stallAtArrival + p.stallArrivals - 1) {
+            stallShift += p.postStallPhase;
+        }
         if (p.periodPattern.empty()) {
-            t = p.phaseOffset + (i + 1) * p.srcPeriod;
+            t = p.phaseOffset + (i + 1) * p.srcPeriod + stallShift;
         } else {
             t += p.periodPattern[(size_t)(i % (int64_t)p.periodPattern.size())];
         }
@@ -170,15 +192,24 @@ static SimResult Simulate(const SimParams& p) {
             b.afterDiff = b.afterTs - target;
         }
 
-        if (cfg.combQpc > 0 && b.hasBefore && b.hasAfter) {
-            policy::UpdatePhaseLock(lock, cfg, b.beforeDiff);
-            if (lock.pullQpc - prevPull > cfg.combQpc / 2 ||
-                prevPull - lock.pullQpc > cfg.combQpc / 2) {
-                r.wraps++;
-                r.wrapAt.push_back((size_t)(k - 1));
+        // Mirrors Run()'s lock wiring, INCLUDING the stall-run counter that arms the
+        // re-seed: the trigger is part of the behavior under test, so the simulator has
+        // to drive it the same way production does rather than assume the flag.
+        bool resumedFromStall = false;
+        if (cfg.combQpc > 0) {
+            resumedFromStall = policy::UpdateStallRun(lock, cfg, b);
+            if (!policy::BracketIsStalled(b, cfg)) {
+                policy::UpdatePhaseLock(lock, cfg, b.beforeDiff, resumedFromStall);
+                if (lock.pullQpc - prevPull > cfg.combQpc / 2 ||
+                    prevPull - lock.pullQpc > cfg.combQpc / 2) {
+                    r.wraps++;
+                    r.wrapAt.push_back((size_t)(k - 1));
+                }
+                prevPull = lock.pullQpc;
             }
-            prevPull = lock.pullQpc;
         }
+        r.snapped.push_back(resumedFromStall);
+        r.span.push_back((b.hasBefore && b.hasAfter) ? (b.afterTs - b.beforeTs) : -1);
 
         r.picks.push_back(policy::SelectFrame(b, sel, cfg));
         r.shownTs.push_back(sel.lastShownTs);
@@ -446,6 +477,69 @@ static void test_lock_reseed_recovery() {
     CHECK(snapPresents <= 3, "re-seed recovered in %d presents (expected <= 3)", snapPresents);
     CHECK((int64_t)snapPresents * 20 < slewPresents,
           "re-seed (%d) not >=20x faster than slew (%d)", snapPresents, slewPresents);
+}
+
+// A real source stall, as the ring sees it. A frozen game does NOT starve the ring:
+// NvFBC's grab times out and returns the SAME frame, so arrivals keep landing at the
+// timeout period and the bracket stays COMPLETE, just wide. The re-seed trigger counts
+// consecutive INCOMPLETE brackets, so it never arms here and the pull crawls back at
+// the steady-state slew, blending the whole way. Measured in the field at ~8% of
+// stalls, up to 175 presents (~2.9 s) of continuous synth.
+static void test_lock_reseed_wide_bracket_stall() {
+    SimParams p;
+    p.srcPeriod = 16667;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 0;
+    p.combQpc = 16667;
+    p.presents = 700;
+    p.phaseOffset = 0;
+    p.passthroughQpc = 4166;
+    p.lagOverride = 0;
+    p.stallAtArrival = 300;      // let the lock settle first
+    p.stallArrivals = 2;         // 2 timeout re-grabs = ~200 ms frozen
+    p.stallGap = 100000;         // NvFBC's grab timeout
+    p.postStallPhase = 8333;     // the game resumes half a comb away
+    const SimResult r = Simulate(p);
+
+    // The stall region is everything abnormal: a wide bracket or a one-sided one.
+    size_t stallEnd = 0;
+    int wide = 0, oneSided = 0;
+    for (size_t i = 0; i < r.span.size(); i++) {
+        const bool abnormal = r.span[i] < 0 || r.span[i] > p.srcPeriod * 2;
+        if (abnormal) { stallEnd = i; }
+        if (r.span[i] > p.srcPeriod * 2) wide++;
+        if (r.span[i] < 0) oneSided++;
+    }
+    CHECK(wide > 0, "no wide bracket produced: the stall was not simulated");
+
+    int snaps = 0, snapApplied = 0;
+    for (size_t i = 0; i < r.snapped.size(); i++) {
+        if (!r.snapped[i]) continue;
+        snaps++;
+        // A snap that actually moved the pull shows up as a step past the slew clamp.
+        if (i > 0 && (r.pull[i] > r.pull[i-1] ? r.pull[i]-r.pull[i-1] : r.pull[i-1]-r.pull[i]) > kSlewUs) snapApplied++;
+    }
+    int synthAfter = 0;
+    for (size_t i = stallEnd + 1; i < r.ops.size() && i <= stallEnd + 200; i++) {
+        if (r.ops[i] == policy::CompositeOp::Synthesize) synthAfter++;
+    }
+    std::printf("  wide-bracket stall: %d wide, %d one-sided, re-seed armed %d / applied %d, "
+                "%d synth in the 200 presents after\n",
+                wide, oneSided, snaps, snapApplied, synthAfter);
+    for (size_t i = 0; i < r.snapped.size(); i++) {
+        if (!r.snapped[i]) continue;
+        std::printf("    armed at present %zu: span=%" PRId64 " beforeDiff=%" PRId64
+                    " pull %" PRId64 " -> %" PRId64 " engaged=%d\n",
+                    i, r.span[i], r.beforeDiff[i], i ? r.pull[i - 1] : 0, r.pull[i],
+                    (int)r.engaged[i]);
+    }
+
+    // Arming the re-seed is not enough: the snap is gated on the lock being engaged at
+    // that instant, and devEma only decays 15/16 per present after a stall drives it up.
+    CHECK(snaps > 0, "lock never detected the stall resume (no re-seed armed)");
+    CHECK(snapApplied > 0, "re-seed armed but the pull never moved past the slew clamp");
+    CHECK(synthAfter <= 10,
+          "slow recovery: %d synth presents after the stall (expected <= 10)", synthAfter);
 }
 
 // ---------------------------------------------------------------------------------
@@ -1158,6 +1252,10 @@ int main(int argc, char** argv) {
     test_ring_underrun_graceful();
     test_composite_lock_acquisition();
     test_composite_quantized_arrivals();
+
+    // Appended LAST: this suite draws from the shared LCG stream, so placing it anywhere
+    // earlier shifts the stream position of every census pin below it.
+    test_lock_reseed_wide_bracket_stall();
 
     if (g_failures) {
         std::printf("POLICY TESTS FAILED: %d failure(s)\n", g_failures);

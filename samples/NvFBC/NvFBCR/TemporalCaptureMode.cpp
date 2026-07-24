@@ -13,11 +13,6 @@ extern int BUF_HEIGHT;
 // the log quiet, frequent enough that a wrong -src is caught within the first minute.
 static const int kTelemetryPeriodPresents = 600;
 
-// A source stall of at least this many consecutive incomplete-bracket presents (~50 ms at 60
-// fps) re-seeds the comb-lock pull on resume instead of slewing it back. Above the normal
-// one-dupe drift sweep, so steady-state tracking never triggers it.
-static const int kReseedStallPresents = 3;
-
 // Source rate assumed when -src is not given: the slowest source served without
 // configuration, at any present rate. Slower sources need an explicit -src.
 static const float kDefaultAssumedSrcFps = 60.0f;
@@ -118,6 +113,10 @@ bool TemporalCaptureMode::Setup() {
     // (<= one comb spacing peak-to-peak, drift-rate ramp, one discrete step per beat),
     // accepted as a documented trade alongside the static lag (spec clause 4).
     m_policyCfg.phasePullSlewQpc = m_scheduler.Freq() / 40000;   // 25 us per present
+    // Twice the declared source period: wide enough that ordinary jitter and a single
+    // dropped frame stay under it, narrow enough that a frozen source (whose grab-timeout
+    // re-grabs land ~100 ms apart) reads as stalled on the first present.
+    m_policyCfg.stallSpanQpc = m_assumedSrcPeriodQpc * 2;
     if (m_lock && m_srcRateHint > 0.0f) {
         int combM = 1;
         bool combMatched = false;
@@ -226,12 +225,11 @@ void TemporalCaptureMode::Run(
         // incomplete (startup, stalls): the pull freezes rather than integrating on a
         // one-sided error, and the frozen value stays bounded by construction.
         if (m_policyCfg.combQpc > 0) {
-            if (bracket.info.hasBefore && bracket.info.hasAfter) {
-                const bool resumedFromStall = (m_lockStallRun >= kReseedStallPresents);
-                m_lockStallRun = 0;
-                policy::UpdatePhaseLock(m_lockState, m_policyCfg, bracket.info.beforeDiff, resumedFromStall);
-            } else {
-                m_lockStallRun++;  // incomplete bracket = source stall; the pull stays frozen
+            const bool resumedFromStall =
+                policy::UpdateStallRun(m_lockState, m_policyCfg, bracket.info);
+            if (!policy::BracketIsStalled(bracket.info, m_policyCfg)) {
+                policy::UpdatePhaseLock(m_lockState, m_policyCfg, bracket.info.beforeDiff,
+                                        resumedFromStall);
             }
         }
 
