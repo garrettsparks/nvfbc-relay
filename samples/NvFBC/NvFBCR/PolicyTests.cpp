@@ -50,8 +50,14 @@ static const int64_t kSlewUs = 25;
 // production ring-underrun class).
 static const int kRingSlots = 8;
 
-// Deterministic LCG so every run exercises identical timelines.
-static uint64_t g_rng = 0x2545F4914F6CDD1Dull;
+// Deterministic LCG so every run exercises identical timelines. Every suite RESEEDS it
+// (SeedRng, called from Simulate and from the suites that draw directly), so suites are
+// independent of each other and of their order in main(). Without that the stream position
+// leaks between suites and the census pins below become constants of the CALL ORDER as much
+// as of the policy: appending a suite silently shifts every pin after it.
+static const uint64_t kRngSeed = 0x2545F4914F6CDD1Dull;
+static uint64_t g_rng = kRngSeed;
+static void SeedRng() { g_rng = kRngSeed; }
 static int64_t JitterUs(int64_t amplitude) {
     g_rng = g_rng * 6364136223846793005ull + 1442695040888963407ull;
     if (amplitude == 0) return 0;
@@ -111,6 +117,7 @@ struct SimParams {
 };
 
 static SimResult Simulate(const SimParams& p) {
+    SeedRng();   // each simulation owns its jitter stream; see kRngSeed
     PolicyConfig cfg;
     cfg.stickinessQpc = kStickinessUs;
     cfg.combQpc = p.combQpc;
@@ -294,6 +301,7 @@ static Pick SelectFrameV15Ref(const BracketInfo& b, SelectionState& s, int64_t b
 static void test_lock_off_matches_v15() {
     // Differential over jittered mismatched-rate brackets: every pick and every state
     // field identical to the v15 reference when combQpc == 0.
+    SeedRng();   // draws jitter directly rather than through Simulate
     PolicyConfig cfg;
     cfg.stickinessQpc = kStickinessUs;
     SelectionState a, b;
@@ -543,12 +551,9 @@ static void test_lock_reseed_wide_bracket_stall() {
 }
 
 // ---------------------------------------------------------------------------------
-// Composite (blend-mode) suites. All run AFTER the selection suites: the shared LCG
-// stream means the selection suites' timelines stay byte-identical only if nothing
-// before them draws jitter. NEW SUITES APPEND AT THE END of the composite list for
-// the same reason: the exact census pins below are constants of the policy AND of
-// the stream position, so inserting a jitter-drawing suite mid-list shifts every
-// pinned number after it.
+// Composite (blend-mode) suites. Order no longer matters: every simulation reseeds the
+// LCG (see kRngSeed), so a suite's timeline depends only on its own parameters and the
+// census pins below are constants of the POLICY alone. New suites may go anywhere.
 //
 // The threshold convention mirrors the production Setup rule
 // T = max(assumed srcP, presentP) / 4. The presentP floor covers the oversampling
@@ -817,7 +822,7 @@ static void test_composite_unlocked_sweep() {
           "unlocked pass fraction %d/%d outside the geometric ~50%%", pass, total);
     CHECK(blend >= total * 35 / 100, "unlocked blend fraction %d/%d (< 35%%)", blend, total);
     CHECK(transitions <= total / 10, "%d pass/blend transitions (> 10%%)", transitions);
-    PinCensus(r, warmup, 6037, 5863, 0, 8, "unlocked_sweep");
+    PinCensus(r, warmup, 6020, 5880, 0, 8, "unlocked_sweep");
 }
 
 // Parked phase at the gate: an unlocked source whose clock is coherent with the
@@ -874,10 +879,10 @@ static void test_composite_v16_differential() {
     p.arrivalJitter = 300;
     p.combQpc = 16672;
     p.presents = 12000;
-    const uint64_t seed = g_rng;
+    // Both runs get the same jitter stream because Simulate reseeds; the differential is
+    // then purely the composite config.
     p.passthroughQpc = 0;
     SimResult off = Simulate(p);
-    g_rng = seed;
     p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
     SimResult on = Simulate(p);
     CHECK(off.picks.size() == on.picks.size(), "differential run sizes diverged");
@@ -978,7 +983,7 @@ static void test_composite_lock_acquisition() {
     }
     CHECK(tailPass == 1000, "steady state after acquisition: %d/1000 pass", tailPass);
     CHECK(r.engaged.back(), "lock not engaged at the end of the acquisition run");
-    PinCensus(r, warmup, 5923, 67, 0, 1, "lock_acquisition");
+    PinCensus(r, warmup, 5928, 62, 0, 1, "lock_acquisition");
 }
 
 // Display-quantized arrivals: a 90 fps source on a FIXED-REFRESH 240 Hz panel flips
@@ -1253,8 +1258,6 @@ int main(int argc, char** argv) {
     test_composite_lock_acquisition();
     test_composite_quantized_arrivals();
 
-    // Appended LAST: this suite draws from the shared LCG stream, so placing it anywhere
-    // earlier shifts the stream position of every census pin below it.
     test_lock_reseed_wide_bracket_stall();
 
     if (g_failures) {
