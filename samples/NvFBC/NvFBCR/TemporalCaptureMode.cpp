@@ -13,6 +13,11 @@ extern int BUF_HEIGHT;
 // the log quiet, frequent enough that a wrong -src is caught within the first minute.
 static const int kTelemetryPeriodPresents = 600;
 
+// A source stall of at least this many consecutive incomplete-bracket presents (~50 ms at 60
+// fps) re-seeds the comb-lock pull on resume instead of slewing it back. Above the normal
+// one-dupe drift sweep, so steady-state tracking never triggers it.
+static const int kReseedStallPresents = 3;
+
 // Source rate assumed when -src is not given: the slowest source served without
 // configuration, at any present rate. Slower sources need an explicit -src.
 static const float kDefaultAssumedSrcFps = 60.0f;
@@ -220,8 +225,14 @@ void TemporalCaptureMode::Run(
         // Update the comb-lock pull for the next present. Skipped when the bracket is
         // incomplete (startup, stalls): the pull freezes rather than integrating on a
         // one-sided error, and the frozen value stays bounded by construction.
-        if (m_policyCfg.combQpc > 0 && bracket.info.hasBefore && bracket.info.hasAfter) {
-            policy::UpdatePhaseLock(m_lockState, m_policyCfg, bracket.info.beforeDiff);
+        if (m_policyCfg.combQpc > 0) {
+            if (bracket.info.hasBefore && bracket.info.hasAfter) {
+                const bool resumedFromStall = (m_lockStallRun >= kReseedStallPresents);
+                m_lockStallRun = 0;
+                policy::UpdatePhaseLock(m_lockState, m_policyCfg, bracket.info.beforeDiff, resumedFromStall);
+            } else {
+                m_lockStallRun++;  // incomplete bracket = source stall; the pull stays frozen
+            }
         }
 
         // The DECISION is pure policy (selection or composite, in TemporalPolicy.cpp

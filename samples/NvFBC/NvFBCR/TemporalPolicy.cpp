@@ -21,13 +21,17 @@ int64_t WrapHalf(int64_t d, int64_t p) {
     return m - p / 2;
 }
 
-void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeDiff) {
+void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeDiff,
+                     bool resumedFromStall) {
     // Closed loop: the pull is already inside the target this error was measured at, so
     // want = pull + errEma converges instead of integrating. Error and EMAs live on the
     // circular comb domain; a linear controller here saturates against clock skew and
     // drains through a disengaged sweep every beat (measured - see the comb-lock spec).
     const int64_t err = WrapHalf(beforeDiff, cfg.combQpc);
-    if (!s.seeded) {
+    // Re-seed on stall-resume treats the resumed phase like a fresh acquisition: the fresh
+    // err (not the /16-lagged EMA) both drives dev to zero (so the lock stays engaged
+    // through the resume instead of flapping) and lets want reflect the true new phase.
+    if (!s.seeded || resumedFromStall) {
         s.errEmaQpc = err;
         s.seeded = true;
     } else {
@@ -48,8 +52,13 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     s.engaged = s.devEmaQpc < cfg.combQpc / 8;
     const int64_t want = s.engaged ? s.pullQpc + s.errEmaQpc : 0;
     int64_t delta = want - s.pullQpc;
-    if (delta > cfg.phasePullSlewQpc) delta = cfg.phasePullSlewQpc;
-    else if (delta < -cfg.phasePullSlewQpc) delta = -cfg.phasePullSlewQpc;
+    // Snap the full correction on an engaged stall-resume; otherwise slew-limit it so
+    // steady-state tracking stays gentle (no abrupt phase jumps). A disengaged resume
+    // has want == 0 and just decays the pull, so it needs no snap.
+    if (!(resumedFromStall && s.engaged)) {
+        if (delta > cfg.phasePullSlewQpc) delta = cfg.phasePullSlewQpc;
+        else if (delta < -cfg.phasePullSlewQpc) delta = -cfg.phasePullSlewQpc;
+    }
     s.pullQpc += delta;
 
     // Wrap hysteresis: the pull may overshoot the [0, comb) domain by a band before

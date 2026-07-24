@@ -401,6 +401,53 @@ static void test_no_excursion_while_locked() {
     CHECK(excursions == 0, "%d gate excursions while lock engaged", excursions);
 }
 
+// Re-seed vs slew after a source stall. A stall freezes the pull; if the phase parked mid-gap
+// on resume, the steady-state slew crawls the pull back over ~a hundred presents (the "couple
+// seconds of blend" seen after a map open/close), while the stall-resume re-seed snaps it in
+// one. This reproduces the slow recovery with the flag off, then confirms the fix with it on -
+// no game-specific tuning: any coherent source (source period == present period, so the phase
+// parks) whose big drop leaves the phase mid-gap. Oversampled sources recover instantly either
+// way, so this is the regime where the recovery cost actually shows.
+static void test_lock_reseed_recovery() {
+    PolicyConfig cfg;
+    cfg.stickinessQpc = kStickinessUs;
+    cfg.combQpc = 16667;              // 60 fps source, M=1
+    cfg.phasePullSlewQpc = kSlewUs;   // 25 us/present
+    cfg.passthroughQpc = 4166;
+    const int64_t comb = cfg.combQpc;
+    // The present target parks a half-comb past the nearest source frame (deepest blend); the
+    // resulting beforeDiff is a pure function of the pull the lock still has to work off.
+    const int64_t parkedPhase = comb / 2;
+    auto beforeDiffAt = [&](int64_t pull) -> int64_t {
+        return ((parkedPhase - pull) % comb + comb) % comb;
+    };
+    auto passing = [&](int64_t pull) -> bool {
+        const int64_t bd = beforeDiffAt(pull);
+        const int64_t d = bd < comb - bd ? bd : comb - bd;   // distance to the nearest frame
+        return d < cfg.passthroughQpc;                       // a real frame back on target
+    };
+    auto settledLock = []() {
+        PhaseLockState s;
+        s.seeded = true; s.engaged = true; s.devEmaQpc = 0; s.errEmaQpc = 0; s.pullQpc = 0;
+        return s;
+    };
+
+    int slewPresents = 0;
+    for (PhaseLockState s = settledLock(); !passing(s.pullQpc) && slewPresents < 10000; slewPresents++)
+        policy::UpdatePhaseLock(s, cfg, beforeDiffAt(s.pullQpc), /*resumedFromStall=*/false);
+
+    int snapPresents = 0;
+    for (PhaseLockState s = settledLock(); !passing(s.pullQpc) && snapPresents < 10000; snapPresents++)
+        policy::UpdatePhaseLock(s, cfg, beforeDiffAt(s.pullQpc), /*resumedFromStall=*/snapPresents == 0);
+
+    std::printf("  reseed recovery: slew=%d presents (~%.2fs of blend) vs snap=%d present\n",
+                slewPresents, slewPresents * 16667.0 / 1e6, snapPresents);
+    CHECK(slewPresents > 100, "un-fixed slew recovered in %d presents (expected the slow >100)", slewPresents);
+    CHECK(snapPresents <= 3, "re-seed recovered in %d presents (expected <= 3)", snapPresents);
+    CHECK((int64_t)snapPresents * 20 < slewPresents,
+          "re-seed (%d) not >=20x faster than slew (%d)", snapPresents, slewPresents);
+}
+
 // ---------------------------------------------------------------------------------
 // Composite (blend-mode) suites. All run AFTER the selection suites: the shared LCG
 // stream means the selection suites' timelines stay byte-identical only if nothing
@@ -1096,6 +1143,7 @@ int main(int argc, char** argv) {
     test_hysteresis_no_flip_flop();
     test_advance_gate_no_excursion();
     test_no_excursion_while_locked();
+    test_lock_reseed_recovery();
 
     test_composite_passthrough_at_lock();
     test_composite_gate_placement();
@@ -1115,6 +1163,6 @@ int main(int argc, char** argv) {
         std::printf("POLICY TESTS FAILED: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("POLICY TESTS PASSED (6 selection + 13 composite suites)\n");
+    std::printf("POLICY TESTS PASSED (7 selection + 13 composite suites)\n");
     return 0;
 }

@@ -82,7 +82,13 @@ int64_t WrapHalf(int64_t d, int64_t p);
 // NEXT present. EMA filter, stability gate, symmetric bounded slew, wrap modulo the
 // comb behind a hysteresis band. Call only with a complete bracket (both sides): the
 // pull freezes across gaps rather than integrating a one-sided error.
-void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeDiff);
+// resumedFromStall: this present is the first complete bracket after a multi-present source
+// stall (map open/close, alt-tab). The frozen pull is now far from the resumed phase, so
+// snap the correction in one present (re-seed the error EMA, apply the full delta unclamped)
+// instead of crawling back at the steady-state slew. Perceptually free: the snap lands on the
+// stall's own content discontinuity.
+void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeDiff,
+                     bool resumedFromStall = false);
 
 // The per-present selection decision: nearest-to-target among frames NEWER than the
 // last shown (monotonic output), stickiness Schmitt band at the bracket midpoint,
