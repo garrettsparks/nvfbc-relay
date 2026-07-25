@@ -1,124 +1,168 @@
-# ETW Frame-Timing Correlation Spec (honest present time + real/gen labels)
+# ETW Frame-Timing Spec (reading the driver's real scanout times)
 
-Status: DESIGN / EXPLORATION (nothing committed). The capture APIs (NvFBC, DXGI Desktop
-Duplication) fundamentally cannot give the relay two things it wants: the TRUE per-frame display
-(scanout) time, and whether a frame is REAL or driver-GENERATED. Both are emitted by the graphics
-driver/OS as ETW events, which PresentMon consumes. This spec is how the relay could tap that -
-correlated to its own captures - and, critically, a cheap offline Phase 0 that proves the join
-before any real-time plumbing is built. Companion: `dxgi-native-pipeline-spec.md`,
-`nvfbc-capture-pacing.md`, `frame-marker-spec.md`.
+Status: DESIGN. Probe built and CI-green; no measurements taken yet, no relay code consuming it.
+Companions: `dxgi-native-pipeline-spec.md`, `nvfbc-capture-pacing.md`, `frame-marker-spec.md`.
 
-## Why (from the framegen finding, 2026-07-23)
+## The problem
 
-Under Smooth Motion the relay captures the real+gen pair batched (~250us apart on DXGI's
-LastPresentTime, ~2-3ms on NvFBC's grab-wake `arr=`), while the driver schedules the two SCANOUTS
-~8.33ms apart. Neither capture API exposes that scanout spacing, and neither labels gen vs real.
-PresentMon does both:
-- `msBetweenDisplayChange` = the actual scanout cadence (vs `msBetweenPresents` = submission).
-  NVIDIA's DLSS4 PresentMon build adds "flip metering" for it.
-- "Frame Type Differentiation" = a real-vs-AI-generated label per frame.
+The relay stamps every captured frame with the time NvFBC woke up. That is submission time, and
+under frame generation it is wrong in a way that matters. Measured on this hardware:
 
-The relay gives the pixels; ETW gives the honest timeline and the identity. Joined, that is the
-data the relay has never had.
+| | measured |
+|---|---|
+| gap between real and generated frame ARRIVING at NvFBC | 0.35 - 0.50 ms |
+| gap between those frames APPEARING on screen | 8.33 ms |
 
-### Correction (2026-07-24, from reading the PresentMon source)
+The driver submits the pair together and scans them out half a source period apart. So the ring
+believes two frames representing motion 8.33 ms apart are 0.4 ms apart. Neither NvFBC nor DXGI
+exposes the scanout time, and neither labels a frame real or generated.
 
-Half of the above is wrong for this hardware, and the correction changes what Phase 0 tests.
+Today the relay sidesteps this: batch-collapse keep-real discards the generated frame and stamps
+the survivor at batch-start. Correct at 60 -> 60, where only real frames are needed.
 
-- **Honest display timing: AVAILABLE, and upstream.** NVIDIA's flip-metering work was merged
-  into GameTechDev/PresentMon `main` (PR #440, 2025-06-13), so any release from v2.4.0 on has
-  it. The separate `PresentMon-2.3.1-x64-DLSS4.exe` bundled with RTSS is not needed. It adds
-  `PresentData/NvidiaTraceConsumer.*`, consuming the NVIDIA DisplayDriver provider
-  `{AE4F8626-8265-40D1-A70B-11B64240E8E9}`, single event `FlipRequest` (Id 1, level 0x04,
-  keyword 0x1000000000000000; fields `alloc`, `vidPnSourceId`, `ts`, `token`). It surfaces as
-  the `MsFlipDelay` column, and makes `MsBetweenDisplayChange` reflect real metered intervals.
-- **Real-vs-generated label: NOT AVAILABLE for Smooth Motion.** `FrameType` is an enum with no
-  NVIDIA member: `NotSet, Unspecified, Application, Repeated, Intel_XEFG, AMD_AFMF`, printed as
-  `Application` / `Repeated` / `Intel XeSS-FG` / `AMD AFMF`. `--track_frame_type` is documented
-  as requiring instrumentation via the Intel-PresentMon provider, which the NVIDIA driver does
-  not emit. On the 5080 the column will read `Application` for every row.
-- **But the label is recoverable structurally.** `NVTraceConsumer::ApplyFlipDelay` attaches the
-  metering delay to an EXISTING `PresentEvent`; it never manufactures a row. So PresentMon rows
-  are application presents only (~60/s under Smooth Motion), while the NvFBC ring wakes ~120/s.
-  Each present therefore draws ~2 captures, and the one sitting at the measured capture latency
-  is the real frame; the other is generated. The join becomes the labeller, which is exactly
-  what tests the ring's keep-real heuristic. This is what `etwjoin.py` measures.
-- **Epoch gap.** Relay log `arr=`/`dl=` are QPC minus `m_baseQpc` in microseconds - relative to
-  relay start. PresentMon's QPC is absolute. Closed without touching relay code by having
-  PresentMon also capture `NvFBCR.exe`: the relay's own presents are the same events in both
-  files, so aligning those two sequences pins the origin.
+## Why it is worth fixing
 
-## The join key: QPC (answers "is the ETW stamp ours?")
+At 90 fps source -> 60 output, 90 does not divide into 60, so roughly half the output frames are
+synthesized by the relay (a lerp of two real frames). But Smooth Motion has already produced 180
+frames per second, and 180 / 60 = 3 exactly. Every output frame could land on a real captured
+frame with no blending at all, IF the generated frames are stamped at the times they actually
+appeared.
 
-No - and it does not need to be. `QueryPerformanceCounter` is a SYSTEM-WIDE monotonic clock:
-every process reads the same timebase, and ETW event timestamps are QPC-based. So the relay's
-own `arr=` (QPC at NvFBC grab-return) and an ETW present event's QPC are on the SAME clock,
-directly comparable - they just mark DIFFERENT events (grab-wake vs true present), separated by a
-small, roughly-constant capture latency. That is exactly what makes a nearest-QPC join work:
-match each captured frame to the ETW present event whose QPC is nearest its `arr=`; the offset is
-the capture latency, which the join measures rather than assumes.
+The comparison is not gen-vs-real (Round 10 settled that: real wins). It is the relay's linear
+cross-fade versus the driver's motion interpolation, for the ~50% of output frames that cannot be
+a real frame. The driver already paid for those frames; re-synthesizing worse ones is waste.
 
-Caveat the relay must respect: ETW delivery LAGS the event by ms to tens of ms (buffered). Fine
-for offline correlation; for a LIVE relay it fights the need to decide the present NOW (see
-Architecture).
+## Decisions
 
-## Phase 0: offline correlation (build/validate this FIRST)
+**Raw ETW, not PresentMon.** The NVIDIA timing data is a single event with four fields, so the
+"large fragile surface" argument does not apply. More decisively, PresentMon COLLAPSES exactly the
+data we need: `NVTraceConsumer` dedupes by token, keeps only the latest flip time per head, and
+folds the result into one `MsFlipDelay` column on the application's present row. The individual
+generated-frame flip times never reach its CSV. Reading the provider directly is the only way to
+see them.
 
-Prove the join and the data before any real-time consumer. No relay code.
-1. Capture a Smooth-Motion-ON session with BOTH running: the marked relay (`-mark N`, so the video
-   and log are frame-exact) AND PresentMon (Intel's, or NVIDIA's DLSS4 build) writing its per-frame
-   CSV of the SAME source game.
-2. Offline join: for each relay temporal-line (its `arr=`/capture QPC) find the nearest PresentMon
-   present row by QPC. Emit a table: relay op/bw + PresentMon present-time, display-time
-   (`msBetweenDisplayChange`), and frame-type (real/gen).
-3. Metrics / go-no-go:
-   - Join quality: is the nearest-QPC match unambiguous (a clean, roughly-constant offset, one
-     PresentMon row per capture)? A bimodal or drifting offset means the join is unreliable.
-   - Does the frame-type label line up with the batch-collapse belief (the ring's presumed-gen vs
-     real)? This validates OR corrects the "take the second frame" heuristic against ground truth.
-   - Do the display-times reveal the even 8.33ms spacing the capture timeline hid?
-4. This is a script in frame-drop-analysis (like the blend-fingerprint matcher), not relay code.
-   Cheap, and it either proves the holy grail is real or kills it.
+**ETW is retained and drives alignment continuously.** Not a one-time calibration that bakes
+constants into a hardcoded pattern. A model that assumes "2x, inserted at the midpoint" fails
+SILENTLY on x3, on MFG, and on any driver change: it produces confident wrong stamps. Reading
+actual scanout times derives the cadence instead of assuming it, including for patterns nobody has
+characterized yet.
 
-## Architecture (if Phase 0 passes)
+**Enrichment, not dependency.** The existing stamping rule (arrival time, batch-start for
+intra-batch members, keep-real) stays as the baseline and never goes away. ETW UPGRADES a slot's
+timestamp from estimated to measured when the data arrives in time. Nothing branches on "is ETW
+available"; the timestamp is either better or it is not. Dropping the lag floor back to 20 ms must
+leave the relay working as it does today.
+
+## Architecture
 
 ```
- NvFBC capture ─► ring (pixels + arr= QPC)
- PresentMon/ETW ─► present-event stream (QPC present + display time + real/gen)
-                     │  nearest-QPC join
-                     ▼
-         each ring frame tagged with true display time + real/gen  ─► policy
+ NvFBC capture ─► ring (pixels + arrival-stamped timestamp)   <- works standalone, as today
+ NVIDIA DisplayDriver ETW ─► flip history (capture_seq -> true scanout time)
+                               │  upgrade slots not yet bracketed
+                               ▼
+                     policy sees a measured timeline when available,
+                     the estimated one when not
 ```
 
-- Consumer: prefer the PresentMon SERVICE + its streaming API (Intel PresentMon SDK) over
-  hand-rolling an ETW session - PresentMon already parses the DxgKrnl/Dwm providers, tracks the
-  present token through the flip, and does frame-type differentiation. Re-deriving that from raw
-  ETW is a large, fragile surface.
-- The LIVE latency problem: ETW/PresentMon events arrive AFTER the present. A relay presenting on a
-  60Hz deadline cannot wait tens of ms for the label. Options to evaluate: (a) run the relay one
-  present BEHIND so the ETW label for present N is available when N is composited (adds a frame of
-  latency - acceptable? measure); (b) use ETW only to VALIDATE/retune the heuristic offline and
-  keep the real-time path heuristic; (c) predict the label from the timeline and correct when the
-  ETW event lands. Phase 0 informs which.
+**The coherence rule: only upgrade slots that have not been bracketed yet.** If a slot's timestamp
+changed after the policy bracketed against it, a frame could move from "before" to "after" under
+the policy's feet. Comparing the slot's sequence number against the newest sequence the policy has
+consumed closes that.
 
-## EtwProbe (this branch's relay-side probe, parallel to DdProbe)
+That one rule is also the entire degradation path. At a 90 ms floor an upgrade landing ~30 ms
+after capture arrives long before the target (90 ms back) reaches the slot, so nearly everything
+upgrades. At 20 ms the upgrade almost always arrives after the slot was used and is declined. No
+separate fallback code exists; the ordering rule produces both behaviours.
 
-A standalone probe that opens a real-time ETW session for the present/flip providers and logs each
-event's QPC + present metadata, so we can see the live event stream and its latency directly
-(complements the offline PresentMon-CSV join). First cut; the exact provider GUIDs, event IDs, and
-property decoding need on-hardware verification (ETW schemas are not stable to guess blind). If the
-raw-ETW surface proves too fragile, fall back to consuming the PresentMon service API instead - the
-probe is a means to measure feasibility, not the final architecture.
+For generated frames specifically: with ETW they get a measured stamp and are kept; without, no
+stamp arrives in time and keep-real retracts them as today. 120 usable frames/s with, 60 without.
 
-## Open questions / risks
+**Sizing.** ETW history is metadata, so size it by TIME, not by ring slots:
 
-- Raw ETW vs PresentMon SDK: raw ETW is a big fragile surface; the PresentMon service/SDK is the
-  pragmatic path. Decide in Phase 0.
-- Live latency budget: can the relay afford one frame of lag to get the label, or must it stay
-  predictive? Measure the actual ETW delivery lag first.
-- Frame-type coverage: does differentiation cover Smooth Motion specifically (vs only DLSS-FG)?
-  Verify on the RTX 5080 + Smooth Motion.
-- Admin/session: ETW real-time sessions and PresentMon typically need elevation; the relay would
-  inherit that requirement.
-- This whole direction is only worth it if the relay ever wants to USE gen frames or needs precise
-  gen/real timing; keep-real + the relay's own interpolation may remain the simpler answer.
+```
+{capture_seq u64, display_qpc u64, token u32, head u32} = 24 bytes
+5 seconds at 180 events/s = ~900 records = ~22 KB
+```
+
+Keyed by the monotonic capture counter, never by slot index, so recycling cannot corrupt it.
+
+The ring itself must grow only if the lag floor is raised, because the frames have to survive
+until the target reaches them:
+
+| capture rate | frames alive for a 90 ms floor + ~2 source periods | RING_SIZE |
+|---|---|---|
+| 120/s (60x2) | ~123 ms | >= 16 |
+| 180/s (90x2) | ~123 ms | >= 22, use 32 |
+
+32 slots is ~253 MiB at 1920x1080x4B. Negligible on this card.
+
+**The lag floor is a runtime knob, not a design commitment.** Because degradation is graceful, the
+relay can ship at today's 20833 us and raise the floor per-profile. Relay output latency does not
+touch the player's input loop (gameplay happens on the source display; the relay feeds the XR1 ->
+OBS PC -> Twitch), so 90-120 ms costs stream viewers a rounding error on top of seconds they
+already have. The lag must stay CONSTANT for audio-sync compensation, which the existing
+launch-time-constant design already guarantees.
+
+## The provider
+
+```
+NVIDIA DisplayDriver {AE4F8626-8265-40D1-A70B-11B64240E8E9}
+FlipRequest (Id 1, level 0x04, keyword 0x1000000000000000)
+fields: alloc (u64), vidPnSourceId (u32), ts (u64), token (u32)
+```
+
+`ts` is the PROPOSED FLIP TIME in QPC ticks. Consecutive `ts` values on one head are the true
+scanout cadence. GUID and descriptor come from the manifest PresentMon embeds, cross-checked
+against its consumer; field order above is READ order from that consumer, which is not necessarily
+wire order.
+
+## EtwProbe
+
+Standalone exe, in the solution so CI builds it. Requires elevation. Reports:
+
+- **dts histogram** - gaps between consecutive proposed flip times on a head. A tight spike near
+  8.33 ms at 60x2 means the grid is even and readable. Smeared or multi-modal kills the arithmetic
+  model outright.
+- **ahead** - `ts` minus the event stamp: how far in advance the driver schedules a flip.
+- **lag** - callback time minus event stamp: raw ETW delivery latency. This sizes the floor.
+- **hexdump of the first 8 payloads**, always. `TdhGetProperty` resolves field names only if the
+  manifest is registered, and PresentMon embedding NVIDIA's manifest is evidence it may not be. If
+  TDH fails the hexdump is how the wire layout gets recovered from hardware instead of guessed.
+- **`--dxgk` control** - also enables DxgKrnl and counts it. If NVIDIA events are zero but DxgKrnl
+  is not, the session works and the provider is the problem. Without the control a silent probe
+  has five possible causes.
+
+## Open questions
+
+1. **Raw ETW delivery lag distribution. UNMEASURED.** The ~30 ms figure is PresentMon's own
+   pipeline, not raw ETW, which delivers on buffer-fill or flush timer. The p99 and tail size the
+   lag floor. The probe's `lag` line answers it.
+2. **Pairing.** ETW gives a flip with a token and a scanout time; NvFBC gives a wake with no
+   identity. Nothing in either stream names the other, so matching is structural (N flips per
+   source period against M captures per batch, in order). This does NOT get easier with more
+   latency, and it is now the hard part.
+3. **Is the grid readable at x3?** x3 never paced correctly and the reason is unknown. Where those
+   frames actually land is a direct measurement, and it may be a different explanation from the
+   batch-grouping one.
+4. **Does DLSS-FG look structurally different** from driver-level Smooth Motion?
+5. **Lost events fail silently.** An estimator fed incomplete data is the silent-wrong failure this
+   project keeps hitting. Whatever consumes ETW must log lost-event counters.
+6. **Two behaviour modes is two test surfaces.** The more the policy exploits ETW when present, the
+   more the modes diverge, including at the boundary where upgrades land intermittently. The
+   trace-replay harness is what makes that testable without a capture cycle.
+
+## Settled, do not re-litigate
+
+- **PresentMon as the consumer.** Rejected: it collapses per-flip data, and its `FrameType` enum
+  has no NVIDIA member (`NotSet, Unspecified, Application, Repeated, Intel_XEFG, AMD_AFMF`), so it
+  cannot label Smooth Motion frames anyway. `--track_frame_type` requires instrumentation via the
+  Intel-PresentMon provider, which the NVIDIA driver does not emit.
+- **Real-vs-generated labelling from any ETW source.** Not available for Smooth Motion. Not needed
+  either: keep-first vs keep-real (Round 10) already answered which batch member is real, visually,
+  on real output. That is stronger evidence than a driver label.
+- **ETW as offline-only calibration.** Too weak. It discards the data's main value, which is
+  aligning to patterns no built-in heuristic covers.
+- **"Per-frame lookup is impossible."** It is viable given a raised lag floor and unambiguous
+  pairing. Both are measurements, not assumptions.
+- **Elevation.** Admin or the Performance Log Users group. Moot here: the relay already runs as
+  admin.
