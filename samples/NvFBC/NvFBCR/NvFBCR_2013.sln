@@ -14,6 +14,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Common", "..\..\Common\Comm
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "NvFBCEnable", "..\NvFBCEnable\NvFBCEnable.vcxproj", "{6D5CBBB4-BF06-464C-9A88-1DC8CA9DF39B}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "EtwProbe", "..\EtwProbe\EtwProbe.vcxproj", "{C9F4D3B2-A05E-4F6B-9D2C-3E4F5A6B7C8D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -34,6 +36,10 @@ Global
 		{6D5CBBB4-BF06-464C-9A88-1DC8CA9DF39B}.Debug|x64.Build.0 = Debug|x64
 		{6D5CBBB4-BF06-464C-9A88-1DC8CA9DF39B}.Release|x64.ActiveCfg = Release|x64
 		{6D5CBBB4-BF06-464C-9A88-1DC8CA9DF39B}.Release|x64.Build.0 = Release|x64
+		{C9F4D3B2-A05E-4F6B-9D2C-3E4F5A6B7C8D}.Debug|x64.ActiveCfg = Debug|x64
+		{C9F4D3B2-A05E-4F6B-9D2C-3E4F5A6B7C8D}.Debug|x64.Build.0 = Debug|x64
+		{C9F4D3B2-A05E-4F6B-9D2C-3E4F5A6B7C8D}.Release|x64.ActiveCfg = Release|x64
+		{C9F4D3B2-A05E-4F6B-9D2C-3E4F5A6B7C8D}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

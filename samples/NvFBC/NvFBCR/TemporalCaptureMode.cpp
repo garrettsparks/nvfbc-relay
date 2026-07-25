@@ -177,6 +177,12 @@ void TemporalCaptureMode::Run(
     HWND hwnd)
 {
     QueryPerformanceCounter(&m_baseQpc);
+    // Every time in this log (arr=, dl=, tgt=, before=, after=) is microseconds since this
+    // origin, not absolute QPC. Anything correlating the log against another QPC-stamped
+    // source - an ETW trace, a second process - needs the origin to convert, and recovering
+    // it by cross-correlating event sequences is guesswork this one line removes.
+    LOG("QPC origin %lld ticks, frequency %lld Hz (log times are us since the origin)",
+        m_baseQpc.QuadPart, m_scheduler.Freq());
     const double usPerTick = 1000000.0 / (double)m_scheduler.Freq();
     const long long lagUs = (long long)(m_bracketingDelayQpc * usPerTick);
 
