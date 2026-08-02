@@ -2,3 +2,4 @@
 # Build with: uv run mktrace.py <NvFBCR.log> <name>.trace "<description>"
 # (mktrace.py lives in this directory; run the suite afterwards for the bounds)
 kcd_60x2_mapcycles.trace
+kcd_60x2_mapcycles_postfix.trace
