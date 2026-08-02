@@ -32,6 +32,34 @@ The comparison is not gen-vs-real (Round 10 settled that: real wins). It is the 
 cross-fade versus the driver's motion interpolation, for the ~50% of output frames that cannot be
 a real frame. The driver already paid for those frames; re-synthesizing worse ones is waste.
 
+**There is a second payoff, and it is already costing frames in the daily-driver config.** The
+above is about 90 fps. Measured on two 60 fps captures (~30 KCD map cycles each), a large share of
+the blends the relay produces TODAY are compensating for a stamping error rather than for real
+motion:
+
+| gaps of 1.3 - 2.5 source periods | capture A | capture B |
+|---|---|---|
+| followed by catch-up, i.e. the pair sums to 2 periods | 36% | 28% |
+| consistent with a genuinely dropped source frame (~3 periods) | 2% | 3% |
+
+A dropped frame leaves a gap of ~N periods and the frames after it stay on the shifted grid. A
+frame that WAS rendered on time but handed over late leaves a long gap followed immediately by a
+short one, because the next frame arrives near its own correct time. Real drops are ~2%. When a
+gap does catch up, the delivery was late by a median of 7650 us, which is 0.46 of a source period:
+almost exactly the amount that pushes the target past the srcPeriod/4 passthrough threshold and
+forces a blend. So the ring records motion that did not happen, and the relay smoothly interpolates
+across it.
+
+**Wake stamping cannot even classify these.** A real frame delivered ~8 ms late and a GENERATED
+frame whose delivery slipped past the 3 ms batch-collapse window produce identical wake timelines:
+one entry, roughly half a source period off the grid, with no way to tell which it was. Note that
+0.46 of a source period is also, to within measurement error, the flip separation between a real
+frame and its Smooth Motion twin. Both readings fit the same data. A flip token and a true scanout
+time separate them immediately, which is something no amount of arrival-time analysis can do.
+
+This does not change the design below. It changes the priority: the payoff is not confined to a
+source rate nobody runs yet, and the first probe trace can settle the ambiguity directly.
+
 ## Decisions
 
 **Raw ETW, not PresentMon.** The NVIDIA timing data is a single event with four fields, so the
@@ -150,6 +178,13 @@ Standalone exe, in the solution so CI builds it. Requires elevation. Reports:
 6. **Two behaviour modes is two test surfaces.** The more the policy exploits ETW when present, the
    more the modes diverge, including at the boundary where upgrades land intermittently. The
    trace-replay harness is what makes that testable without a capture cycle.
+7. **Late real frame, or a generated frame that missed the batch window?** The wide brackets that
+   force blends at 60 fps sit a median of 0.46 source periods off the grid, which fits BOTH a real
+   frame handed over late and a Smooth Motion twin whose delivery slipped past the 3 ms collapse
+   threshold. The wake timelines are identical. The x2 baseline trace answers it: count the flips
+   per source period and compare their scanout spacing against the wake spacing over the same
+   interval. If the answer is "generated frame", the 3 ms threshold is the thing to fix and it is
+   cheaper than consuming ETW at runtime.
 
 ## Settled, do not re-litigate
 
