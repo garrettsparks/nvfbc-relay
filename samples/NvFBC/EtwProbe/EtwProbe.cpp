@@ -34,7 +34,7 @@
 // than guessing at it. Field order in the struct above is READ order from PresentMon's
 // consumer, which is not necessarily wire order.
 //
-// Requires elevation (real-time ETW). Usage: EtwProbe.exe [seconds] [--dxgk]
+// Requires elevation (real-time ETW). Usage: EtwProbe.exe [seconds] [--dxgk] [--events N]
 //   --dxgk also enables Microsoft-Windows-DxgKrnl and counts its events. Purely a control: if
 //   the NVIDIA event count is zero but DxgKrnl is nonzero, the session works and the NVIDIA
 //   provider is the problem (wrong GUID, Smooth Motion off, or nothing being flipped).
@@ -67,7 +67,11 @@ static const GUID kDxgKrnlGuid =
 static const wchar_t* kSessionName = L"EtwProbeSession";
 static const int  kMaxHeads      = 8;    // vidPnSourceId values tracked
 static const int  kHexDumpEvents = 8;    // payloads dumped verbatim for layout recovery
-static const int  kLogEvents     = 400;  // per-event lines before going quiet
+// Per-event lines before going quiet. The aggregates below (histogram, percentiles)
+// always cover the whole run, but correlating flips against NvFBC wakes needs the raw
+// ts= values, so the default is sized for a full minute at ~120 flips/s rather than for
+// a small log. Override with --events N.
+static int        g_logEvents    = 20000;
 static const int  kDtsBuckets    = 80;   // 0.5 ms each, so 0..40 ms
 
 static FILE*       g_log      = nullptr;
@@ -189,7 +193,7 @@ static void WINAPI OnEvent(PEVENT_RECORD ev) {
     if (g_lagN < kMaxSamples) g_lagUs[g_lagN++] = lagUs;
     if (g_aheadN < kMaxSamples && ts != 0) g_aheadUs[g_aheadN++] = aheadUs;
 
-    if (g_flipEvents <= kLogEvents) {
+    if (g_flipEvents <= g_logEvents) {
         LogLine("flip #%lld evt=%lld recv_lag=%lldus ts=%llu ahead=%lldus dts=%lldus "
                 "head=%u token=%u alloc=0x%llX",
                 g_flipEvents, evtQpc, lagUs, (unsigned long long)ts, aheadUs, dtsUs,
@@ -279,15 +283,20 @@ int main(int argc, char** argv) {
     bool alsoDxgk = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dxgk")) alsoDxgk = true;
+        else if (!strcmp(argv[i], "--events") && i + 1 < argc) g_logEvents = atoi(argv[++i]);
         else seconds = atoi(argv[i]);
     }
     if (seconds <= 0) seconds = 20;
+    if (g_logEvents < 0) g_logEvents = 0;
 
     LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_qpcFreq = f.QuadPart;
     g_log = fopen("EtwProbe.log", "w");
     LogLine("=== EtwProbe (NVIDIA DisplayDriver FlipRequest) - run %d s%s ===",
             seconds, alsoDxgk ? ", DxgKrnl control enabled" : "");
     LogLine("QPC frequency %lld Hz", g_qpcFreq);
+    // evt= and ts= below are ABSOLUTE QPC ticks on the same clock the relay logs its
+    // origin in, so the two logs join exactly with no wallclock or fingerprinting.
+    LogLine("per-event lines: first %d flips", g_logEvents);
 
     const size_t nameBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
     const size_t sz = sizeof(EVENT_TRACE_PROPERTIES) + nameBytes;
