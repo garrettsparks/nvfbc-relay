@@ -125,6 +125,9 @@ struct SimParams {
     // present; the comb lock exists to track exactly that, so a synthetic grid removes
     // the phenomenon under test.
     std::vector<int64_t> explicitPresents;
+    // Batch-collapse window. Production sizes this at 3 ms; frame generation submits a
+    // pair well inside it and no real content cadence produces gaps that short.
+    int64_t batchThresholdQpc = 3000;
 };
 
 static SimResult Simulate(const SimParams& p) {
@@ -181,11 +184,26 @@ static SimResult Simulate(const SimParams& p) {
         arrivals.swap(kept);
     }
 
+    // Fold the wake list through the REAL batch-collapse before any bracket sees it.
+    // The ring publishes one slot per wake and retracts the generated member, so the
+    // visible timeline is stamps[] filtered by valid[], not the raw wake list. Modelling
+    // the wakes directly is what made an earlier replay disagree with the hardware.
+    std::vector<int64_t> stamps(arrivals.size(), 0);
+    std::vector<char> valid(arrivals.size(), 1);
+    {
+        policy::BatchState bs;
+        for (size_t i = 0; i < arrivals.size(); i++) {
+            const policy::BatchDecision bd =
+                policy::UpdateBatch(bs, arrivals[i], p.batchThresholdQpc);
+            stamps[i] = bd.stampTs;
+            if (bd.retractPrevious && i >= 1) valid[i - 1] = 0;
+        }
+    }
+
     SelectionState sel;
     PhaseLockState lock;
     policy::CompositeState comp;
     SimResult r;
-    size_t cursor = 0;
     size_t published = 0;
     int64_t prevPull = 0;
     const int64_t presentCount =
@@ -206,24 +224,25 @@ static SimResult Simulate(const SimParams& p) {
         while (published < arrivals.size() && arrivals[published] <= deadline) published++;
         const size_t oldest = published > (size_t)kRingSlots ? published - kRingSlots : 0;
 
-        while (cursor + 1 < arrivals.size() && arrivals[cursor + 1] <= target) cursor++;
+        // Nearest valid slot on each side of the target, which is what production's
+        // ring scan returns. Retracted slots still occupy their ring position (the
+        // write counter advanced), so the window is kRingSlots WAKES wide while only
+        // the surviving members are eligible. When everything visible is newer than
+        // the target there is no before-frame and the nearest-after is the oldest
+        // visible slot, the same result the production scan gives while the display
+        // is pinned at the ring's tail.
         BracketInfo b;
-        b.hasBefore = cursor >= oldest && arrivals[cursor] <= target;
-        if (b.hasBefore) {
-            b.beforeTs = arrivals[cursor];
-            b.beforeDiff = target - b.beforeTs;
+        for (size_t i = oldest; i < published; i++) {
+            if (!valid[i]) continue;
+            const int64_t ts = stamps[i];
+            if (ts <= target) {
+                if (!b.hasBefore || ts > b.beforeTs) { b.hasBefore = true; b.beforeTs = ts; }
+            } else {
+                if (!b.hasAfter || ts < b.afterTs) { b.hasAfter = true; b.afterTs = ts; }
+            }
         }
-        // The after-frame is normally the arrival following the before; when the
-        // before was evicted, everything in the window is newer than the target and
-        // the nearest-after is the OLDEST visible frame (what production's bracket
-        // scan returns while the display is pinned at the ring's tail).
-        size_t afterIdx = cursor + 1;
-        if (cursor < oldest) afterIdx = oldest;
-        b.hasAfter = afterIdx < published;
-        if (b.hasAfter) {
-            b.afterTs = arrivals[afterIdx];
-            b.afterDiff = b.afterTs - target;
-        }
+        if (b.hasBefore) b.beforeDiff = target - b.beforeTs;
+        if (b.hasAfter) b.afterDiff = b.afterTs - target;
 
         // Mirrors Run()'s lock wiring, INCLUDING the stall-run counter that arms the
         // re-seed: the trigger is part of the behavior under test, so the simulator has
@@ -574,6 +593,55 @@ static void test_lock_reseed_wide_bracket_stall() {
     CHECK(snapApplied > 0, "re-seed armed but the pull never moved past the slew clamp");
     CHECK(synthAfter <= 10,
           "slow recovery: %d synth presents after the stall (expected <= 10)", synthAfter);
+}
+
+// Batch-collapse keep-real, asserted directly rather than inferred from a timeline.
+// Wake order under frame generation is [GENERATED, REAL], so the SECOND member of a
+// batch is the one worth keeping: it publishes, and the generated member ahead of it is
+// retracted. Flipping this to keep-first ghosted throughout in the definitive A/B, and
+// the flip would be invisible in any aggregate timing metric, so it is pinned here.
+static void test_batch_collapse_keep_real() {
+    const int64_t kThreshold = 3000;
+    policy::BatchState s;
+
+    // A lone wake opens a batch: nothing to retract, stamped at its own arrival.
+    policy::BatchDecision d = policy::UpdateBatch(s, 100000, kThreshold);
+    CHECK(!d.intraBatch, "first wake should open a batch");
+    CHECK(!d.retractPrevious, "first wake has no predecessor to retract");
+    CHECK(d.stampTs == 100000, "lone wake stamps at its own arrival, got %lld",
+          (long long)d.stampTs);
+
+    // Its twin arrives an epsilon later: same batch, keeps the BATCH-START stamp so the
+    // ring timeline stays at base cadence, and retracts the generated member.
+    d = policy::UpdateBatch(s, 100400, kThreshold);
+    CHECK(d.intraBatch, "a wake 400us later is inside the batch");
+    CHECK(d.retractPrevious, "keep-real: the intra-batch member retracts its predecessor");
+    CHECK(d.stampTs == 100000, "intra-batch member stamps at batch start, got %lld",
+          (long long)d.stampTs);
+
+    // A third member an epsilon on is still inside the batch (the chain rule).
+    d = policy::UpdateBatch(s, 100700, kThreshold);
+    CHECK(d.intraBatch, "chained third member is still intra-batch");
+    CHECK(d.stampTs == 100000, "chained member still stamps at batch start, got %lld",
+          (long long)d.stampTs);
+
+    // The next base frame opens a new batch and reports the base period, with the
+    // submission epsilon excluded (batch start to batch start, not wake to wake).
+    d = policy::UpdateBatch(s, 116667, kThreshold);
+    CHECK(!d.intraBatch, "a wake a full source period later opens a new batch");
+    CHECK(!d.retractPrevious, "a new batch must not retract the previous batch's keeper");
+    CHECK(d.batchGap == 16667, "batch gap is base cadence, got %lld", (long long)d.batchGap);
+
+    // A gap just under the threshold still collapses; just over it does not.
+    policy::BatchState t;
+    policy::UpdateBatch(t, 0, kThreshold);
+    CHECK(policy::UpdateBatch(t, kThreshold - 1, kThreshold).intraBatch,
+          "a gap just under the threshold collapses");
+    policy::BatchState u;
+    policy::UpdateBatch(u, 0, kThreshold);
+    CHECK(!policy::UpdateBatch(u, kThreshold, kThreshold).intraBatch,
+          "a gap at the threshold does not collapse");
+    std::printf("  batch-collapse keep-real: stamping, retraction, chaining, thresholds\n");
 }
 
 // The same stall on the arrival cadence the relay actually sees with frame generation on.
@@ -1402,6 +1470,7 @@ int main(int argc, char** argv) {
     test_composite_lock_acquisition();
     test_composite_quantized_arrivals();
 
+    test_batch_collapse_keep_real();
     test_lock_reseed_wide_bracket_stall();
     test_lock_reseed_stall_paired_cadence();
     test_lock_replay_captured_stall();

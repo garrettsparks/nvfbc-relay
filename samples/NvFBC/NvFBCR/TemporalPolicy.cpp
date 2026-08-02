@@ -25,6 +25,23 @@ int64_t WrapHalf(int64_t d, int64_t p) {
 // normal one-dupe drift sweep, so steady-state tracking never triggers it.
 static const int kStallRunPresents = 3;
 
+BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTicks) {
+    BatchDecision d;
+    d.intraBatch = s.started && (arrivalTs - s.lastArrivalTs) < thresholdTicks;
+    if (!d.intraBatch) {
+        // Batch-start to batch-start, so the submission epsilon between a generated
+        // frame and its real twin never pollutes the source-period estimate.
+        if (s.started) d.batchGap = arrivalTs - s.batchStartTs;
+        s.batchStartTs = arrivalTs;
+    }
+    // Chain: a third member an epsilon after the second is still inside the batch.
+    s.lastArrivalTs = arrivalTs;
+    s.started = true;
+    d.stampTs = d.intraBatch ? s.batchStartTs : arrivalTs;
+    d.retractPrevious = d.intraBatch;
+    return d;
+}
+
 bool BracketIsStalled(const BracketInfo& b, const PolicyConfig& cfg) {
     if (!b.hasBefore || !b.hasAfter) return true;
     if (cfg.stallSpanQpc <= 0) return false;

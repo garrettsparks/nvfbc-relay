@@ -45,6 +45,37 @@ struct BracketInfo {
     int64_t afterDiff = 0;
 };
 
+// Batch-collapse memory across capture wakes. Under driver-level frame generation the
+// grab wakes about twice per base frame, the pair submitted together and arriving a
+// fraction of a millisecond apart while their display flips are half a base period
+// apart. Collapsing the pair is what keeps the ring timeline at base cadence.
+struct BatchState {
+    int64_t batchStartTs = 0;    // arrival of the current batch's first member
+    int64_t lastArrivalTs = 0;   // previous wake, batch member or not
+    // Explicit rather than inferring "no history" from a zero timestamp: replayed and
+    // simulated timelines legitimately start at 0, and a sentinel would silently treat
+    // the second wake of such a run as batch-opening.
+    bool started = false;
+};
+
+// What one capture wake does to the ring. stampTs is the timestamp to publish the slot
+// with: the intra-batch member takes BATCH-START so the ring timeline stays at base
+// cadence rather than recording the submission epsilon. batchGap is batch-start to
+// batch-start (0 when this wake continues a batch or there is no history), which is the
+// source-period estimate with frame-generation gaps already excluded.
+struct BatchDecision {
+    bool intraBatch = false;
+    bool retractPrevious = false;
+    int64_t stampTs = 0;
+    int64_t batchGap = 0;
+};
+
+// Fold one capture wake into the batch timeline. Wake order is measured
+// [GENERATED, REAL], so the intra-batch member is the REAL frame: it publishes and the
+// previous slot (the generated member) is retracted. Callers apply retractPrevious only
+// when a previous slot exists.
+BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTicks);
+
 // Selection memory across presents. lastShownTs strictly advances except on Repeat;
 // the two bools are the Schmitt states (stickiness side, advance gate).
 struct SelectionState {

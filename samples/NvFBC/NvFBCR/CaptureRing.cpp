@@ -211,7 +211,6 @@ void CaptureRing::Stop() {
 void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     RECT srcRect = { 0, 0, (LONG)m_width, (LONG)m_height };
     const double usPerTick = 1000000.0 / (double)m_freqQuad;
-    LONGLONG lastArrival = 0;
     long long collapsed = 0;
 
     // Batch-collapse threshold. Under NVIDIA Smooth Motion (driver-level frame gen; in-game
@@ -226,7 +225,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     // inside the ~ε window still shows the gen frame). Keep-real won the definitive A/B:
     // keep-first ghosted throughout, keep-real crisp throughout (Round 10).
     const LONGLONG batchThresholdQpc = (m_freqQuad * 3) / 1000;
-    LONGLONG batchStartQpc = 0;
+    policy::BatchState batchState;
     LOG("CaptureRing: batch-collapse keep-real (intra-batch wake <3ms = real member; previous slot retracted)");
 
     while (!m_stop.load()) {
@@ -245,27 +244,19 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
 
-        const LONGLONG prevArrival = lastArrival;
-        const bool intraBatch =
-            (prevArrival != 0 && (now.QuadPart - prevArrival) < batchThresholdQpc);
-        if (!intraBatch) {
-            // Source-period estimate (batch-start to batch-start, so frame-gen epsilon gaps
-            // never pollute it; gaps over 125 ms are stalls, not cadence). Grab-timeout
-            // re-grabs of a static source return SUCCESS at the timeout period and DO
-            // enter: that is the source's effective cadence while nothing new is drawn.
-            // EMA alpha 1/8: stable within ~8 source frames of a regime change,
-            // jitter-immune in steady state.
-            if (batchStartQpc != 0) {
-                const LONGLONG gap = now.QuadPart - batchStartQpc;
-                if (gap < m_freqQuad / 8) {
-                    long long ema = m_srcPeriodEmaQpc.load(std::memory_order_relaxed);
-                    ema = ema ? (ema * 7 + gap) / 8 : gap;
-                    m_srcPeriodEmaQpc.store(ema, std::memory_order_relaxed);
-                }
-            }
-            batchStartQpc = now.QuadPart;
+        const LONGLONG prevArrival = batchState.lastArrivalTs;
+        const policy::BatchDecision batch =
+            policy::UpdateBatch(batchState, now.QuadPart, batchThresholdQpc);
+        // Source-period estimate (gaps over 125 ms are stalls, not cadence). Grab-timeout
+        // re-grabs of a static source return SUCCESS at the timeout period and DO enter:
+        // that is the source's effective cadence while nothing new is drawn. EMA alpha
+        // 1/8: stable within ~8 source frames of a regime change, jitter-immune in
+        // steady state.
+        if (batch.batchGap > 0 && batch.batchGap < m_freqQuad / 8) {
+            long long ema = m_srcPeriodEmaQpc.load(std::memory_order_relaxed);
+            ema = ema ? (ema * 7 + batch.batchGap) / 8 : batch.batchGap;
+            m_srcPeriodEmaQpc.store(ema, std::memory_order_relaxed);
         }
-        lastArrival = now.QuadPart;   // chain: a 3rd member ε after the 2nd is still intra-batch
 
         long long count = m_writeCount;
         int slot = (int)(count % RING_SIZE);
@@ -288,13 +279,13 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
 
         // The intra-batch (real) member is stamped with the BATCH-START time so the ring
         // timeline stays at base cadence; everything else is stamped at its own arrival.
-        m_ring[slot].timestamp.QuadPart = intraBatch ? batchStartQpc : now.QuadPart;
+        m_ring[slot].timestamp.QuadPart = batch.stampTs;
         m_ring[slot].valid = true;
 
         m_writeCount = count + 1;
         m_published.store(count + 1);  // publish only after the slot write is GPU-complete
 
-        if (intraBatch && count >= 1) {
+        if (batch.retractPrevious && count >= 1) {
             // Retract the previous member (the generated frame): hide it from future brackets.
             // Content is never overwritten, so a present read already in flight stays coherent.
             m_ring[(int)((count - 1) % RING_SIZE)].valid = false;
