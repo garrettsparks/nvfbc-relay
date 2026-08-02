@@ -13,6 +13,7 @@
 // All synthetic tests run in the microsecond domain; the policy is unit-agnostic.
 
 #include "TemporalPolicy.h"
+#include "PolicyTestTrace.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -114,6 +115,16 @@ struct SimParams {
     // cadences, e.g. a fixed-refresh 240 Hz panel flipping a 90 fps source 2-3-3);
     // srcPeriod stays the DECLARED rate that sizes lag/threshold/comb.
     std::vector<int64_t> periodPattern;
+    // Non-empty: replay these arrival times verbatim instead of synthesizing a cadence.
+    // A generated timeline can only contain the shapes someone thought to model; a
+    // captured one carries whatever the hardware actually did, including transients
+    // nobody has characterized. srcPeriod still sizes lag, threshold and comb.
+    std::vector<int64_t> explicitArrivals;
+    // Non-empty: use these present deadlines instead of a uniform grid. The relay's
+    // present clock is DWM's, which skews against the source clock by tens of us per
+    // present; the comb lock exists to track exactly that, so a synthetic grid removes
+    // the phenomenon under test.
+    std::vector<int64_t> explicitPresents;
 };
 
 static SimResult Simulate(const SimParams& p) {
@@ -135,7 +146,8 @@ static SimResult Simulate(const SimParams& p) {
     std::vector<int64_t> arrivals;
     const int64_t horizon = (p.presents + 4) * p.presentPeriod;
     int64_t stallShift = 0;   // accumulated delay the stall pushes onto later arrivals
-    for (int64_t t = p.phaseOffset, i = 0; t < horizon; i++) {
+    if (!p.explicitArrivals.empty()) arrivals = p.explicitArrivals;
+    for (int64_t t = p.phaseOffset, i = 0; p.explicitArrivals.empty() && t < horizon; i++) {
         arrivals.push_back(t + JitterUs(p.arrivalJitter));
         const bool inStall = p.stallAtArrival >= 0 && i >= p.stallAtArrival &&
                              i < p.stallAtArrival + p.stallArrivals;
@@ -146,7 +158,17 @@ static SimResult Simulate(const SimParams& p) {
         if (p.periodPattern.empty()) {
             t = p.phaseOffset + (i + 1) * p.srcPeriod + stallShift;
         } else {
-            t += p.periodPattern[(size_t)(i % (int64_t)p.periodPattern.size())];
+            // The stall overrides the cadence rather than riding on top of it: NvFBC's
+            // grab times out and re-delivers stale content at the timeout period no
+            // matter what pattern the source was producing before the freeze. Without
+            // this the pattern branch silently ignores the stall entirely, so a stall
+            // and a non-uniform cadence cannot be simulated together.
+            int64_t step = p.periodPattern[(size_t)(i % (int64_t)p.periodPattern.size())];
+            if (inStall) step = p.stallGap;
+            if (p.stallAtArrival >= 0 && i == p.stallAtArrival + p.stallArrivals - 1) {
+                step += p.postStallPhase;
+            }
+            t += step;
         }
     }
     if (!p.drops.empty()) {
@@ -166,8 +188,12 @@ static SimResult Simulate(const SimParams& p) {
     size_t cursor = 0;
     size_t published = 0;
     int64_t prevPull = 0;
-    for (int64_t k = 1; k <= p.presents; k++) {
-        const int64_t deadline = k * p.presentPeriod;
+    const int64_t presentCount =
+        p.explicitPresents.empty() ? p.presents : (int64_t)p.explicitPresents.size();
+    for (int64_t k = 1; k <= presentCount; k++) {
+        const int64_t deadline = p.explicitPresents.empty()
+                                     ? k * p.presentPeriod
+                                     : p.explicitPresents[(size_t)(k - 1)];
         const int64_t target = deadline - (lag + lock.pullQpc);
 
         // Frames visible to the bracket: arrived by pick time (the ring can't contain
@@ -548,6 +574,124 @@ static void test_lock_reseed_wide_bracket_stall() {
     CHECK(snapApplied > 0, "re-seed armed but the pull never moved past the slew clamp");
     CHECK(synthAfter <= 10,
           "slow recovery: %d synth presents after the stall (expected <= 10)", synthAfter);
+}
+
+// The same stall on the arrival cadence the relay actually sees with frame generation on.
+// Smooth Motion x2 delivers the real frame and its generated twin about 0.4 ms apart, then
+// the rest of the source period to the next pair, so the ring takes two arrivals per source
+// period rather than one. Measured on a 60 fps source: gaps alternate ~16.3 ms / ~0.4 ms,
+// P(short | previous long) = 0.91 and P(short | previous short) = 0.00, and each pair sums
+// to one source period. A uniform grid therefore tests a cadence that never occurs whenever
+// frame generation is enabled, which is the default configuration.
+//
+// Both the resume phase and the parity matter: a freeze can begin on the real frame or on
+// its generated twin, and only the paired cadence has that second degree of freedom.
+static void test_lock_reseed_stall_paired_cadence() {
+    int worstRun = 0, badPhases = 0, totalPhases = 0;
+    int64_t worstPhase = 0;
+    int worstParity = 0;
+    for (int parity = 0; parity < 2; parity++) {
+        for (int k = 0; k < 21; k++) {
+            SimParams p;
+            p.srcPeriod = 16667;
+            p.presentPeriod = 16667;
+            p.arrivalJitter = 0;
+            p.combQpc = 16667;
+            p.presents = 700;
+            p.phaseOffset = 0;
+            p.passthroughQpc = 4166;
+            p.lagOverride = 0;
+            p.stallAtArrival = 300 + parity;
+            p.stallArrivals = 2;         // 2 timeout re-grabs = ~200 ms frozen
+            p.stallGap = 100000;         // NvFBC's grab timeout
+            p.postStallPhase = (int64_t)k * 16667 / 21;
+            p.periodPattern = { 16250, 400 };   // the real/generated pair
+            const SimResult r = Simulate(p);
+
+            size_t stallEnd = 0;
+            int wide = 0;
+            for (size_t i = 0; i < r.span.size(); i++) {
+                if (r.span[i] < 0 || r.span[i] > p.srcPeriod * 2) stallEnd = i;
+                if (r.span[i] > p.srcPeriod * 2) wide++;
+            }
+            CHECK(wide > 0, "paired cadence: the stall was not simulated (phase %d)", k);
+
+            int run = 0, best = 0;
+            for (size_t i = stallEnd + 1; i < r.ops.size() && i <= stallEnd + 250; i++) {
+                if (r.ops[i] == policy::CompositeOp::Synthesize) {
+                    run++;
+                    if (run > best) best = run;
+                } else {
+                    run = 0;
+                }
+            }
+            totalPhases++;
+            if (best >= 50) badPhases++;
+            if (best > worstRun) { worstRun = best; worstPhase = p.postStallPhase; worstParity = parity; }
+        }
+    }
+    std::printf("  paired-cadence stall: worst synth run %d (resume phase %" PRId64
+                "us, parity %d), %d of %d phases over 50\n",
+                worstRun, worstPhase, worstParity, badPhases, totalPhases);
+    CHECK(badPhases == 0,
+          "slow recovery on a paired cadence: %d of %d resume phases blended 50+ presents",
+          badPhases, totalPhases);
+}
+
+// Replay a captured arrival timeline rather than a synthetic one. Synthetic stalls model
+// the shapes we already understand: a uniform or paired cadence, a clean freeze, an
+// instant resume onto a new phase. Every one of those passes. The hardware still blends
+// for seconds after roughly one stall in seven, so the shape that breaks the lock is one
+// nobody has modelled, and a generated timeline cannot contain it by construction.
+static void test_lock_replay_captured_stall() {
+    std::vector<int64_t> arrivals, presents;
+    {
+        int64_t t = kTraceArrivalFirst;
+        arrivals.push_back(t);
+        for (size_t i = 0; i < sizeof(kTraceArrivalDeltas) / sizeof(kTraceArrivalDeltas[0]); i++)
+            arrivals.push_back(t += kTraceArrivalDeltas[i]);
+        int64_t d = kTracePresentFirst;
+        presents.push_back(d);
+        for (size_t i = 0; i < sizeof(kTracePresentDeltas) / sizeof(kTracePresentDeltas[0]); i++)
+            presents.push_back(d += kTracePresentDeltas[i]);
+    }
+
+    SimParams p;
+    p.srcPeriod = 16667;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 0;         // the trace carries the real jitter
+    p.combQpc = 16667;
+    p.presents = 0;              // explicitPresents drives the count
+    p.phaseOffset = 0;
+    p.passthroughQpc = 4166;
+    p.lagOverride = 0;
+    p.explicitArrivals = arrivals;
+    p.explicitPresents = presents;
+    const SimResult r = Simulate(p);
+
+    // The lock starts cold here where the real relay had been running for minutes, so
+    // the acquisition sweep at the head of the replay is an artifact of the window, not
+    // a recovery. Measure past it.
+    const size_t kWarmup = 100;
+    int run = 0, worst = 0, worstEnd = 0, synthTotal = 0, reseeds = 0;
+    for (size_t i = kWarmup; i < r.ops.size(); i++) {
+        if (r.ops[i] == policy::CompositeOp::Synthesize) {
+            synthTotal++;
+            run++;
+            if (run > worst) { worst = run; worstEnd = (int)i; }
+        } else {
+            run = 0;
+        }
+    }
+    for (size_t i = kWarmup; i < r.snapped.size(); i++) if (r.snapped[i]) reseeds++;
+
+    std::printf("  replayed capture: %zu arrivals, %zu presents, %d synth past warmup, "
+                "worst run %d (presents %d-%d), re-seeds %d\n",
+                arrivals.size(), presents.size(), synthTotal, worst,
+                worstEnd - worst + 1, worstEnd, reseeds);
+    CHECK(worst < 50,
+          "replayed capture blended %d consecutive presents after a stall resume",
+          worst);
 }
 
 // ---------------------------------------------------------------------------------
@@ -1259,6 +1403,8 @@ int main(int argc, char** argv) {
     test_composite_quantized_arrivals();
 
     test_lock_reseed_wide_bracket_stall();
+    test_lock_reseed_stall_paired_cadence();
+    test_lock_replay_captured_stall();
 
     if (g_failures) {
         std::printf("POLICY TESTS FAILED: %d failure(s)\n", g_failures);
