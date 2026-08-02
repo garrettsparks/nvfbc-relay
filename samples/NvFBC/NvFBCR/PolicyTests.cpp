@@ -13,13 +13,13 @@
 // All synthetic tests run in the microsecond domain; the policy is unit-agnostic.
 
 #include "TemporalPolicy.h"
-#include "PolicyTestTrace.h"
 
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <string>
 #include <vector>
 
 using policy::BracketInfo;
@@ -706,60 +706,205 @@ static void test_lock_reseed_stall_paired_cadence() {
           badPhases, totalPhases);
 }
 
-// Replay a captured arrival timeline rather than a synthetic one. Synthetic stalls model
-// the shapes we already understand: a uniform or paired cadence, a clean freeze, an
-// instant resume onto a new phase. Every one of those passes. The hardware still blends
-// for seconds after roughly one stall in seven, so the shape that breaks the lock is one
-// nobody has modelled, and a generated timeline cannot contain it by construction.
-static void test_lock_replay_captured_stall() {
-    std::vector<int64_t> arrivals, presents;
-    {
-        int64_t t = kTraceArrivalFirst;
-        arrivals.push_back(t);
-        for (size_t i = 0; i < sizeof(kTraceArrivalDeltas) / sizeof(kTraceArrivalDeltas[0]); i++)
-            arrivals.push_back(t += kTraceArrivalDeltas[i]);
-        int64_t d = kTracePresentFirst;
-        presents.push_back(d);
-        for (size_t i = 0; i < sizeof(kTracePresentDeltas) / sizeof(kTracePresentDeltas[0]); i++)
-            presents.push_back(d += kTracePresentDeltas[i]);
-    }
+// Replay real captures through the real policy. Every .trace in testdata/ is a corpus
+// member: drop a capture in (testdata/mktrace.py builds one from an NvFBCR.log)
+// and it becomes a permanent gate.
+//
+// WHY A CORPUS AND NOT A SCENARIO. Synthetic stalls only contain the shapes someone
+// thought to model, and all of them pass while hardware still blends for seconds after
+// roughly one stall in seven. Worse, a single captured event is not a gate either: a
+// candidate stall fix took one capture's worst event from 189 presents to nothing while
+// quadrupling long recoveries across the whole session by suppressing a third of all
+// re-seeds. Only whole-session numbers, over more than one capture, catch that.
+//
+// EACH FIXTURE CARRIES ITS OWN FIDELITY CHECK. A fixture records what the RELAY did on
+// that capture, and the replay must land near it. The model is not exact (it drives the
+// policy directly rather than reproducing every ring effect), so the per-fixture
+// tolerance is explicit: a configuration where the model cannot track the hardware must
+// widen it deliberately, in the fixture, where the next reader can see it.
+struct TraceFixture {
+    std::string path;
+    std::string name;
+    std::string description;
+    std::vector<int64_t> arrivals;
+    std::vector<int64_t> presents;
+    // Bounds on the REPLAY. Inequalities, so an improvement passes and only a
+    // regression fails. Absent (-1) means the fixture is unblessed: the test prints the
+    // measured lines and fails, so a new capture cannot silently join as a no-op.
+    int maxWorstRun = -1;
+    int maxLongRuns = -1;
+    double maxSynthPct = -1.0;
+    int minReseeds = -1;
+    // What the relay actually did, and how far the replay may sit from it.
+    int fieldWorstRun = -1;
+    int fieldLongRuns = -1;
+    double fieldSynthPct = -1.0;
+};
 
-    SimParams p;
-    p.srcPeriod = 16667;
-    p.presentPeriod = 16667;
-    p.arrivalJitter = 0;         // the trace carries the real jitter
-    p.combQpc = 16667;
-    p.presents = 0;              // explicitPresents drives the count
-    p.phaseOffset = 0;
-    p.passthroughQpc = 4166;
-    p.lagOverride = 0;
-    p.explicitArrivals = arrivals;
-    p.explicitPresents = presents;
-    const SimResult r = Simulate(p);
-
-    // The lock starts cold here where the real relay had been running for minutes, so
-    // the acquisition sweep at the head of the replay is an artifact of the window, not
-    // a recovery. Measure past it.
-    const size_t kWarmup = 100;
-    int run = 0, worst = 0, worstEnd = 0, synthTotal = 0, reseeds = 0;
-    for (size_t i = kWarmup; i < r.ops.size(); i++) {
-        if (r.ops[i] == policy::CompositeOp::Synthesize) {
-            synthTotal++;
-            run++;
-            if (run > worst) { worst = run; worstEnd = (int)i; }
-        } else {
-            run = 0;
+static bool ParseFixture(const std::string& path, TraceFixture* out) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    out->path = path;
+    char tag[64];
+    bool ok = true;
+    while (std::fscanf(f, "%63s", tag) == 1) {
+        auto rest_of_line = [&](std::string* into) {
+            int c;
+            std::string acc;
+            while ((c = std::fgetc(f)) != EOF && c != '\n') {
+                if (c != '\r') acc += (char)c;   // fixture may arrive CRLF-checked-out
+            }
+            size_t i = acc.find_first_not_of(" \t");
+            if (into) *into = (i == std::string::npos) ? std::string() : acc.substr(i);
+        };
+        auto num = [&](long long* v) { if (std::fscanf(f, "%lld", v) != 1) ok = false; };
+        auto dbl = [&](double* v) { if (std::fscanf(f, "%lf", v) != 1) ok = false; };
+        long long n = 0;
+        if (tag[0] == '#')                              { rest_of_line(NULL); }
+        else if (std::strcmp(tag, "description") == 0)  { rest_of_line(&out->description); }
+        else if (std::strcmp(tag, "max_worst_run") == 0){ num(&n); out->maxWorstRun = (int)n; }
+        else if (std::strcmp(tag, "max_long_runs") == 0){ num(&n); out->maxLongRuns = (int)n; }
+        else if (std::strcmp(tag, "min_reseeds") == 0)  { num(&n); out->minReseeds = (int)n; }
+        else if (std::strcmp(tag, "max_synth_pct") == 0){ dbl(&out->maxSynthPct); }
+        else if (std::strcmp(tag, "field_worst_run") == 0) { num(&n); out->fieldWorstRun = (int)n; }
+        else if (std::strcmp(tag, "field_long_runs") == 0) { num(&n); out->fieldLongRuns = (int)n; }
+        else if (std::strcmp(tag, "field_synth_pct") == 0) { dbl(&out->fieldSynthPct); }
+        else if (std::strcmp(tag, "arrivals") == 0 || std::strcmp(tag, "presents") == 0) {
+            std::vector<int64_t>* into =
+                (tag[0] == 'a') ? &out->arrivals : &out->presents;
+            num(&n);
+            if (!ok) break;
+            into->clear();
+            into->reserve((size_t)n);
+            int64_t acc = 0;
+            for (long long i = 0; i < n; i++) {
+                long long v = 0;
+                if (std::fscanf(f, "%lld", &v) != 1) { ok = false; break; }
+                acc = (i == 0) ? v : acc + v;
+                into->push_back(acc);
+            }
         }
+        if (!ok) break;
     }
-    for (size_t i = kWarmup; i < r.snapped.size(); i++) if (r.snapped[i]) reseeds++;
+    std::fclose(f);
+    return ok && !out->arrivals.empty() && !out->presents.empty();
+}
 
-    std::printf("  replayed capture: %zu arrivals, %zu presents, %d synth past warmup, "
-                "worst run %d (presents %d-%d), re-seeds %d\n",
-                arrivals.size(), presents.size(), synthTotal, worst,
-                worstEnd - worst + 1, worstEnd, reseeds);
-    CHECK(worst < 50,
-          "replayed capture blended %d consecutive presents after a stall resume",
-          worst);
+// Fixtures live beside this source, so they resolve from the source tree rather than
+// from whatever directory the test binary was launched in.
+static std::string TestDataDir() {
+    std::string here(__FILE__);
+    const size_t cut = here.find_last_of("/\\");
+    return ((cut == std::string::npos) ? std::string() : here.substr(0, cut + 1)) + "testdata/";
+}
+
+static std::vector<std::string> FixturePaths() {
+    std::vector<std::string> out;
+    std::string dir = TestDataDir();
+    // No <filesystem>: an index file also documents the corpus in one readable place.
+    std::FILE* idx = std::fopen((dir + "index.txt").c_str(), "rb");
+    if (!idx) {   // out-of-tree build: fall back to the path from the repo root
+        dir = "samples/NvFBC/NvFBCR/testdata/";
+        idx = std::fopen((dir + "index.txt").c_str(), "rb");
+    }
+    if (!idx) return out;
+    char name[256];
+    while (std::fscanf(idx, "%255s", name) == 1) {
+        if (name[0] == '#') { int c; while ((c = std::fgetc(idx)) != EOF && c != '\n') {} continue; }
+        out.push_back(dir + name);
+    }
+    std::fclose(idx);
+    return out;
+}
+
+static void test_replay_capture_corpus() {
+    const std::vector<std::string> paths = FixturePaths();
+    // Loud, never a skip: a corpus gate that quietly vanishes leaves the suite green
+    // while the thing it guards regresses. Both lookup paths are relative to the repo
+    // root, which is where CI and the documented local command both run.
+    CHECK(!paths.empty(),
+          "no replay fixtures found (looked for %sindex.txt and "
+          "samples/NvFBC/NvFBCR/testdata/index.txt). Run the suite from the repository "
+          "root. The capture corpus is the only gate that has caught a real pacing "
+          "regression, so it is a failure rather than a skip.",
+          TestDataDir().c_str());
+
+    for (const std::string& path : paths) {
+        TraceFixture fx;
+        CHECK(ParseFixture(path, &fx), "fixture unreadable or malformed: %s", path.c_str());
+
+        SimParams p;
+        p.srcPeriod = 16667;
+        p.presentPeriod = 16667;
+        p.arrivalJitter = 0;          // the capture carries the real jitter
+        p.combQpc = 16667;
+        p.presents = 0;               // explicitPresents drives the count
+        p.phaseOffset = 0;
+        p.passthroughQpc = 4166;
+        p.lagOverride = 0;
+        p.explicitArrivals = fx.arrivals;
+        p.explicitPresents = fx.presents;
+        const SimResult r = Simulate(p);
+
+        // Must match mktrace.py's WARMUP: the lock starts cold here where the relay had
+        // been running for minutes, so the head of a replay is a window artifact.
+        const size_t kWarmup = 200;
+        int run = 0, worst = 0, longRuns = 0, synth = 0, reseeds = 0;
+        for (size_t i = kWarmup; i < r.ops.size(); i++) {
+            if (r.ops[i] == policy::CompositeOp::Synthesize) {
+                synth++; run++;
+                if (run > worst) worst = run;
+            } else {
+                if (run >= 50) longRuns++;
+                run = 0;
+            }
+        }
+        if (run >= 50) longRuns++;
+        for (size_t i = kWarmup; i < r.snapped.size(); i++) if (r.snapped[i]) reseeds++;
+        const double synthPct = 100.0 * synth / (double)(r.ops.size() - kWarmup);
+
+        std::printf("  corpus [%s]\n"
+                    "    replay: synth %.1f%%, runs>=50 %d, worst %d, re-seeds %d\n",
+                    fx.description.empty() ? path.c_str() : fx.description.c_str(),
+                    synthPct, longRuns, worst, reseeds);
+        if (fx.fieldWorstRun >= 0) {
+            std::printf("    field : synth %.1f%%, runs>=50 %d, worst %d\n",
+                        fx.fieldSynthPct, fx.fieldLongRuns, fx.fieldWorstRun);
+        }
+
+        if (fx.maxWorstRun < 0) {
+            CHECK(false,
+                  "fixture %s has no bounds. Compare the replay line above against the "
+                  "field line: if they disagree materially the model is missing something "
+                  "this capture exercises, and bounds would be theatre. If they agree, "
+                  "paste:\n"
+                  "        max_worst_run %d\n        max_long_runs %d\n"
+                  "        max_synth_pct %.1f\n        min_reseeds %d",
+                  path.c_str(), worst, longRuns, synthPct + 0.4, (int)(reseeds * 0.97));
+            continue;
+        }
+
+        // The field numbers are printed, never asserted. They are fidelity evidence for
+        // the policy the capture was taken WITH, so they are checked once by a human at
+        // blessing time. Asserting them continuously would invert as soon as someone
+        // lands a real improvement: the replay would rightly diverge downward from
+        // recorded hardware behaviour and a fidelity check would call that a failure.
+        // Regressions are caught by the bounds below, which do not have that problem.
+
+        CHECK(worst <= fx.maxWorstRun,
+              "[%s] worst recovery grew to %d presents (bound %d)",
+              fx.description.c_str(), worst, fx.maxWorstRun);
+        CHECK(longRuns <= fx.maxLongRuns,
+              "[%s] long recoveries grew to %d (bound %d)",
+              fx.description.c_str(), longRuns, fx.maxLongRuns);
+        CHECK(synthPct <= fx.maxSynthPct,
+              "[%s] synth share grew to %.1f%% (bound %.1f%%)",
+              fx.description.c_str(), synthPct, fx.maxSynthPct);
+        CHECK(reseeds >= fx.minReseeds,
+              "[%s] re-seeds fell to %d (bound %d): a suppressed re-seed means a stall "
+              "recovers by slew instead of snapping",
+              fx.description.c_str(), reseeds, fx.minReseeds);
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -1473,7 +1618,7 @@ int main(int argc, char** argv) {
     test_batch_collapse_keep_real();
     test_lock_reseed_wide_bracket_stall();
     test_lock_reseed_stall_paired_cadence();
-    test_lock_replay_captured_stall();
+    test_replay_capture_corpus();
 
     if (g_failures) {
         std::printf("POLICY TESTS FAILED: %d failure(s)\n", g_failures);
