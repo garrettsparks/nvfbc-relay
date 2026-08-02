@@ -1,0 +1,4 @@
+# Capture corpus for the policy replay gate. One fixture per line.
+# Build with: uv run mktrace.py <NvFBCR.log> <name>.trace "<description>"
+# (mktrace.py lives in this directory; run the suite afterwards for the bounds)
+kcd_60x2_mapcycles.trace
