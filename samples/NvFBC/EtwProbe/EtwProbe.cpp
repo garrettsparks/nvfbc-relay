@@ -83,6 +83,8 @@ static long long g_flipEvents  = 0;
 static long long g_dxgkEvents  = 0;
 static long long g_decodeOk    = 0;
 static long long g_decodeFail  = 0;
+static long long g_decodePos   = 0;
+static long long g_startQpc    = 0;
 static int       g_dumped      = 0;
 
 static long long g_lastTsByHead[kMaxHeads] = {};
@@ -135,6 +137,36 @@ static long long Pct(long long* v, int n, int p) {
     return v[i];
 }
 
+// Positional decode, used when TDH cannot resolve field names because the manifest is
+// not registered (measured: it is not, on this driver). The layout was recovered from
+// the hexdumps of a real 2x trace rather than guessed: a 44-byte payload where the u64
+// at +16 is the QPC flip time, confirmed because its per-head deltas land on the 8.33 ms
+// half-period that a 60 fps source with 2x frame generation produces, and the u32 at +24
+// separates the two heads (the gaming display at 120 flips/s, the relay's own output at
+// 60). Guarded on size and version so a different event layout cannot be misread as this
+// one; if the driver changes the payload, decoding stops rather than reporting nonsense.
+static bool DecodePositional(PEVENT_RECORD ev, uint64_t* alloc, uint64_t* ts,
+                             uint32_t* head, uint32_t* token) {
+    if (ev->UserDataLength < 32) return false;
+    if (ev->EventHeader.EventDescriptor.Version != 0) return false;
+    const BYTE* p = (const BYTE*)ev->UserData;
+    memcpy(alloc, p +  0, sizeof(*alloc));
+    memcpy(ts,    p + 16, sizeof(*ts));
+    memcpy(head,  p + 24, sizeof(*head));
+    memcpy(token, p + 28, sizeof(*token));
+    // Value check, not just a version check. A layout change that does NOT bump the
+    // version would otherwise be read as valid and produce confident wrong timestamps,
+    // which is worse than not decoding. A proposed flip time is necessarily near the
+    // event that announced it: a second either side is far wider than any real
+    // scheduling horizon and far narrower than a misparse, which lands astronomically
+    // off because the field would be part of a handle or a zero run.
+    const long long evt = ev->EventHeader.TimeStamp.QuadPart;
+    const long long diff = (long long)*ts - evt;
+    if (diff > g_qpcFreq || diff < -g_qpcFreq) return false;
+    if (*head >= kMaxHeads) return false;
+    return true;
+}
+
 static void WINAPI OnEvent(PEVENT_RECORD ev) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -170,12 +202,17 @@ static void WINAPI OnEvent(PEVENT_RECORD ev) {
                     GetProp(ev, L"alloc", &alloc, sizeof(alloc));
     if (!ok) {
         g_decodeFail++;
+        ok = DecodePositional(ev, &alloc, &ts, &head, &token);
+        if (ok) g_decodePos++;
         if (g_decodeFail <= 3) {
-            LogLine("  TDH decode failed (manifest likely not registered) - use the hexdumps above");
+            LogLine("  TDH decode failed (manifest not registered) - %s",
+                    ok ? "falling back to the recovered positional layout"
+                       : "and the payload does not match the recovered layout either");
         }
-        return;
+        if (!ok) return;
+    } else {
+        g_decodeOk++;
     }
-    g_decodeOk++;
 
     // ts is a QPC tick value: the flip the driver intends to scan out. Gaps between
     // consecutive values on one head ARE the scanout cadence.
@@ -223,10 +260,19 @@ static void FillProps(EVENT_TRACE_PROPERTIES* props, size_t sz) {
 }
 
 static void Summary() {
+    LARGE_INTEGER endQpc;
+    QueryPerformanceCounter(&endQpc);
     LogLine("");
     LogLine("=== summary ===");
-    LogLine("NVIDIA DisplayDriver events: %lld (FlipRequest %lld, decoded %lld, decode-failed %lld)",
-            g_nvEvents, g_flipEvents, g_decodeOk, g_decodeFail);
+    // The relay's log is normally much longer than the probe's window (it starts before
+    // the game and stops after). These two values are what window it to this trace, on
+    // the same QPC clock the relay records its origin in.
+    LogLine("session window (QPC ticks): %lld .. %lld",
+            g_startQpc, (long long)endQpc.QuadPart);
+    LogLine("NVIDIA DisplayDriver events: %lld (FlipRequest %lld, TDH-decoded %lld, "
+            "positionally decoded %lld, undecodable %lld)",
+            g_nvEvents, g_flipEvents, g_decodeOk, g_decodePos,
+            g_decodeFail - g_decodePos);
     if (g_dxgkEvents) LogLine("DxgKrnl control events: %lld", g_dxgkEvents);
 
     if (g_nvEvents == 0) {
@@ -237,7 +283,7 @@ static void Summary() {
         LogLine("  If DxgKrnl is also zero, the session itself never delivered - check elevation.");
         return;
     }
-    if (g_decodeOk == 0) {
+    if (g_decodeOk == 0 && g_decodePos == 0) {
         LogLine("");
         LogLine("EVENTS ARRIVED BUT NONE DECODED: the manifest is not registered for TDH.");
         LogLine("  The hexdumps above are the payloads; derive the field offsets from them and");
@@ -290,6 +336,7 @@ int main(int argc, char** argv) {
     if (g_logEvents < 0) g_logEvents = 0;
 
     LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_qpcFreq = f.QuadPart;
+    LARGE_INTEGER startQpc; QueryPerformanceCounter(&startQpc); g_startQpc = startQpc.QuadPart;
     g_log = fopen("EtwProbe.log", "w");
     LogLine("=== EtwProbe (NVIDIA DisplayDriver FlipRequest) - run %d s%s ===",
             seconds, alsoDxgk ? ", DxgKrnl control enabled" : "");
