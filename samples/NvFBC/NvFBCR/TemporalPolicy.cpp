@@ -25,6 +25,23 @@ int64_t WrapHalf(int64_t d, int64_t p) {
 // normal one-dupe drift sweep, so steady-state tracking never triggers it.
 static const int kStallRunPresents = 3;
 
+// Post-resume convergence window. The re-seed measures phase from ONE bracket, picked by
+// the threshold above, and that bracket's before-frame is frequently a grab-timeout
+// re-grab whose timestamp is the timeout instant rather than a source render tick. The
+// resulting estimate is often wrong by a few hundred to a few thousand microseconds, and
+// at the steady-state slew that residual takes 50-190 presents to bleed off: seconds of
+// visible blending after the source has already recovered.
+//
+// Moving the threshold only changes WHICH resumes draw a bad sample (measured: events
+// trade places, the worst case barely moves). So rather than commit to the sample, the
+// estimator runs fast for a short window afterwards and the actuator is allowed to keep
+// up with it. A bad sample is then corrected within a few presents. The faster actuator
+// is safe here precisely because it is paired with the faster estimator; outside the
+// window both revert to steady-state values and tracking is unchanged.
+static const int kRecoverPresents = 16;   // about 0.27 s at 60 Hz
+static const int kRecoverAlpha    = 2;    // error-EMA divisor while recovering (16 otherwise)
+static const int kRecoverSlewDiv  = 32;   // slew cap of comb/32 while recovering
+
 BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTicks) {
     BatchDecision d;
     d.intraBatch = s.started && (arrivalTs - s.lastArrivalTs) < thresholdTicks;
@@ -71,8 +88,12 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     if (!s.seeded || resumedFromStall) {
         s.errEmaQpc = err;
         s.seeded = true;
+        // Only a stall resume opens the window. Cold acquisition converges from a clean
+        // timeline and has its own pinned behaviour.
+        if (resumedFromStall) s.recoverRun = kRecoverPresents;
     } else {
-        s.errEmaQpc += WrapHalf(err - s.errEmaQpc, cfg.combQpc) / 16;
+        const int alpha = (s.recoverRun > 0) ? kRecoverAlpha : 16;
+        s.errEmaQpc += WrapHalf(err - s.errEmaQpc, cfg.combQpc) / alpha;
         s.errEmaQpc = WrapHalf(s.errEmaQpc, cfg.combQpc);
     }
     int64_t dev = WrapHalf(err - s.errEmaQpc, cfg.combQpc);
@@ -92,10 +113,15 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     // Snap the full correction on an engaged stall-resume; otherwise slew-limit it so
     // steady-state tracking stays gentle (no abrupt phase jumps). A disengaged resume
     // has want == 0 and just decays the pull, so it needs no snap.
+    // Inside the convergence window the actuator may move faster, matched to the faster
+    // estimator above; outside it steady-state tracking is untouched.
+    const int64_t slew = (s.recoverRun > 0) ? (cfg.combQpc / kRecoverSlewDiv)
+                                            : cfg.phasePullSlewQpc;
     if (!(resumedFromStall && s.engaged)) {
-        if (delta > cfg.phasePullSlewQpc) delta = cfg.phasePullSlewQpc;
-        else if (delta < -cfg.phasePullSlewQpc) delta = -cfg.phasePullSlewQpc;
+        if (delta > slew) delta = slew;
+        else if (delta < -slew) delta = -slew;
     }
+    if (s.recoverRun > 0) s.recoverRun--;
     s.pullQpc += delta;
 
     // Wrap hysteresis: the pull may overshoot the [0, comb) domain by a band before

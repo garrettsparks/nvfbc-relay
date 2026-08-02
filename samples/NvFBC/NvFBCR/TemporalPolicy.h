@@ -92,6 +92,7 @@ struct PhaseLockState {
     bool engaged = false;
     bool seeded = false;
     int stallRun = 0;      // consecutive presents whose bracket carried no phase information
+    int recoverRun = 0;    // presents left in the post-resume convergence window
 };
 
 // Fixed at Setup. combQpc == 0 disables the lock entirely (selection then equals the
