@@ -1,6 +1,10 @@
 # ETW Frame-Timing Spec (reading the driver's real scanout times)
 
-Status: DESIGN. Probe built and CI-green; no measurements taken yet, no relay code consuming it.
+Status: FEASIBILITY ESTABLISHED, no relay code consuming it yet. Measured on hardware: the events
+arrive, the wire layout is recovered and validated against a known refresh rate, the scanout grid
+is readable, delivery latency is 8 ms p50 once the session is configured for it, and flips pair to
+capture wakes within ~70 us. What remains unbuilt is the relay-side consumer and the pairing rule
+itself.
 Companions: `dxgi-native-pipeline-spec.md`, `nvfbc-capture-pacing.md`, `frame-marker-spec.md`.
 
 ## The problem
@@ -117,19 +121,24 @@ Keyed by the monotonic capture counter, never by slot index, so recycling cannot
 The ring itself must grow only if the lag floor is raised, because the frames have to survive
 until the target reaches them:
 
-| capture rate | frames alive for a 90 ms floor + ~2 source periods | RING_SIZE |
+| capture rate | frames alive for a 40 ms floor + ~2 source periods | RING_SIZE |
 |---|---|---|
-| 120/s (60x2) | ~123 ms | >= 16 |
-| 180/s (90x2) | ~123 ms | >= 22, use 32 |
+| 120/s (60x2) | ~73 ms | >= 9, use 16 |
+| 180/s (90x2) | ~73 ms | >= 14, use 16 |
 
-32 slots is ~253 MiB at 1920x1080x4B. Negligible on this card.
+16 slots is ~127 MiB at 1920x1080x4B. The 90 ms floor this table originally assumed needed 32;
+measuring delivery lag at 8 ms p50 rather than the ~30 ms guessed made the smaller floor viable.
 
 **The lag floor is a runtime knob, not a design commitment.** Because degradation is graceful, the
 relay can ship at today's 20833 us and raise the floor per-profile. Relay output latency does not
 touch the player's input loop (gameplay happens on the source display; the relay feeds the XR1 ->
-OBS PC -> Twitch), so 90-120 ms costs stream viewers a rounding error on top of seconds they
-already have. The lag must stay CONSTANT for audio-sync compensation, which the existing
+OBS PC -> Twitch), so tens of milliseconds cost stream viewers a rounding error on top of seconds
+they already have. The lag must stay CONSTANT for audio-sync compensation, which the existing
 launch-time-constant design already guarantees.
+
+Measured, the floor needed is **40-50 ms**, not the 90-120 ms guessed here originally. At today's
+20833 us the p50 upgrade lands and the tail does not, which is exactly the graceful path this
+section describes rather than a failure.
 
 ## The provider
 
@@ -141,8 +150,37 @@ fields: alloc (u64), vidPnSourceId (u32), ts (u64), token (u32)
 
 `ts` is the PROPOSED FLIP TIME in QPC ticks. Consecutive `ts` values on one head are the true
 scanout cadence. GUID and descriptor come from the manifest PresentMon embeds, cross-checked
-against its consumer; field order above is READ order from that consumer, which is not necessarily
-wire order.
+against its consumer.
+
+**The wire layout is now recovered from hardware, not taken from that field list.** TDH cannot
+resolve field names here: NVIDIA's provider does not register a manifest (10800 of 10800 events
+failed on a current driver), which is why PresentMon ships a reverse-engineered copy of the schema
+rather than asking the system. Decoding is positional, from a layout read off real payloads:
+
+```
++0  u64   per-head counter, +1 per event
++8  u64   second counter, +1 per event
++16 u64   PROPOSED FLIP TIME (QPC)
++24 u32   vidPnSourceId (head)
++28 u32   token
++32       12 bytes, zero on every payload observed
+44 bytes total, descriptor ver=0 opcode=10
+```
+
+`+16` is identified positively rather than by elimination: its per-head deltas land on the 8.33 ms
+half-period a 60 fps source with 2x frame generation produces, and on a 240 Hz desktop they land on
+4.167 ms with 95.7% of gaps in a single bucket - a rate known independently of the measurement.
+Decoding is guarded three ways (payload size, descriptor version, and the flip time landing within
+a second of the event that announced it) so a driver that moves the layout stops decoding rather
+than reporting confident nonsense.
+
+**Two heads appear, not one.** The gaming display at 120 flips/s under 2x and the relay's own XR1
+output at 60. Filter by head; never aggregate them.
+
+**`ahead` is ~0.** The driver logs the event at the instant it assigns the flip time (measured
+0-880 us depending on workload). There is no advance notice, so the earliest a flip can be known
+is its own scanout time plus delivery lag. That makes delivery lag the whole budget rather than
+one term in it.
 
 ## EtwProbe
 
@@ -151,24 +189,108 @@ Standalone exe, in the solution so CI builds it. Requires elevation. Reports:
 - **dts histogram** - gaps between consecutive proposed flip times on a head. A tight spike near
   8.33 ms at 60x2 means the grid is even and readable. Smeared or multi-modal kills the arithmetic
   model outright.
-- **ahead** - `ts` minus the event stamp: how far in advance the driver schedules a flip.
+- **ahead** - `ts` minus the event stamp. Measured at ~0, see above.
 - **lag** - callback time minus event stamp: raw ETW delivery latency. This sizes the floor.
-- **hexdump of the first 8 payloads**, always. `TdhGetProperty` resolves field names only if the
-  manifest is registered, and PresentMon embedding NVIDIA's manifest is evidence it may not be. If
-  TDH fails the hexdump is how the wire layout gets recovered from hardware instead of guessed.
+- **session losses** - events, real-time buffers and log buffers dropped, read from the session at
+  stop. Mandatory next to any latency figure: latency bought by discarding events looks identical
+  to latency earned, and this project's recurring failure is the silently wrong measurement.
+- **hexdump of the first 8 payloads**, always, decode success or not. It is the only route to
+  re-deriving the layout when a driver update moves it.
 - **`--dxgk` control** - also enables DxgKrnl and counts it. If NVIDIA events are zero but DxgKrnl
   is not, the session works and the provider is the problem. Without the control a silent probe
   has five possible causes.
 
+## Required session configuration
+
+Any consumer, probe or relay, needs all of these. Each was established by measurement and three of
+them are the difference between an 8 ms pipeline and a 1.5 second one.
+
+```
+StartTrace:
+  Wnode.ClientContext = 1                              // QPC, so flip times and NvFBC arr= share a clock
+  LogFileMode = EVENT_TRACE_REAL_TIME_MODE
+              | EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING // removes ~14 ms of pipeline delay
+  BufferSize = 64 KB, MinimumBuffers = 256, MaximumBuffers = 1024   // PresentMon's sizing
+
+OpenTrace:
+  ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME
+                   | PROCESS_TRACE_MODE_EVENT_RECORD
+                   | PROCESS_TRACE_MODE_RAW_TIMESTAMP  // without this EventHeader.TimeStamp is
+                                                       // system time, not the QPC asked for above
+
+Consumer thread:
+  ControlTrace(EVENT_TRACE_CONTROL_FLUSH) every ~10 ms // delivery is otherwise on a ~1 s cadence
+```
+
+`RAW_TIMESTAMP` is the subtle one: `Wnode.ClientContext` alone does NOT make the event header
+arrive in QPC, and mixing a QPC payload against a system-time header silently rejects or corrupts
+every comparison. Both PresentMon and this probe set it.
+
+Read the session's loss counters at stop and log them. Every configuration above was verified to
+lose zero events across seven runs, but that is a property of a measured workload, not a guarantee.
+
 ## Open questions
 
-1. **Raw ETW delivery lag distribution. UNMEASURED.** The ~30 ms figure is PresentMon's own
-   pipeline, not raw ETW, which delivers on buffer-fill or flush timer. The p99 and tail size the
-   lag floor. The probe's `lag` line answers it.
-2. **Pairing.** ETW gives a flip with a token and a scanout time; NvFBC gives a wake with no
-   identity. Nothing in either stream names the other, so matching is structural (N flips per
-   source period against M captures per batch, in order). This does NOT get easier with more
-   latency, and it is now the hard part.
+1. **Raw ETW delivery lag. MEASURED - and the session must be configured for it.** Left at
+   defaults, real-time ETW delivers on a ~1 s cadence and hands over the PREVIOUS period's buffer,
+   so even the freshest event in a delivery is ~1 s old (p50 1487 ms, max 2025 ms). That is 70x
+   past the relay's bracketing lag and would have killed the design. Two settings fix it, and both
+   are needed:
+
+   | configuration | lag p50 | p95 | max |
+   |---|---|---|---|
+   | defaults | 1487 ms | 1961 ms | 2025 ms |
+   | forced flush every 10 ms | 23.7 ms | 30.7 ms | 35.9 ms |
+   | `EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING` | 20.2 ms | 36.8 ms | 37.5 ms |
+   | **both** | **8.0 ms** | **15.0 ms** | **30.4 ms** |
+
+   The two are not the same mechanism. A forced flush (`ControlTrace` with
+   `EVENT_TRACE_CONTROL_FLUSH` on a timer) delivers OFTEN but each delivery is stale; consolidating
+   the per-processor buffers makes each delivery FRESH by removing ~14 ms of pipeline delay.
+   Combining them gives frequent delivery of fresh data. The relationship is simply
+   `p50 ~= flush interval / 2`.
+
+   Two practical notes. `Sleep()` is quantised by the 15.6 ms system timer, so a 10 ms request
+   produces a 16 ms interval and 20 ms and 30 ms requests are indistinguishable (both measured
+   15.7 ms p50); a high-resolution waitable timer would take p50 to ~2.5 ms if anything ever needs
+   it. And zero events were lost in any configuration, including the consolidated one that
+   Microsoft documents as able to lose them - verified across seven runs, not assumed.
+
+   PresentMon independently confirms the approach: it uses `PROCESS_TRACE_MODE_RAW_TIMESTAMP` and
+   exposes a `SetEtwFlushPeriod` API for exactly this, defaulting to off. It does NOT consolidate
+   per-processor buffers, and it sizes its pool at 64 KB x 256-1024 buffers, which this probe now
+   matches.
+
+   Consequence for the lag floor: with p95 at 15 ms and the flip 8.33 ms after the wake, an upgrade
+   lands ~23 ms after capture. At today's 20833 us floor most upgrades land and the tail does not,
+   which is the graceful degradation the design already assumes. A **40-50 ms** floor lands
+   everything including the max. The 90-120 ms figure below was a guess made before this
+   measurement and is not needed; RING_SIZE goes 8 -> ~16 rather than 32.
+
+   Not yet measured in situ: these are desktop numbers with a TestUFO tab, not the game plus relay
+   under load. That measurement belongs to the first relay-side consumer.
+2. **Pairing. Much easier than this section assumed, but the RULE is still unvalidated.** The
+   pessimism here predated knowing both streams would share a clock. They do: the probe requests
+   QPC (`Wnode.ClientContext = 1` plus `PROCESS_TRACE_MODE_RAW_TIMESTAMP`) and the relay logs its
+   QPC origin at startup, so the two logs join by arithmetic with no fingerprinting. Against a real
+   capture, every other head-0 flip coincided with an NvFBC wake to within **+73, +62 and -40 us**.
+   That is identification, not structural matching.
+
+   What that establishes and what it does not:
+
+   | claim | status |
+   |---|---|
+   | the first wake of a batch coincides with a flip | measured, 3 of 3 |
+   | the second wake belongs to the NEXT flip, 8.33 ms later | inferred from how frame generation must work, NOT measured |
+
+   The second is the load-bearing half of any pairing rule and is currently reasoning. It needs
+   measuring across thousands of batches, including the ragged cases (a pair that missed the 3 ms
+   collapse window, a stall resume), before a `capture_seq` field exists anywhere. An unpairable
+   wake must come out explicitly unpairable rather than silently matched to a neighbouring flip.
+
+   One consequence already visible: batch-collapse stamps the surviving REAL frame at batch-start,
+   but the flips say that frame does not reach the screen until ~8.33 ms later. A constant offset
+   is harmless; it stops being constant when the batch structure varies.
 3. **Is the grid readable at x3?** x3 never paced correctly and the reason is unknown. Where those
    frames actually land is a direct measurement, and it may be a different explanation from the
    batch-grouping one.
@@ -184,7 +306,8 @@ Standalone exe, in the solution so CI builds it. Requires elevation. Reports:
    threshold. The wake timelines are identical. The x2 baseline trace answers it: count the flips
    per source period and compare their scanout spacing against the wake spacing over the same
    interval. If the answer is "generated frame", the 3 ms threshold is the thing to fix and it is
-   cheaper than consuming ETW at runtime.
+   cheaper than consuming ETW at runtime. Still open: the traces so far are desktop-only, and this
+   question needs the game running with the relay capturing.
 
 ## Settled, do not re-litigate
 

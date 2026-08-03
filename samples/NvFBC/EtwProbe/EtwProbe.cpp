@@ -36,7 +36,8 @@
 // payloads so the layout can be re-derived if a driver update moves it.
 //
 // Requires elevation (real-time ETW).
-// Usage: EtwProbe.exe [seconds] [--dxgk] [--events N] [--bufkb K] [--flushms M] [--noperproc]
+// Usage: EtwProbe.exe [seconds] [--dxgk] [--events N] [--bufkb K] [--minbuf N]
+//                     [--flushms M] [--noperproc]
 //   --dxgk also enables Microsoft-Windows-DxgKrnl and counts its events. Purely a control: if
 //   the NVIDIA event count is zero but DxgKrnl is nonzero, the session works and the NVIDIA
 //   provider is the problem (wrong GUID, Smooth Motion off, or nothing being flipped).
@@ -63,12 +64,19 @@ using flipdecode::kFlipRequestKeyword;
 using flipdecode::kDxgKrnlGuid;
 
 static const wchar_t* kSessionName = L"EtwProbeSession";
-// Trace buffer sizing, which is what actually determines delivery latency. Overridable so
-// the tradeoff can be measured rather than argued about: smaller buffers deliver sooner
-// and cost more flushes.
-static ULONG kBufferSizeKb = 4;
-static ULONG kMinBuffers   = 16;
-static ULONG kMaxBuffers   = 64;
+// Trace buffer pool. Sized to match PresentMon's real-time session, which is the most
+// mature consumer of this same provider: 64 KB buffers, 256 minimum, 1024 maximum.
+//
+// An earlier guess here was 4 KB x 16 on the theory that small buffers fill faster and so
+// deliver sooner. Measurement killed it - shrinking buffers moved delivery latency
+// hardly at all, because the kernel's real-time cadence, not buffer fill, is what governs
+// it. Worse, that config left a 64 KB TOTAL pool against PresentMon's 16 MB, which is the
+// likely reason the one run that consolidated per-processor buffers into that tiny pool
+// also saw a third of the expected events: consolidation removes the per-CPU slack that
+// was hiding how small the pool was.
+static ULONG kBufferSizeKb = 64;
+static ULONG kMinBuffers   = 256;
+static ULONG kMaxBuffers   = 1024;
 // Forced-flush interval in ms, 0 = off. The kernel delivers real-time buffers on a cadence
 // of its own that measured at ~1 s and barely moved for 46x the traffic, but the flush
 // StopTrace performs at shutdown delivered in 9.4 ms. So the consumer asking for a flush
@@ -357,6 +365,7 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--dxgk")) alsoDxgk = true;
         else if (!strcmp(argv[i], "--events") && i + 1 < argc) g_logEvents = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bufkb") && i + 1 < argc) kBufferSizeKb = (ULONG)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--minbuf") && i + 1 < argc) kMinBuffers = (ULONG)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--flushms") && i + 1 < argc) kFlushMs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--noperproc")) kNoPerProc = true;
         else seconds = atoi(argv[i]);
