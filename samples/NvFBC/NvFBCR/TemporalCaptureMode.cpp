@@ -190,9 +190,18 @@ void TemporalCaptureMode::Run(
     // it by cross-correlating event sequences is guesswork this one line removes.
     LOG("QPC origin %lld ticks, frequency %lld Hz (log times are us since the origin)",
         m_baseQpc.QuadPart, m_scheduler.Freq());
-    // Started here rather than in Setup because it needs that origin. A failure is logged
-    // and ignored: this is instrumentation, and it must never be able to stop a capture.
-    if (m_etw) m_etwConsumer.Start(m_scheduler.Freq(), m_baseQpc.QuadPart);
+    // Started here rather than in Setup because it needs that origin. A failure never stops
+    // the capture, but it does interrupt: the console is closed by the time this runs, so a
+    // logged-and-ignored failure is invisible until the capture is already spent. Asking for
+    // -etw and silently getting a normal capture has cost a session once already.
+    if (m_etw && !m_etwConsumer.Start(m_scheduler.Freq(), m_baseQpc.QuadPart)) {
+        MessageBoxA(NULL,
+                    "-etw was requested but the ETW session did not start.\n\n"
+                    "Flip timing will NOT be recorded. The capture will otherwise run "
+                    "normally.\n\nSee NvFBCR.log for the reason.",
+                    "NvFBCR: ETW flip capture unavailable",
+                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+    }
     const double usPerTick = 1000000.0 / (double)m_scheduler.Freq();
     const long long lagUs = (long long)(m_bracketingDelayQpc * usPerTick);
 
