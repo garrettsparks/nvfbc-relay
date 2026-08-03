@@ -155,8 +155,18 @@ static void WINAPI OnEvent(PEVENT_RECORD ev) {
     if (!flipdecode::DecodeFlip(ev, g_qpcFreq, &fe)) {
         g_decodeFail++;
         if (g_decodeFail <= 3) {
-            LogLine("  payload does not match the recovered layout - dump it and re-derive "
-                    "the offsets; the driver may have changed the event");
+            // Print the numbers that failed, not just that something did: the guard
+            // rejects on size, version, an implausible flip time, or an implausible head,
+            // and which one it was decides whether the driver changed or the session is
+            // misconfigured.
+            unsigned long long rawTs = 0;
+            if (ev->UserDataLength >= 24) memcpy(&rawTs, (const BYTE*)ev->UserData + 16, 8);
+            LogLine("  decode rejected: len=%lu ver=%u payloadTs=%llu evtTs=%lld delta=%lld "
+                    "(a delta far outside a second means the event clock is not QPC)",
+                    (unsigned long)ev->UserDataLength,
+                    ev->EventHeader.EventDescriptor.Version,
+                    rawTs, (long long)ev->EventHeader.TimeStamp.QuadPart,
+                    (long long)((long long)rawTs - ev->EventHeader.TimeStamp.QuadPart));
         }
         return;
     }
@@ -324,7 +334,12 @@ int main(int argc, char** argv) {
 
     EVENT_TRACE_LOGFILEW logfile = {};
     logfile.LoggerName          = (LPWSTR)kSessionName;
-    logfile.ProcessTraceMode    = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    // RAW_TIMESTAMP is what makes EventHeader.TimeStamp arrive in the units the session
+    // asked for (Wnode.ClientContext = 1, i.e. QPC). Without it ETW helpfully converts
+    // every stamp to system time, so the event clock and the payload's flip time end up
+    // in different units and nothing can be compared against anything.
+    logfile.ProcessTraceMode    = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD |
+                                  PROCESS_TRACE_MODE_RAW_TIMESTAMP;
     logfile.EventRecordCallback = OnEvent;
     TRACEHANDLE consumer = OpenTraceW(&logfile);
     if (consumer == INVALID_PROCESSTRACE_HANDLE) {
