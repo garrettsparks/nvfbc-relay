@@ -19,7 +19,7 @@ static const float kDefaultAssumedSrcFps = 60.0f;
 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
-                                         bool tint)
+                                         bool tint, bool etw)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_compositor(NULL)
@@ -29,6 +29,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_mark(mark)
     , m_markFrames(markFrames)
     , m_tint(tint)
+    , m_etw(etw)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_srcRateHint(srcRateHint)
@@ -38,6 +39,12 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
 }
 
 TemporalCaptureMode::~TemporalCaptureMode() {
+    // Stop the ETW session before anything else: its callback touches this object, and a
+    // consumer thread outliving the object it writes into is a crash on shutdown.
+    if (m_etw) {
+        m_etwConsumer.LogSummary();
+        m_etwConsumer.Stop();
+    }
     delete m_compositor;
 }
 
@@ -183,6 +190,9 @@ void TemporalCaptureMode::Run(
     // it by cross-correlating event sequences is guesswork this one line removes.
     LOG("QPC origin %lld ticks, frequency %lld Hz (log times are us since the origin)",
         m_baseQpc.QuadPart, m_scheduler.Freq());
+    // Started here rather than in Setup because it needs that origin. A failure is logged
+    // and ignored: this is instrumentation, and it must never be able to stop a capture.
+    if (m_etw) m_etwConsumer.Start(m_scheduler.Freq(), m_baseQpc.QuadPart);
     const double usPerTick = 1000000.0 / (double)m_scheduler.Freq();
     const long long lagUs = (long long)(m_bracketingDelayQpc * usPerTick);
 

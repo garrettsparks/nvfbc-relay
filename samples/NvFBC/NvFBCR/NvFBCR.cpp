@@ -90,6 +90,10 @@ bool g_mark = false;
 // Rides the blend shader's existing pass, so it costs no extra draw and leaves
 // passthrough frames untouched.
 bool g_tint = false;
+// Consume the display driver's flip events alongside capture (-etw, debug). Diagnostic
+// only: it adds flip lines to the log and nothing reads them. Off by default so the
+// validated daily-driver path is untouched.
+bool g_etw = false;
 
 // Optional count for -mark: burn only the first N presents (a head burst that aligns a
 // stream VOD without marking watched gameplay), then run clean. 0 = every present (the
@@ -135,7 +139,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             _stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0 ||
             _stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
-                                           kind, g_mark, g_markFrames, g_tint);
+                                           kind, g_mark, g_markFrames, g_tint, g_etw);
         }
 
         // QPC-timer present (t:60 / b:60 / o:60 format).
@@ -143,7 +147,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             float framerate;
             if (ParseFps(modeStr.substr(2), &framerate)) {
                 return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
-                                               kind, g_mark, g_markFrames, g_tint);
+                                               kind, g_mark, g_markFrames, g_tint, g_etw);
             }
         }
     }
@@ -181,6 +185,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  -interp flow|fruc - o:* synthesis engine (default flow = raw NVOFA + warp)");
     LOGERR("  -mark [N]      - Burn the frame-counter marker (video-to-log alignment, debug); off by default. N = first N presents only (stream head anchor), else every present");
     LOGERR("  -tint          - Border-tint synthesized frames red (blend mode, debug); off by default");
+    LOGERR("  -etw           - Log the display driver's true scanout times alongside capture (debug); off by default");
     return NULL;
 }
 
@@ -436,6 +441,10 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         g_tint = true;
         return 1;
     }
+    if (tokens[i] == "-etw") {
+        g_etw = true;
+        return 1;
+    }
     if (tokens[i] == "-mark") {
         g_mark = true;
         // Optional frame count: consume the next token as N only if it is all digits, so
@@ -648,9 +657,10 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     if (!g_mark)           snprintf(markDesc, sizeof(markDesc), "off");
     else if (g_markFrames) snprintf(markDesc, sizeof(markDesc), "on (first %u presents)", g_markFrames);
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
-    LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s",
+    LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s, "
+        "etw flip capture %s",
         g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
-        g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off");
+        g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off");
 
     BUF_WIDTH = target.position.right - target.position.left;
     BUF_HEIGHT = target.position.bottom - target.position.top;
