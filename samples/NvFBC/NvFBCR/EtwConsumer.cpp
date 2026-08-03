@@ -166,6 +166,11 @@ void EtwFlipConsumer::OnEvent(PEVENT_RECORD ev) {
     m_events.fetch_add(1, std::memory_order_relaxed);
     if (!flipdecode::IsFlipRequest(ev)) return;
 
+    // Read the clock only once past the provider filter: this callback also sees every
+    // non-flip event from the provider, and a QPC read on each of those is pure cost.
+    LARGE_INTEGER nowQpc;
+    QueryPerformanceCounter(&nowQpc);
+
     flipdecode::FlipEvent fe;
     if (!flipdecode::DecodeFlip(ev, m_qpcFreq, &fe)) {
         m_decodeFail.fetch_add(1, std::memory_order_relaxed);
@@ -185,10 +190,16 @@ void EtwFlipConsumer::OnEvent(PEVENT_RECORD ev) {
 
     // Same origin and units as arr= and dl=, so the flip stream and the capture stream are
     // directly comparable inside one log without any alignment step.
+    //
+    // lag is how long after the driver announced the flip this process learned about it.
+    // It decides whether the data could ever inform a decision rather than only describe
+    // one afterwards, and it has only ever been measured on an idle desktop; under a game
+    // plus a running relay it may be a different number entirely.
     const double usPerTick = 1000000.0 / (double)m_qpcFreq;
-    LOG("flip disp=%lldus evt=%lldus head=%u token=%u",
+    LOG("flip disp=%lldus evt=%lldus lag=%lldus head=%u token=%u",
         (long long)(((int64_t)fe.displayQpc - m_baseQpc) * usPerTick),
         (long long)((fe.eventQpc - m_baseQpc) * usPerTick),
+        (long long)((nowQpc.QuadPart - fe.eventQpc) * usPerTick),
         fe.head, fe.token);
 }
 
