@@ -6,6 +6,7 @@
 #include "CaptureRing.h"
 #include "FrameMarker.h"
 #include "TemporalPolicy.h"
+#include "EtwConsumer.h"
 
 // Temporal capture mode — nearest-frame selection for smooth fixed-rate capture of a
 // (possibly variable-rate) source.
@@ -55,6 +56,8 @@ private:
     float m_srcRateHint;            // declared source fps (-src); 0 = unset, assume >= 60
     IDirect3DDevice9Ex* m_device;
     FrameMarker m_marker;           // per-present provenance burn-in (inert unless -mark)
+    bool m_etw;                     // -etw: read the driver's scanout times while capturing
+    EtwFlipConsumer m_etwConsumer;  // inert unless m_etw; nothing in the policy reads it
 
     // The one lag-sizing rule: 1.25x the source period for bracketing headroom, floored at
     // the present period. Setup sizes the operative lag with it; telemetry sizes suggestions.
@@ -63,7 +66,8 @@ private:
 public:
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
                         bool lock = false, CompositorKind compositor = kCompositorNearest,
-                        bool mark = false, unsigned int markFrames = 0, bool tint = false);
+                        bool mark = false, unsigned int markFrames = 0, bool tint = false,
+                        bool etw = false);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;
