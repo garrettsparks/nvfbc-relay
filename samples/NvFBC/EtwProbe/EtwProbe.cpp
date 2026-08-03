@@ -35,7 +35,7 @@
 // recovered on real hardware (see FlipDecode), and this probe ALWAYS hexdumps the first few
 // payloads so the layout can be re-derived if a driver update moves it.
 //
-// Requires elevation (real-time ETW). Usage: EtwProbe.exe [seconds] [--dxgk] [--events N]
+// Requires elevation (real-time ETW). Usage: EtwProbe.exe [seconds] [--dxgk] [--events N] [--bufkb K]
 //   --dxgk also enables Microsoft-Windows-DxgKrnl and counts its events. Purely a control: if
 //   the NVIDIA event count is zero but DxgKrnl is nonzero, the session works and the NVIDIA
 //   provider is the problem (wrong GUID, Smooth Motion off, or nothing being flipped).
@@ -62,6 +62,12 @@ using flipdecode::kFlipRequestKeyword;
 using flipdecode::kDxgKrnlGuid;
 
 static const wchar_t* kSessionName = L"EtwProbeSession";
+// Trace buffer sizing, which is what actually determines delivery latency. Overridable so
+// the tradeoff can be measured rather than argued about: smaller buffers deliver sooner
+// and cost more flushes.
+static ULONG kBufferSizeKb = 4;
+static ULONG kMinBuffers   = 16;
+static ULONG kMaxBuffers   = 64;
 static const int  kMaxHeads      = 8;    // vidPnSourceId values tracked
 static const int  kHexDumpEvents = 8;    // payloads dumped verbatim for layout recovery
 // Per-event lines before going quiet. The aggregates below (histogram, percentiles)
@@ -212,11 +218,28 @@ static DWORD WINAPI StopAfter(LPVOID arg) {
 }
 
 static void FillProps(EVENT_TRACE_PROPERTIES* props, size_t sz) {
-    props->Wnode.BufferSize    = (ULONG)sz;
+    props->Wnode.BufferSize    = (ULONG)sz;   // size of THIS struct, not the trace buffer
     props->Wnode.Flags         = WNODE_FLAG_TRACED_GUID;
     props->Wnode.ClientContext = 1;                     // QPC clock, matching the relay's arr=
     props->LogFileMode         = EVENT_TRACE_REAL_TIME_MODE;
     props->LoggerNameOffset    = sizeof(EVENT_TRACE_PROPERTIES);
+
+    // Delivery latency is set here, and the defaults are useless for this purpose.
+    // Measured with them: buffers flushed once a second and delivered the PREVIOUS
+    // second's, so even the freshest event in a burst was ~1017 ms old - two orders of
+    // magnitude past the relay's 20833 us bracketing lag. The same run's final burst,
+    // which StopTrace flushes immediately, delivered in 9.8 ms, so the pipeline is fast
+    // and only the cadence was slow.
+    //
+    // FlushTimer is in SECONDS and cannot go below 1, so it is not the lever. Buffers
+    // also flush when FULL, so the lever is making them small enough to fill quickly:
+    // at the measured ~100 KB/s of provider traffic a 4 KB buffer fills in roughly
+    // 40 ms. More buffers in rotation keeps the provider from stalling or dropping while
+    // the consumer drains one.
+    props->BufferSize     = kBufferSizeKb;
+    props->MinimumBuffers = kMinBuffers;
+    props->MaximumBuffers = kMaxBuffers;
+    props->FlushTimer     = 1;
 }
 
 static void Summary() {
@@ -288,6 +311,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dxgk")) alsoDxgk = true;
         else if (!strcmp(argv[i], "--events") && i + 1 < argc) g_logEvents = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bufkb") && i + 1 < argc) kBufferSizeKb = (ULONG)atoi(argv[++i]);
         else seconds = atoi(argv[i]);
     }
     if (seconds <= 0) seconds = 20;
@@ -302,6 +326,10 @@ int main(int argc, char** argv) {
     // evt= and ts= below are ABSOLUTE QPC ticks on the same clock the relay logs its
     // origin in, so the two logs join exactly with no wallclock or fingerprinting.
     LogLine("per-event lines: first %d flips", g_logEvents);
+    LogLine("trace buffers: %lu KB x %lu-%lu, flush timer 1 s (buffer FILL is what makes "
+            "delivery prompt; the timer floor is 1 s)",
+            (unsigned long)kBufferSizeKb, (unsigned long)kMinBuffers,
+            (unsigned long)kMaxBuffers);
 
     const size_t nameBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
     const size_t sz = sizeof(EVENT_TRACE_PROPERTIES) + nameBytes;
