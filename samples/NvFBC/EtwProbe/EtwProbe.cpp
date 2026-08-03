@@ -35,7 +35,8 @@
 // recovered on real hardware (see FlipDecode), and this probe ALWAYS hexdumps the first few
 // payloads so the layout can be re-derived if a driver update moves it.
 //
-// Requires elevation (real-time ETW). Usage: EtwProbe.exe [seconds] [--dxgk] [--events N] [--bufkb K]
+// Requires elevation (real-time ETW).
+// Usage: EtwProbe.exe [seconds] [--dxgk] [--events N] [--bufkb K] [--flushms M] [--noperproc]
 //   --dxgk also enables Microsoft-Windows-DxgKrnl and counts its events. Purely a control: if
 //   the NVIDIA event count is zero but DxgKrnl is nonzero, the session works and the NVIDIA
 //   provider is the problem (wrong GUID, Smooth Motion off, or nothing being flipped).
@@ -68,6 +69,17 @@ static const wchar_t* kSessionName = L"EtwProbeSession";
 static ULONG kBufferSizeKb = 4;
 static ULONG kMinBuffers   = 16;
 static ULONG kMaxBuffers   = 64;
+// Forced-flush interval in ms, 0 = off. The kernel delivers real-time buffers on a cadence
+// of its own that measured at ~1 s and barely moved for 46x the traffic, but the flush
+// StopTrace performs at shutdown delivered in 9.4 ms. So the consumer asking for a flush
+// on a timer exercises a path already known to be fast.
+static int   kFlushMs      = 0;
+// Consolidate the per-processor buffers into one set. By default ETW keeps a buffer per
+// CPU, so a given provider's traffic is divided across them and each fills N times slower.
+static bool  kNoPerProc    = false;
+// Loss statistics, captured from the session at stop. Aggressive flushing that "fixes"
+// latency by dropping events would otherwise look like success.
+static ULONG g_eventsLost = 0, g_rtBuffersLost = 0, g_logBuffersLost = 0, g_buffersWritten = 0;
 static const int  kMaxHeads      = 8;    // vidPnSourceId values tracked
 static const int  kHexDumpEvents = 8;    // payloads dumped verbatim for layout recovery
 // Per-event lines before going quiet. The aggregates below (histogram, percentiles)
@@ -87,6 +99,7 @@ static long long g_dxgkEvents  = 0;
 static long long g_decodeOk    = 0;
 static long long g_decodeFail  = 0;
 static long long g_startQpc    = 0;
+static volatile bool g_stopFlush = false;
 static int       g_dumped      = 0;
 
 static long long g_lastTsByHead[kMaxHeads] = {};
@@ -204,15 +217,39 @@ static void WINAPI OnEvent(PEVENT_RECORD ev) {
     }
 }
 
+// Ask the kernel to hand over whatever it has, rather than waiting for its own cadence.
+static DWORD WINAPI FlushLoop(LPVOID) {
+    const size_t nameBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t sz = sizeof(EVENT_TRACE_PROPERTIES) + nameBytes;
+    EVENT_TRACE_PROPERTIES* p = (EVENT_TRACE_PROPERTIES*)calloc(1, sz);
+    if (!p) return 0;
+    while (!g_stopFlush) {
+        Sleep((DWORD)kFlushMs);
+        memset(p, 0, sz);
+        p->Wnode.BufferSize = (ULONG)sz;
+        ControlTraceW(g_session, kSessionName, p, EVENT_TRACE_CONTROL_FLUSH);
+    }
+    free(p);
+    return 0;
+}
+
 static DWORD WINAPI StopAfter(LPVOID arg) {
     const int seconds = (int)(intptr_t)arg;
     Sleep((DWORD)seconds * 1000);
+    g_stopFlush = true;
     const size_t nameBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
     const size_t sz = sizeof(EVENT_TRACE_PROPERTIES) + nameBytes;
     EVENT_TRACE_PROPERTIES* p = (EVENT_TRACE_PROPERTIES*)calloc(1, sz);
     if (!p) return 0;
     p->Wnode.BufferSize = (ULONG)sz;
-    ControlTraceW(g_session, kSessionName, p, EVENT_TRACE_CONTROL_STOP);
+    // The stop call returns the session's final counters, which is the only honest way to
+    // tell a genuine latency win from one bought by dropping events.
+    if (ControlTraceW(g_session, kSessionName, p, EVENT_TRACE_CONTROL_STOP) == ERROR_SUCCESS) {
+        g_eventsLost     = p->EventsLost;
+        g_rtBuffersLost  = p->RealTimeBuffersLost;
+        g_logBuffersLost = p->LogBuffersLost;
+        g_buffersWritten = p->BuffersWritten;
+    }
     free(p);
     return 0;
 }
@@ -236,6 +273,7 @@ static void FillProps(EVENT_TRACE_PROPERTIES* props, size_t sz) {
     // at the measured ~100 KB/s of provider traffic a 4 KB buffer fills in roughly
     // 40 ms. More buffers in rotation keeps the provider from stalling or dropping while
     // the consumer drains one.
+    if (kNoPerProc) props->LogFileMode |= EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING;
     props->BufferSize     = kBufferSizeKb;
     props->MinimumBuffers = kMinBuffers;
     props->MaximumBuffers = kMaxBuffers;
@@ -255,6 +293,13 @@ static void Summary() {
     LogLine("NVIDIA DisplayDriver events: %lld (FlipRequest %lld, decoded %lld, undecodable %lld)",
             g_nvEvents, g_flipEvents, g_decodeOk, g_decodeFail);
     if (g_dxgkEvents) LogLine("DxgKrnl control events: %lld", g_dxgkEvents);
+    LogLine("session losses: events %lu, realtime buffers %lu, log buffers %lu, "
+            "buffers written %lu%s",
+            (unsigned long)g_eventsLost, (unsigned long)g_rtBuffersLost,
+            (unsigned long)g_logBuffersLost, (unsigned long)g_buffersWritten,
+            (g_eventsLost || g_rtBuffersLost || g_logBuffersLost)
+                ? "   <== LOSS: any latency figure here was partly bought by dropping data"
+                : "");
 
     if (g_nvEvents == 0) {
         LogLine("");
@@ -312,6 +357,8 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--dxgk")) alsoDxgk = true;
         else if (!strcmp(argv[i], "--events") && i + 1 < argc) g_logEvents = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bufkb") && i + 1 < argc) kBufferSizeKb = (ULONG)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--flushms") && i + 1 < argc) kFlushMs = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--noperproc")) kNoPerProc = true;
         else seconds = atoi(argv[i]);
     }
     if (seconds <= 0) seconds = 20;
@@ -326,10 +373,12 @@ int main(int argc, char** argv) {
     // evt= and ts= below are ABSOLUTE QPC ticks on the same clock the relay logs its
     // origin in, so the two logs join exactly with no wallclock or fingerprinting.
     LogLine("per-event lines: first %d flips", g_logEvents);
-    LogLine("trace buffers: %lu KB x %lu-%lu, flush timer 1 s (buffer FILL is what makes "
-            "delivery prompt; the timer floor is 1 s)",
+    LogLine("trace buffers: %lu KB x %lu-%lu, flush timer 1 s, forced flush %s, "
+            "per-processor buffering %s",
             (unsigned long)kBufferSizeKb, (unsigned long)kMinBuffers,
-            (unsigned long)kMaxBuffers);
+            (unsigned long)kMaxBuffers,
+            kFlushMs > 0 ? "on" : "off", kNoPerProc ? "OFF (consolidated)" : "on (default)");
+    if (kFlushMs > 0) LogLine("  forced flush every %d ms", kFlushMs);
 
     const size_t nameBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
     const size_t sz = sizeof(EVENT_TRACE_PROPERTIES) + nameBytes;
@@ -377,7 +426,10 @@ int main(int argc, char** argv) {
     }
 
     HANDLE stopper = CreateThread(nullptr, 0, StopAfter, (LPVOID)(intptr_t)seconds, 0, nullptr);
+    HANDLE flusher = kFlushMs > 0 ? CreateThread(nullptr, 0, FlushLoop, nullptr, 0, nullptr) : NULL;
     ProcessTrace(&consumer, 1, nullptr, nullptr);   // blocks until the stop thread stops the session
+    g_stopFlush = true;
+    if (flusher) { WaitForSingleObject(flusher, 2000); CloseHandle(flusher); }
     if (stopper) CloseHandle(stopper);
 
     Summary();
