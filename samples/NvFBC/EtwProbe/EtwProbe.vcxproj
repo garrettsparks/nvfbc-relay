@@ -34,6 +34,7 @@
       <WarningLevel>Level3</WarningLevel>
       <Optimization Condition="'$(Configuration)'=='Release'">MaxSpeed</Optimization>
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\NvFBCR;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -41,6 +42,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="EtwProbe.cpp" />
+    <ClCompile Include="..\NvFBCR\FlipDecode.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

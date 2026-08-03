@@ -124,6 +124,7 @@ lib /nologo /machine:x64 /def:"$(ProjectDir)NvOFFRUC.def" /out:"$(IntDir)NvOFFRU
     <ClCompile Include="TemporalPolicy.cpp" />
     <ClCompile Include="FrameMarker.cpp" />
     <ClCompile Include="CaptureRing.cpp" />
+    <ClCompile Include="FlipDecode.cpp" />
     <ClCompile Include="NvFBCR.cpp" />
     <ClCompile Include="PresentScheduler.cpp" />
     <ClCompile Include="TimerCaptureMode.cpp" />
@@ -135,6 +136,7 @@ lib /nologo /machine:x64 /def:"$(ProjectDir)NvOFFRUC.def" /out:"$(IntDir)NvOFFRU
     <ClInclude Include="CaptureRing.h" />
     <ClInclude Include="FlowWarpEngine.h" />
     <ClInclude Include="FrameCompositors.h" />
+    <ClInclude Include="FlipDecode.h" />
     <ClInclude Include="FrameMarker.h" />
     <ClInclude Include="IFrameCompositor.h" />
     <ClInclude Include="InterpSidecar.h" />

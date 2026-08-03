@@ -27,22 +27,24 @@
 //   - lag: our callback time minus the event timestamp, i.e. ETW delivery latency. This is the
 //     number that decides whether a live relay could ever use this in-band.
 //
-// DECODING CAVEAT: TdhGetProperty resolves fields by name only if the provider's manifest is
-// registered on the machine. PresentMon embeds and loads NVIDIA's manifest itself, which
-// suggests it may not be. So this probe tries TDH first and ALWAYS hexdumps the first few
-// payloads; if TDH fails, the hexdump is how we recover the layout from real hardware rather
-// than guessing at it. Field order in the struct above is READ order from PresentMon's
-// consumer, which is not necessarily wire order.
+// DECODING: field names are not available. TdhGetProperty resolves them only when the
+// provider registers a manifest, and NVIDIA's DisplayDriver provider does not - it is an
+// internal diagnostic surface, which is why PresentMon ships a reverse-engineered copy of
+// the schema instead of asking the system. Measured on a current driver: 10800 of 10800
+// events failed to resolve. Payloads are therefore decoded positionally from a layout
+// recovered on real hardware (see FlipDecode), and this probe ALWAYS hexdumps the first few
+// payloads so the layout can be re-derived if a driver update moves it.
 //
 // Requires elevation (real-time ETW). Usage: EtwProbe.exe [seconds] [--dxgk] [--events N]
 //   --dxgk also enables Microsoft-Windows-DxgKrnl and counts its events. Purely a control: if
 //   the NVIDIA event count is zero but DxgKrnl is nonzero, the session works and the NVIDIA
 //   provider is the problem (wrong GUID, Smooth Motion off, or nothing being flipped).
 
+#include "FlipDecode.h"
+
 #include <windows.h>
 #include <evntrace.h>
 #include <evntcons.h>
-#include <tdh.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdlib>
@@ -50,19 +52,14 @@
 #include <cstring>
 
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "tdh.lib")
 
-// NVIDIA DisplayDriver. GUID and event descriptor taken from the manifest PresentMon embeds
-// (PresentData/ETW/NV_DD.h); verified against its NVTraceConsumer, not guessed.
-static const GUID kNvDisplayDriverGuid =
-    { 0xae4f8626, 0x8265, 0x40d1, { 0xa7, 0x0b, 0x11, 0xb6, 0x42, 0x40, 0xe8, 0xe9 } };
-static const USHORT   kFlipRequestId      = 1;
-static const UCHAR    kFlipRequestLevel   = 4;
-static const ULONGLONG kFlipRequestKeyword = 0x1000000000000000ull;
-
-// Control provider: the DirectX graphics kernel. Only counted, never decoded.
-static const GUID kDxgKrnlGuid =
-    { 0x802ec45a, 0x1e99, 0x4b83, { 0x99, 0x20, 0x87, 0xc9, 0x82, 0x77, 0xba, 0x9d } };
+// Provider identities and the payload layout live in FlipDecode so the relay and this
+// probe cannot drift apart in how they read the same events.
+using flipdecode::kNvDisplayDriverGuid;
+using flipdecode::kFlipRequestId;
+using flipdecode::kFlipRequestLevel;
+using flipdecode::kFlipRequestKeyword;
+using flipdecode::kDxgKrnlGuid;
 
 static const wchar_t* kSessionName = L"EtwProbeSession";
 static const int  kMaxHeads      = 8;    // vidPnSourceId values tracked
@@ -83,7 +80,6 @@ static long long g_flipEvents  = 0;
 static long long g_dxgkEvents  = 0;
 static long long g_decodeOk    = 0;
 static long long g_decodeFail  = 0;
-static long long g_decodePos   = 0;
 static long long g_startQpc    = 0;
 static int       g_dumped      = 0;
 
@@ -103,15 +99,6 @@ static void LogLine(const char* fmt, ...) {
     va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
     fputs(buf, stdout); fputc('\n', stdout);
     if (g_log) { fputs(buf, g_log); fputc('\n', g_log); fflush(g_log); }
-}
-
-// TdhGetProperty by field name. Returns false when the manifest is not registered, which is
-// the case this probe is built to survive (see the decoding caveat above).
-static bool GetProp(EVENT_RECORD* ev, const wchar_t* name, void* out, ULONG size) {
-    PROPERTY_DATA_DESCRIPTOR desc = {};
-    desc.PropertyName = (ULONGLONG)(uintptr_t)name;
-    desc.ArrayIndex = ULONG_MAX;
-    return TdhGetProperty(ev, 0, nullptr, 1, &desc, size, (PBYTE)out) == ERROR_SUCCESS;
 }
 
 static void HexDump(const BYTE* p, ULONG n) {
@@ -137,36 +124,6 @@ static long long Pct(long long* v, int n, int p) {
     return v[i];
 }
 
-// Positional decode, used when TDH cannot resolve field names because the manifest is
-// not registered (measured: it is not, on this driver). The layout was recovered from
-// the hexdumps of a real 2x trace rather than guessed: a 44-byte payload where the u64
-// at +16 is the QPC flip time, confirmed because its per-head deltas land on the 8.33 ms
-// half-period that a 60 fps source with 2x frame generation produces, and the u32 at +24
-// separates the two heads (the gaming display at 120 flips/s, the relay's own output at
-// 60). Guarded on size and version so a different event layout cannot be misread as this
-// one; if the driver changes the payload, decoding stops rather than reporting nonsense.
-static bool DecodePositional(PEVENT_RECORD ev, uint64_t* alloc, uint64_t* ts,
-                             uint32_t* head, uint32_t* token) {
-    if (ev->UserDataLength < 32) return false;
-    if (ev->EventHeader.EventDescriptor.Version != 0) return false;
-    const BYTE* p = (const BYTE*)ev->UserData;
-    memcpy(alloc, p +  0, sizeof(*alloc));
-    memcpy(ts,    p + 16, sizeof(*ts));
-    memcpy(head,  p + 24, sizeof(*head));
-    memcpy(token, p + 28, sizeof(*token));
-    // Value check, not just a version check. A layout change that does NOT bump the
-    // version would otherwise be read as valid and produce confident wrong timestamps,
-    // which is worse than not decoding. A proposed flip time is necessarily near the
-    // event that announced it: a second either side is far wider than any real
-    // scheduling horizon and far narrower than a misparse, which lands astronomically
-    // off because the field would be part of a handle or a zero run.
-    const long long evt = ev->EventHeader.TimeStamp.QuadPart;
-    const long long diff = (long long)*ts - evt;
-    if (diff > g_qpcFreq || diff < -g_qpcFreq) return false;
-    if (*head >= kMaxHeads) return false;
-    return true;
-}
-
 static void WINAPI OnEvent(PEVENT_RECORD ev) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -183,8 +140,8 @@ static void WINAPI OnEvent(PEVENT_RECORD ev) {
     const long long evtQpc = ev->EventHeader.TimeStamp.QuadPart;
     const long long lagUs  = (now.QuadPart - evtQpc) * 1000000 / g_qpcFreq;
 
-    // Verbatim payload for the first few events: this is what lets us recover the wire layout
-    // on real hardware if TDH cannot resolve the field names.
+    // Verbatim payload for the first few events. This is the only route to recovering the
+    // wire layout if a driver update moves it, so it runs regardless of decode success.
     if (g_dumped < kHexDumpEvents) {
         g_dumped++;
         LogLine("flip payload #%d: %lu bytes (ver=%u opcode=%u)",
@@ -194,25 +151,18 @@ static void WINAPI OnEvent(PEVENT_RECORD ev) {
         HexDump((const BYTE*)ev->UserData, ev->UserDataLength);
     }
 
-    uint64_t alloc = 0, ts = 0;
-    uint32_t head = 0, token = 0;
-    const bool ok = GetProp(ev, L"ts", &ts, sizeof(ts)) &&
-                    GetProp(ev, L"vidPnSourceId", &head, sizeof(head)) &&
-                    GetProp(ev, L"token", &token, sizeof(token)) &&
-                    GetProp(ev, L"alloc", &alloc, sizeof(alloc));
-    if (!ok) {
+    flipdecode::FlipEvent fe;
+    if (!flipdecode::DecodeFlip(ev, g_qpcFreq, &fe)) {
         g_decodeFail++;
-        ok = DecodePositional(ev, &alloc, &ts, &head, &token);
-        if (ok) g_decodePos++;
         if (g_decodeFail <= 3) {
-            LogLine("  TDH decode failed (manifest not registered) - %s",
-                    ok ? "falling back to the recovered positional layout"
-                       : "and the payload does not match the recovered layout either");
+            LogLine("  payload does not match the recovered layout - dump it and re-derive "
+                    "the offsets; the driver may have changed the event");
         }
-        if (!ok) return;
-    } else {
-        g_decodeOk++;
+        return;
     }
+    g_decodeOk++;
+    const uint64_t alloc = fe.alloc, ts = fe.displayQpc;
+    const uint32_t head = fe.head, token = fe.token;
 
     // ts is a QPC tick value: the flip the driver intends to scan out. Gaps between
     // consecutive values on one head ARE the scanout cadence.
@@ -269,10 +219,8 @@ static void Summary() {
     // the same QPC clock the relay records its origin in.
     LogLine("session window (QPC ticks): %lld .. %lld",
             g_startQpc, (long long)endQpc.QuadPart);
-    LogLine("NVIDIA DisplayDriver events: %lld (FlipRequest %lld, TDH-decoded %lld, "
-            "positionally decoded %lld, undecodable %lld)",
-            g_nvEvents, g_flipEvents, g_decodeOk, g_decodePos,
-            g_decodeFail - g_decodePos);
+    LogLine("NVIDIA DisplayDriver events: %lld (FlipRequest %lld, decoded %lld, undecodable %lld)",
+            g_nvEvents, g_flipEvents, g_decodeOk, g_decodeFail);
     if (g_dxgkEvents) LogLine("DxgKrnl control events: %lld", g_dxgkEvents);
 
     if (g_nvEvents == 0) {
@@ -283,11 +231,11 @@ static void Summary() {
         LogLine("  If DxgKrnl is also zero, the session itself never delivered - check elevation.");
         return;
     }
-    if (g_decodeOk == 0 && g_decodePos == 0) {
+    if (g_decodeOk == 0) {
         LogLine("");
-        LogLine("EVENTS ARRIVED BUT NONE DECODED: the manifest is not registered for TDH.");
-        LogLine("  The hexdumps above are the payloads; derive the field offsets from them and");
-        LogLine("  decode positionally instead of by name.");
+        LogLine("EVENTS ARRIVED BUT NONE DECODED: the payload no longer matches the layout");
+        LogLine("  this build was built against. The hexdumps above are the current payloads;");
+        LogLine("  re-derive the field offsets from them.");
         return;
     }
 
