@@ -42,6 +42,88 @@ static const int kRecoverPresents = 16;   // about 0.27 s at 60 Hz
 static const int kRecoverAlpha    = 2;    // error-EMA divisor while recovering (16 otherwise)
 static const int kRecoverSlewDiv  = 32;   // slew cap of comb/32 while recovering
 
+void FlipHistory::Add(const Flip& f) {
+    if (f.head < kMaxHeadsTracked) {
+        if (m_lastTsByHead[f.head] != 0 && f.displayTs < m_lastTsByHead[f.head]) m_outOfOrder++;
+        m_lastTsByHead[f.head] = f.displayTs;
+    }
+    if (m_count == kCapacity) {
+        m_dropped++;
+        m_ring[m_head] = f;
+        m_head = (m_head + 1) % kCapacity;
+    } else {
+        m_ring[(m_head + m_count) % kCapacity] = f;
+        m_count++;
+    }
+}
+
+const Flip& FlipHistory::At(int i) const {
+    return m_ring[(m_head + i) % kCapacity];
+}
+
+const Flip* FlipHistory::NewestAtOrBefore(int64_t ts, uint32_t head) const {
+    // Newest first. Callers ask about recent times, so this normally hits within a few
+    // entries instead of walking the whole history. It does NOT stop at the first match
+    // by position: it keeps the best by display time, so a head whose flips ever arrive
+    // out of order still yields the right answer rather than a plausible wrong one.
+    const Flip* best = 0;
+    for (int i = m_count - 1; i >= 0; i--) {
+        const Flip& f = At(i);
+        if (f.head != head) continue;
+        if (f.displayTs > ts) continue;
+        if (!best || f.displayTs > best->displayTs) best = &m_ring[(m_head + i) % kCapacity];
+        // One full source period of older entries is ample slack to cover any reordering
+        // the driver could plausibly emit; beyond that, older flips cannot win.
+        if (best && f.displayTs < best->displayTs - 33333) break;
+    }
+    return best;
+}
+
+int FlipHistory::InRange(int64_t lo, int64_t hi, uint32_t head,
+                         const Flip** out, int maxOut) const {
+    int n = 0;
+    for (int i = 0; i < m_count && n < maxOut; i++) {
+        const Flip& f = At(i);
+        if (f.head != head) continue;
+        if (f.displayTs < lo || f.displayTs > hi) continue;
+        out[n++] = &m_ring[(m_head + i) % kCapacity];
+    }
+    return n;
+}
+
+int64_t FlipHistory::MedianSpacing(int64_t lo, int64_t hi, uint32_t head) const {
+    // Median, not mean: one dropped or duplicated flip would drag a mean toward a cadence
+    // the display never ran at, and the whole point of reading these is to stop assuming.
+    // Keeps the NEWEST kMaxSpacingSamples gaps, because a cadence that changed mid-window
+    // should read as the current one rather than an average of two regimes.
+    int64_t gaps[kMaxSpacingSamples];
+    int n = 0, write = 0;
+    int64_t prev = 0;
+    bool havePrev = false;
+    for (int i = 0; i < m_count; i++) {
+        const Flip& f = At(i);
+        if (f.head != head) continue;
+        if (f.displayTs < lo || f.displayTs > hi) continue;
+        if (havePrev && f.displayTs > prev) {
+            gaps[write] = f.displayTs - prev;
+            write = (write + 1) % kMaxSpacingSamples;
+            if (n < kMaxSpacingSamples) n++;
+        }
+        prev = f.displayTs;
+        havePrev = true;
+    }
+    if (n == 0) return 0;
+    int64_t sorted[kMaxSpacingSamples];
+    for (int i = 0; i < n; i++) sorted[i] = gaps[i];
+    for (int i = 1; i < n; i++) {          // insertion sort: n is bounded and small
+        const int64_t v = sorted[i];
+        int j = i - 1;
+        while (j >= 0 && sorted[j] > v) { sorted[j + 1] = sorted[j]; j--; }
+        sorted[j + 1] = v;
+    }
+    return sorted[n / 2];
+}
+
 BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTicks) {
     BatchDecision d;
     d.intraBatch = s.started && (arrivalTs - s.lastArrivalTs) < thresholdTicks;

@@ -595,6 +595,84 @@ static void test_lock_reseed_wide_bracket_stall() {
           "slow recovery: %d synth presents after the stall (expected <= 10)", synthAfter);
 }
 
+// The flip history the platform layer will feed from the display driver's scanout events.
+// Tested here rather than only in a capture because the entire reason it is a plain
+// structure with no ETW types is so the awkward cases can be BUILT: a capture timeline
+// whose wakes jitter badly while the flip grid underneath stays evenly paced is the
+// scenario that motivates reading flips at all, and it is nearly impossible to provoke on
+// demand with a game.
+static void test_flip_history() {
+    policy::FlipHistory h;
+    CHECK(h.Count() == 0, "a fresh history is empty");
+    CHECK(h.NewestAtOrBefore(1000, 0) == NULL, "empty history must report no data, not a guess");
+    CHECK(h.MedianSpacing(0, 1000000, 0) == 0, "no cadence can be derived from nothing");
+
+    // Two heads at once, which is what the hardware actually produces: the source display
+    // running frame generation at twice the base rate, and the relay's own output.
+    const int64_t kSrc = 16667, kHalf = 8333;
+    for (int i = 0; i < 40; i++) {
+        policy::Flip a;
+        a.displayTs = 100000 + (int64_t)i * kHalf;   // 120/s on head 0
+        a.eventTs   = a.displayTs - 5000;
+        a.head = 0;
+        a.token = (uint32_t)i;
+        h.Add(a);
+        if (i % 2 == 0) {
+            policy::Flip b;
+            b.displayTs = 100000 + (int64_t)(i / 2) * kSrc;   // 60/s on head 1
+            b.eventTs   = b.displayTs - 5000;
+            b.head = 1;
+            h.Add(b);
+        }
+    }
+    CHECK(h.Count() == 60, "40 flips on one head and 20 on the other, got %d", h.Count());
+
+    // Cadence is MEASURED per head, never assumed from a multiplier.
+    CHECK(h.MedianSpacing(0, 10000000, 0) == kHalf,
+          "head 0 cadence should be the half period %lld, got %lld",
+          (long long)kHalf, (long long)h.MedianSpacing(0, 10000000, 0));
+    CHECK(h.MedianSpacing(0, 10000000, 1) == kSrc,
+          "head 1 cadence should be the source period %lld, got %lld",
+          (long long)kSrc, (long long)h.MedianSpacing(0, 10000000, 1));
+
+    // Lookup must not leak one head's timeline into the other's.
+    const policy::Flip* f = h.NewestAtOrBefore(100000 + 5 * kHalf + 10, 0);
+    CHECK(f && f->displayTs == 100000 + 5 * kHalf, "wrong flip for head 0");
+    f = h.NewestAtOrBefore(100000 + 5 * kHalf + 10, 1);
+    CHECK(f && f->displayTs == 100000 + 2 * kSrc, "head 1 lookup must not return a head 0 flip");
+    CHECK(h.NewestAtOrBefore(99999, 0) == NULL, "a time before all history has no flip");
+
+    const policy::Flip* got[8];
+    const int n = h.InRange(100000, 100000 + 3 * kHalf, 0, got, 8);
+    CHECK(n == 4, "four head-0 flips in the first three half periods, got %d", n);
+
+    // Eviction is oldest-first and counted: silently losing history is how an estimator
+    // ends up confidently wrong about a cadence it can no longer see.
+    policy::FlipHistory small;
+    for (int i = 0; i < policy::FlipHistory::kCapacity + 25; i++) {
+        policy::Flip x;
+        x.displayTs = (int64_t)i * 1000;
+        x.head = 0;
+        small.Add(x);
+    }
+    CHECK(small.Count() == policy::FlipHistory::kCapacity, "history must cap at its capacity");
+    CHECK(small.Dropped() == 25, "evictions must be counted, got %lld", small.Dropped());
+    CHECK(small.At(0).displayTs == 25 * 1000, "oldest retained flip should be the 26th added");
+    CHECK(h.OutOfOrder() == 0, "an in-order feed must report no reordering, got %lld",
+          h.OutOfOrder());
+    // A driver that ever emits a head out of order must be visible, not silently absorbed:
+    // a later binary search over this history would depend on the ordering holding.
+    policy::FlipHistory ooo;
+    policy::Flip p1; p1.displayTs = 2000; p1.head = 0; ooo.Add(p1);
+    policy::Flip p2; p2.displayTs = 1000; p2.head = 0; ooo.Add(p2);
+    CHECK(ooo.OutOfOrder() == 1, "a backward display time must be counted");
+    const policy::Flip* q = ooo.NewestAtOrBefore(3000, 0);
+    CHECK(q && q->displayTs == 2000,
+          "lookup must return the newest by DISPLAY time, not the last inserted");
+    std::printf("  flip history: per-head cadence, lookup isolation, counted eviction, "
+                "reorder-safe lookup\n");
+}
+
 // Batch-collapse keep-real, asserted directly rather than inferred from a timeline.
 // Wake order under frame generation is [GENERATED, REAL], so the SECOND member of a
 // batch is the one worth keeping: it publishes, and the generated member ahead of it is
@@ -1615,6 +1693,7 @@ int main(int argc, char** argv) {
     test_composite_lock_acquisition();
     test_composite_quantized_arrivals();
 
+    test_flip_history();
     test_batch_collapse_keep_real();
     test_lock_reseed_wide_bracket_stall();
     test_lock_reseed_stall_paired_cadence();

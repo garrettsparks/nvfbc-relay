@@ -76,6 +76,72 @@ struct BatchDecision {
 // when a previous slot exists.
 BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTicks);
 
+// A flip the display driver intends to scan out, as plain data. Deliberately free of any
+// ETW or Windows type: the platform layer decodes the driver's events, this is what the
+// policy is allowed to reason about, and a simulated timeline is therefore indistinguishable
+// from a captured one. That is the whole point - the interesting cases (jittery capture
+// wakes against an evenly paced flip grid) can be built in a test instead of hunted for in
+// a capture.
+struct Flip {
+    int64_t displayTs = 0;   // when this frame is intended to reach the screen
+    int64_t eventTs   = 0;   // when the driver announced it; displayTs minus this is lead time
+    uint32_t head     = 0;   // which display
+    uint32_t token    = 0;
+};
+
+// Recent flips, kept by TIME rather than by slot count, because the useful history is "the
+// last few source periods" and the event rate changes with the frame-generation multiplier.
+// Fixed capacity, oldest evicted first, no allocation: this is written from a callback.
+//
+// NOTHING IN THE POLICY READS THIS YET. It exists so the plumbing, the sizing and the tests
+// are in place before any decision depends on it; wiring behaviour to a data source that has
+// never been exercised is how the silent-wrong failures in this project have started.
+class FlipHistory {
+public:
+    // 24 bytes a record, so this is ~48 KB: irrelevant beside the frame ring, and worth
+    // spending to keep history well past anything the policy could want. ~17 s at 120
+    // flips/s, ~11 s at 180.
+    static const int kCapacity = 2048;
+    // Cadence is a RECENT property, so the median samples at most this many gaps (the
+    // newest ones in the window). Bounding it keeps the sort cheap and the stack small
+    // however wide a window a caller asks for.
+    static const int kMaxSpacingSamples = 256;
+
+    void Clear() { m_count = 0; m_head = 0; m_dropped = 0; m_outOfOrder = 0; }
+    void Add(const Flip& f);
+
+    int Count() const { return m_count; }
+    long long Dropped() const { return m_dropped; }
+    // Flips whose display time went BACKWARD against the previous one on the same head.
+    // Expected to be zero: the driver schedules a head in order. Counted rather than
+    // assumed, because "the history is sorted" is exactly the kind of assumption that
+    // would let a later binary search silently return the wrong flip.
+    long long OutOfOrder() const { return m_outOfOrder; }
+    // Oldest-first indexing, so i == 0 is the oldest retained flip.
+    const Flip& At(int i) const;
+
+    // Newest flip on a head at or before ts, or null when the history does not reach it.
+    // Returning null rather than a nearest guess is deliberate: a caller that cannot tell
+    // "no data" from "data" would silently treat a stale flip as current.
+    const Flip* NewestAtOrBefore(int64_t ts, uint32_t head) const;
+
+    // Flips on a head within [lo, hi]. Returns how many were written to out.
+    int InRange(int64_t lo, int64_t hi, uint32_t head, const Flip** out, int maxOut) const;
+
+    // Median spacing between consecutive flips on a head inside the window, or 0 when
+    // fewer than two are present. The measured cadence, never an assumed one.
+    int64_t MedianSpacing(int64_t lo, int64_t hi, uint32_t head) const;
+
+private:
+    Flip m_ring[kCapacity];
+    int  m_count = 0;
+    int  m_head = 0;          // next write position
+    long long m_dropped = 0;  // evicted before anyone read them, for telemetry
+    long long m_outOfOrder = 0;
+    static const int kMaxHeadsTracked = 8;
+    int64_t m_lastTsByHead[kMaxHeadsTracked] = {};
+};
+
 // Selection memory across presents. lastShownTs strictly advances except on Repeat;
 // the two bools are the Schmitt states (stickiness side, advance gate).
 struct SelectionState {
