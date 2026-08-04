@@ -35,9 +35,23 @@ public:
     bool Start(LONGLONG qpcFreq, LONGLONG baseQpc);
     void Stop();
 
-    // Snapshot under the lock. The history is written from the ETW thread, so a future
-    // reader on the present thread must go through here rather than touching it directly.
+    // Snapshot under the lock. The history is written from the ETW thread, so a reader on
+    // the present thread must go through here rather than touching it directly.
     void CopyHistory(policy::FlipHistory* out) const;
+
+    // Place one captured frame on the flip grid, holding the lock only for the lookup.
+    //
+    // Preferred over CopyHistory for the present thread: the history is ~48 KB, so a
+    // snapshot is a memcpy of the same order as the entire measured present jitter (p50
+    // 3 us), while the lookup itself is a few bounded scans. It also needs no 48 KB of
+    // somewhere to live on a thread that runs every 16.67 ms.
+    //
+    // Callers must gate on whether ETW was requested at all rather than relying on this
+    // returning an empty verdict: with -etw off the session never starts, and not taking
+    // the lock keeps that configuration on exactly the code path it had before any of this
+    // existed, which is what makes an on/off comparison meaningful.
+    policy::FlipPairing PairCapture(uint32_t head, int64_t batchStartTs, int member,
+                                    int64_t maxAnchorOffset) const;
 
     long long Flips() const { return m_flips.load(std::memory_order_relaxed); }
     long long DecodeFailures() const { return m_decodeFail.load(std::memory_order_relaxed); }

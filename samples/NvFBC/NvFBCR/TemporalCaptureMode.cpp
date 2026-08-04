@@ -88,6 +88,7 @@ bool TemporalCaptureMode::Setup() {
     const float assumedFps = (m_srcRateHint > 0.0f) ? m_srcRateHint : kDefaultAssumedSrcFps;
     m_assumedSrcPeriodQpc = (LONGLONG)((double)m_scheduler.Freq() / assumedFps);
     m_bracketingDelayQpc = LagForSourcePeriod(m_assumedSrcPeriodQpc);
+    m_flipAnchorBoundQpc = m_scheduler.Freq() / 1000;   // 1 ms; see the header for why
     m_telemetryCountdown = kTelemetryPeriodPresents;
 
     // Selection stickiness (Schmitt band): prefer the before-frame unless the after-frame is
@@ -308,6 +309,56 @@ void TemporalCaptureMode::Run(
             if (m_policyCfg.combQpc > 0) {
                 lkField = m_lockState.engaged ? 1 : 0;
             }
+            // Where the shown frame actually scanned out, when ETW is running. Diagnostic:
+            // nothing above this point consulted it, and the selection that produced this
+            // line was made from arrival stamps exactly as it always has been.
+            //
+            // Done HERE rather than at capture time on purpose. At grab-return the member's
+            // flip is usually not announced yet (it scans out a grid step later), so a
+            // capture-time verdict would report not-yet-announced for structural reasons and
+            // measure nothing. By present time the target is a bracketing lag back and the
+            // data has arrived.
+            //
+            // Head 0 is the source display and head 1 is the relay's own output. If that
+            // ever inverts, this reads as a total pairing failure in the log rather than as
+            // plausible wrong numbers.
+            //
+            // BOTH sides, not just the before-frame: pass-after is the most common outcome
+            // (measured 49% of presents at 60x2), so pairing only the before-frame would
+            // report a scanout time for a frame that was not shown on most lines. With both,
+            // fat minus fbt is also the TRUE source interval the bracket spans, which is the
+            // quantity that exposed the x3 judder and is worth having per present.
+            char flipFields[176] = "";
+            if (m_etw) {
+                auto place = [&](char* out, size_t cap, const char* tag, bool has,
+                                 int64_t stampTs, int member) {
+                    if (!has) return 0;
+                    const policy::FlipPairing fp =
+                        m_etwConsumer.PairCapture(0, stampTs, member, m_flipAnchorBoundQpc);
+                    if (fp.paired) {
+                        return snprintf(out, cap, " %st=%lldus %so=%lldus %sm=%d",
+                                        tag,
+                                        (long long)((fp.displayTs - m_baseQpc.QuadPart) * usPerTick),
+                                        tag, (long long)(fp.anchorOffset * usPerTick),
+                                        tag, member);
+                    }
+                    return snprintf(out, cap, " %st=none:%s %sm=%d", tag,
+                                    fp.memberAhead ? "ahead" :
+                                    fp.gridGap ? "gap" :
+                                    fp.anchorFound ? "unplaced" : "noanchor",
+                                    tag, member);
+                };
+                // n == 0 when there is no before-frame, which must still leave the after-side
+                // reported rather than skipped: a one-sided bracket is exactly the case where
+                // knowing what the surviving side scanned out is most useful.
+                int n = place(flipFields, sizeof(flipFields), "fb", bracket.info.hasBefore,
+                              bracket.info.beforeTs, bracket.beforeMember);
+                if (n < 0) n = 0;
+                if ((size_t)n < sizeof(flipFields)) {
+                    place(flipFields + n, sizeof(flipFields) - n, "fa", bracket.info.hasAfter,
+                          bracket.info.afterTs, bracket.afterMember);
+                }
+            }
             char opFields[96] = "";
             if (outcome.opLabel) {
                 int n = snprintf(opFields, sizeof(opFields), " op=%s bw=%.3f",
@@ -320,7 +371,7 @@ void TemporalCaptureMode::Run(
                     snprintf(opFields + n, sizeof(opFields) - n, " pt=%lld", outcome.synthUs);
                 }
             }
-            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld%s",
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld%s%s",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((bracket.info.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
@@ -332,7 +383,8 @@ void TemporalCaptureMode::Run(
                 (long long)(m_lockState.pullQpc * usPerTick),
                 lkField,
                 markN,
-                opFields);
+                opFields,
+                flipFields);
             if (!bracket.info.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }

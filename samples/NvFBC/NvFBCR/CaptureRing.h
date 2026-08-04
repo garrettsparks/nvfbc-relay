@@ -24,6 +24,11 @@ struct FrameBracket {
     int beforeSlot = -1;               // ring slot indices; cross-API consumers pick their own
     int afterSlot = -1;                //  per-device aliases by slot (-1 when the side is absent)
     double weight = 0.0;               // beforeDiff / (beforeDiff + afterDiff); 1.0 if no after
+    // Position inside the capture batch. The timestamps above are BATCH-START, shared by
+    // every member, so placing a frame on the driver's flip grid needs this to know how many
+    // flips along it scanned out.
+    int beforeMember = 0;
+    int afterMember = 0;
 };
 
 // Source-paced capture ring on its OWN D3D9Ex device (branch B: two devices).
@@ -92,6 +97,7 @@ private:
         IDirect3DSurface9* mainSurface;
         HANDLE sharedHandle;              // retained for cross-API consumers
         LARGE_INTEGER timestamp;
+        int member;                       // position inside its capture batch; 0 opens one
         bool valid;
     };
 
