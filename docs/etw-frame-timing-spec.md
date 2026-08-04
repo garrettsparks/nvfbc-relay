@@ -158,9 +158,18 @@ OBS PC -> Twitch), so tens of milliseconds cost stream viewers a rounding error 
 they already have. The lag must stay CONSTANT for audio-sync compensation, which the existing
 launch-time-constant design already guarantees.
 
-Measured, the floor needed is **40-50 ms**, not the 90-120 ms guessed here originally. At today's
-20833 us the p50 upgrade lands and the tail does not, which is exactly the graceful path this
-section describes rather than a failure.
+**Measured in situ, the floor needs no raising at all.** The 40-50 ms figure (itself a correction
+of an earlier 90-120 ms guess) came from a desktop probe using delivery lag alone. Under the game
+with the relay capturing, the governing quantity is `known - display` (see the provider section),
+whose p95 is 9479 us at 60x2. An upgrade must land before the target reaches the slot: the real
+member is stamped at batch start and flips 8331 us later, so the budget is
+`known - display < 20833 - 8331 = 12502 us`. p95 clears it with 3 ms to spare, so **~99% of
+upgrades land at today's 20833 us floor**, and the rest are declined by the coherence rule exactly
+as designed.
+
+Consequence: `RING_SIZE` stays at 8 and `LagForSourcePeriod` stays at `srcPeriod * 1.25`. If the
+tail is ever worth chasing, ~32 ms suffices. If the floor IS raised later, size the ring by
+CAPTURED frames (120/s at 60x2, 180/s at 60x3), not by source frames.
 
 ## The provider
 
@@ -199,10 +208,32 @@ than reporting confident nonsense.
 **Two heads appear, not one.** The gaming display at 120 flips/s under 2x and the relay's own XR1
 output at 60. Filter by head; never aggregate them.
 
-**`ahead` is ~0.** The driver logs the event at the instant it assigns the flip time (measured
-0-880 us depending on workload). There is no advance notice, so the earliest a flip can be known
-is its own scanout time plus delivery lag. That makes delivery lag the whole budget rather than
-one term in it.
+**`ahead` is ~0 at the median and up to a full flip interval in the tail.** The earlier reading
+(0-880 us, "no advance notice") was the median of a desktop probe and understates the tail badly.
+Measured in situ over 14332 head-0 flips at 60x2 and 21290 at 60x3:
+
+| | 60x2 | 60x3 |
+|---|---|---|
+| ahead (event before display) p50 | 228 us | 239 us |
+| ahead p95 | **8205 us** | **5445 us** |
+| ahead max | 8647 us | 5900 us |
+
+The p95 is one flip interval (8331 us at x2, 5559 at x3): the driver queues the next flip while
+the current one is still scanning out, so a large minority of flips are announced a full frame
+early.
+
+**The quantity that governs the design is neither `ahead` nor `lag` but their difference:
+`(event + lag) - display`, how long after a flip appeared the relay could first know about it.**
+
+| | 60x2 | 60x3 |
+|---|---|---|
+| known after display p50 | +1353 us | +2965 us |
+| p95 | +9479 us | +9578 us |
+| known BEFORE it displayed | **37.2%** | 23.3% |
+
+So delivery lag is NOT the whole budget. Storing lag alone in a replay fixture is wrong by a
+median of ~3.8 ms and by a full flip interval in the tail, which is why the fixture format
+records `known - display` per flip rather than the lag it was derived from.
 
 ## EtwProbe
 
@@ -211,7 +242,9 @@ Standalone exe, in the solution so CI builds it. Requires elevation. Reports:
 - **dts histogram** - gaps between consecutive proposed flip times on a head. A tight spike near
   8.33 ms at 60x2 means the grid is even and readable. Smeared or multi-modal kills the arithmetic
   model outright.
-- **ahead** - `ts` minus the event stamp. Measured at ~0, see above.
+- **ahead** - `ts` minus the event stamp. ~0 at the median, up to a full flip interval at p95;
+  report the distribution, not a single number, and see the provider section for why the figure
+  that actually matters is `(event + lag) - ts`.
 - **lag** - callback time minus event stamp: raw ETW delivery latency. This sizes the floor.
 - **session losses** - events, real-time buffers and log buffers dropped, read from the session at
   stop. Mandatory next to any latency figure: latency bought by discarding events looks identical
@@ -283,14 +316,21 @@ lose zero events across seven runs, but that is a property of a measured workloa
    per-processor buffers, and it sizes its pool at 64 KB x 256-1024 buffers, which this probe now
    matches.
 
-   Consequence for the lag floor: with p95 at 15 ms and the flip 8.33 ms after the wake, an upgrade
-   lands ~23 ms after capture. At today's 20833 us floor most upgrades land and the tail does not,
-   which is the graceful degradation the design already assumes. A **40-50 ms** floor lands
-   everything including the max. The 90-120 ms figure below was a guess made before this
-   measurement and is not needed; RING_SIZE goes 8 -> ~16 rather than 32.
+   **Now measured in situ, and the table above is the pessimistic case.** Under the game with the
+   relay capturing, delivery is FASTER than on the idle desktop, and x2 and x3 agree within 4% at
+   every percentile despite x3 carrying 50% more events - confirming delivery is flush-dominated
+   rather than event-rate dependent:
 
-   Not yet measured in situ: these are desktop numbers with a TestUFO tab, not the game plus relay
-   under load. That measurement belongs to the first relay-side consumer.
+   | | 60x2 walk | 60x3 walk | desktop probe |
+   |---|---|---|---|
+   | p50 | 5286 us | 5496 us | 8000 |
+   | p95 | 9974 us | 10024 us | 15000 |
+   | p99 | 10867 us | 10898 us | - |
+   | max | 22671 us | 31173 us | 30400 |
+
+   Consequence for the lag floor: none. See the sizing section - the budget is governed by
+   `known - display`, not by lag, and ~99% of upgrades land at today's 20833 us floor. The
+   40-50 ms figure is superseded and RING_SIZE stays at 8.
 2. **Pairing. Much easier than this section assumed, but the RULE is still unvalidated.** The
    pessimism here predated knowing both streams would share a clock. They do: the probe requests
    QPC (`Wnode.ClientContext = 1` plus `PROCESS_TRACE_MODE_RAW_TIMESTAMP`) and the relay logs its
@@ -302,13 +342,21 @@ lose zero events across seven runs, but that is a property of a measured workloa
 
    | claim | status |
    |---|---|
-   | the first wake of a batch coincides with a flip | measured, 3 of 3 |
-   | the second wake belongs to the NEXT flip, 8.33 ms later | inferred from how frame generation must work, NOT measured |
+   | the first wake of a batch coincides with a flip | measured, p50 223-244 us, 93-94% within 1 ms |
+   | the second wake belongs to the NEXT flip | **measured indirectly by tiling**, 2026-08-03 |
 
-   The second is the load-bearing half of any pairing rule and is currently reasoning. It needs
-   measuring across thousands of batches, including the ragged cases (a pair that missed the 3 ms
-   collapse window, a stall resume), before a `capture_seq` field exists anywhere. An unpairable
-   wake must come out explicitly unpairable rather than silently matched to a neighbouring flip.
+   The second was reasoning when this was written; it is now supported by a structural
+   measurement. Consecutive batches advance by **exactly 2 flip indices** - 94.9% at 60x2
+   (7348 batches) and 96.4% at 60x3 (10795 batches) - while carrying 2 members each. Two members
+   per batch advancing 2 flips per batch means members tile the flip grid one-to-one in order,
+   with no gaps and no double-coverage, which is only consistent with the second member belonging
+   to the next flip. Not a direct per-frame proof, but a whole-session one over ~18000 batches.
+
+   The gate for the in-code rule is reproducing the offline join: 22942 captures at 60x2 and
+   32249 at 60x3 already have verdicts computed outside the relay, so the implementation can be
+   checked against them rather than against a fresh capture. An unpairable wake must still come
+   out explicitly unpairable rather than silently matched to a neighbouring flip; at a 1 ms gate
+   that is ~7% of wakes.
 
    One consequence already visible: batch-collapse stamps the surviving REAL frame at batch-start,
    but the flips say that frame does not reach the screen until ~8.33 ms later. A constant offset

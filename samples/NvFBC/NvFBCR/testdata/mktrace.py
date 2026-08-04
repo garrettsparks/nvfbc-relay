@@ -27,6 +27,9 @@ import re, sys, os
 
 CAP  = re.compile(r"capture #\d+ arr=(\d+)us")
 PRE  = re.compile(r"temporal dl=(-?\d+)us")
+# lag= is optional: logs recorded before it existed still carry usable scanout times, they
+# just cannot say when the relay could first have known them.
+FLIP = re.compile(r"flip disp=(-?\d+)us evt=(-?\d+)us(?: lag=(-?\d+)us)? head=(\d+)")
 WARMUP = 200          # must match the test: skips the lock's cold-start acquisition
 
 def main():
@@ -41,6 +44,11 @@ def main():
     src, out = argv[0], argv[1]
     desc = argv[2] if len(argv) > 2 else os.path.basename(src)
     arr, pres, synth = [], [], []
+    # Head 0 only: head 1 is the relay's own output, which no pairing rule reads. Kept in
+    # DELIVERY order rather than sorted by scanout time, because the replay has to model
+    # when each flip became knowable, and sorting would erase that.
+    flips, delays = [], []
+    have_lag = True
     for line in open(src, errors="replace"):
         m = CAP.search(line)
         if m:
@@ -53,6 +61,21 @@ def main():
             if v >= skip_us:
                 pres.append(v)
                 synth.append("op=synth" in line)
+            continue
+        m = FLIP.search(line)
+        if m and m.group(4) == "0":
+            disp, evt, lag = int(m.group(1)), int(m.group(2)), m.group(3)
+            if disp < skip_us:
+                continue
+            flips.append(disp)
+            if lag is None:
+                have_lag = False
+            else:
+                # When the relay could FIRST have known this flip, relative to the flip
+                # itself. Drives the coherence rule offline: an upgrade that arrives after
+                # the policy already bracketed the slot has to be declined, and that is
+                # only testable if the fixture records arrival as well as occurrence.
+                delays.append(int(evt) + int(lag) - disp)
     if not arr or not pres:
         print("no capture/temporal lines found"); return 1
 
@@ -81,7 +104,16 @@ def main():
         f.write(f"field_synth_pct {pct:.1f}\n")
         f.write(f"arrivals {len(arr)}\n{enc(arr)}\n")
         f.write(f"presents {len(pres)}\n{enc(pres)}\n")
-    print(f"{out}: {len(arr)} arrivals, {len(pres)} presents, {os.path.getsize(out)/1e6:.2f} MB")
+        if flips:
+            f.write("# Head-0 scanout times in delivery order, and how long after each flip\n")
+            f.write("# the relay could first have known it. A fixture without flips_h0_delay\n")
+            f.write("# predates the lag= field and can drive pairing but not the timing rule.\n")
+            f.write(f"flips_h0 {len(flips)}\n{enc(flips)}\n")
+            if have_lag and len(delays) == len(flips):
+                f.write(f"flips_h0_delay {len(delays)}\n{' '.join(str(d) for d in delays)}\n")
+    print(f"{out}: {len(arr)} arrivals, {len(pres)} presents, "
+          f"{len(flips)} head-0 flips{'' if have_lag and flips else ' (no lag= in log)'}, "
+          f"{os.path.getsize(out)/1e6:.2f} MB")
     print(f"  field behaviour past warmup {WARMUP}: synth {pct:.1f}%, "
           f"runs>=50 {longRuns}, worst {worst}")
     return 0
