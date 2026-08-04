@@ -58,6 +58,11 @@ private:
     FrameMarker m_marker;           // per-present provenance burn-in (inert unless -mark)
     bool m_etw;                     // -etw: read the driver's scanout times while capturing
     EtwFlipConsumer m_etwConsumer;  // inert unless m_etw; nothing in the policy reads it
+    // How far a batch start may sit from a flip and still be placed on the grid. 1 ms, where
+    // the measured distribution has its cliff: batch starts land within 250 us of a flip
+    // 92.4% of the time and within 1 ms 99.2%, with 0.24% past 2 ms. Half a grid step would
+    // never reject anything, since every instant is within half a step of some flip.
+    LONGLONG m_flipAnchorBoundQpc = 0;
 
     // The one lag-sizing rule: 1.25x the source period for bracketing headroom, floored at
     // the present period. Setup sizes the operative lag with it; telemetry sizes suggestions.

@@ -208,6 +208,12 @@ void EtwFlipConsumer::CopyHistory(policy::FlipHistory* out) const {
     *out = m_history;
 }
 
+policy::FlipPairing EtwFlipConsumer::PairCapture(uint32_t head, int64_t batchStartTs,
+                                                 int member, int64_t maxAnchorOffset) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return policy::PairBatchMember(m_history, head, batchStartTs, member, maxAnchorOffset);
+}
+
 void EtwFlipConsumer::LogSummary() {
     SessionProps sp;
     FillProps(&sp);

@@ -35,6 +35,7 @@ CaptureRing::CaptureRing()
         m_ring[i].sharedHandle = NULL;
         m_ring[i].valid = false;
         m_ring[i].timestamp.QuadPart = 0;
+        m_ring[i].member = 0;
     }
     m_baseQpc.QuadPart = 0;
 }
@@ -280,6 +281,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         // The intra-batch (real) member is stamped with the BATCH-START time so the ring
         // timeline stays at base cadence; everything else is stamped at its own arrival.
         m_ring[slot].timestamp.QuadPart = batch.stampTs;
+        m_ring[slot].member = batch.member;
         m_ring[slot].valid = true;
 
         m_writeCount = count + 1;
@@ -328,6 +330,7 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, FrameBracket* out) const {
                 out->info.beforeDiff = diff;
                 out->beforeDepth = (int)(p - 1 - i);
                 out->beforeSlot = slot;
+                out->beforeMember = m_ring[slot].member;
             }
         } else {
             if (-diff < bestAfterDiff) {
@@ -338,6 +341,7 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, FrameBracket* out) const {
                 out->info.afterTs = ts;
                 out->info.afterDiff = -diff;
                 out->afterSlot = slot;
+                out->afterMember = m_ring[slot].member;
             }
         }
     }
