@@ -326,8 +326,11 @@ void TemporalCaptureMode::Run(
             // BOTH sides, not just the before-frame: pass-after is the most common outcome
             // (measured 49% of presents at 60x2), so pairing only the before-frame would
             // report a scanout time for a frame that was not shown on most lines. With both,
-            // fat minus fbt is also the TRUE source interval the bracket spans, which is the
-            // quantity that exposed the x3 judder and is worth having per present.
+            // aflip minus bflip is also the TRUE source interval the bracket spans, which is
+            // the quantity that exposed the x3 judder and is worth having per present.
+            //
+            // Field names mirror the before=/after= pair already on this line rather than
+            // compressing to a prefix, so the line needs no legend to read.
             char flipFields[176] = "";
             if (m_etw) {
                 auto place = [&](char* out, size_t cap, const char* tag, bool has,
@@ -336,13 +339,13 @@ void TemporalCaptureMode::Run(
                     const policy::FlipPairing fp =
                         m_etwConsumer.PairCapture(0, stampTs, member, m_flipAnchorBoundQpc);
                     if (fp.paired) {
-                        return snprintf(out, cap, " %st=%lldus %so=%lldus %sm=%d",
+                        return snprintf(out, cap, " %sflip=%lldus %soff=%lldus %smem=%d",
                                         tag,
                                         (long long)((fp.displayTs - m_baseQpc.QuadPart) * usPerTick),
                                         tag, (long long)(fp.anchorOffset * usPerTick),
                                         tag, member);
                     }
-                    return snprintf(out, cap, " %st=none:%s %sm=%d", tag,
+                    return snprintf(out, cap, " %sflip=none:%s %smem=%d", tag,
                                     fp.memberAhead ? "ahead" :
                                     fp.gridGap ? "gap" :
                                     fp.anchorFound ? "unplaced" : "noanchor",
@@ -351,11 +354,11 @@ void TemporalCaptureMode::Run(
                 // n == 0 when there is no before-frame, which must still leave the after-side
                 // reported rather than skipped: a one-sided bracket is exactly the case where
                 // knowing what the surviving side scanned out is most useful.
-                int n = place(flipFields, sizeof(flipFields), "fb", bracket.info.hasBefore,
+                int n = place(flipFields, sizeof(flipFields), "b", bracket.info.hasBefore,
                               bracket.info.beforeTs, bracket.beforeMember);
                 if (n < 0) n = 0;
                 if ((size_t)n < sizeof(flipFields)) {
-                    place(flipFields + n, sizeof(flipFields) - n, "fa", bracket.info.hasAfter,
+                    place(flipFields + n, sizeof(flipFields) - n, "a", bracket.info.hasAfter,
                           bracket.info.afterTs, bracket.afterMember);
                 }
             }
