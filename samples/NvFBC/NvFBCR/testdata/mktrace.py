@@ -13,8 +13,15 @@ Bounds are deliberately NOT written here: they describe the model, which only th
 can measure. Run the suite once and it prints the lines to paste.
 
   usage: uv run samples/NvFBC/NvFBCR/testdata/mktrace.py \
-             <log> samples/NvFBC/NvFBCR/testdata/<name>.trace "<description>"
+             <log> samples/NvFBC/NvFBCR/testdata/<name>.trace "<description>" [--skip-us N]
   then add <name>.trace to index.txt and run the suite: it prints the bounds.
+
+--skip-us drops everything before an absolute log time, for a fixture that must isolate one
+regime. A capture whose early minutes carry source hitches reports the hitch recovery as its
+headline synth share, which buries a steady-state regression: measured on the 60x2 walk,
+whole-log synth is 9.1% against 1.1% past the hitches, so a steady-state doubling would sit
+inside any bound loose enough to hold the whole log. Trim only when another fixture already
+covers the regime being cut; stall recovery lives in the map-cycle fixtures.
 """
 import re, sys, os
 
@@ -23,20 +30,29 @@ PRE  = re.compile(r"temporal dl=(-?\d+)us")
 WARMUP = 200          # must match the test: skips the lock's cold-start acquisition
 
 def main():
-    if len(sys.argv) < 3:
+    argv = [a for a in sys.argv[1:]]
+    skip_us = 0
+    if "--skip-us" in argv:
+        i = argv.index("--skip-us")
+        skip_us = int(argv[i + 1])
+        del argv[i:i + 2]
+    if len(argv) < 2:
         print(__doc__); return 2
-    src, out = sys.argv[1], sys.argv[2]
-    desc = sys.argv[3] if len(sys.argv) > 3 else os.path.basename(src)
+    src, out = argv[0], argv[1]
+    desc = argv[2] if len(argv) > 2 else os.path.basename(src)
     arr, pres, synth = [], [], []
     for line in open(src, errors="replace"):
         m = CAP.search(line)
         if m:
-            arr.append(int(m.group(1)))
+            v = int(m.group(1))
+            if v >= skip_us: arr.append(v)
             continue
         m = PRE.search(line)
         if m:
-            pres.append(int(m.group(1)))
-            synth.append("op=synth" in line)
+            v = int(m.group(1))
+            if v >= skip_us:
+                pres.append(v)
+                synth.append("op=synth" in line)
     if not arr or not pres:
         print("no capture/temporal lines found"); return 1
 
