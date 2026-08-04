@@ -806,6 +806,13 @@ struct TraceFixture {
     std::string description;
     std::vector<int64_t> arrivals;
     std::vector<int64_t> presents;
+    // Head-0 scanout times in DELIVERY order, and the instant each first became knowable
+    // to the relay. Both empty for a fixture built from a log with no ETW; flipKnown alone
+    // is empty for one predating lag=, which can drive a pairing rule but not a timing one.
+    // Delivery order is deliberate: sorting by scanout time would erase the very lateness
+    // the coherence rule exists to handle.
+    std::vector<int64_t> flipDisplay;
+    std::vector<int64_t> flipKnown;
     // Bounds on the REPLAY. Inequalities, so an improvement passes and only a
     // regression fails. Absent (-1) means the fixture is unblessed: the test prints the
     // measured lines and fails, so a new capture cannot silently join as a no-op.
@@ -847,9 +854,11 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         else if (std::strcmp(tag, "field_worst_run") == 0) { num(&n); out->fieldWorstRun = (int)n; }
         else if (std::strcmp(tag, "field_long_runs") == 0) { num(&n); out->fieldLongRuns = (int)n; }
         else if (std::strcmp(tag, "field_synth_pct") == 0) { dbl(&out->fieldSynthPct); }
-        else if (std::strcmp(tag, "arrivals") == 0 || std::strcmp(tag, "presents") == 0) {
-            std::vector<int64_t>* into =
-                (tag[0] == 'a') ? &out->arrivals : &out->presents;
+        else if (std::strcmp(tag, "arrivals") == 0 || std::strcmp(tag, "presents") == 0 ||
+                 std::strcmp(tag, "flips_h0") == 0) {
+            std::vector<int64_t>* into = &out->presents;
+            if (std::strcmp(tag, "arrivals") == 0) into = &out->arrivals;
+            else if (std::strcmp(tag, "flips_h0") == 0) into = &out->flipDisplay;
             num(&n);
             if (!ok) break;
             into->clear();
@@ -861,6 +870,24 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
                 acc = (i == 0) ? v : acc + v;
                 into->push_back(acc);
             }
+        }
+        else if (std::strcmp(tag, "flips_h0_delay") == 0) {
+            // Raw, not delta-encoded: knowability is not monotonic in delivery order, so
+            // a delta chain would be both larger and a lie about the shape of the data.
+            num(&n);
+            if (!ok) break;
+            out->flipKnown.clear();
+            out->flipKnown.reserve((size_t)n);
+            for (long long i = 0; i < n; i++) {
+                long long v = 0;
+                if (std::fscanf(f, "%lld", &v) != 1) { ok = false; break; }
+                const size_t k = (size_t)i;
+                if (k < out->flipDisplay.size()) out->flipKnown.push_back(out->flipDisplay[k] + v);
+            }
+            // A delay stream that does not line up with its flips is a malformed fixture,
+            // not a partially usable one: silently keeping the prefix would give the
+            // coherence rule a timeline that is wrong only in its tail.
+            if (out->flipKnown.size() != out->flipDisplay.size()) ok = false;
         }
         if (!ok) break;
     }
@@ -910,6 +937,45 @@ static void test_replay_capture_corpus() {
     for (const std::string& path : paths) {
         TraceFixture fx;
         CHECK(ParseFixture(path, &fx), "fixture unreadable or malformed: %s", path.c_str());
+
+        // Flip data has no consumer yet, so nothing else would notice a decoding mistake.
+        // These are the shape checks that hold for any ETW capture of a frame-generated
+        // source, so they fail on a corrupt stream rather than only on an implausible one.
+        if (!fx.flipDisplay.empty()) {
+            std::vector<int64_t> gaps;
+            for (size_t i = 1; i < fx.flipDisplay.size(); i++) {
+                const int64_t d = fx.flipDisplay[i] - fx.flipDisplay[i - 1];
+                if (d > 0 && d < 40000) gaps.push_back(d);
+            }
+            CHECK(gaps.size() > fx.flipDisplay.size() / 2,
+                  "%s: only %zu of %zu flip gaps are plausible; the stream is not a scanout "
+                  "grid", path.c_str(), gaps.size(), fx.flipDisplay.size());
+            std::sort(gaps.begin(), gaps.end());
+            const int64_t medGap = gaps[gaps.size() / 2];
+            CHECK(medGap > 2000 && medGap < 20000,
+                  "%s: median flip spacing %lld us is outside any sane refresh rate",
+                  path.c_str(), (long long)medGap);
+            if (!fx.flipKnown.empty()) {
+                CHECK(fx.flipKnown.size() == fx.flipDisplay.size(),
+                      "%s: %zu knowability stamps for %zu flips", path.c_str(),
+                      fx.flipKnown.size(), fx.flipDisplay.size());
+                // The driver stamps the event as it assigns the flip time and delivery only
+                // adds delay, so learning of a flip BEFORE it happened means the two streams
+                // were joined wrong.
+                std::vector<int64_t> delay;
+                for (size_t i = 0; i < fx.flipKnown.size(); i++)
+                    delay.push_back(fx.flipKnown[i] - fx.flipDisplay[i]);
+                std::sort(delay.begin(), delay.end());
+                const int64_t medDelay = delay[delay.size() / 2];
+                CHECK(medDelay > 0 && medDelay < 100000,
+                      "%s: median knowability delay %lld us is not a delivery latency",
+                      path.c_str(), (long long)medDelay);
+                std::printf("  flips [%s]: %zu head-0, spacing %lld us (%.1f Hz), "
+                            "known +%lld us median\n",
+                            fx.description.c_str(), fx.flipDisplay.size(),
+                            (long long)medGap, 1e6 / (double)medGap, (long long)medDelay);
+            }
+        }
 
         SimParams p;
         p.srcPeriod = 16667;
