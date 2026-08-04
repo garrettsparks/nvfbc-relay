@@ -79,6 +79,28 @@ SILENTLY on x3, on MFG, and on any driver change: it produces confident wrong st
 actual scanout times derives the cadence instead of assuming it, including for patterns nobody has
 characterized yet.
 
+**Correct timestamps are NOT a licence to treat generated frames as interchangeable with real
+ones.** This is the constraint the whole design has to respect, and it is easy to get backwards.
+
+Flip-stamping makes the generated frames usable, but selection must still PREFER the real one.
+Measured at 60x2: if both members were kept, flip-stamped, and selection simply took
+nearest-to-target, it would land on a generated frame **93.2% of the time**. The targets sit almost
+exactly half a source period from every real flip (p50 7937 us, and 0.0% of them within the 4166 us
+passthrough threshold), because at a 16.67 ms output period against an 8.33 ms flip grid the lock
+phase picks a parity and holds it. Nearest-selection would therefore invert the output from
+essentially all-real to almost all-generated, which the keep-first vs keep-real A/B (two full
+videos, Round 10) established is the visibly worse picture.
+
+This also explains something that looks like a bug and is not. The ring stamps the surviving real
+member at BATCH-START, which is the GENERATED frame's display time, roughly 8.3 ms "early". The
+comb lock has settled with targets landing on that same instant. The stamp offset and the lock
+phase cancel, so selection reliably picks the real frame. **That 8.3 ms offset is load-bearing**;
+removing it without re-phasing the lock by half a comb inverts the output.
+
+So the shape of the win is narrow and specific: a generated frame becomes usable when NO real frame
+is near the target. That is rate mismatch (90 -> 60), stall resumes, and ragged delivery. It is not
+a general upgrade at 60x2, where the existing behaviour is already correct.
+
 **Enrichment, not dependency.** The existing stamping rule (arrival time, batch-start for
 intra-batch members, keep-real) stays as the baseline and never goes away. ETW UPGRADES a slot's
 timestamp from estimated to measured when the data arrives in time. Nothing branches on "is ETW
@@ -294,7 +316,34 @@ lose zero events across seven runs, but that is a property of a measured workloa
 3. **Is the grid readable at x3?** x3 never paced correctly and the reason is unknown. Where those
    frames actually land is a direct measurement, and it may be a different explanation from the
    batch-grouping one.
-4. **Does DLSS-FG look structurally different** from driver-level Smooth Motion?
+4. **Does DLSS-FG look structurally different** from driver-level Smooth Motion? It is an in-game
+   SDK path rather than a driver one, so it may not emit FlipRequest with the same shape, or at
+   all. Everything below assumes it does until measured.
+
+4b. **Can the multiplier be DERIVED rather than configured?** A "-fg x2 / x3 / x4" flag would be
+   one more thing to get wrong, and would be silently wrong the moment the user changes a driver
+   setting without changing the flag. Both quantities needed appear to be measurable at runtime:
+
+   | quantity | how it is read |
+   |---|---|
+   | multiplier | flips per capture batch, or source period / flip period |
+   | which member is real | position in the batch |
+
+   At 60x2 the batch holds 2 wakes and the interval carries exactly 2 flips in 99.96% of cases, so
+   the multiplier falls straight out of counting. The real member is the SECOND of two, which the
+   two-video A/B established independently of any of this.
+
+   The rule that would generalise without configuration is **"the real frame is the LAST member of
+   the batch"**, which follows from how interpolation must work: the driver cannot produce frames
+   between N-1 and N until it has N, so the generated ones are submitted first. If that holds, x3
+   is [gen, gen, real] and x4 is [gen, gen, gen, real], and nothing needs declaring.
+
+   UNVERIFIED beyond x2. Profiling x3, x4 and DLSS-FG is what settles it, and the failure mode if
+   the rule does not generalise is severe rather than subtle: picking the wrong member outputs
+   almost entirely generated frames. The offset from the nearest flip is a weaker independent
+   signal (74 us for the generated member, 411 us for the real one at x2, separating 99% / 76%),
+   and it is the only signal available for the ~17% of batches that arrive with a single wake,
+   where position cannot say anything.
 5. **Lost events fail silently.** An estimator fed incomplete data is the silent-wrong failure this
    project keeps hitting. Whatever consumes ETW must log lost-event counters.
 6. **Two behaviour modes is two test surfaces.** The more the policy exploits ETW when present, the
@@ -315,9 +364,14 @@ lose zero events across seven runs, but that is a property of a measured workloa
   has no NVIDIA member (`NotSet, Unspecified, Application, Repeated, Intel_XEFG, AMD_AFMF`), so it
   cannot label Smooth Motion frames anyway. `--track_frame_type` requires instrumentation via the
   Intel-PresentMon provider, which the NVIDIA driver does not emit.
-- **Real-vs-generated labelling from any ETW source.** Not available for Smooth Motion. Not needed
-  either: keep-first vs keep-real (Round 10) already answered which batch member is real, visually,
-  on real output. That is stronger evidence than a driver label.
+- **Real-vs-generated labelling from any ETW source.** Not available for Smooth Motion. The label
+  comes from batch position, which the keep-first vs keep-real A/B (Round 10) established visually
+  on real output - stronger evidence than a driver label would be.
+
+  What has changed since that entry was written: the label is now REQUIRED rather than merely
+  available. Correct timestamps make generated frames usable, and a selection that cannot tell the
+  two apart lands on generated frames 93.2% of the time at 60x2. See the constraint under
+  Decisions. So "not needed either" was true only while generated frames were being discarded.
 - **ETW as offline-only calibration.** Too weak. It discards the data's main value, which is
   aligning to patterns no built-in heuristic covers.
 - **"Per-frame lookup is impossible."** It is viable given a raised lag floor and unambiguous

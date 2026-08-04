@@ -3,3 +3,6 @@
 # (mktrace.py lives in this directory; run the suite afterwards for the bounds)
 kcd_60x2_mapcycles.trace
 kcd_60x2_mapcycles_postfix.trace
+# Steady walking, the regime the map-cycle fixtures do not cover: they are dominated by
+# stall recovery, so a selection change that quietly raised gameplay synth would pass them.
+kcd_60x2_walk.trace
