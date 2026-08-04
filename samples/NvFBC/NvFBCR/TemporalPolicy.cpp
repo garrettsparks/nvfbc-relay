@@ -134,11 +134,67 @@ BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTic
         s.batchStartTs = arrivalTs;
     }
     // Chain: a third member an epsilon after the second is still inside the batch.
+    s.member = d.intraBatch ? s.member + 1 : 0;
     s.lastArrivalTs = arrivalTs;
     s.started = true;
     d.stampTs = d.intraBatch ? s.batchStartTs : arrivalTs;
     d.retractPrevious = d.intraBatch;
+    d.member = s.member;
     return d;
+}
+
+FlipPairing PairBatchMember(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
+                            int member, int64_t maxAnchorOffset) {
+    // Wide enough to hold the anchor, this member's flip, and a flip of slack on each side.
+    static const int kLookup = 16;
+    // The cadence is measured over a window rather than assumed, because the flip rate is
+    // the frame-generation multiplier times the source rate and neither is declared here.
+    static const int64_t kCadenceWindow = 200000;
+    FlipPairing r;
+    if (member < 0 || member + 2 > kLookup || maxAnchorOffset <= 0) return r;
+
+    const int64_t spacing = h.MedianSpacing(batchStartTs - kCadenceWindow, batchStartTs, head);
+    if (spacing <= 0) return r;   // no cadence yet: not an anomaly, just no data
+
+    // NEAREST, on either side. displayTs is a PROPOSED FUTURE scanout time and the driver
+    // hands a frame to the capture API before it reaches the screen, so a wake legitimately
+    // lands on either side of its own flip: measured at 60x2, 17.7% of batches arrive BEFORE
+    // theirs, by a median of well under 100 us. Anchoring strictly at-or-before pushes every
+    // one of those a whole grid step into the past, which is a wrong answer wearing the shape
+    // of a right one.
+    const Flip* buf[kLookup];
+    const int64_t lo = batchStartTs - maxAnchorOffset;
+    const int64_t hi = batchStartTs + maxAnchorOffset + spacing * (int64_t)(member + 1);
+    const int n = h.InRange(lo, hi, head, buf, kLookup);
+    if (n == 0) return r;
+
+    int best = 0;
+    int64_t bestAbs = -1;
+    for (int i = 0; i < n; i++) {
+        int64_t d = batchStartTs - buf[i]->displayTs;
+        if (d < 0) d = -d;
+        if (bestAbs < 0 || d < bestAbs) { bestAbs = d; best = i; }
+    }
+    // A confidence gate, not an ambiguity one: half a step would never reject anything, since
+    // every instant is within half a step of some flip. Batch starts cluster hard on the grid
+    // (measured 92.4% within 250 us, 99.2% within 1 ms, then a cliff), so a bound in that
+    // valley rejects the fraction that genuinely cannot be placed instead of trimming a
+    // continuum.
+    if (bestAbs > maxAnchorOffset) return r;
+    r.anchorFound = true;
+    r.anchorOffset = batchStartTs - buf[best]->displayTs;
+
+    if (best + member >= n) { r.memberAhead = true; return r; }   // not announced yet: normal
+    // The member's flip must sit the right number of steps along the grid. Indexing alone
+    // would silently skip a missing flip and hand back the one after it, which is a wrong
+    // scanout time wearing the same shape as a right one.
+    const int64_t span = buf[best + member]->displayTs - buf[best]->displayTs;
+    const int64_t want = spacing * (int64_t)member;
+    if (span < want - spacing / 2 || span > want + spacing / 2) { r.gridGap = true; return r; }
+
+    r.displayTs = buf[best + member]->displayTs;
+    r.paired = true;
+    return r;
 }
 
 bool BracketIsStalled(const BracketInfo& b, const PolicyConfig& cfg) {

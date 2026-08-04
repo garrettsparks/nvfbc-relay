@@ -52,6 +52,10 @@ struct BracketInfo {
 struct BatchState {
     int64_t batchStartTs = 0;    // arrival of the current batch's first member
     int64_t lastArrivalTs = 0;   // previous wake, batch member or not
+    // Position of the last wake inside its batch: 0 opens a batch, 1 is the next member.
+    // Needed to place a member on the flip grid, because the members of a batch arrive
+    // within a submission epsilon of each other but scan out one flip apart.
+    int member = 0;
     // Explicit rather than inferring "no history" from a zero timestamp: replayed and
     // simulated timelines legitimately start at 0, and a sentinel would silently treat
     // the second wake of such a run as batch-opening.
@@ -68,6 +72,9 @@ struct BatchDecision {
     bool retractPrevious = false;
     int64_t stampTs = 0;
     int64_t batchGap = 0;
+    // 0 for the wake that opens a batch, 1 for the next, and so on. Carried on the ring
+    // slot so a later flip lookup can ask which flip this frame actually scanned out on.
+    int member = 0;
 };
 
 // Fold one capture wake into the batch timeline. Wake order is measured
@@ -141,6 +148,40 @@ private:
     static const int kMaxHeadsTracked = 8;
     int64_t m_lastTsByHead[kMaxHeadsTracked] = {};
 };
+
+// Where one captured frame actually scanned out. Every field is meaningful on failure too:
+// a caller has to be able to tell "no flip data yet" from "flip data says this is unpairable",
+// because the first is the normal early-capture state and the second is a real anomaly.
+struct FlipPairing {
+    bool paired = false;       // displayTs is meaningful ONLY when this is true
+    int64_t displayTs = 0;     // true scanout time of THIS member's frame
+    int64_t anchorOffset = 0;  // batch start minus its anchor flip, signed: delivery lateness
+    bool anchorFound = false;  // a flip sat near the batch start
+    bool memberAhead = false;  // anchor found, but this member's flip is not announced yet
+    bool gridGap = false;      // anchor found and the member's flip is missing from the grid
+};
+
+// Place a batch member on the flip grid.
+//
+// The batch, not the member, is what lands on a flip: members arrive within a submission
+// epsilon of each other (measured 351 us) while the grid steps 5.6-8.3 ms, so every member
+// of a batch has the same nearest flip and position alone would collapse them onto one
+// scanout time. Measured instead: consecutive batches advance by exactly 2 flip indices
+// (94.9% at 60x2 over 7348 batches, 96.4% at 60x3 over 10795) while carrying 2 members
+// each, so members tile the grid one-to-one in order and member k scans out k flips after
+// the anchor.
+//
+// The anchor is the flip NEAREST the batch start, on either side. displayTs is a proposed
+// FUTURE scanout time and the driver hands a frame over before it reaches the screen, so a
+// wake lands on either side of its own flip; measured at 60x2, 17.7% of batches arrive before
+// theirs. maxAnchorOffset is a confidence bound, not an ambiguity one - half a step would
+// never reject anything, because every instant is within half a step of some flip. Measured,
+// batch starts sit within 250 us of a flip 92.4% of the time and within 1 ms 99.2% of the
+// time, with a clear cliff after, so a bound near 1 ms rejects what genuinely cannot be
+// placed. A large offset within the bound is late delivery, not an error, and reporting it
+// is half the point of doing this at all.
+FlipPairing PairBatchMember(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
+                            int member, int64_t maxAnchorOffset);
 
 // Selection memory across presents. lastShownTs strictly advances except on Repeat;
 // the two bools are the Schmitt states (stickiness side, advance gate).

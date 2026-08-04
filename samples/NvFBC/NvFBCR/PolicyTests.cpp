@@ -673,6 +673,116 @@ static void test_flip_history() {
                 "reorder-safe lookup\n");
 }
 
+// Placing captures on the flip grid. The cases that matter are the FAILURES: a pairing
+// that cannot be made must say so, because a confident wrong scanout time is worse than
+// none at all - the estimated stamp it would replace is at least honest about being an
+// estimate.
+static void test_flip_pairing() {
+    const int64_t kGrid = 8333;            // 60x2: 120 flips/s
+    const int64_t kMaxOff = kGrid / 2;
+    const int64_t kBase = 1000000;
+    policy::FlipHistory h;
+    for (int i = 0; i < 60; i++) {
+        policy::Flip f;
+        f.displayTs = kBase + (int64_t)i * kGrid;
+        f.eventTs = f.displayTs - 200;
+        f.head = 0;
+        h.Add(f);
+        policy::Flip g;                     // head 1 decoy on a different cadence
+        g.displayTs = kBase + (int64_t)i * 16667;
+        g.head = 1;
+        h.Add(g);
+    }
+    const int64_t anchor = kBase + 30 * kGrid;
+
+    // A batch landing on a flip: member 0 takes that flip, member 1 the NEXT one. The two
+    // arrive an epsilon apart and scan out a full grid step apart, which is the entire
+    // reason this function exists.
+    policy::FlipPairing p0 = policy::PairBatchMember(h, 0, anchor + 240, 0, kMaxOff);
+    CHECK(p0.paired && p0.displayTs == anchor,
+          "member 0 should pair to its anchor flip, got paired=%d ts=%lld",
+          (int)p0.paired, (long long)p0.displayTs);
+    CHECK(p0.anchorOffset == 240, "anchor offset should be the wake's lateness, got %lld",
+          (long long)p0.anchorOffset);
+    policy::FlipPairing p1 = policy::PairBatchMember(h, 0, anchor + 240, 1, kMaxOff);
+    CHECK(p1.paired && p1.displayTs == anchor + kGrid,
+          "member 1 should pair one grid step later, got %lld",
+          (long long)(p1.displayTs - anchor));
+    CHECK(p1.displayTs - p0.displayTs == kGrid,
+          "two members of one batch must scan out exactly one flip apart");
+
+    // Head isolation: head 1 runs a different cadence, and leaking it in would produce a
+    // plausible-looking wrong answer rather than a visible failure.
+    policy::FlipPairing ph = policy::PairBatchMember(h, 1, anchor + 240, 0, kMaxOff);
+    CHECK(!ph.paired || ph.displayTs % 16667 == kBase % 16667,
+          "a head-1 pairing must come from head 1's own grid");
+
+    // A wake landing just BEFORE a flip belongs to that flip, not the previous one: the
+    // driver hands the frame over ahead of its proposed scanout time, and 17.7% of real
+    // batches arrive on this side. Anchoring at-or-before would put them a grid step back.
+    policy::FlipPairing early = policy::PairBatchMember(h, 0, anchor - 90, 0, kMaxOff);
+    CHECK(early.paired && early.displayTs == anchor,
+          "a wake 90us before its flip must anchor to THAT flip, got %lld",
+          (long long)(early.displayTs - anchor));
+    CHECK(early.anchorOffset == -90,
+          "an early wake must report a negative offset, got %lld",
+          (long long)early.anchorOffset);
+    policy::FlipPairing early1 = policy::PairBatchMember(h, 0, anchor - 90, 1, kMaxOff);
+    CHECK(early1.paired && early1.displayTs == anchor + kGrid,
+          "member stepping must work from an early-arriving batch too, got %lld",
+          (long long)(early1.displayTs - anchor));
+
+    // Past the bound, no flip is close enough to claim this wake, so it is unpairable rather
+    // than pairable-with-a-big-offset. The bound has to be tighter than half a step for this
+    // to be reachable at all.
+    const int64_t kTight = 1000;
+    policy::FlipPairing far = policy::PairBatchMember(h, 0, anchor + 2500, 0, kTight);
+    CHECK(!far.paired && !far.anchorFound,
+          "a wake 2.5ms from any flip must be unpairable at a 1ms bound");
+    policy::FlipPairing near = policy::PairBatchMember(h, 0, anchor + 800, 0, kTight);
+    CHECK(near.paired && near.displayTs == anchor,
+          "a wake inside the bound must still pair, with the offset reported");
+
+    // The member's flip has not been announced yet. This is the ordinary early state, not
+    // an anomaly, and the caller has to be able to tell the two apart.
+    policy::FlipHistory partial;
+    for (int i = 0; i < 40; i++) {
+        policy::Flip f;
+        f.displayTs = kBase + (int64_t)i * kGrid;
+        f.head = 0;
+        partial.Add(f);
+    }
+    const int64_t last = kBase + 39 * kGrid;
+    policy::FlipPairing ahead = policy::PairBatchMember(partial, 0, last, 1, kMaxOff);
+    CHECK(!ahead.paired && ahead.anchorFound && ahead.memberAhead,
+          "member 1 past the end of history must report memberAhead, not a guess");
+
+    // A hole in the grid must not be stepped over. Indexing alone would hand back the flip
+    // AFTER the hole and call it member 1.
+    policy::FlipHistory gap;
+    for (int i = 0; i < 40; i++) {
+        if (i == 21) continue;              // the flip member 1 would want
+        policy::Flip f;
+        f.displayTs = kBase + (int64_t)i * kGrid;
+        f.head = 0;
+        gap.Add(f);
+    }
+    policy::FlipPairing holed =
+        policy::PairBatchMember(gap, 0, kBase + 20 * kGrid, 1, kMaxOff);
+    CHECK(!holed.paired && holed.gridGap,
+          "a missing flip must fail as a grid gap, got paired=%d ts=%lld",
+          (int)holed.paired, (long long)holed.displayTs);
+
+    // No cadence at all: no data is not an anomaly either.
+    policy::FlipHistory empty;
+    policy::FlipPairing none = policy::PairBatchMember(empty, 0, anchor, 0, kMaxOff);
+    CHECK(!none.paired && !none.anchorFound && !none.memberAhead && !none.gridGap,
+          "an empty history must report plain no-data");
+
+    std::printf("  flip pairing: member steps the grid, head isolation, and unpairable "
+                "wakes report WHY (out of range / not yet announced / grid gap)\n");
+}
+
 // Batch-collapse keep-real, asserted directly rather than inferred from a timeline.
 // Wake order under frame generation is [GENERATED, REAL], so the SECOND member of a
 // batch is the one worth keeping: it publishes, and the generated member ahead of it is
@@ -688,6 +798,7 @@ static void test_batch_collapse_keep_real() {
     CHECK(!d.retractPrevious, "first wake has no predecessor to retract");
     CHECK(d.stampTs == 100000, "lone wake stamps at its own arrival, got %lld",
           (long long)d.stampTs);
+    CHECK(d.member == 0, "a batch-opening wake is member 0, got %d", d.member);
 
     // Its twin arrives an epsilon later: same batch, keeps the BATCH-START stamp so the
     // ring timeline stays at base cadence, and retracts the generated member.
@@ -696,12 +807,16 @@ static void test_batch_collapse_keep_real() {
     CHECK(d.retractPrevious, "keep-real: the intra-batch member retracts its predecessor");
     CHECK(d.stampTs == 100000, "intra-batch member stamps at batch start, got %lld",
           (long long)d.stampTs);
+    CHECK(d.member == 1, "the second member is index 1, got %d", d.member);
 
     // A third member an epsilon on is still inside the batch (the chain rule).
     d = policy::UpdateBatch(s, 100700, kThreshold);
     CHECK(d.intraBatch, "chained third member is still intra-batch");
     CHECK(d.stampTs == 100000, "chained member still stamps at batch start, got %lld",
           (long long)d.stampTs);
+    // The index has to keep counting, not saturate: it is what places the member on the
+    // flip grid, and a third member scans out two flips after the anchor, not one.
+    CHECK(d.member == 2, "the chained third member is index 2, got %d", d.member);
 
     // The next base frame opens a new batch and reports the base period, with the
     // submission epsilon excluded (batch start to batch start, not wake to wake).
@@ -709,6 +824,7 @@ static void test_batch_collapse_keep_real() {
     CHECK(!d.intraBatch, "a wake a full source period later opens a new batch");
     CHECK(!d.retractPrevious, "a new batch must not retract the previous batch's keeper");
     CHECK(d.batchGap == 16667, "batch gap is base cadence, got %lld", (long long)d.batchGap);
+    CHECK(d.member == 0, "a new batch restarts the member index, got %d", d.member);
 
     // A gap just under the threshold still collapses; just over it does not.
     policy::BatchState t;
@@ -922,6 +1038,80 @@ static std::vector<std::string> FixturePaths() {
     return out;
 }
 
+// Replay the join over a real capture, on the relay's own terms: a flip enters history when
+// the relay could FIRST HAVE KNOWN it, not when it happened, and a capture is placed on the
+// grid one bracketing lag after it arrived, which is when the policy first needs its stamp.
+// Feeding history from display times instead would answer a question nobody is asking - it
+// would measure whether the grid is joinable in hindsight, which was never in doubt.
+static void ReportPairing(const TraceFixture& fx, int64_t lagFloor, int64_t batchThreshold) {
+    if (fx.flipDisplay.empty()) return;
+
+    struct Attempt { int64_t at; int64_t batchStart; int member; };
+    std::vector<Attempt> pend;
+    pend.reserve(fx.arrivals.size());
+    policy::BatchState bs;
+    for (size_t i = 0; i < fx.arrivals.size(); i++) {
+        const policy::BatchDecision d = policy::UpdateBatch(bs, fx.arrivals[i], batchThreshold);
+        pend.push_back({fx.arrivals[i] + lagFloor, d.stampTs, d.member});
+    }
+
+    policy::FlipHistory h;
+    size_t fi = 0, pi = 0;
+    int paired = 0, ahead = 0, gap = 0, noAnchor = 0;
+    std::vector<int64_t> offsets;
+    offsets.reserve(pend.size());
+    // 1 ms is where the measured distribution has its cliff: batch starts sit within 250 us
+    // of a flip 92.4% of the time and within 1 ms 99.2%, with only 0.24% past 2 ms. Deriving
+    // it from the grid step instead would put the bound out in the flat tail and pair things
+    // that cannot honestly be placed.
+    const int64_t bound = 1000;
+
+    while (pi < pend.size()) {
+        const int64_t now = pend[pi].at;
+        while (fi < fx.flipDisplay.size()) {
+            const int64_t known = fx.flipKnown.empty() ? fx.flipDisplay[fi] : fx.flipKnown[fi];
+            if (known > now) break;
+            policy::Flip f;
+            f.displayTs = fx.flipDisplay[fi];
+            f.eventTs = known;
+            f.head = 0;
+            h.Add(f);
+            fi++;
+        }
+        const policy::FlipPairing r =
+            policy::PairBatchMember(h, 0, pend[pi].batchStart, pend[pi].member, bound);
+        if (r.paired) { paired++; offsets.push_back(r.anchorOffset); }
+        else if (r.memberAhead) ahead++;
+        else if (r.gridGap) gap++;
+        else noAnchor++;
+        pi++;
+    }
+
+    std::sort(offsets.begin(), offsets.end());
+    const int64_t p50 = offsets.empty() ? 0 : offsets[offsets.size() / 2];
+    const int64_t p95 = offsets.empty() ? 0 : offsets[(size_t)(offsets.size() * 0.95)];
+    const size_t total = pend.size();
+    std::printf("    pairing: %.1f%% placed (p50 +%lld us, p95 +%lld us), "
+                "unpaired %.1f%% not-yet-announced / %.1f%% grid gap / %.1f%% no anchor\n",
+                100.0 * paired / (double)total, (long long)p50, (long long)p95,
+                100.0 * ahead / (double)total, 100.0 * gap / (double)total,
+                100.0 * noAnchor / (double)total);
+
+    // Measured 99.5% on the walk fixture, so 98 is a regression gate rather than a hopeful
+    // one. The premise of the whole design is that the flip data arrives in time at the
+    // CURRENT lag floor; if that stops holding the number should be argued about, not
+    // quietly accepted.
+    CHECK(paired * 100 / (int)total >= 98,
+          "%s: only %d of %zu captures placed on the flip grid; the join does not hold at a "
+          "%lld us floor", fx.path.c_str(), paired, total, (long long)lagFloor);
+    // Not-yet-announced is the failure the lag floor governs. It measured 0.0%, which is the
+    // evidence that the floor needs no raising; a nonzero reading here is the first sign that
+    // conclusion has expired.
+    CHECK(ahead * 100 / (int)total <= 2,
+          "%s: %d of %zu captures had no flip announced in time; the lag floor conclusion "
+          "no longer holds", fx.path.c_str(), ahead, total);
+}
+
 static void test_replay_capture_corpus() {
     const std::vector<std::string> paths = FixturePaths();
     // Loud, never a skip: a corpus gate that quietly vanishes leaves the suite green
@@ -975,6 +1165,10 @@ static void test_replay_capture_corpus() {
                             fx.description.c_str(), fx.flipDisplay.size(),
                             (long long)medGap, 1e6 / (double)medGap, (long long)medDelay);
             }
+            // 20833 us is today's floor at 60 fps (srcPeriod * 1.25); 3000 us is the batch
+            // threshold CaptureRing uses. Both are the shipping values, so this reports what
+            // the relay would actually achieve rather than what a tuned one could.
+            ReportPairing(fx, 20833, 3000);
         }
 
         SimParams p;
@@ -1760,6 +1954,7 @@ int main(int argc, char** argv) {
     test_composite_quantized_arrivals();
 
     test_flip_history();
+    test_flip_pairing();
     test_batch_collapse_keep_real();
     test_lock_reseed_wide_bracket_stall();
     test_lock_reseed_stall_paired_cadence();
