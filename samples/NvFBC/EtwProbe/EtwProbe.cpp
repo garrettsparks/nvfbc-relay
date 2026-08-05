@@ -37,16 +37,27 @@
 //
 // Requires elevation (real-time ETW).
 // Usage: EtwProbe.exe [seconds] [--dxgk] [--events N] [--bufkb K] [--minbuf N]
-//                     [--flushms M] [--noperproc]
-//   --dxgk also enables Microsoft-Windows-DxgKrnl and counts its events. Purely a control: if
-//   the NVIDIA event count is zero but DxgKrnl is nonzero, the session works and the NVIDIA
-//   provider is the problem (wrong GUID, Smooth Motion off, or nothing being flipped).
+//                     [--flushms M] [--noperproc] [--dxgkkw HEX] [--dxgklevel N]
+//   --dxgk enables Microsoft-Windows-DxgKrnl and prints a census of every event kind that
+//   arrives: id, opcode, version, count, and the TDH-resolved task/opcode/field names.
+//
+//   It started as a liveness control (NVIDIA silent + DxgKrnl alive = the provider is the
+//   problem) and it still serves that, but its real job now is a question the NVIDIA event
+//   cannot answer. That event is called FlipRequest and its payload is a PROPOSED flip time,
+//   so it records what the driver INTENDED. Measured on real captures, consecutive proposals
+//   sometimes alternate short/long by ~1 ms around a rock-steady mean while the monitor's own
+//   readout stays locked - consistent with the proposals being corrected before scanout.
+//   DxgKrnl is where a completion timestamp would live, and unlike NVIDIA's provider it
+//   registers a manifest, so TDH names its events and fields instead of us guessing IDs.
+//
+//   --dxgkkw widens the keyword past the 0x1 default if the census looks too thin.
 
 #include "FlipDecode.h"
 
 #include <windows.h>
 #include <evntrace.h>
 #include <evntcons.h>
+#include <tdh.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdlib>
@@ -54,6 +65,7 @@
 #include <cstring>
 
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "tdh.lib")
 
 // Provider identities and the payload layout live in FlipDecode so the relay and this
 // probe cannot drift apart in how they read the same events.
@@ -115,6 +127,35 @@ static long long g_dtsHist[kDtsBuckets] = {};
 static long long g_dtsCount = 0;
 static long long g_dtsSum = 0;
 
+// DxgKrnl census. The NVIDIA event is called FlipRequest and its payload field is a
+// PROPOSED flip time, so it records the driver's INTENT. Whether the hardware scanned out
+// on that schedule is a different question, and DxgKrnl is where the answer lives: unlike
+// NVIDIA's provider it registers a manifest, so TDH resolves event and field names and we
+// can find the completion event by READING what the system offers instead of guessing IDs
+// off memory. This is deliberately a census, not a decoder: the first job is to learn which
+// events exist and what their fields are called.
+static const int kMaxDxgkKinds = 192;
+static const int kDxgkNameLen  = 72;
+static const int kDxgkPropsLen = 320;
+struct DxgkKind {
+    USHORT id;
+    UCHAR  opcode;
+    UCHAR  version;
+    long long count;
+    bool   resolved;
+    char   task[kDxgkNameLen];
+    char   opname[kDxgkNameLen];
+    char   props[kDxgkPropsLen];
+};
+static DxgkKind g_dxgkKinds[kMaxDxgkKinds];
+static int  g_dxgkKindN = 0;
+// 0x1 is DxgKrnl's base keyword, which carries the flip and vsync events without pulling in
+// the scheduler and memory-manager traffic that makes an unfiltered session lose data.
+static ULONGLONG g_dxgkKeyword = 0x1;
+static int       g_dxgkLevel   = TRACE_LEVEL_INFORMATION;
+static bool g_dxgkNamed = false;   // did TDH resolve anything at all
+static long long g_dxgkUnresolved = 0;
+
 // Reservoir-free percentile inputs: these streams are small enough to keep whole.
 static const int kMaxSamples = 20000;
 static long long g_lagUs[kMaxSamples];
@@ -139,6 +180,76 @@ static void HexDump(const BYTE* p, ULONG n) {
     }
 }
 
+// Narrow a manifest's wide strings into the fixed buffers above. Names are ASCII in
+// practice; anything else is truncated rather than rejected, because a garbled name is
+// still a usable discriminator between event kinds.
+static void NarrowInto(const wchar_t* w, char* out, int cap) {
+    if (!w) { out[0] = 0; return; }
+    int i = 0;
+    for (; w[i] && i < cap - 1; i++) out[i] = (w[i] < 128) ? (char)w[i] : '?';
+    out[i] = 0;
+    while (i > 0 && (out[i - 1] == ' ' || out[i - 1] == '\n' || out[i - 1] == '\r')) out[--i] = 0;
+}
+
+// Resolve one event kind's names and top-level field names through TDH. Called once per
+// distinct kind, never per event: TdhGetEventInformation allocates and parses a manifest
+// section, which is far too slow for a callback that sees thousands of events a second.
+static void ResolveDxgkKind(PEVENT_RECORD ev, DxgkKind* k) {
+    k->resolved = true;
+    ULONG size = 0;
+    if (TdhGetEventInformation(ev, 0, nullptr, nullptr, &size) != ERROR_INSUFFICIENT_BUFFER) {
+        g_dxgkUnresolved++;
+        return;
+    }
+    TRACE_EVENT_INFO* info = (TRACE_EVENT_INFO*)malloc(size);
+    if (!info) return;
+    if (TdhGetEventInformation(ev, 0, nullptr, info, &size) != ERROR_SUCCESS) {
+        free(info);
+        g_dxgkUnresolved++;
+        return;
+    }
+    g_dxgkNamed = true;
+    if (info->TaskNameOffset)
+        NarrowInto((const wchar_t*)((PBYTE)info + info->TaskNameOffset), k->task, kDxgkNameLen);
+    if (info->OpcodeNameOffset)
+        NarrowInto((const wchar_t*)((PBYTE)info + info->OpcodeNameOffset), k->opname, kDxgkNameLen);
+    // Field names are the point: a completion event that carries a VidPnSourceId and a
+    // timestamp is what would replace the NVIDIA proposal, and only the manifest says
+    // which of these events has them.
+    int w = 0;
+    for (ULONG i = 0; i < info->TopLevelPropertyCount && w < kDxgkPropsLen - 2; i++) {
+        const ULONG off = info->EventPropertyInfoArray[i].NameOffset;
+        if (!off) continue;
+        char name[kDxgkNameLen];
+        NarrowInto((const wchar_t*)((PBYTE)info + off), name, kDxgkNameLen);
+        const int n = snprintf(k->props + w, (size_t)(kDxgkPropsLen - w), "%s%s",
+                               w ? "," : "", name);
+        if (n <= 0) break;
+        w += n;
+    }
+    free(info);
+}
+
+static void CountDxgk(PEVENT_RECORD ev) {
+    const USHORT id = ev->EventHeader.EventDescriptor.Id;
+    const UCHAR op = ev->EventHeader.EventDescriptor.Opcode;
+    const UCHAR ver = ev->EventHeader.EventDescriptor.Version;
+    for (int i = 0; i < g_dxgkKindN; i++) {
+        DxgkKind* k = &g_dxgkKinds[i];
+        if (k->id == id && k->opcode == op && k->version == ver) { k->count++; return; }
+    }
+    if (g_dxgkKindN >= kMaxDxgkKinds) return;
+    DxgkKind* k = &g_dxgkKinds[g_dxgkKindN++];
+    k->id = id; k->opcode = op; k->version = ver; k->count = 1;
+    k->task[0] = 0; k->opname[0] = 0; k->props[0] = 0;
+    ResolveDxgkKind(ev, k);
+}
+
+static int CmpDxgk(const void* a, const void* b) {
+    const long long x = ((const DxgkKind*)a)->count, y = ((const DxgkKind*)b)->count;
+    return (x < y) - (x > y);   // descending
+}
+
 static int Cmp(const void* a, const void* b) {
     const long long x = *(const long long*)a, y = *(const long long*)b;
     return (x > y) - (x < y);
@@ -157,6 +268,7 @@ static void WINAPI OnEvent(PEVENT_RECORD ev) {
 
     if (IsEqualGUID(ev->EventHeader.ProviderId, kDxgKrnlGuid)) {
         g_dxgkEvents++;
+        CountDxgk(ev);
         return;
     }
     if (!IsEqualGUID(ev->EventHeader.ProviderId, kNvDisplayDriverGuid)) return;
@@ -300,7 +412,30 @@ static void Summary() {
             g_startQpc, (long long)endQpc.QuadPart);
     LogLine("NVIDIA DisplayDriver events: %lld (FlipRequest %lld, decoded %lld, undecodable %lld)",
             g_nvEvents, g_flipEvents, g_decodeOk, g_decodeFail);
-    if (g_dxgkEvents) LogLine("DxgKrnl control events: %lld", g_dxgkEvents);
+    if (g_dxgkEvents) {
+        LogLine("DxgKrnl events: %lld across %d distinct kinds%s",
+                g_dxgkEvents, g_dxgkKindN,
+                g_dxgkNamed ? "" : "   <== TDH resolved NOTHING; names below are blank");
+        // Sorted by volume, because the event that fires once per scanout is the one whose
+        // rate matches the refresh rate, and that is visible in the count alone.
+        qsort(g_dxgkKinds, (size_t)g_dxgkKindN, sizeof(DxgkKind), CmpDxgk);
+        LogLine("  %-6s %-4s %-4s %10s  %-28s %-16s %s",
+                "id", "op", "ver", "count", "task", "opcode", "fields");
+        for (int i = 0; i < g_dxgkKindN; i++) {
+            const DxgkKind* k = &g_dxgkKinds[i];
+            LogLine("  %-6u %-4u %-4u %10lld  %-28s %-16s %s",
+                    (unsigned)k->id, (unsigned)k->opcode, (unsigned)k->version, k->count,
+                    k->task[0] ? k->task : "-", k->opname[0] ? k->opname : "-",
+                    k->props[0] ? k->props : "-");
+        }
+        if (g_dxgkUnresolved) {
+            LogLine("  (%lld kinds had no manifest entry; those rows show '-')",
+                    g_dxgkUnresolved);
+        }
+        LogLine("  READ THIS AGAINST THE NVIDIA RATE ABOVE. A kind whose count matches the");
+        LogLine("  refresh rate and whose fields carry a VidPnSourceId is the scanout event;");
+        LogLine("  if its cadence is even while FlipRequest's is not, FlipRequest is an intent.");
+    }
     LogLine("session losses: events %lu, realtime buffers %lu, log buffers %lu, "
             "buffers written %lu%s",
             (unsigned long)g_eventsLost, (unsigned long)g_rtBuffersLost,
@@ -368,6 +503,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--minbuf") && i + 1 < argc) kMinBuffers = (ULONG)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--flushms") && i + 1 < argc) kFlushMs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--noperproc")) kNoPerProc = true;
+        else if (!strcmp(argv[i], "--dxgkkw") && i + 1 < argc)
+            g_dxgkKeyword = strtoull(argv[++i], nullptr, 0);
+        else if (!strcmp(argv[i], "--dxgklevel") && i + 1 < argc)
+            g_dxgkLevel = atoi(argv[++i]);
         else seconds = atoi(argv[i]);
     }
     if (seconds <= 0) seconds = 20;
@@ -413,9 +552,14 @@ int main(int argc, char** argv) {
                 "on this driver", st);
     }
     if (alsoDxgk) {
+        // Keyword 0 means "every keyword", which on DxgKrnl is a firehose (context switches,
+        // allocations, paging). Default to the base keyword and let --dxgkkw widen it, so a
+        // discovery run does not drown itself and start losing the events it came for.
         st = EnableTraceEx2(g_session, &kDxgKrnlGuid, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                            TRACE_LEVEL_INFORMATION, 0, 0, 0, nullptr);
+                            (UCHAR)g_dxgkLevel, g_dxgkKeyword, 0, 0, nullptr);
         if (st != ERROR_SUCCESS) LogLine("WARN: EnableTraceEx2(DxgKrnl) failed (%lu)", st);
+        else LogLine("DxgKrnl enabled: level %d keyword 0x%llX",
+                     g_dxgkLevel, (unsigned long long)g_dxgkKeyword);
     }
 
     EVENT_TRACE_LOGFILEW logfile = {};
