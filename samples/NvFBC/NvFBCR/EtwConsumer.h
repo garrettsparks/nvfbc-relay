@@ -51,7 +51,7 @@ public:
     // the lock keeps that configuration on exactly the code path it had before any of this
     // existed, which is what makes an on/off comparison meaningful.
     policy::FlipPairing PairCapture(uint32_t head, int64_t batchStartTs, int member,
-                                    int64_t maxAnchorOffset) const;
+                                    int64_t cadenceWindow) const;
 
     long long Flips() const { return m_flips.load(std::memory_order_relaxed); }
     long long DecodeFailures() const { return m_decodeFail.load(std::memory_order_relaxed); }

@@ -94,6 +94,11 @@ bool g_tint = false;
 // only: it adds flip lines to the log and nothing reads them. Off by default so the
 // validated daily-driver path is untouched.
 bool g_etw = false;
+// -nojoin: keep the ETW session and the flip log, skip the per-present grid lookup. Exists
+// so the join can be A/B'd inside ONE binary in ONE session: comparing against an older
+// build confounds the join with everything else that changed, and the -etw off path logs no
+// flips at all, so it cannot answer questions about the flip grid itself.
+bool g_noJoin = false;
 
 // Optional count for -mark: burn only the first N presents (a head burst that aligns a
 // stream VOD without marking watched gameplay), then run clean. 0 = every present (the
@@ -139,7 +144,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             _stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0 ||
             _stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
-                                           kind, g_mark, g_markFrames, g_tint, g_etw);
+                                           kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin);
         }
 
         // QPC-timer present (t:60 / b:60 / o:60 format).
@@ -147,7 +152,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             float framerate;
             if (ParseFps(modeStr.substr(2), &framerate)) {
                 return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
-                                               kind, g_mark, g_markFrames, g_tint, g_etw);
+                                               kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin);
             }
         }
     }
@@ -186,6 +191,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  -mark [N]      - Burn the frame-counter marker (video-to-log alignment, debug); off by default. N = first N presents only (stream head anchor), else every present");
     LOGERR("  -tint          - Border-tint synthesized frames red (blend mode, debug); off by default");
     LOGERR("  -etw           - Log the display driver's true scanout times alongside capture (debug); off by default");
+    LOGERR("  -nojoin        - With -etw: log flips but skip the per-present grid lookup (debug A/B control)");
     return NULL;
 }
 
@@ -445,6 +451,10 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         g_etw = true;
         return 1;
     }
+    if (tokens[i] == "-nojoin") {
+        g_noJoin = true;
+        return 1;
+    }
     if (tokens[i] == "-mark") {
         g_mark = true;
         // Optional frame count: consume the next token as N only if it is all digits, so
@@ -658,9 +668,10 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     else if (g_markFrames) snprintf(markDesc, sizeof(markDesc), "on (first %u presents)", g_markFrames);
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
     LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s, "
-        "etw flip capture %s",
+        "etw flip capture %s, flip join %s",
         g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
-        g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off");
+        g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off",
+        !g_etw ? "off (no -etw)" : (g_noJoin ? "OFF (-nojoin)" : "on"));
 
     BUF_WIDTH = target.position.right - target.position.left;
     BUF_HEIGHT = target.position.bottom - target.position.top;

@@ -19,7 +19,7 @@ static const float kDefaultAssumedSrcFps = 60.0f;
 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
-                                         bool tint, bool etw)
+                                         bool tint, bool etw, bool noJoin)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_compositor(NULL)
@@ -30,6 +30,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_markFrames(markFrames)
     , m_tint(tint)
     , m_etw(etw)
+    , m_noJoin(noJoin)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_srcRateHint(srcRateHint)
@@ -88,7 +89,7 @@ bool TemporalCaptureMode::Setup() {
     const float assumedFps = (m_srcRateHint > 0.0f) ? m_srcRateHint : kDefaultAssumedSrcFps;
     m_assumedSrcPeriodQpc = (LONGLONG)((double)m_scheduler.Freq() / assumedFps);
     m_bracketingDelayQpc = LagForSourcePeriod(m_assumedSrcPeriodQpc);
-    m_flipAnchorBoundQpc = m_scheduler.Freq() / 1000;   // 1 ms; see the header for why
+    m_flipCadenceWindowQpc = m_scheduler.Freq() / 5;    // 200 ms; see the header for why
     m_telemetryCountdown = kTelemetryPeriodPresents;
 
     // Selection stickiness (Schmitt band): prefer the before-frame unless the after-frame is
@@ -332,12 +333,12 @@ void TemporalCaptureMode::Run(
             // Field names mirror the before=/after= pair already on this line rather than
             // compressing to a prefix, so the line needs no legend to read.
             char flipFields[176] = "";
-            if (m_etw) {
+            if (m_etw && !m_noJoin) {
                 auto place = [&](char* out, size_t cap, const char* tag, bool has,
                                  int64_t stampTs, int member) {
                     if (!has) return 0;
                     const policy::FlipPairing fp =
-                        m_etwConsumer.PairCapture(0, stampTs, member, m_flipAnchorBoundQpc);
+                        m_etwConsumer.PairCapture(0, stampTs, member, m_flipCadenceWindowQpc);
                     if (fp.paired) {
                         return snprintf(out, cap, " %sflip=%lldus %soff=%lldus %smem=%d",
                                         tag,

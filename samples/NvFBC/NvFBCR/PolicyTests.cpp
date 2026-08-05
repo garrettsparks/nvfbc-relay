@@ -679,7 +679,11 @@ static void test_flip_history() {
 // estimate.
 static void test_flip_pairing() {
     const int64_t kGrid = 8333;            // 60x2: 120 flips/s
-    const int64_t kMaxOff = kGrid / 2;
+    // Cadence window, in this file's microseconds. The confidence bound is derived from the
+    // measured step (a quarter of it), so tests exercise the same derivation the relay does
+    // rather than pinning a number the relay does not use.
+    const int64_t kWindow = 200000;
+    const int64_t kBound = kGrid / 4;
     const int64_t kBase = 1000000;
     policy::FlipHistory h;
     for (int i = 0; i < 60; i++) {
@@ -698,13 +702,13 @@ static void test_flip_pairing() {
     // A batch landing on a flip: member 0 takes that flip, member 1 the NEXT one. The two
     // arrive an epsilon apart and scan out a full grid step apart, which is the entire
     // reason this function exists.
-    policy::FlipPairing p0 = policy::PairBatchMember(h, 0, anchor + 240, 0, kMaxOff);
+    policy::FlipPairing p0 = policy::PairBatchMember(h, 0, anchor + 240, 0, kWindow);
     CHECK(p0.paired && p0.displayTs == anchor,
           "member 0 should pair to its anchor flip, got paired=%d ts=%lld",
           (int)p0.paired, (long long)p0.displayTs);
     CHECK(p0.anchorOffset == 240, "anchor offset should be the wake's lateness, got %lld",
           (long long)p0.anchorOffset);
-    policy::FlipPairing p1 = policy::PairBatchMember(h, 0, anchor + 240, 1, kMaxOff);
+    policy::FlipPairing p1 = policy::PairBatchMember(h, 0, anchor + 240, 1, kWindow);
     CHECK(p1.paired && p1.displayTs == anchor + kGrid,
           "member 1 should pair one grid step later, got %lld",
           (long long)(p1.displayTs - anchor));
@@ -713,35 +717,40 @@ static void test_flip_pairing() {
 
     // Head isolation: head 1 runs a different cadence, and leaking it in would produce a
     // plausible-looking wrong answer rather than a visible failure.
-    policy::FlipPairing ph = policy::PairBatchMember(h, 1, anchor + 240, 0, kMaxOff);
+    policy::FlipPairing ph = policy::PairBatchMember(h, 1, anchor + 240, 0, kWindow);
     CHECK(!ph.paired || ph.displayTs % 16667 == kBase % 16667,
           "a head-1 pairing must come from head 1's own grid");
 
     // A wake landing just BEFORE a flip belongs to that flip, not the previous one: the
     // driver hands the frame over ahead of its proposed scanout time, and 17.7% of real
     // batches arrive on this side. Anchoring at-or-before would put them a grid step back.
-    policy::FlipPairing early = policy::PairBatchMember(h, 0, anchor - 90, 0, kMaxOff);
+    policy::FlipPairing early = policy::PairBatchMember(h, 0, anchor - 90, 0, kWindow);
     CHECK(early.paired && early.displayTs == anchor,
           "a wake 90us before its flip must anchor to THAT flip, got %lld",
           (long long)(early.displayTs - anchor));
     CHECK(early.anchorOffset == -90,
           "an early wake must report a negative offset, got %lld",
           (long long)early.anchorOffset);
-    policy::FlipPairing early1 = policy::PairBatchMember(h, 0, anchor - 90, 1, kMaxOff);
+    policy::FlipPairing early1 = policy::PairBatchMember(h, 0, anchor - 90, 1, kWindow);
     CHECK(early1.paired && early1.displayTs == anchor + kGrid,
           "member stepping must work from an early-arriving batch too, got %lld",
           (long long)(early1.displayTs - anchor));
 
-    // Past the bound, no flip is close enough to claim this wake, so it is unpairable rather
-    // than pairable-with-a-big-offset. The bound has to be tighter than half a step for this
-    // to be reachable at all.
-    const int64_t kTight = 1000;
-    policy::FlipPairing far = policy::PairBatchMember(h, 0, anchor + 2500, 0, kTight);
+    // Past the derived bound (a quarter step, 2083us here) no flip is close enough to claim
+    // this wake, so it is unpairable rather than pairable-with-a-big-offset. The bound has to
+    // be tighter than half a step for this to be reachable at all, which is why it is a
+    // quarter and not a half.
+    policy::FlipPairing far =
+        policy::PairBatchMember(h, 0, anchor + kBound + 400, 0, kWindow);
     CHECK(!far.paired && !far.anchorFound,
-          "a wake 2.5ms from any flip must be unpairable at a 1ms bound");
-    policy::FlipPairing near = policy::PairBatchMember(h, 0, anchor + 800, 0, kTight);
+          "a wake past a quarter step from any flip must be unpairable");
+    policy::FlipPairing near =
+        policy::PairBatchMember(h, 0, anchor + kBound - 400, 0, kWindow);
     CHECK(near.paired && near.displayTs == anchor,
           "a wake inside the bound must still pair, with the offset reported");
+    CHECK(near.anchorOffset == kBound - 400,
+          "the reported offset must be the real distance, not a clamped one, got %lld",
+          (long long)near.anchorOffset);
 
     // The member's flip has not been announced yet. This is the ordinary early state, not
     // an anomaly, and the caller has to be able to tell the two apart.
@@ -753,7 +762,7 @@ static void test_flip_pairing() {
         partial.Add(f);
     }
     const int64_t last = kBase + 39 * kGrid;
-    policy::FlipPairing ahead = policy::PairBatchMember(partial, 0, last, 1, kMaxOff);
+    policy::FlipPairing ahead = policy::PairBatchMember(partial, 0, last, 1, kWindow);
     CHECK(!ahead.paired && ahead.anchorFound && ahead.memberAhead,
           "member 1 past the end of history must report memberAhead, not a guess");
 
@@ -768,14 +777,14 @@ static void test_flip_pairing() {
         gap.Add(f);
     }
     policy::FlipPairing holed =
-        policy::PairBatchMember(gap, 0, kBase + 20 * kGrid, 1, kMaxOff);
+        policy::PairBatchMember(gap, 0, kBase + 20 * kGrid, 1, kWindow);
     CHECK(!holed.paired && holed.gridGap,
           "a missing flip must fail as a grid gap, got paired=%d ts=%lld",
           (int)holed.paired, (long long)holed.displayTs);
 
     // No cadence at all: no data is not an anomaly either.
     policy::FlipHistory empty;
-    policy::FlipPairing none = policy::PairBatchMember(empty, 0, anchor, 0, kMaxOff);
+    policy::FlipPairing none = policy::PairBatchMember(empty, 0, anchor, 0, kWindow);
     CHECK(!none.paired && !none.anchorFound && !none.memberAhead && !none.gridGap,
           "an empty history must report plain no-data");
 
@@ -1060,11 +1069,11 @@ static void ReportPairing(const TraceFixture& fx, int64_t lagFloor, int64_t batc
     int paired = 0, ahead = 0, gap = 0, noAnchor = 0;
     std::vector<int64_t> offsets;
     offsets.reserve(pend.size());
-    // 1 ms is where the measured distribution has its cliff: batch starts sit within 250 us
-    // of a flip 92.4% of the time and within 1 ms 99.2%, with only 0.24% past 2 ms. Deriving
-    // it from the grid step instead would put the bound out in the flat tail and pair things
-    // that cannot honestly be placed.
-    const int64_t bound = 1000;
+    // Cadence window in the fixture's microseconds; the confidence bound derives from the
+    // measured step inside PairBatchMember. A FIXED bound was tried and does not survive a
+    // second capture: 1 ms placed 99.2% on one 60x2 walk and 91.5% on another whose render
+    // times wobbled more, because with G-SYNC the scanout grid follows the render rate.
+    const int64_t bound = 200000;
 
     while (pi < pend.size()) {
         const int64_t now = pend[pi].at;

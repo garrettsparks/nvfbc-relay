@@ -6,3 +6,7 @@ kcd_60x2_mapcycles_postfix.trace
 # Steady walking, the regime the map-cycle fixtures do not cover: they are dominated by
 # stall recovery, so a selection change that quietly raised gameplay synth would pass them.
 kcd_60x2_walk.trace
+# Same content and flip rate as the walk above, but a scanout grid that jitters 5.5x more
+# (step IQR 1610us vs 291us) for reasons still unexplained. Kept because the jitter broke a
+# fixed anchor bound that the clean walk passed: a rule tuned on one grid is not a rule.
+kcd_60x2_walk_jitter.trace

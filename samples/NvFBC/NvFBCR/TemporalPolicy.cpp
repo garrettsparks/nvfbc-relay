@@ -144,17 +144,20 @@ BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTic
 }
 
 FlipPairing PairBatchMember(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
-                            int member, int64_t maxAnchorOffset) {
+                            int member, int64_t cadenceWindow) {
     // Wide enough to hold the anchor, this member's flip, and a flip of slack on each side.
     static const int kLookup = 16;
-    // The cadence is measured over a window rather than assumed, because the flip rate is
-    // the frame-generation multiplier times the source rate and neither is declared here.
-    static const int64_t kCadenceWindow = 200000;
     FlipPairing r;
-    if (member < 0 || member + 2 > kLookup || maxAnchorOffset <= 0) return r;
+    if (member < 0 || member + 2 > kLookup || cadenceWindow <= 0) return r;
 
-    const int64_t spacing = h.MedianSpacing(batchStartTs - kCadenceWindow, batchStartTs, head);
+    // The cadence is measured, never assumed: the flip rate is the frame-generation
+    // multiplier times the source rate and neither is declared here.
+    const int64_t spacing = h.MedianSpacing(batchStartTs - cadenceWindow, batchStartTs, head);
     if (spacing <= 0) return r;   // no cadence yet: not an anomaly, just no data
+    // Quarter of a step: ambiguity starts at half, so this keeps a 2x margin. See the header
+    // for why this is derived rather than configured.
+    const int64_t maxAnchorOffset = spacing / 4;
+    if (maxAnchorOffset <= 0) return r;
 
     // NEAREST, on either side. displayTs is a PROPOSED FUTURE scanout time and the driver
     // hands a frame to the capture API before it reaches the screen, so a wake legitimately
