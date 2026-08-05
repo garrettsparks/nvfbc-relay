@@ -1,10 +1,15 @@
 # ETW Frame-Timing Spec (reading the driver's real scanout times)
 
-Status: FEASIBILITY ESTABLISHED, no relay code consuming it yet. Measured on hardware: the events
-arrive, the wire layout is recovered and validated against a known refresh rate, the scanout grid
-is readable, delivery latency is 8 ms p50 once the session is configured for it, and flips pair to
-capture wakes within ~70 us. What remains unbuilt is the relay-side consumer and the pairing rule
-itself.
+Status: **THE JOIN IS BUILT AND VALIDATED, DIAGNOSTIC ONLY.** The relay places every bracket
+frame on the driver's flip grid once per present and logs the verdict; nothing branches on it and
+`-etw` off is byte-identical to the pre-ETW build. Measured live: 98.5% of presents placed at 60x2
+and 97.9% at 60x3, anchor offset p50 +69 us, and no measurable pacing cost (present jitter p50 4 us
+against a 3 us baseline). The flip timestamps are corroborated by a SECOND, independent provider -
+see "What the scanout grid actually looks like".
+
+What remains unbuilt is stage 6 (flip-stamping ring slots behind the coherence rule) and stage 7
+(selection preferring real frames). The one question that gates stage 7 is untouched: whether a
+generated frame's CONTENT phase matches its DISPLAY phase.
 Companions: `dxgi-native-pipeline-spec.md`, `nvfbc-capture-pacing.md`, `frame-marker-spec.md`.
 
 ## The problem
@@ -171,6 +176,73 @@ Consequence: `RING_SIZE` stays at 8 and `LagForSourcePeriod` stays at `srcPeriod
 tail is ever worth chasing, ~32 ms suffices. If the floor IS raised later, size the ring by
 CAPTURED frames (120/s at 60x2, 180/s at 60x3), not by source frames.
 
+## What the scanout grid actually looks like
+
+This section replaces an assumption the rest of this document was built on. Everything below is
+measured in-game, marker-anchored to video-verified gameplay, over five 2-minute relay captures
+and two 10-minute probe runs.
+
+**There is no 8.33 ms grid. There is an 8.33 ms AVERAGE.** At 60x2 the mean inter-flip interval is
+8.333 ms (120.0 Hz exactly), but individual intervals run 6.5-10.0 ms in a broad unimodal hump.
+The mode bucket holds only ~21% of samples and it takes a 3.5 ms-wide window to capture 94%:
+
+| interval | share |
+|---|---|
+| 6.5-7.0 ms | 5.6% |
+| 7.0-7.5 | 12.5% |
+| 7.5-8.0 | 16.0% |
+| **8.0-8.5** | **20.8%** |
+| 8.5-9.0 | 20.2% |
+| 9.0-9.5 | 14.4% |
+| 9.5-10.0 | 7.9% |
+
+**This is real, and a second provider proves it.** Microsoft-Windows-DxgKrnl's
+`VSyncDPC.FrameQPCTime` - a completely independent event from a provider that DOES register a
+manifest, so TDH resolves it by name - reproduces that distribution bucket-for-bucket to within
+0.2 percentage points over ~72000 samples, and sits at a rigid constant offset from the NVIDIA
+stream (p50 +3785 us, p95 +3805 us, a 30 us spread). The two are the same display events at two
+stages of one pipeline.
+
+So the hypothesis that `FlipRequest` is a mere INTENT that hardware corrects is dead. It was worth
+testing - the event's own name says "Request" and its field is documented as a PROPOSED time - but
+the graphics kernel's scanout DPC agrees with it.
+
+**Why the grid is uneven: VRR.** Scanout is not quantized to the panel's 240 Hz lattice (residual
+of each interval mod 4166.6 us has p50 628 us, where a fixed-refresh panel gives ~0). Windows
+reports `CurrentSmoothenedVSyncPeriodQpc` = 4166.6 us as the panel's base. So the panel is
+240 Hz-capable and G-SYNC refreshes it as frames arrive, at whatever spacing they arrive.
+
+**How much is the source and how much is frame generation.** Consecutive-interval pair sums (one
+source period) have sd 714 us against single-interval sd 878 us. 714 us on 16.67 ms is 4.3%, which
+is ordinary game frame-time variance. Do NOT describe this as a metronomic source with a wandering
+generated frame - that overstatement was checked and corrected. It is a moderately variable source
+with generated-frame placement wander on top.
+
+**The tight-spike readability criterion is RETIRED.** The EtwProbe section used to say a smeared
+histogram "kills the arithmetic model outright". That criterion was met exactly once, on an idle
+desktop at 240 Hz (95.7% in a single 0.5 ms bucket), and has NEVER been met in-game. Meanwhile the
+relay runs at 1.1% gameplay synth on this grid with the comb lock engaged 90% of presents. The
+criterion was wrong about what mattered.
+
+**An unexplained two-regime oscillation, which costs nothing.** Flip intervals sit in one of two
+states, stable for minutes at a time: sd ~900 us with lag-1 autocorrelation ~-0.67 (alternating),
+or sd ~350 us with correlation ~-0.09. Established about it:
+
+- NOT caused by the flip join: a pre-join build produced the high state, and a `-nojoin` run
+  produced it too.
+- NOT event loss: 0 lost events, 0 realtime buffers, 0 log buffers, 0 decode failures, 0
+  out-of-order across every capture.
+- NOT duplicate or revised events: 0 exact duplicate display times, 0 backward deltas.
+- NOT `VsyncState`: it cycles 0->1->2 every few seconds and the regime does not track it
+  (sd 913 us / corr -0.625 in state 0 vs 855 us / -0.644 in state 2).
+- NOT warm-up or capture-start alignment: it switches mid-capture, in both directions.
+- Does NOT reach relay output: a clean-grid and a jittery-grid walk produce identical results
+  (synth 1.1%, worst run 7, both). Both are in the corpus as `kcd_60x2_walk` and
+  `kcd_60x2_walk_jitter`.
+
+`FlipQueueIntervalTarget` is always 0 on this hardware, so there is no published target to compare
+intent against outcome. Leave this open; it is a VRR-scheduling curiosity, not a blocker.
+
 ## The provider
 
 ```
@@ -239,9 +311,12 @@ records `known - display` per flip rather than the lag it was derived from.
 
 Standalone exe, in the solution so CI builds it. Requires elevation. Reports:
 
-- **dts histogram** - gaps between consecutive proposed flip times on a head. A tight spike near
-  8.33 ms at 60x2 means the grid is even and readable. Smeared or multi-modal kills the arithmetic
-  model outright.
+- **dts histogram** - gaps between consecutive proposed flip times on a head. Expect a BROAD hump
+  centred on 8.33 ms in-game, not a spike: see "What the scanout grid actually looks like". The
+  old criterion here ("a tight spike means the grid is readable, smeared kills the model") has
+  been retired; it only ever held on an idle desktop. Read the histogram, never the mean - the
+  mean is 8.333 ms in every capture including the ones where intervals swing +-20%, so it hides
+  exactly what this histogram exists to show.
 - **ahead** - `ts` minus the event stamp. ~0 at the median, up to a full flip interval at p95;
   report the distribution, not a single number, and see the provider section for why the figure
   that actually matters is `(event + lag) - ts`.
@@ -251,9 +326,30 @@ Standalone exe, in the solution so CI builds it. Requires elevation. Reports:
   to latency earned, and this project's recurring failure is the silently wrong measurement.
 - **hexdump of the first 8 payloads**, always, decode success or not. It is the only route to
   re-deriving the layout when a driver update moves it.
-- **`--dxgk` control** - also enables DxgKrnl and counts it. If NVIDIA events are zero but DxgKrnl
-  is not, the session works and the provider is the problem. Without the control a silent probe
-  has five possible causes.
+- **`--dxgk`** - enables Microsoft-Windows-DxgKrnl. Still the liveness control (NVIDIA silent +
+  DxgKrnl alive = the provider is the problem, not the session), but now also the corroboration
+  path. It prints a census of every event kind that arrives with TDH-resolved task, opcode and
+  field names, then decodes the ones that matter. DxgKrnl registers a manifest, so unlike NVIDIA's
+  provider its fields are read BY NAME rather than positionally.
+
+  Decoded ids `{17,181,259,266,273,458,502,503,505,506}`:
+
+  | id | event | what it gives |
+  |---|---|---|
+  | 17 | `VSyncDPC` | **`FrameQPCTime`** + `VidPnSourceId` - the independent scanout stream |
+  | 181 | `VSyncInterrupt` | its event-header stamp is the raw vblank, no payload decode needed |
+  | 259 | `MMIOFlipMultiPlaneOverlay` | submission; count matched NVIDIA FlipRequest EXACTLY (72056 both) |
+  | 266 | `IndependentFlip` | `PresentAtQpc` |
+  | 273 | `VSyncDPCMultiPlane` | `FlipQueueIntervalTarget` - always 0 on this hardware |
+  | 184 | `Present` | the APPLICATION's own Present() call, with **ProcessId in the event header** |
+  | 458/503 | VRR state | `VsyncState`; cycles 0->1->2 every few seconds |
+  | 502 | `VSyncSmoothenedTime` | `OriginalDpcFrameTime` vs `SmoothenedDpcFrameTime` |
+  | 505 | `VSyncHwFlipQueueLogUpdate` | `CompletionTimeStamp` |
+
+  Requested through an `EVENT_FILTER_TYPE_EVENT_ID` filter. UNFILTERED THIS PROVIDER IS A
+  FIREHOSE: 27.4 million events in 600 s, which pushed ETW delivery latency to 738 ms p50.
+  Filtered it is ~500/s. `--dxgkall` drops the filter to re-run the full census after a Windows
+  update; do that rather than assuming the event ids above survived.
 
 ## Required session configuration
 
@@ -285,6 +381,31 @@ Read the session's loss counters at stop and log them. Every configuration above
 lose zero events across seven runs, but that is a property of a measured workload, not a guarantee.
 
 ## Open questions
+
+0. **THE ONE THAT GATES STAGE 7: does a generated frame's CONTENT phase match its DISPLAY
+   phase?** Nothing measured so far speaks to this, and every other question here is now closed
+   enough to proceed without.
+
+   A generated frame's content is an interpolation at some fraction between two real frames. Its
+   display time is wherever the driver's metering put it, and that is measurably NOT the midpoint:
+   placement wanders by hundreds of microseconds and, in the high-jitter regime, by over a
+   millisecond. If the driver interpolates at fraction f and displays at fraction g with f != g,
+   then flip-stamping a generated frame places its motion at the wrong instant by (g - f) of a
+   source period, silently.
+
+   The likely answer is that they AGREE: a frame-generation implementation has every reason to
+   generate content for the time it intends to display, and "insert a midpoint frame" would be the
+   naive design. But that is reasoning, and this project has been burned by reasoning that sounded
+   this good.
+
+   It costs nothing today. At 60x2 keep-real discards the generated frame, so its placement never
+   reaches the ring. It becomes load-bearing the moment selection starts USING generated frames.
+
+   How to settle it without new instrumentation: content phase is measurable from pixels. A
+   generated frame sits at some fraction between its neighbours, and the July `-probe` work
+   already measured generated-frame content (archived at `archive/fg-and-dupe-content-probe`).
+   Measure content fraction against ETW display fraction on the same frames; if they track, stage
+   7 is safe.
 
 1. **Raw ETW delivery lag. MEASURED - and the session must be configured for it.** Left at
    defaults, real-time ETW delivers on a ~1 s cadence and hands over the PREVIOUS period's buffer,
@@ -412,9 +533,21 @@ lose zero events across seven runs, but that is a property of a measured workloa
   has no NVIDIA member (`NotSet, Unspecified, Application, Repeated, Intel_XEFG, AMD_AFMF`), so it
   cannot label Smooth Motion frames anyway. `--track_frame_type` requires instrumentation via the
   Intel-PresentMon provider, which the NVIDIA driver does not emit.
-- **Real-vs-generated labelling from any ETW source.** Not available for Smooth Motion. The label
-  comes from batch position, which the keep-first vs keep-real A/B (Round 10) established visually
-  on real output - stronger evidence than a driver label would be.
+- **Real-vs-generated labelling from any ETW source.** ~~Not available for Smooth Motion.~~
+  **REOPENED 2026-08-04 on new evidence, and this entry is now the weakest thing in this section.**
+  It was written about NVIDIA's provider, before DxgKrnl was known to be reachable and
+  manifest-backed. DxgKrnl event 184 `Present` fires on the APPLICATION's own Present() with the
+  calling ProcessId in the event header, and a driver-generated frame has no application Present
+  behind it - so a head-0 flip that matches a game Present is real and one that does not is
+  generated. That is a label needing no content analysis. UNTESTED: the census counted Present at
+  120/s pooled across all processes where the game renders 60, so the first check is whether the
+  game's own share is a clean 60/s. See the kickoff's "START HERE" section.
+
+  The batch-position label remains what the relay actually uses, and the keep-first vs keep-real
+  A/B (Round 10) established it visually on real output - stronger evidence than a driver label
+  would be. But batch position does NOT generalise to x3, where the pair boundary rotates through
+  the source period and the real frame is the first member of one pair, the second of the next,
+  and absent from the third.
 
   What has changed since that entry was written: the label is now REQUIRED rather than merely
   available. Correct timestamps make generated frames usable, and a selection that cannot tell the
