@@ -57,12 +57,17 @@ private:
     IDirect3DDevice9Ex* m_device;
     FrameMarker m_marker;           // per-present provenance burn-in (inert unless -mark)
     bool m_etw;                     // -etw: read the driver's scanout times while capturing
+    // -nojoin: keep the ETW session and its flip lines, skip the per-present grid lookup.
+    // The A/B control for the join itself: -etw off logs no flips, so it cannot answer
+    // whether the join affects the flip grid, and an older build differs by more than the
+    // join. This is the only arrangement where one binary in one session isolates it.
+    bool m_noJoin;
     EtwFlipConsumer m_etwConsumer;  // inert unless m_etw; nothing in the policy reads it
-    // How far a batch start may sit from a flip and still be placed on the grid. 1 ms, where
-    // the measured distribution has its cliff: batch starts land within 250 us of a flip
-    // 92.4% of the time and within 1 ms 99.2%, with 0.24% past 2 ms. Half a grid step would
-    // never reject anything, since every instant is within half a step of some flip.
-    LONGLONG m_flipAnchorBoundQpc = 0;
+    // How far back PairBatchMember measures the flip grid's step, in QPC ticks. The
+    // confidence bound it accepts is derived from that measurement, so nothing here needs to
+    // know the frame-generation multiplier. 200 ms holds ~24 flips at 60x2 and ~36 at 60x3,
+    // which is a stable median without spanning a rate change.
+    LONGLONG m_flipCadenceWindowQpc = 0;
 
     // The one lag-sizing rule: 1.25x the source period for bracketing headroom, floored at
     // the present period. Setup sizes the operative lag with it; telemetry sizes suggestions.
@@ -72,7 +77,7 @@ public:
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
                         bool lock = false, CompositorKind compositor = kCompositorNearest,
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
-                        bool etw = false);
+                        bool etw = false, bool noJoin = false);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

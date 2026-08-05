@@ -209,9 +209,9 @@ void EtwFlipConsumer::CopyHistory(policy::FlipHistory* out) const {
 }
 
 policy::FlipPairing EtwFlipConsumer::PairCapture(uint32_t head, int64_t batchStartTs,
-                                                 int member, int64_t maxAnchorOffset) const {
+                                                 int member, int64_t cadenceWindow) const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return policy::PairBatchMember(m_history, head, batchStartTs, member, maxAnchorOffset);
+    return policy::PairBatchMember(m_history, head, batchStartTs, member, cadenceWindow);
 }
 
 void EtwFlipConsumer::LogSummary() {

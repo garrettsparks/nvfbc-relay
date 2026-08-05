@@ -173,15 +173,26 @@ struct FlipPairing {
 //
 // The anchor is the flip NEAREST the batch start, on either side. displayTs is a proposed
 // FUTURE scanout time and the driver hands a frame over before it reaches the screen, so a
-// wake lands on either side of its own flip; measured at 60x2, 17.7% of batches arrive before
-// theirs. maxAnchorOffset is a confidence bound, not an ambiguity one - half a step would
-// never reject anything, because every instant is within half a step of some flip. Measured,
-// batch starts sit within 250 us of a flip 92.4% of the time and within 1 ms 99.2% of the
-// time, with a clear cliff after, so a bound near 1 ms rejects what genuinely cannot be
-// placed. A large offset within the bound is late delivery, not an error, and reporting it
-// is half the point of doing this at all.
+// wake lands on either side of its own flip; measured at 60x2, 17.7% of batches arrive
+// before theirs.
+//
+// The confidence bound is DERIVED as a quarter of the measured grid step, not passed in.
+// Ambiguity only begins at half a step, so a quarter keeps a 2x margin, and deriving it
+// makes the rule scale with the frame-generation multiplier without being told about it.
+// A fixed bound does not survive contact: 1 ms placed 99.2% of batches on one 60x2 capture
+// and only 91.5% on another where the game's render times wobbled more and the G-SYNC grid
+// followed. A quarter step placed 99.48-99.66% on all three captures measured, and doubling
+// it gains 0.2%, so it sits in a valley rather than on a slope.
+//
+// A large offset within the bound is late delivery, not an error, and reporting it is half
+// the point of doing this at all.
+//
+// cadenceWindow is how far back to measure the grid step, in the CALLER's time units. It is
+// a parameter rather than a constant because this file is unit-agnostic by contract (QPC
+// ticks in production, microseconds in tests) and a hardcoded duration silently means two
+// different things: 200000 is 200 ms of microseconds but 20 ms of 10 MHz QPC ticks.
 FlipPairing PairBatchMember(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
-                            int member, int64_t maxAnchorOffset);
+                            int member, int64_t cadenceWindow);
 
 // Selection memory across presents. lastShownTs strictly advances except on Repeat;
 // the two bools are the Schmitt states (stickiness side, advance gate).
