@@ -50,7 +50,14 @@
 //   DxgKrnl is where a completion timestamp would live, and unlike NVIDIA's provider it
 //   registers a manifest, so TDH names its events and fields instead of us guessing IDs.
 //
-//   --dxgkkw widens the keyword past the 0x1 default if the census looks too thin.
+//   --dxgkkw widens the keyword past the 0x1 default if the census looks too thin, and
+//   --dxgkall drops the event-id filter to re-run the full census after a Windows update.
+//
+//   The census has now been run (600 s, 60x2). DxgKrnl carries VSyncDPC.FrameQPCTime at the
+//   refresh rate with a VidPnSourceId, so the probe decodes it and prints its cadence beside
+//   the NVIDIA one. Also decoded: VSyncSmoothenedTime, which exposes both an ORIGINAL and a
+//   SMOOTHENED vsync stamp - Windows keeping two clocks is itself evidence about how even
+//   the raw one is.
 
 #include "FlipDecode.h"
 
@@ -147,8 +154,47 @@ struct DxgkKind {
     char   opname[kDxgkNameLen];
     char   props[kDxgkPropsLen];
 };
+// The events worth decoding, found by running the census above on real hardware. Requested
+// through an event-ID filter because the unfiltered provider delivered 27.4 MILLION events in
+// 600 s and pushed ETW delivery latency to 738 ms p50 - harmless for a probe reading payload
+// timestamps, useless for anything in-band, and a needless risk of loss.
+//
+//   17  VSyncDPC                   FrameQPCTime + VidPnSourceId. The scanout boundary.
+//   259 MMIOFlipMultiPlaneOverlay  submission; its count matched NVIDIA FlipRequest EXACTLY
+//                                  (72056 both), which is why FlipRequest looks like a submit
+//                                  -path event rather than a completion.
+//   266 IndependentFlip            PresentAtQpc.
+//   502 VSyncSmoothenedTime        OriginalDpcFrameTime vs SmoothenedDpcFrameTime: Windows
+//                                  keeps a SMOOTHED vsync clock beside the raw one, which is
+//                                  the system saying outright that raw vsync timing is noisy.
+//   505 VSyncHwFlipQueueLogUpdate  CompletionTimeStamp, an independent completion stamp.
+//   181 VSyncInterrupt             no timestamp FIELD, but its event-header stamp is the raw
+//                                  vblank interrupt - a scanout reference that depends on no
+//                                  payload decoding at all.
+//   273 VSyncDPCMultiPlane         FlipQueueIntervalTarget: what interval the driver is
+//                                  AIMING for. A constant target beside a varying actual is
+//                                  the difference between intent and outcome, stated by the
+//                                  system rather than inferred by us.
+//   506 ResetSmoother              CurrentSmoothenedVSyncPeriodQpc: what Windows currently
+//                                  believes the vsync period to be.
+//   458 DdiControlInterrupt2       VsyncState + LastFrameTime, low volume.
+//   503 VSyncTimeStatistics        VsyncState and how long it spent on / off / keeping phase,
+//                                  which is the VRR state machine reporting itself.
+static const USHORT kDxgkWantIds[] = { 17, 181, 259, 266, 273, 458, 502, 503, 505, 506 };
+static const int    kDxgkWantN = (int)(sizeof(kDxgkWantIds) / sizeof(kDxgkWantIds[0]));
+static bool g_dxgkFilter = true;
+
 static DxgkKind g_dxgkKinds[kMaxDxgkKinds];
 static int  g_dxgkKindN = 0;
+// Scanout cadence measured from VSyncDPC, kept per head exactly like the NVIDIA one so the
+// two can be read side by side. This is the comparison the whole probe now exists for.
+static long long g_vsLastByHead[kMaxHeads] = {};
+static long long g_vsHist[kDtsBuckets] = {};
+static long long g_vsCount = 0;
+static long long g_vsEvents = 0;
+static long long g_vsSmoothN = 0;
+static long long g_vsSmoothDeltaSum = 0;
+static long long g_dxgkLogged = 0;   // shared --events budget for the per-event detail lines
 // 0x1 is DxgKrnl's base keyword, which carries the flip and vsync events without pulling in
 // the scheduler and memory-manager traffic that makes an unfiltered session lose data.
 static ULONGLONG g_dxgkKeyword = 0x1;
@@ -230,6 +276,157 @@ static void ResolveDxgkKind(PEVENT_RECORD ev, DxgkKind* k) {
     free(info);
 }
 
+// Read one named scalar field. Works for any integer width up to 8 bytes because the value
+// is zero-extended into a u64, which is what every field we want here is. Returns false
+// rather than a default when the field is absent, so a manifest change surfaces as missing
+// data instead of as a plausible zero.
+static bool TdhScalar(PEVENT_RECORD ev, const wchar_t* name, uint64_t* out) {
+    PROPERTY_DATA_DESCRIPTOR d = {};
+    d.PropertyName = (ULONGLONG)(ULONG_PTR)name;
+    d.ArrayIndex = ULONG_MAX;
+    ULONG size = 0;
+    if (TdhGetPropertySize(ev, 0, nullptr, 1, &d, &size) != ERROR_SUCCESS) return false;
+    if (size == 0 || size > sizeof(uint64_t)) return false;
+    uint64_t v = 0;
+    if (TdhGetProperty(ev, 0, nullptr, 1, &d, size, (PBYTE)&v) != ERROR_SUCCESS) return false;
+    *out = v;
+    return true;
+}
+
+// The measurement this probe now exists to make: the ACTUAL scanout grid, from the graphics
+// kernel, beside the NVIDIA driver's PROPOSED one. If VSyncDPC's cadence is even while
+// FlipRequest's alternates, FlipRequest is an intent and every "true scanout time" derived
+// from it needs revisiting.
+static void DecodeDxgk(PEVENT_RECORD ev, long long evtQpc) {
+    const USHORT id = ev->EventHeader.EventDescriptor.Id;
+    if (id == 17) {                       // VSyncDPC
+        uint64_t qpc = 0, head = 0, frame = 0;
+        if (!TdhScalar(ev, L"FrameQPCTime", &qpc)) return;
+        TdhScalar(ev, L"VidPnSourceId", &head);
+        TdhScalar(ev, L"FrameNumber", &frame);
+        g_vsEvents++;
+        long long dtsUs = -1;
+        if (head < (uint64_t)kMaxHeads && qpc != 0) {
+            if (g_vsLastByHead[head] != 0 && (long long)qpc > g_vsLastByHead[head]) {
+                dtsUs = ((long long)qpc - g_vsLastByHead[head]) * 1000000 / g_qpcFreq;
+                const int b = (int)(dtsUs / 500);
+                if (b >= 0 && b < kDtsBuckets) { g_vsHist[b]++; g_vsCount++; }
+            }
+            g_vsLastByHead[head] = (long long)qpc;
+        }
+        if (g_vsEvents <= g_logEvents) {
+            LogLine("vsync head=%llu frame=%llu qpc=%lld dts=%lldus evt=%lld",
+                    (unsigned long long)head, (unsigned long long)frame,
+                    (long long)qpc, dtsUs, evtQpc);
+        }
+        return;
+    }
+    if (id == 502) {                      // VSyncSmoothenedTime
+        uint64_t head = 0, orig = 0, smooth = 0, delta = 0;
+        TdhScalar(ev, L"VidPnSourceId", &head);
+        const bool haveOrig = TdhScalar(ev, L"OriginalDpcFrameTime", &orig);
+        const bool haveSm = TdhScalar(ev, L"SmoothenedDpcFrameTime", &smooth);
+        TdhScalar(ev, L"FrameTimeDeltaIn100ns", &delta);
+        if (haveOrig && haveSm) {
+            g_vsSmoothN++;
+            g_vsSmoothDeltaSum += (long long)delta;
+        }
+        if (g_vsSmoothN <= g_logEvents) {
+            LogLine("vsmooth head=%llu orig=%llu smooth=%llu delta100ns=%llu evt=%lld",
+                    (unsigned long long)head, (unsigned long long)orig,
+                    (unsigned long long)smooth, (unsigned long long)delta, evtQpc);
+        }
+        return;
+    }
+    // Everything below is per-event detail for offline windowing, so it shares one budget
+    // with --events. Unbudgeted it is ~500 lines/s, which turns a ten-minute run into a
+    // 50 MB log and makes the probe's own I/O a variable in the thing it is measuring.
+    if (g_dxgkLogged >= g_logEvents) return;
+    g_dxgkLogged++;
+
+    if (id == 505) {                      // VSyncHwFlipQueueLogUpdate
+        uint64_t head = 0, comp = 0, done = 0, pid = 0;
+        if (!TdhScalar(ev, L"CompletionTimeStamp", &comp)) return;
+        TdhScalar(ev, L"VidPnSourceId", &head);
+        TdhScalar(ev, L"FlipsCompletedCount", &done);
+        TdhScalar(ev, L"PresentId", &pid);
+        LogLine("hwflip head=%llu comp=%llu done=%llu presentid=%llu evt=%lld",
+                (unsigned long long)head, (unsigned long long)comp,
+                (unsigned long long)done, (unsigned long long)pid, evtQpc);
+        return;
+    }
+    if (id == 266) {                      // IndependentFlip
+        uint64_t head = 0, at = 0, dur = 0;
+        if (!TdhScalar(ev, L"PresentAtQpc", &at)) return;
+        TdhScalar(ev, L"VidPnSourceId", &head);
+        TdhScalar(ev, L"Duration", &dur);
+        LogLine("indflip head=%llu at=%llu dur=%llu evt=%lld",
+                (unsigned long long)head, (unsigned long long)at,
+                (unsigned long long)dur, evtQpc);
+        return;
+    }
+    if (id == 259) {                      // MMIOFlipMultiPlaneOverlay
+        uint64_t head = 0, seq = 0, pid = 0;
+        TdhScalar(ev, L"VidPnSourceId", &head);
+        TdhScalar(ev, L"FlipSubmitSequence", &seq);
+        TdhScalar(ev, L"FlipPresentId", &pid);
+        LogLine("mmioflip head=%llu seq=%llu presentid=%llu evt=%lld",
+                (unsigned long long)head, (unsigned long long)seq,
+                (unsigned long long)pid, evtQpc);
+        return;
+    }
+    if (id == 181) {                      // VSyncInterrupt: header stamp IS the vblank
+        uint64_t target = 0, addr = 0;
+        TdhScalar(ev, L"VidPnTargetId", &target);
+        TdhScalar(ev, L"ScannedPhysicalAddress", &addr);
+        LogLine("vsyncint target=%llu scanned=0x%llX evt=%lld",
+                (unsigned long long)target, (unsigned long long)addr, evtQpc);
+        return;
+    }
+    if (id == 273) {                      // VSyncDPCMultiPlane: the AIMED-FOR interval
+        uint64_t head = 0, frame = 0, itarget = 0, entries = 0, planes = 0;
+        TdhScalar(ev, L"VidPnSourceId", &head);
+        TdhScalar(ev, L"FrameNumber", &frame);
+        TdhScalar(ev, L"FlipQueueIntervalTarget", &itarget);
+        TdhScalar(ev, L"FlipEntryCount", &entries);
+        TdhScalar(ev, L"PlaneCount", &planes);
+        LogLine("vsmulti head=%llu frame=%llu itarget=%llu entries=%llu planes=%llu evt=%lld",
+                (unsigned long long)head, (unsigned long long)frame,
+                (unsigned long long)itarget, (unsigned long long)entries,
+                (unsigned long long)planes, evtQpc);
+        return;
+    }
+    if (id == 506) {                      // ResetSmoother: Windows' believed vsync period
+        uint64_t cur = 0, def = 0;
+        TdhScalar(ev, L"CurrentSmoothenedVSyncPeriodQpc", &cur);
+        TdhScalar(ev, L"NewDefaultVSyncPeriodQpc", &def);
+        LogLine("smoothreset cur=%llu newdefault=%llu evt=%lld",
+                (unsigned long long)cur, (unsigned long long)def, evtQpc);
+        return;
+    }
+    if (id == 458) {                      // DdiControlInterrupt2: VRR state
+        uint64_t head = 0, state = 0, last = 0;
+        TdhScalar(ev, L"VidPnSourceId", &head);
+        TdhScalar(ev, L"VsyncState", &state);
+        TdhScalar(ev, L"LastFrameTime", &last);
+        LogLine("vsyncstate head=%llu state=%llu lastframe=%llu evt=%lld",
+                (unsigned long long)head, (unsigned long long)state,
+                (unsigned long long)last, evtQpc);
+        return;
+    }
+    if (id == 503) {                      // VSyncTimeStatistics: the VRR state machine
+        uint64_t state = 0, on = 0, keep = 0, nop = 0;
+        TdhScalar(ev, L"VsyncState", &state);
+        TdhScalar(ev, L"VSyncOnTotalTimeMs", &on);
+        TdhScalar(ev, L"VSyncOffKeepPhaseTotalTimeMs", &keep);
+        TdhScalar(ev, L"VSyncOffNoPhaseTotalTimeMs", &nop);
+        LogLine("vsyncstats state=%llu onMs=%llu keepPhaseMs=%llu noPhaseMs=%llu evt=%lld",
+                (unsigned long long)state, (unsigned long long)on,
+                (unsigned long long)keep, (unsigned long long)nop, evtQpc);
+        return;
+    }
+}
+
 static void CountDxgk(PEVENT_RECORD ev) {
     const USHORT id = ev->EventHeader.EventDescriptor.Id;
     const UCHAR op = ev->EventHeader.EventDescriptor.Opcode;
@@ -269,6 +466,7 @@ static void WINAPI OnEvent(PEVENT_RECORD ev) {
     if (IsEqualGUID(ev->EventHeader.ProviderId, kDxgKrnlGuid)) {
         g_dxgkEvents++;
         CountDxgk(ev);
+        DecodeDxgk(ev, ev->EventHeader.TimeStamp.QuadPart);
         return;
     }
     if (!IsEqualGUID(ev->EventHeader.ProviderId, kNvDisplayDriverGuid)) return;
@@ -436,6 +634,32 @@ static void Summary() {
         LogLine("  refresh rate and whose fields carry a VidPnSourceId is the scanout event;");
         LogLine("  if its cadence is even while FlipRequest's is not, FlipRequest is an intent.");
     }
+    if (g_vsCount) {
+        // THE COMPARISON. Same buckets, same clock, same run: the graphics kernel's actual
+        // vsync grid against the display driver's proposed one. A verdict is deliberately
+        // NOT printed here - the shape of both histograms is the evidence, and collapsing
+        // it to one word is how a measurement stops being checkable.
+        LogLine("");
+        LogLine("=== ACTUAL scanout (DxgKrnl VSyncDPC.FrameQPCTime), n=%lld from %lld events ===",
+                g_vsCount, g_vsEvents);
+        long long peak = 0, mode = 0;
+        for (int i = 0; i < kDtsBuckets; i++) {
+            if (g_vsHist[i] > peak) { peak = g_vsHist[i]; mode = i; }
+        }
+        for (int i = 0; i < kDtsBuckets; i++) {
+            if (!g_vsHist[i]) continue;
+            LogLine("  %5.1f-%5.1f ms  %8lld  %5.1f%%%s", i * 0.5, (i + 1) * 0.5,
+                    g_vsHist[i], 100.0 * (double)g_vsHist[i] / (double)g_vsCount,
+                    i == mode ? "   <== mode" : "");
+        }
+        if (g_vsSmoothN) {
+            LogLine("  VSyncSmoothenedTime samples %lld, mean FrameTimeDelta %.3f ms",
+                    g_vsSmoothN,
+                    (double)g_vsSmoothDeltaSum / (double)g_vsSmoothN / 10000.0);
+            LogLine("  (Windows keeps a smoothed vsync clock beside the raw one; that it does");
+            LogLine("   so at all is the system reporting that raw vsync timing is not even.)");
+        }
+    }
     LogLine("session losses: events %lu, realtime buffers %lu, log buffers %lu, "
             "buffers written %lu%s",
             (unsigned long)g_eventsLost, (unsigned long)g_rtBuffersLost,
@@ -507,6 +731,7 @@ int main(int argc, char** argv) {
             g_dxgkKeyword = strtoull(argv[++i], nullptr, 0);
         else if (!strcmp(argv[i], "--dxgklevel") && i + 1 < argc)
             g_dxgkLevel = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dxgkall")) g_dxgkFilter = false;
         else seconds = atoi(argv[i]);
     }
     if (seconds <= 0) seconds = 20;
@@ -555,11 +780,41 @@ int main(int argc, char** argv) {
         // Keyword 0 means "every keyword", which on DxgKrnl is a firehose (context switches,
         // allocations, paging). Default to the base keyword and let --dxgkkw widen it, so a
         // discovery run does not drown itself and start losing the events it came for.
+        // Ask the provider for only the ids we decode. Unfiltered, this provider delivered
+        // 27.4 M events in 600 s; filtered it is ~500/s, which keeps delivery latency usable
+        // and removes any chance that the events we came for are the ones that get dropped.
+        // --dxgkall turns the filter off to re-run the census after a Windows update.
+        BYTE filterBuf[sizeof(EVENT_FILTER_EVENT_ID) + sizeof(USHORT) * 16] = {};
+        ENABLE_TRACE_PARAMETERS params = {};
+        EVENT_FILTER_DESCRIPTOR fd = {};
+        if (g_dxgkFilter) {
+            EVENT_FILTER_EVENT_ID* f = (EVENT_FILTER_EVENT_ID*)filterBuf;
+            f->FilterIn = TRUE;
+            f->Count = (USHORT)kDxgkWantN;
+            for (int i = 0; i < kDxgkWantN; i++) f->Events[i] = kDxgkWantIds[i];
+            fd.Ptr = (ULONGLONG)(ULONG_PTR)f;
+            fd.Size = (ULONG)(sizeof(EVENT_FILTER_EVENT_ID) +
+                              sizeof(USHORT) * (size_t)(kDxgkWantN - 1));
+            fd.Type = EVENT_FILTER_TYPE_EVENT_ID;
+            params.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+            params.EnableFilterDesc = &fd;
+            params.FilterDescCount = 1;
+        }
         st = EnableTraceEx2(g_session, &kDxgKrnlGuid, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                            (UCHAR)g_dxgkLevel, g_dxgkKeyword, 0, 0, nullptr);
+                            (UCHAR)g_dxgkLevel, g_dxgkKeyword, 0, 0,
+                            g_dxgkFilter ? &params : nullptr);
         if (st != ERROR_SUCCESS) LogLine("WARN: EnableTraceEx2(DxgKrnl) failed (%lu)", st);
-        else LogLine("DxgKrnl enabled: level %d keyword 0x%llX",
-                     g_dxgkLevel, (unsigned long long)g_dxgkKeyword);
+        else if (g_dxgkFilter) {
+            char ids[64]; int w = 0;
+            for (int i = 0; i < kDxgkWantN && w < (int)sizeof(ids) - 6; i++)
+                w += snprintf(ids + w, sizeof(ids) - w, "%s%u", i ? "," : "",
+                              (unsigned)kDxgkWantIds[i]);
+            LogLine("DxgKrnl enabled: level %d keyword 0x%llX, event ids {%s}",
+                    g_dxgkLevel, (unsigned long long)g_dxgkKeyword, ids);
+        } else {
+            LogLine("DxgKrnl enabled: level %d keyword 0x%llX, ALL event ids (census mode)",
+                    g_dxgkLevel, (unsigned long long)g_dxgkKeyword);
+        }
     }
 
     EVENT_TRACE_LOGFILEW logfile = {};
