@@ -180,7 +180,16 @@ struct DxgkKind {
 //   458 DdiControlInterrupt2       VsyncState + LastFrameTime, low volume.
 //   503 VSyncTimeStatistics        VsyncState and how long it spent on / off / keeping phase,
 //                                  which is the VRR state machine reporting itself.
-static const USHORT kDxgkWantIds[] = { 17, 181, 259, 266, 273, 458, 502, 503, 505, 506 };
+//   184 Present                    the APPLICATION's own Present() call, with the calling
+//                                  process in the event header. This is what PresentMon derives
+//                                  MsBetweenPresents from, and it is the candidate real-vs-
+//                                  generated LABEL: the game calls Present once per real frame,
+//                                  and a driver-generated frame has no application Present behind
+//                                  it. A flip that matches a game Present is real; one that does
+//                                  not is generated. Census counted 71995 of these in 600 s
+//                                  (120/s) with all processes pooled, so the FIRST thing to check
+//                                  is whether the game's own share comes out at a clean 60/s.
+static const USHORT kDxgkWantIds[] = { 17, 181, 184, 259, 266, 273, 458, 502, 503, 505, 506 };
 static const int    kDxgkWantN = (int)(sizeof(kDxgkWantIds) / sizeof(kDxgkWantIds[0]));
 static bool g_dxgkFilter = true;
 
@@ -195,6 +204,14 @@ static long long g_vsEvents = 0;
 static long long g_vsSmoothN = 0;
 static long long g_vsSmoothDeltaSum = 0;
 static long long g_dxgkLogged = 0;   // shared --events budget for the per-event detail lines
+// Application presents per process. The whole point of reading event 184 is attribution: pooled
+// across processes it is meaningless, but if ONE process presents at the source rate while flips
+// arrive at twice that, the flips without a present behind them are the generated frames.
+static const int kMaxPresentPids = 24;
+struct PidCount { unsigned long pid; long long n; };
+static PidCount g_presentPids[kMaxPresentPids];
+static int g_presentPidN = 0;
+static long long g_presentTotal = 0;
 // 0x1 is DxgKrnl's base keyword, which carries the flip and vsync events without pulling in
 // the scheduler and memory-manager traffic that makes an unfiltered session lose data.
 static ULONGLONG g_dxgkKeyword = 0x1;
@@ -338,6 +355,23 @@ static void DecodeDxgk(PEVENT_RECORD ev, long long evtQpc) {
         }
         return;
     }
+    // Per-process present counting happens BEFORE the log budget, because the census has to
+    // cover the whole run: a rate is only meaningful over the full window, and truncating it
+    // at --events would silently report the rate of the first few minutes.
+    if (id == 184) {
+        const unsigned long pid = (unsigned long)ev->EventHeader.ProcessId;
+        g_presentTotal++;
+        bool found = false;
+        for (int i = 0; i < g_presentPidN; i++) {
+            if (g_presentPids[i].pid == pid) { g_presentPids[i].n++; found = true; break; }
+        }
+        if (!found && g_presentPidN < kMaxPresentPids) {
+            g_presentPids[g_presentPidN].pid = pid;
+            g_presentPids[g_presentPidN].n = 1;
+            g_presentPidN++;
+        }
+    }
+
     // Everything below is per-event detail for offline windowing, so it shares one budget
     // with --events. Unbudgeted it is ~500 lines/s, which turns a ten-minute run into a
     // 50 MB log and makes the probe's own I/O a variable in the thing it is measuring.
@@ -373,6 +407,19 @@ static void DecodeDxgk(PEVENT_RECORD ev, long long evtQpc) {
         LogLine("mmioflip head=%llu seq=%llu presentid=%llu evt=%lld",
                 (unsigned long long)head, (unsigned long long)seq,
                 (unsigned long long)pid, evtQpc);
+        return;
+    }
+    if (id == 184) {                      // Present: the application's own Present() call
+        uint64_t head = 0, iv = 0, flags = 0;
+        TdhScalar(ev, L"VidPnSourceId", &head);
+        TdhScalar(ev, L"FlipInterval", &iv);
+        TdhScalar(ev, L"Flags", &flags);
+        // ProcessId comes from the event HEADER, not the payload: it is what attributes a
+        // present to the game rather than to DWM, and without it the stream is every
+        // process on the machine pooled together.
+        LogLine("present pid=%lu head=%llu interval=%llu flags=0x%llX evt=%lld",
+                (unsigned long)ev->EventHeader.ProcessId, (unsigned long long)head,
+                (unsigned long long)iv, (unsigned long long)flags, evtQpc);
         return;
     }
     if (id == 181) {                      // VSyncInterrupt: header stamp IS the vblank
@@ -651,6 +698,30 @@ static void Summary() {
             LogLine("  %5.1f-%5.1f ms  %8lld  %5.1f%%%s", i * 0.5, (i + 1) * 0.5,
                     g_vsHist[i], 100.0 * (double)g_vsHist[i] / (double)g_vsCount,
                     i == mode ? "   <== mode" : "");
+        }
+        if (g_presentTotal) {
+            // The label test. If one process presents at the SOURCE rate while head-0 flips
+            // arrive at twice it, the flips with no present behind them are the generated
+            // frames - which is a real-vs-generated label that needs no content analysis.
+            const double secs = (double)(endQpc.QuadPart - g_startQpc) / (double)g_qpcFreq;
+            LogLine("");
+            LogLine("=== application Present() by process, %lld total (%.1f/s pooled) ===",
+                    g_presentTotal, (double)g_presentTotal / secs);
+            for (int i = 0; i < g_presentPidN; i++) {
+                for (int j = i + 1; j < g_presentPidN; j++) {
+                    if (g_presentPids[j].n > g_presentPids[i].n) {
+                        const PidCount t = g_presentPids[i];
+                        g_presentPids[i] = g_presentPids[j];
+                        g_presentPids[j] = t;
+                    }
+                }
+            }
+            for (int i = 0; i < g_presentPidN; i++) {
+                LogLine("  pid %-7lu %8lld   %6.1f/s", g_presentPids[i].pid,
+                        g_presentPids[i].n, (double)g_presentPids[i].n / secs);
+            }
+            LogLine("  A process at the SOURCE rate beside head-0 flips at twice it is the");
+            LogLine("  real-vs-generated label: generated frames have no Present behind them.");
         }
         if (g_vsSmoothN) {
             LogLine("  VSyncSmoothenedTime samples %lld, mean FrameTimeDelta %.3f ms",
