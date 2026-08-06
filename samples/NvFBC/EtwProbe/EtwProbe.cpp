@@ -167,7 +167,10 @@ struct DxgkKind {
 //   502 VSyncSmoothenedTime        OriginalDpcFrameTime vs SmoothenedDpcFrameTime: Windows
 //                                  keeps a SMOOTHED vsync clock beside the raw one, which is
 //                                  the system saying outright that raw vsync timing is noisy.
-//   505 VSyncHwFlipQueueLogUpdate  CompletionTimeStamp, an independent completion stamp.
+//   505 VSyncHwFlipQueueLogUpdate  CompletionTimeStamp, an independent completion stamp - and
+//                                  the strongest real-vs-generated label found so far. At 60x2 it
+//                                  fires once per SOURCE frame, half the flip rate, and the flip
+//                                  it lands on is the delayed member of each submission pair.
 //   181 VSyncInterrupt             no timestamp FIELD, but its event-header stamp is the raw
 //                                  vblank interrupt - a scanout reference that depends on no
 //                                  payload decoding at all.
@@ -212,6 +215,22 @@ struct PidCount { unsigned long pid; long long n; };
 static PidCount g_presentPids[kMaxPresentPids];
 static int g_presentPidN = 0;
 static long long g_presentTotal = 0;
+// Hardware flip-queue completions per head, counted outside the --events budget for the same
+// reason the present census is: this is a RATE question and a truncated log answers it wrong.
+//
+// Measured at 60x2 over 567 s: event 505 fires at exactly 60.0/s against 120.0/s of flips, its
+// CompletionTimeStamp lands within 100 us of a FlipRequest scanout time 99.75% of the time, and
+// the flip it marks is the DELAYED member of every submission pair (ahead p50 8213 us against
+// 1 us for the member it skips) in 99.81% of cases. The delayed member is the real frame:
+// interpolation cannot produce the generated frame until the real one has arrived, so the
+// generated one displays first. That makes 505 a real-frame label needing no content analysis.
+//
+// x2 cannot separate that reading from a weaker one - "505 marks any flip that was queued ahead
+// rather than flipped immediately" - because at x2 the delayed member and the real frame are the
+// same flip. The RATE at x3 separates them outright: a real-frame label stays at one per source
+// frame (60/s against 180 flips/s), a queued-flip label becomes two per source frame (120/s).
+static long long g_hwflipByHead[kMaxHeads] = {};
+static long long g_flipByHead[kMaxHeads]   = {};
 // 0x1 is DxgKrnl's base keyword, which carries the flip and vsync events without pulling in
 // the scheduler and memory-manager traffic that makes an unfiltered session lose data.
 static ULONGLONG g_dxgkKeyword = 0x1;
@@ -371,6 +390,12 @@ static void DecodeDxgk(PEVENT_RECORD ev, long long evtQpc) {
             g_presentPidN++;
         }
     }
+    // Same reasoning for the flip-queue completions: the ratio of these to flips is the whole
+    // measurement, so it has to cover the run rather than the first --events of it.
+    if (id == 505) {
+        uint64_t h = 0;
+        if (TdhScalar(ev, L"VidPnSourceId", &h) && h < (uint64_t)kMaxHeads) g_hwflipByHead[h]++;
+    }
 
     // Everything below is per-event detail for offline windowing, so it shares one budget
     // with --events. Unbudgeted it is ~500 lines/s, which turns a ten-minute run into a
@@ -379,13 +404,21 @@ static void DecodeDxgk(PEVENT_RECORD ev, long long evtQpc) {
     g_dxgkLogged++;
 
     if (id == 505) {                      // VSyncHwFlipQueueLogUpdate
-        uint64_t head = 0, comp = 0, done = 0, pid = 0;
+        uint64_t head = 0, comp = 0, done = 0, pid = 0, plane = 0, frame = 0;
         if (!TdhScalar(ev, L"CompletionTimeStamp", &comp)) return;
         TdhScalar(ev, L"VidPnSourceId", &head);
         TdhScalar(ev, L"FlipsCompletedCount", &done);
         TdhScalar(ev, L"PresentId", &pid);
-        LogLine("hwflip head=%llu comp=%llu done=%llu presentid=%llu evt=%lld",
-                (unsigned long long)head, (unsigned long long)comp,
+        // PlaneId and FrameNumber decide between "one completion per real frame" and "one
+        // completion per plane": the desktop portion of the x2 capture carried two of these per
+        // vsync with unrelated PresentIds, which per-plane would explain and a frame label
+        // would not. FrameNumber also joins this event to VSyncDPC's own frame counter.
+        TdhScalar(ev, L"PlaneId", &plane);
+        TdhScalar(ev, L"FrameNumber", &frame);
+        LogLine("hwflip head=%llu plane=%llu frame=%llu comp=%llu done=%llu presentid=%llu "
+                "evt=%lld",
+                (unsigned long long)head, (unsigned long long)plane,
+                (unsigned long long)frame, (unsigned long long)comp,
                 (unsigned long long)done, (unsigned long long)pid, evtQpc);
         return;
     }
@@ -410,16 +443,28 @@ static void DecodeDxgk(PEVENT_RECORD ev, long long evtQpc) {
         return;
     }
     if (id == 184) {                      // Present: the application's own Present() call
-        uint64_t head = 0, iv = 0, flags = 0;
+        uint64_t head = 0, iv = 0, flags = 0, src = 0, ctx = 0, win = 0;
         TdhScalar(ev, L"VidPnSourceId", &head);
         TdhScalar(ev, L"FlipInterval", &iv);
         TdhScalar(ev, L"Flags", &flags);
+        // The pooled rate already looks wrong for the label this event was wanted for: it counts
+        // 120/s where the game renders 60, matching the flip rate one for one. If the pid census
+        // confirms that is the GAME presenting twice per rendered frame, the label has to come
+        // from the payload instead, and these three are where it would be. A generated frame is
+        // composed into a driver-owned target rather than a swapchain back buffer, so its source
+        // allocation and its context should differ from the ones the application presents from.
+        TdhScalar(ev, L"hSrcAllocHandle", &src);
+        TdhScalar(ev, L"hContext", &ctx);
+        TdhScalar(ev, L"hWindow", &win);
         // ProcessId comes from the event HEADER, not the payload: it is what attributes a
         // present to the game rather than to DWM, and without it the stream is every
         // process on the machine pooled together.
-        LogLine("present pid=%lu head=%llu interval=%llu flags=0x%llX evt=%lld",
+        LogLine("present pid=%lu head=%llu interval=%llu flags=0x%llX src=0x%llX ctx=0x%llX "
+                "win=0x%llX evt=%lld",
                 (unsigned long)ev->EventHeader.ProcessId, (unsigned long long)head,
-                (unsigned long long)iv, (unsigned long long)flags, evtQpc);
+                (unsigned long long)iv, (unsigned long long)flags,
+                (unsigned long long)src, (unsigned long long)ctx,
+                (unsigned long long)win, evtQpc);
         return;
     }
     if (id == 181) {                      // VSyncInterrupt: header stamp IS the vblank
@@ -557,6 +602,7 @@ static void WINAPI OnEvent(PEVENT_RECORD ev) {
     g_decodeOk++;
     const uint64_t alloc = fe.alloc, ts = fe.displayQpc;
     const uint32_t head = fe.head, token = fe.token;
+    if (head < kMaxHeads) g_flipByHead[head]++;
 
     // ts is a QPC tick value: the flip the driver intends to scan out. Gaps between
     // consecutive values on one head ARE the scanout cadence.
@@ -648,6 +694,7 @@ static void FillProps(EVENT_TRACE_PROPERTIES* props, size_t sz) {
 static void Summary() {
     LARGE_INTEGER endQpc;
     QueryPerformanceCounter(&endQpc);
+    const double secs = (double)(endQpc.QuadPart - g_startQpc) / (double)g_qpcFreq;
     LogLine("");
     LogLine("=== summary ===");
     // The relay's log is normally much longer than the probe's window (it starts before
@@ -680,6 +727,50 @@ static void Summary() {
         LogLine("  READ THIS AGAINST THE NVIDIA RATE ABOVE. A kind whose count matches the");
         LogLine("  refresh rate and whose fields carry a VidPnSourceId is the scanout event;");
         LogLine("  if its cadence is even while FlipRequest's is not, FlipRequest is an intent.");
+
+        // THE LABEL TEST, and it is a ratio rather than a rate: what matters is how many flips
+        // there are per hardware flip-queue completion on the SAME head over the SAME window.
+        // 2.0 means one completion per source frame, which at x3 can only be the real frame.
+        // 1.5 means one per queued flip, which labels nothing.
+        LogLine("");
+        LogLine("=== flips per hw flip-queue completion (505), by head ===");
+        for (int h = 0; h < kMaxHeads; h++) {
+            if (!g_flipByHead[h] && !g_hwflipByHead[h]) continue;
+            LogLine("  head %d: flips %lld (%.1f/s), completions %lld (%.1f/s), ratio %.3f",
+                    h, g_flipByHead[h], (double)g_flipByHead[h] / secs,
+                    g_hwflipByHead[h], (double)g_hwflipByHead[h] / secs,
+                    g_hwflipByHead[h] ? (double)g_flipByHead[h] / (double)g_hwflipByHead[h] : 0.0);
+        }
+        LogLine("  x2 measured 2.000 (60.0/s against 120.0/s), marking the delayed member of");
+        LogLine("  every submission pair, which is the real frame. At x3 a real-frame label");
+        LogLine("  stays at one per source frame (ratio 3.0); a mere queued-flip marker gives 1.5.");
+
+        if (g_presentTotal) {
+            // The other candidate label. If one process presents at the SOURCE rate while head-0
+            // flips arrive at a multiple of it, the flips with no present behind them are the
+            // generated frames. The pooled rate already counts 120/s against a 60 fps game, so
+            // the question this answers is whether that is two processes or one.
+            LogLine("");
+            LogLine("=== application Present() by process, %lld total (%.1f/s pooled) ===",
+                    g_presentTotal, (double)g_presentTotal / secs);
+            for (int i = 0; i < g_presentPidN; i++) {
+                for (int j = i + 1; j < g_presentPidN; j++) {
+                    if (g_presentPids[j].n > g_presentPids[i].n) {
+                        const PidCount t = g_presentPids[i];
+                        g_presentPids[i] = g_presentPids[j];
+                        g_presentPids[j] = t;
+                    }
+                }
+            }
+            for (int i = 0; i < g_presentPidN; i++) {
+                LogLine("  pid %-7lu %8lld   %6.1f/s", g_presentPids[i].pid,
+                        g_presentPids[i].n, (double)g_presentPids[i].n / secs);
+            }
+            LogLine("  A process at the SOURCE rate beside head-0 flips at a multiple of it is a");
+            LogLine("  real-vs-generated label: generated frames have no Present behind them.");
+            LogLine("  A single process at the FLIP rate means there is no label here, and the");
+            LogLine("  src=/ctx= fields on the per-event lines are the remaining discriminator.");
+        }
     }
     if (g_vsCount) {
         // THE COMPARISON. Same buckets, same clock, same run: the graphics kernel's actual
@@ -698,30 +789,6 @@ static void Summary() {
             LogLine("  %5.1f-%5.1f ms  %8lld  %5.1f%%%s", i * 0.5, (i + 1) * 0.5,
                     g_vsHist[i], 100.0 * (double)g_vsHist[i] / (double)g_vsCount,
                     i == mode ? "   <== mode" : "");
-        }
-        if (g_presentTotal) {
-            // The label test. If one process presents at the SOURCE rate while head-0 flips
-            // arrive at twice it, the flips with no present behind them are the generated
-            // frames - which is a real-vs-generated label that needs no content analysis.
-            const double secs = (double)(endQpc.QuadPart - g_startQpc) / (double)g_qpcFreq;
-            LogLine("");
-            LogLine("=== application Present() by process, %lld total (%.1f/s pooled) ===",
-                    g_presentTotal, (double)g_presentTotal / secs);
-            for (int i = 0; i < g_presentPidN; i++) {
-                for (int j = i + 1; j < g_presentPidN; j++) {
-                    if (g_presentPids[j].n > g_presentPids[i].n) {
-                        const PidCount t = g_presentPids[i];
-                        g_presentPids[i] = g_presentPids[j];
-                        g_presentPids[j] = t;
-                    }
-                }
-            }
-            for (int i = 0; i < g_presentPidN; i++) {
-                LogLine("  pid %-7lu %8lld   %6.1f/s", g_presentPids[i].pid,
-                        g_presentPids[i].n, (double)g_presentPids[i].n / secs);
-            }
-            LogLine("  A process at the SOURCE rate beside head-0 flips at twice it is the");
-            LogLine("  real-vs-generated label: generated frames have no Present behind them.");
         }
         if (g_vsSmoothN) {
             LogLine("  VSyncSmoothenedTime samples %lld, mean FrameTimeDelta %.3f ms",
