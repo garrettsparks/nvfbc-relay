@@ -10,8 +10,9 @@ see "What the scanout grid actually looks like".
 What remains unbuilt is stage 6 (flip-stamping ring slots behind the coherence rule) and stage 7
 (selection preferring real frames). The one question that gates stage 7 is untouched: whether a
 generated frame's CONTENT phase matches its DISPLAY phase. The OTHER thing stage 7 needed, a
-real-vs-generated label, now has a measured candidate at x2 - see "The hardware flip-queue
-completion" - pending the x3 rate test that separates it from a weaker reading.
+real-vs-generated label, is now CLOSED for ETW: the 2026-08-10 multiplier sweep killed both
+DxgKrnl candidates at the mechanism level (see "Settled"). At x2 batch position remains the
+label; at x3 content analysis is the remaining route.
 Companions: `dxgi-native-pipeline-spec.md`, `nvfbc-capture-pacing.md`, `frame-marker-spec.md`.
 
 ## The problem
@@ -214,11 +215,15 @@ of each interval mod 4166.6 us has p50 628 us, where a fixed-refresh panel gives
 reports `CurrentSmoothenedVSyncPeriodQpc` = 4166.6 us as the panel's base. So the panel is
 240 Hz-capable and G-SYNC refreshes it as frames arrive, at whatever spacing they arrive.
 
-**How much is the source and how much is frame generation.** Consecutive-interval pair sums (one
-source period) have sd 714 us against single-interval sd 878 us. 714 us on 16.67 ms is 4.3%, which
-is ordinary game frame-time variance. Do NOT describe this as a metronomic source with a wandering
-generated frame - that overstatement was checked and corrected. It is a moderately variable source
-with generated-frame placement wander on top.
+**How much is the source and how much is frame generation. ANSWERED 2026-08-10: it is Smooth
+Motion, essentially all of it.** With frame generation OFF, same game, same walk, same panel, the
+grid is a metronome: 99.6% of intervals in a single 0.5 ms bucket, sd **48-54 us** on a 16.666 ms
+mean, on both heads. So the game's own cadence is even and G-SYNC reproduces even input evenly;
+the 6.5-10 ms smear at x2/x3 is Smooth Motion's placement of its metered flips. The earlier
+paragraph here read the pair-sum sd (714 us) as "ordinary game frame-time variance" - wrong,
+because pair sums were measured THROUGH Smooth Motion, whose real-frame placement wanders too.
+`VSyncSmoothenedTime`'s mean correction tracks the same thing: +0.006 ms FG-off, -0.319 ms at x2,
+-0.893 ms at x3.
 
 **The tight-spike readability criterion is RETIRED.** The EtwProbe section used to say a smeared
 histogram "kills the arithmetic model outright". That criterion was met exactly once, on an idle
@@ -245,59 +250,48 @@ or sd ~350 us with correlation ~-0.09. Established about it:
 `FlipQueueIntervalTarget` is always 0 on this hardware, so there is no published target to compare
 intent against outcome. Leave this open; it is a VRR-scheduling curiosity, not a blocker.
 
-## The hardware flip-queue completion: a real-frame label, measured
+## The hardware flip-queue completion: a queue marker, NOT a real-frame label
 
-DxgKrnl event 505 `VSyncHwFlipQueueLogUpdate` carries a `CompletionTimeStamp`, and at 60x2 it
-fires at exactly **half the flip rate**. Measured over a 567 s window of the 600 s x2 probe run
-(relay off, so head 0 is the only head that flips), windowed to where every event stream is still
-being logged:
+DxgKrnl event 505 `VSyncHwFlipQueueLogUpdate` looked like a real-frame label at x2 and the
+multiplier sweep killed it. Measured 2026-08-10 over three 120 s captures, same content (KCD
+steady walk), same relay config (`t:vsync -src 60 -lock -etw`), identically windowed; head 1 is
+the relay's own FG-free 60 Hz output and reads ratio 1.000 in every run:
 
-| | measured |
-|---|---|
-| flips on head 0 | 68099 (120.0/s) |
-| 505 completions on head 0 | 34056 (**60.0/s**, the source rate) |
-| `CompletionTimeStamp` within 100 us of a `FlipRequest` scanout time | **99.75%**, p50 -6 us |
-| marks every OTHER flip (grid index gap = 2) | **99.81%** |
-| `PresentId` steps by exactly 2 | 99.6% |
-| `ahead` of the flips it marks | p50 **8213 us** |
-| `ahead` of the flips it skips | p50 **1 us** |
+| head 0 (game) | FG off | 60x2 | 60x3 |
+|---|---|---|---|
+| flips | 60.0/s | 120.0/s | 180.0/s |
+| 505 completions | 60.0/s | 58.4/s | 89.2/s |
+| flips per completion | **1.000** | **2.053** | **2.017** |
+| a real-frame label predicts | 1.0 | 2.0 | **3.0** |
+| marked-flip stride on the grid | 1 (100%) | 2 (98.4%) | **2 (99.1%)** |
+| `done=` (FlipsCompletedCount) | 1 always | 1 always | 1 always |
+| `CompletionTimeStamp` on a flip | 100% | 100% | 99.9% |
 
-**What that says structurally.** Flips arrive in submission PAIRS about 1.4 ms apart whose
-scanouts are ~8.33 ms apart. One member flips immediately (`ahead` ~0) and the other is held for
-the next grid step (`ahead` ~ one flip interval). 505 marks the held member, every time.
+**What 505 actually is: the completion of a flip that WAITED in the hardware flip queue.** Under
+frame generation, submissions arrive in pairs at every multiplier - one member flips immediately
+(`ahead` ~0), the other is held one grid step (`ahead` ~ one flip interval) - and 505 fires for
+the held member only, hence stride 2 regardless of multiplier. With FG off every flip is
+vsync-paced through the queue, hence stride 1. `done=` is 1 in every event across all three
+modes, and with FG off `sum(done)` equals the flip count exactly with `PresentId` 100%
+contiguous, so it is one event per queued flip, not a batched report.
 
-**The held member is the real frame.** Interpolation cannot produce a frame between N-1 and N
-until N has arrived, so when the pair is submitted the generated frame is the one that displays
-first and the real one is held. This is the same batch-order fact keep-real already depends on -
-the ring stamps the surviving real member at batch start, ~8.33 ms before its actual flip - so
-505 is not new evidence for that ordering, it is a direct read of which flip it picked out.
+**Why that is not a label.** At x2 the held member happens to be the real frame (interpolation
+cannot produce the between-frame until the real one exists, so the generated one flips first) -
+but that is the batch-position fact the relay already uses, seen from the kernel side. At x3 the
+held members alternate stride 2 across a 3-flip grid, so the marks rotate through all three
+residues (marked-stream mean interval 11.2 ms = 2/3 of a source period) and cannot name the real
+frame, which lives at ONE residue at 60/s. A 60/s truth cannot be read from a 90/s marker.
 
-**One weaker reading survives x2 and must be excluded.** 505 might mark not "the real frame" but
-merely "a flip that was queued ahead rather than flipped immediately". At x2 those are the same
-flip, so x2 cannot separate them. **The RATE at x3 separates them outright**, because a 60 fps
-source at x3 puts one real frame and two generated ones in each group of three:
+**The excess over 2.000 at x2 (2.053) is missed events, not structure**: the stride-gap
+distribution has runs of 4, 6, 8, 10 with exactly matching `PresentId` jumps - occasional held
+flips whose completion never got logged.
 
-| reading | 505 rate at 60x3 | flips per completion |
-|---|---|---|
-| one completion per REAL frame | 60/s | **3.0** |
-| one completion per QUEUED flip | 120/s | **1.5** |
-
-The probe now prints that ratio per head from counters that sit outside the `--events` budget,
-so the answer is one line of the summary rather than a reconstruction from truncated detail lines.
-
-**If it holds at x3 it also answers x3's residue question** (open question 3), because the
-completion timestamp names WHICH of the three flips is real, and getting that wrong outputs 100%
-generated frames.
-
-**Two things to watch when reading a 505 stream.** It is logged per plane, and the desktop
-portion of the same capture carried two completions per vsync with unrelated `PresentId`s, which
-is what per-plane looks like; during fullscreen gameplay a single `PresentId` sequence stepping
-by 2 is what makes the per-plane explanation implausible there. `PlaneId` and `FrameNumber` are
-now on the per-event line so this is read rather than inferred. And the probe's detail lines for
-ids 259/266/505 share ONE `--events` budget, so when it runs out the DxgKrnl lines stop while the
-NVIDIA flip lines carry on - which reads as real frames with no label. Trim every stream to where
-all of them are alive before computing any ratio; the first pass at this measurement reported
-56.8/s instead of 60.0/s for exactly that reason.
+**Reading a 505 stream, practical notes.** It is logged per plane (desktop carries multiple
+planes; fullscreen gameplay is a single `PlaneId` 0 sequence). The probe's detail lines for ids
+259/266/505 share ONE `--events` budget, so when it runs out the DxgKrnl lines stop while the
+NVIDIA flip lines carry on - which reads as flips with no completion. The ratio counters in the
+probe summary sit OUTSIDE that budget for exactly this reason; the first pass at the x2
+measurement reported 56.8/s instead of 60.0/s off truncated detail lines.
 
 ## The provider
 
@@ -400,7 +394,7 @@ Standalone exe, in the solution so CI builds it. Requires elevation. Reports:
   | 184 | `Present` | the APPLICATION's own Present() call, with **ProcessId in the event header** |
   | 458/503 | VRR state | `VsyncState`; cycles 0->1->2 every few seconds |
   | 502 | `VSyncSmoothenedTime` | `OriginalDpcFrameTime` vs `SmoothenedDpcFrameTime` |
-  | 505 | `VSyncHwFlipQueueLogUpdate` | `CompletionTimeStamp` + `PresentId` + `PlaneId` - **the real-frame label at x2**, see its own section |
+  | 505 | `VSyncHwFlipQueueLogUpdate` | `CompletionTimeStamp` + `PresentId` + `PlaneId` - completion of a QUEUED flip, see its own section; NOT a real-frame label |
 
   Requested through an `EVENT_FILTER_TYPE_EVENT_ID` filter. UNFILTERED THIS PROVIDER IS A
   FIREHOSE: 27.4 million events in 600 s, which pushed ETW delivery latency to 738 ms p50.
@@ -540,9 +534,9 @@ lose zero events across seven runs, but that is a property of a measured workloa
    is harmless; it stops being constant when the batch structure varies.
 3. **Is the grid readable at x3?** x3 never paced correctly and the reason is unknown. Where those
    frames actually land is a direct measurement, and it may be a different explanation from the
-   batch-grouping one. **The cheapest path to it is now the 505 rate test**: if the flip-queue
-   completion holds at one per source frame, it names which of the three flips is real without
-   any content analysis, and the residue question closes with it.
+   batch-grouping one. The 505 rate test was tried for this (2026-08-10) and does NOT answer it:
+   the completion marks rotate through all three residues. Content analysis remains the route to
+   the residue question.
 4. **Does DLSS-FG look structurally different** from driver-level Smooth Motion? It is an in-game
    SDK path rather than a driver one, so it may not emit FlipRequest with the same shape, or at
    all. Everything below assumes it does until measured.
@@ -591,25 +585,29 @@ lose zero events across seven runs, but that is a property of a measured workloa
   has no NVIDIA member (`NotSet, Unspecified, Application, Repeated, Intel_XEFG, AMD_AFMF`), so it
   cannot label Smooth Motion frames anyway. `--track_frame_type` requires instrumentation via the
   Intel-PresentMon provider, which the NVIDIA driver does not emit.
-- **Real-vs-generated labelling from any ETW source.** ~~Not available for Smooth Motion.~~
-  **REOPENED 2026-08-04, and as of 2026-08-05 a label is MEASURED at x2.** The entry was written
-  about NVIDIA's provider, before DxgKrnl was known to be reachable and manifest-backed. Two
-  candidates came out of that provider and they are in very different states:
+- **Real-vs-generated labelling from any ETW source.** Not available for Smooth Motion.
+  REOPENED 2026-08-04 when DxgKrnl turned out to be reachable and manifest-backed;
+  **RE-CLOSED 2026-08-10 on a three-mode measurement (FG off / x2 / x3), and this time the
+  MECHANISMS are known, not just the absence.** Both candidates died:
 
-  **Candidate 1, event 505 `VSyncHwFlipQueueLogUpdate` - measured, and strong.** See "The
-  hardware flip-queue completion" below. It fires once per SOURCE frame at 60x2, and the flip it
-  lands on is the delayed member of each submission pair, which is the real frame. No content
-  analysis, no process attribution, no pixel work.
+  **Event 505 `VSyncHwFlipQueueLogUpdate`** fires once per flip that WAITED in the hardware flip
+  queue - the held member of each submission pair under FG, every flip with FG off. At x2 the
+  held member coincides with the real frame, which is the batch-position fact the relay already
+  uses; at x3 the marks alternate stride 2 across the 3-flip grid and rotate through all
+  residues. Ratios measured 1.000 / 2.053 / 2.017 against a real-frame label's 1 / 2 / 3. See
+  "The hardware flip-queue completion".
 
-  **Candidate 2, event 184 `Present` - looking dead.** It fires on the APPLICATION's own Present()
-  with the calling ProcessId in the event header, so the reasoning was that a driver-generated
-  frame has no application Present behind it. The census contradicts that before pid attribution
-  is even read: over 600 s at 60x2 with the relay off, `Present` counted 71995 against
-  `FlipRequest` 72056, `MMIOFlipMultiPlaneOverlay` 72056 and `IndependentFlip` 71978. The whole
-  present-to-flip chain runs 1:1 at 120/s against a 60 fps game, so unless a second process
-  contributes exactly 60/s there is a kernel present behind every flip including the generated
-  ones. The per-process census settles it; if it shows one process at the flip rate, the
-  remaining discriminator is the payload's `hSrcAllocHandle` / `hContext` rather than the pid.
+  **Event 184 `Present`** is the kernel-level present behind EVERY flip, generated ones
+  included: the game's pid presents at exactly the flip rate at every multiplier (60.0/120.0/
+  180.0 per second), from exactly two alternating `hSrcAllocHandle` values at half the flip rate
+  each, on one kernel context. The two-handle ping-pong exists with FG off too (the game's own
+  presents alternate two handles at 30/s each), so it is flip-model buffer parity, not a
+  real/generated asymmetry. At x3 real:generated is 60:120 while the handles split 90:90, which
+  no per-frame labelling could produce.
+
+  Re-reopening this needs a NEW event source, not a new reading of these two. What the relay
+  actually has: batch position at x2 (proven by the Round 10 A/B), nothing from ETW at x3 -
+  x3's residue question stays open and content analysis is the remaining route.
 
   The batch-position label remains what the relay actually uses, and the keep-first vs keep-real
   A/B (Round 10) established it visually on real output - stronger evidence than a driver label
