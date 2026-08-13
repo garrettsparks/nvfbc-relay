@@ -87,6 +87,13 @@ struct SimResult {
     std::vector<double> weights;
     std::vector<int64_t> outTs;       // composite output content time (Hold carries forward)
     std::vector<int64_t> minDiff;     // nearest-real-frame distance at the target (-1 if none)
+    // Stage 6 telemetry: batches whose measured lateness exceeded the correction gate, and
+    // how many of those had their slots' stamps actually moved (the rest missed the
+    // coherence window and kept today's late stamp).
+    long long lateBatches = 0;
+    long long correctedBatches = 0;
+    long long anchoredBatches = 0;
+    long long totalBatches = 0;
 };
 
 struct SimParams {
@@ -128,6 +135,16 @@ struct SimParams {
     // Batch-collapse window. Production sizes this at 3 ms; frame generation submits a
     // pair well inside it and no real content cadence produces gaps that short.
     int64_t batchThresholdQpc = 3000;
+    // Stage 6: subtract each batch's measured DELIVERY LATENESS (batch start minus its
+    // stride-anchored flip) from its slots' stamps, under the coherence rule. The timeline
+    // stays on the arrival base - on-time batches are left alone entirely - so the lock
+    // phase the ring settled on is untouched; only the late outliers that force phantom
+    // blends move, back onto the grid where their frames were actually rendered.
+    // flipDisplay/flipKnown are the fixture's head-0 scanout stream in delivery order (see
+    // TraceFixture); empty leaves the feature inert. flipDejitter arms it.
+    std::vector<int64_t> flipDisplay;
+    std::vector<int64_t> flipKnown;
+    bool flipDejitter = false;
 };
 
 static SimResult Simulate(const SimParams& p) {
@@ -190,15 +207,41 @@ static SimResult Simulate(const SimParams& p) {
     // the wakes directly is what made an earlier replay disagree with the hardware.
     std::vector<int64_t> stamps(arrivals.size(), 0);
     std::vector<char> valid(arrivals.size(), 1);
+    std::vector<int64_t> batchStart(arrivals.size(), 0);
+    std::vector<int> member(arrivals.size(), 0);
     {
         policy::BatchState bs;
         for (size_t i = 0; i < arrivals.size(); i++) {
             const policy::BatchDecision bd =
                 policy::UpdateBatch(bs, arrivals[i], p.batchThresholdQpc);
             stamps[i] = bd.stampTs;
+            batchStart[i] = bd.stampTs;   // batch-start IS the pre-upgrade stamp, both members
+            member[i] = bd.member;
             if (bd.retractPrevious && i >= 1) valid[i - 1] = 0;
         }
     }
+    // Stage 6 state: flips enter history when they became KNOWN (never when they happened),
+    // exactly as ReportPairing feeds the join. Batches are anchored strictly in arrival
+    // order - the chain is sequential state - so a cursor walks them as presents pass.
+    const bool flipDejitter = p.flipDejitter && !p.flipDisplay.empty() && !p.flipKnown.empty();
+    policy::FlipHistory fliph;
+    policy::AnchorChain chain;
+    size_t nextFlip = 0;
+    int64_t maxTarget = INT64_MIN;
+    const int64_t kCadenceWindowUs = 200000;   // production's m_flipCadenceWindowQpc
+    // First slot index of each batch, in order (a batch is a maximal run of equal
+    // batchStart). batchEnd[i] is one past the batch's last slot.
+    std::vector<size_t> batchFirst;
+    std::vector<size_t> batchEnd;
+    for (size_t i = 0; i < arrivals.size(); i++) {
+        if (i == 0 || batchStart[i] != batchStart[i - 1]) {
+            batchFirst.push_back(i);
+            batchEnd.push_back(i + 1);
+        } else {
+            batchEnd.back() = i + 1;
+        }
+    }
+    size_t nextBatch = 0;
 
     SelectionState sel;
     PhaseLockState lock;
@@ -223,6 +266,52 @@ static SimResult Simulate(const SimParams& p) {
         // (a lag past the ring window loses the before-frame entirely).
         while (published < arrivals.size() && arrivals[published] <= deadline) published++;
         const size_t oldest = published > (size_t)kRingSlots ? published - kRingSlots : 0;
+
+        // Stage 6: measure each batch's delivery lateness against its stride-anchored flip
+        // and subtract it from the batch's stamps. THE COHERENCE RULE is the guard: both
+        // the old and the corrected stamp must be strictly newer than the newest target
+        // the policy has seen, so a stamp can never move a frame across a target the
+        // policy already decided about. A batch that misses the window keeps today's late
+        // stamp - that is the entire degradation path, no separate fallback exists.
+        if (flipDejitter) {
+            if (target > maxTarget) maxTarget = target;
+            while (nextFlip < p.flipDisplay.size() && p.flipKnown[nextFlip] <= deadline) {
+                policy::Flip f;
+                f.displayTs = p.flipDisplay[nextFlip];
+                f.eventTs = p.flipKnown[nextFlip];
+                f.head = 0;
+                fliph.Add(f);
+                nextFlip++;
+            }
+            while (nextBatch < batchFirst.size() &&
+                   arrivals[batchFirst[nextBatch]] <= deadline) {
+                const size_t b0 = batchFirst[nextBatch];
+                const policy::LateCorrection lc = policy::MeasureLateness(
+                    fliph, 0, batchStart[b0], chain, kCadenceWindowUs);
+                // Data in flight: stop and retry this batch next present (the chain is
+                // order-dependent, so later batches wait behind it).
+                if (lc.dataPending) break;
+                r.totalBatches++;
+                if (chain.valid) r.anchoredBatches++;
+                // The two gates the policy layer cannot see, exactly as production holds
+                // them: never move a stamp across a target the policy has consumed, and
+                // never move stamps while the lock is riding out or recovering a stall.
+                const bool lockCalm = (lock.stallRun == 0 && lock.recoverRun == 0);
+                if (lc.correctionTicks != 0 && lockCalm) {
+                    r.lateBatches++;
+                    bool moved = false;
+                    for (size_t i = b0; i < batchEnd[nextBatch]; i++) {
+                        if (!valid[i]) continue;
+                        const int64_t corrected = stamps[i] - lc.correctionTicks;
+                        if (stamps[i] <= maxTarget || corrected <= maxTarget) continue;
+                        stamps[i] = corrected;
+                        moved = true;
+                    }
+                    if (moved) r.correctedBatches++;
+                }
+                nextBatch++;
+            }
+        }
 
         // Nearest valid slot on each side of the target, which is what production's
         // ring scan returns. Retracted slots still occupy their ring position (the
@@ -1251,6 +1340,50 @@ static void test_replay_capture_corpus() {
               "[%s] re-seeds fell to %d (bound %d): a suppressed re-seed means a stall "
               "recovers by slew instead of snapping",
               fx.description.c_str(), reseeds, fx.minReseeds);
+
+        // STAGE 6 GATE: replay the same capture with delivery-lateness correction armed.
+        // The design constraint is DO NO HARM on a steady capture: on-time batches are
+        // untouched by construction, so a steady walk must replay inside its own bounds.
+        // (A naive flip-stamp-everything variant was tried first and measured 4.4-5.0%
+        // synth against these same fixtures' 1.5-1.8% bounds: moving every stamp +8.33 ms
+        // onto the flip base inherits real scanout jitter everywhere. The correction form
+        // keeps the arrival base and touches only the late outliers.) The WIN - phantom
+        // blends collapsing - is gated by fixtures carrying real late-delivery events;
+        // a steady walk cannot show it and is not asked to.
+        if (!fx.flipDisplay.empty() && !fx.flipKnown.empty()) {
+            SimParams p6 = p;
+            p6.flipDisplay = fx.flipDisplay;
+            p6.flipKnown = fx.flipKnown;
+            p6.flipDejitter = true;
+            const SimResult r6 = Simulate(p6);
+            int run6 = 0, worst6 = 0, longRuns6 = 0, synth6 = 0;
+            for (size_t i = kWarmup; i < r6.ops.size(); i++) {
+                if (r6.ops[i] == policy::CompositeOp::Synthesize) {
+                    synth6++; run6++;
+                    if (run6 > worst6) worst6 = run6;
+                } else {
+                    if (run6 >= 50) longRuns6++;
+                    run6 = 0;
+                }
+            }
+            if (run6 >= 50) longRuns6++;
+            const double synthPct6 = 100.0 * synth6 / (double)(r6.ops.size() - kWarmup);
+            std::printf("    stage6 dejitter: synth %.1f%%, runs>=50 %d, worst %d; "
+                        "batches %lld anchored %lld late %lld corrected %lld\n",
+                        synthPct6, longRuns6, worst6, r6.totalBatches, r6.anchoredBatches,
+                        r6.lateBatches, r6.correctedBatches);
+            CHECK(synthPct6 <= fx.maxSynthPct,
+                  "[%s] DEJITTERED synth share %.1f%% exceeds the fixture bound %.1f%%: "
+                  "the correction is doing harm on a steady capture",
+                  fx.description.c_str(), synthPct6, fx.maxSynthPct);
+            CHECK(worst6 <= fx.maxWorstRun,
+                  "[%s] DEJITTERED worst recovery %d exceeds the fixture bound %d",
+                  fx.description.c_str(), worst6, fx.maxWorstRun);
+            CHECK(r6.anchoredBatches * 100 >= r6.totalBatches * 95,
+                  "[%s] only %lld of %lld batches anchored: the stride chain is not "
+                  "holding on this capture",
+                  fx.description.c_str(), r6.anchoredBatches, r6.totalBatches);
+        }
     }
 }
 

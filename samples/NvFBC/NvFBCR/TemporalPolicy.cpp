@@ -200,6 +200,85 @@ FlipPairing PairBatchMember(const FlipHistory& h, uint32_t head, int64_t batchSt
     return r;
 }
 
+FlipPairing AnchorBatch(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
+                        AnchorChain& chain, int64_t cadenceWindow) {
+    static const int kLookup = 16;
+    FlipPairing r;
+    if (cadenceWindow <= 0) return r;
+    const int64_t spacing = h.MedianSpacing(batchStartTs - cadenceWindow, batchStartTs, head);
+    if (spacing <= 0) return r;
+
+    if (chain.valid) {
+        // Two flips on from the previous anchor, with a half-step window: the prediction
+        // already carries the batch-to-flip assignment, so the quarter-step confidence
+        // bound that guards a stateless search would only reject real grid jitter here
+        // (two steps of it stack, and the jittery-grid fixture runs 1.6 ms IQR per step).
+        const int64_t predicted = chain.lastAnchorTs + 2 * spacing;
+        // An empty prediction window means one of two very different things. If the
+        // history's newest flip has not REACHED the window, the data is still in flight
+        // (flips are known ~1-10 ms after they happen): report not-yet-announced and keep
+        // the chain, the caller retries. Only a window the history has moved PAST is
+        // evidence the flip never happened.
+        const Flip* newest = h.NewestAtOrBefore(INT64_MAX, head);
+        if (newest && newest->displayTs < predicted + spacing / 2) {
+            r.memberAhead = true;
+            return r;
+        }
+        const Flip* buf[kLookup];
+        const int n = h.InRange(predicted - spacing / 2, predicted + spacing / 2, head,
+                                buf, kLookup);
+        if (n > 0) {
+            int best = 0;
+            int64_t bestAbs = -1;
+            for (int i = 0; i < n; i++) {
+                int64_t d = predicted - buf[i]->displayTs;
+                if (d < 0) d = -d;
+                if (bestAbs < 0 || d < bestAbs) { bestAbs = d; best = i; }
+            }
+            // The lateness this exists to measure is bounded by what a late-but-rendered
+            // frame can be: within a source period. Beyond that the source is stalled and
+            // the chain is fiction; drop it and let re-acquisition decide.
+            const int64_t lateness = batchStartTs - buf[best]->displayTs;
+            if (lateness > -spacing && lateness < 2 * spacing) {
+                chain.lastAnchorTs = buf[best]->displayTs;
+                if (chain.warmup > 0) chain.warmup--;
+                r.anchorFound = true;
+                r.paired = true;
+                r.displayTs = buf[best]->displayTs;
+                r.anchorOffset = lateness;
+                r.chainWarm = (chain.warmup == 0);
+                return r;
+            }
+        }
+        chain.valid = false;
+    }
+
+    // Re-acquisition: the stateless nearest rule, which is only trustworthy when the batch
+    // arrived on time - exactly the batches it accepts (quarter-step bound). Eight batches
+    // of proven stride (two flip-grid cycles at x2) before corrections trust the chain.
+    const FlipPairing acq = PairBatchMember(h, head, batchStartTs, 0, cadenceWindow);
+    if (acq.paired) {
+        chain.lastAnchorTs = acq.displayTs;
+        chain.valid = true;
+        chain.warmup = 8;
+    }
+    return acq;
+}
+
+LateCorrection MeasureLateness(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
+                               AnchorChain& chain, int64_t cadenceWindow) {
+    LateCorrection out;
+    const FlipPairing fp = AnchorBatch(h, head, batchStartTs, chain, cadenceWindow);
+    if (!fp.paired) {
+        out.dataPending = fp.memberAhead;
+        return out;
+    }
+    if (!fp.chainWarm) return out;
+    const int64_t spacing = h.MedianSpacing(batchStartTs - cadenceWindow, batchStartTs, head);
+    if (spacing > 0 && fp.anchorOffset > spacing / 8) out.correctionTicks = fp.anchorOffset;
+    return out;
+}
+
 bool BracketIsStalled(const BracketInfo& b, const PolicyConfig& cfg) {
     if (!b.hasBefore || !b.hasAfter) return true;
     if (cfg.stallSpanQpc <= 0) return false;

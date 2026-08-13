@@ -7,12 +7,15 @@ and 97.9% at 60x3, anchor offset p50 +69 us, and no measurable pacing cost (pres
 against a 3 us baseline). The flip timestamps are corroborated by a SECOND, independent provider -
 see "What the scanout grid actually looks like".
 
-What remains unbuilt is stage 6 (flip-stamping ring slots behind the coherence rule) and stage 7
-(selection preferring real frames). The one question that gates stage 7 is untouched: whether a
-generated frame's CONTENT phase matches its DISPLAY phase. The OTHER thing stage 7 needed, a
-real-vs-generated label, is now CLOSED for ETW: the 2026-08-10 multiplier sweep killed both
-DxgKrnl candidates at the mechanism level (see "Settled"). At x2 batch position remains the
-label; at x3 content analysis is the remaining route.
+Stage 6 is BUILT (2026-08-10) as DELIVERY-LATENESS CORRECTION behind `-dejit`, replay-validated
+against the corpus, awaiting a live capture. It is deliberately NOT the flip-stamping this
+document originally specified - see "Stage 6 as built" for why the literal design measured
+3-4x worse in replay and what shipped instead. What remains unbuilt is stage 7 (selection
+preferring real frames), whose gating question is untouched: whether a generated frame's
+CONTENT phase matches its DISPLAY phase. The real-vs-generated label is CLOSED for ETW (the
+2026-08-10 multiplier sweep killed both DxgKrnl candidates at the mechanism level, see
+"Settled"); at x2 batch position remains the label, and at x3 the rotation phase is readable
+from arrival timing (see open question 3).
 Companions: `dxgi-native-pipeline-spec.md`, `nvfbc-capture-pacing.md`, `frame-marker-spec.md`.
 
 ## The problem
@@ -178,6 +181,44 @@ as designed.
 Consequence: `RING_SIZE` stays at 8 and `LagForSourcePeriod` stays at `srcPeriod * 1.25`. If the
 tail is ever worth chasing, ~32 ms suffices. If the floor IS raised later, size the ring by
 CAPTURED frames (120/s at 60x2, 180/s at 60x3), not by source frames.
+
+## Stage 6 as built: delivery-lateness correction, not flip-stamping
+
+The architecture section below says "upgrade a slot's timestamp from estimated to measured".
+Built literally - every stamp moved onto the flip base - the corpus replay measured synth
+going 1.4% -> 4.4% on the clean walk and 1.1% -> 5.0% on the jittery one, without the
+predicted selection inversion (the comb lock re-converges across the uniform +8.33 ms shift
+on its own) but with two costs the design had not priced: every stamp inherits the flip
+grid's real jitter (up to 1.6 ms IQR) where arrival stamps are smooth, and the ~4% of slots
+that structurally miss the upgrade window (a member's flip cannot be known before it
+displays, and upgrades run at present granularity) sit 8.33 ms off-base among corrected
+neighbours, poisoning every bracket they touch.
+
+**What shipped instead** (`-dejit`, requires `-etw` with the join on): measure each batch's
+delivery lateness - batch start minus its stride-anchored flip - and SUBTRACT it from the
+batch's stamps. The timeline stays on the arrival base, so the batch-start/lock-phase
+cancellation is untouched and no re-phasing exists to get wrong; on-time batches are left
+alone entirely; only the late outliers that force phantom blends move, back to where their
+frames were rendered. Four gates, each earned by a measured failure in replay:
+
+- **Stride-chained anchoring** (`policy::AnchorBatch`): the median phantom event is ~7.6 ms
+  late = 0.9 flip steps, which the stateless quarter-step nearest-anchor MIS-anchors by
+  construction. Prediction from the previous anchor (+2 flips, 94.9% rigid) reads the true
+  lateness; the stateless rule is only the re-acquisition path.
+- **Late-only**: lateness is physically one-sided. A batch reading "early" past the gate is
+  a mis-anchored prediction; correcting one moved an after-frame 1.28 ms LATER at a
+  passthrough-gate boundary dwell and stretched a 50-present synth dwell to 59.
+- **Chain warm-up** (8 batches after re-acquisition) and **lock calm** (no corrections while
+  the phase lock rides out or converges from a stall): the same dwell reached 72 without.
+- **The coherence rule**, unchanged from the original design: a stamp never moves unless
+  both its old and new values are strictly newer than the newest target the policy has
+  consumed.
+
+Replay-validated on the full corpus (now five fixtures; `kcd_60x2_join_events` carries real
+late-delivery events WITH flip data): clean walk 1.4% -> 1.3% synth, jitter walk 1.1% -> 1.1%,
+event fixture 8.4% -> 8.3% with the worst synth run 50 -> 45 and no runs over 50. Every
+correction logs a `dejit:` line beside the arr= timeline it amends, and the session total
+logs at exit.
 
 ## What the scanout grid actually looks like
 
@@ -532,11 +573,29 @@ lose zero events across seven runs, but that is a property of a measured workloa
    One consequence already visible: batch-collapse stamps the surviving REAL frame at batch-start,
    but the flips say that frame does not reach the screen until ~8.33 ms later. A constant offset
    is harmless; it stops being constant when the batch structure varies.
-3. **Is the grid readable at x3?** x3 never paced correctly and the reason is unknown. Where those
-   frames actually land is a direct measurement, and it may be a different explanation from the
-   batch-grouping one. The 505 rate test was tried for this (2026-08-10) and does NOT answer it:
-   the completion marks rotate through all three residues. Content analysis remains the route to
-   the residue question.
+3. **Is the grid readable at x3? YES - and the rotation PHASE is readable from arrival timing
+   (2026-08-10, two captures).** The 505 rate test does not answer it (completion marks rotate
+   through all residues), but the batch classes do. Classifying batches by anchor flip index
+   mod 6 over stride-2 chains, both x3 captures show the same three-class cycle on two
+   independent features:
+
+   | class | anchor offset p50 | single-wake share | composition |
+   |---|---|---|---|
+   | real-led | **-43 / -61 us** (leads its flip) | normal | **[real, gen]** |
+   | real-trailing | +76 us | **elevated (4.0% / 7.5%)** | **[gen, real]** |
+   | all-generated | +77 us | low (2.0-2.5%) | **[gen, gen]** |
+
+   The naming rests on the x2 calibration (gen-led batches wake +74 us after their flip) plus
+   the late-real single-wake mechanism, consistently across both captures; a marked-video check
+   would make it ground truth. Per-batch classification is weak (~125 us shift against ~200 us
+   spread) - the phase is an ENSEMBLE property: vote over a few hundred batches, dead-reckon on
+   the 96%-rigid stride. The mod-6 phase held globally for the full 120-160 s of both captures.
+
+   **This also names today's x3 failure**: batch-collapse keep-real retains member 1, which
+   keeps the real frame only in [gen, real] batches - one source period in two - and DISCARDS
+   the real in [real, gen] batches. A phase-aware keep-real (member 0 in real-led batches,
+   member 1 in real-trailing ones) keeps exactly one real frame per source period. Analysis:
+   `x3residue.py` against `etw_x3_walk` and `join2_x3_on`.
 4. **Does DLSS-FG look structurally different** from driver-level Smooth Motion? It is an in-game
    SDK path rather than a driver one, so it may not emit FlipRequest with the same shape, or at
    all. Everything below assumes it does until measured.

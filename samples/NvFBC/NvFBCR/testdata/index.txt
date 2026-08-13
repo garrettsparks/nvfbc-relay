@@ -10,3 +10,6 @@ kcd_60x2_walk.trace
 # (step IQR 1610us vs 291us) for reasons still unexplained. Kept because the jitter broke a
 # fixed anchor bound that the clean walk passed: a rule tuned on one grid is not a rule.
 kcd_60x2_walk_jitter.trace
+# Varied content WITH flip data (the walks are steady; the map cycles carry no flips): the
+# fixture that exercises stage-6 delivery-lateness correction against real late events.
+kcd_60x2_join_events.trace

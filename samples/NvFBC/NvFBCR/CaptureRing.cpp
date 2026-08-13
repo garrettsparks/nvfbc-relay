@@ -1,4 +1,5 @@
 #include "CaptureRing.h"
+#include "EtwConsumer.h"
 #include <SimpleLogger.h>
 #include <limits.h>
 
@@ -35,6 +36,7 @@ CaptureRing::CaptureRing()
         m_ring[i].sharedHandle = NULL;
         m_ring[i].valid = false;
         m_ring[i].timestamp.QuadPart = 0;
+        m_ring[i].batchStartQpc = 0;
         m_ring[i].member = 0;
     }
     m_baseQpc.QuadPart = 0;
@@ -281,6 +283,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         // The intra-batch (real) member is stamped with the BATCH-START time so the ring
         // timeline stays at base cadence; everything else is stamped at its own arrival.
         m_ring[slot].timestamp.QuadPart = batch.stampTs;
+        m_ring[slot].batchStartQpc = batch.stampTs;
         m_ring[slot].member = batch.member;
         m_ring[slot].valid = true;
 
@@ -354,4 +357,57 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, FrameBracket* out) const {
     } else {
         out->weight = 0.0;
     }
+}
+
+int CaptureRing::CorrectLateStamps(LONGLONG safeQpc, LONGLONG* lastDoneQpc,
+                                   EtwFlipConsumer* etw, policy::AnchorChain* chain,
+                                   LONGLONG cadenceWindowQpc, bool lockCalm) {
+    const long long p = m_published.load();
+    long long oldest = p - (RING_SIZE - 1);
+    if (oldest < 0) oldest = 0;
+
+    int corrected = 0;
+    long long i = oldest;
+    while (i < p) {
+        const LONGLONG bs = m_ring[(int)(i % RING_SIZE)].batchStartQpc;
+        // The batch is the window's slots sharing this batch start (they are contiguous:
+        // the capture thread publishes in arrival order).
+        long long end = i + 1;
+        while (end < p && m_ring[(int)(end % RING_SIZE)].batchStartQpc == bs) end++;
+        if (bs <= *lastDoneQpc) { i = end; continue; }
+        // The newest batch may still be growing (its next member not yet published), and a
+        // batch corrected before it finished would leave its late member on the old stamp.
+        // It becomes safe once anything newer exists or its stamp has aged past the fence,
+        // and until then the walk simply ends here - the chain cannot skip it anyway.
+        if (end == p && bs > safeQpc) break;
+
+        const policy::LateCorrection lc =
+            etw->MeasureLateness(0, bs, *chain, cadenceWindowQpc);
+        if (lc.dataPending) break;   // flip data in flight: retry this batch next present
+        if (lc.correctionTicks != 0 && lockCalm) {
+            bool moved = false;
+            for (long long j = i; j < end; j++) {
+                Slot& s = m_ring[(int)(j % RING_SIZE)];
+                if (!s.valid) continue;
+                const LONGLONG ts = s.timestamp.QuadPart;
+                const LONGLONG want = ts - lc.correctionTicks;
+                if (ts <= safeQpc || want <= safeQpc) continue;
+                s.timestamp.QuadPart = want;
+                moved = true;
+            }
+            if (moved) {
+                corrected++;
+                // The arr= line already recorded this batch at its late stamp, so the
+                // correction must be in the log too or offline replay reconstructs a
+                // timeline the relay never used.
+                const double usPerTick = 1000000.0 / (double)m_freqQuad;
+                LOG("dejit: batch arr=%lldus late by %lldus, stamps corrected",
+                    (long long)((bs - m_baseQpc.QuadPart) * usPerTick),
+                    (long long)(lc.correctionTicks * usPerTick));
+            }
+        }
+        *lastDoneQpc = bs;
+        i = end;
+    }
+    return corrected;
 }

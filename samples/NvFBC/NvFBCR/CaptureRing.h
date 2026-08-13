@@ -9,6 +9,8 @@
 
 #include "TemporalPolicy.h"
 
+class EtwFlipConsumer;
+
 // Result of a bracketing query: the captured frames immediately before and after a target
 // time, plus the interpolation weight a blending consumer would use. The timestamp/diff
 // half lives in the embedded policy::BracketInfo so the policy layer consumes it without
@@ -86,6 +88,18 @@ public:
     // Find the published frames bracketing targetQpc (present-device aliases).
     void FindBracket(LONGLONG targetQpc, FrameBracket* out) const;
 
+    // Stage 6: walk unprocessed batches in the published window in arrival order, measure
+    // each one's delivery lateness through `measure`, and subtract it from the batch's
+    // stamps. Present-thread only (the same thread FindBracket runs on). safeQpc is the
+    // coherence fence: a stamp never moves unless both its current and corrected values
+    // are strictly newer, so nothing can cross a target the policy has consumed.
+    // lastDoneQpc is the caller-held cursor of the newest batch already settled; a batch
+    // whose flip data is still in flight stops the walk (the anchor chain is sequential),
+    // to be retried next present. Returns batches whose stamps moved this call.
+    int CorrectLateStamps(LONGLONG safeQpc, LONGLONG* lastDoneQpc,
+                          EtwFlipConsumer* etw, policy::AnchorChain* chain,
+                          LONGLONG cadenceWindowQpc, bool lockCalm);
+
     // Shared handle of slot i, for opening the same texture on another API's device.
     HANDLE SlotSharedHandle(int i) const { return m_ring[i].sharedHandle; }
 
@@ -97,6 +111,10 @@ private:
         IDirect3DSurface9* mainSurface;
         HANDLE sharedHandle;              // retained for cross-API consumers
         LARGE_INTEGER timestamp;
+        // The batch-start the slot was published with. timestamp starts equal to it and a
+        // lateness correction may move timestamp; this stays put, because the flip-grid
+        // anchoring is keyed to when the batch ARRIVED, not to where its stamp ended up.
+        LONGLONG batchStartQpc;
         int member;                       // position inside its capture batch; 0 opens one
         bool valid;
     };

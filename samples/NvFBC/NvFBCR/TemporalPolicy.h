@@ -159,6 +159,9 @@ struct FlipPairing {
     bool anchorFound = false;  // a flip sat near the batch start
     bool memberAhead = false;  // anchor found, but this member's flip is not announced yet
     bool gridGap = false;      // anchor found and the member's flip is missing from the grid
+    // AnchorBatch only: this anchor came from a chain whose stride has held since its last
+    // re-acquisition long enough to be trusted for stamp corrections.
+    bool chainWarm = false;
 };
 
 // Place a batch member on the flip grid.
@@ -193,6 +196,57 @@ struct FlipPairing {
 // different things: 200000 is 200 ms of microseconds but 20 ms of 10 MHz QPC ticks.
 FlipPairing PairBatchMember(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
                             int member, int64_t cadenceWindow);
+
+// Anchor continuity across batches. Consecutive batches advance exactly 2 flips (94.9% at
+// 60x2, 96.4% at 60x3), so once one batch is anchored the next batch's flip is PREDICTED
+// rather than searched for. That matters for exactly the batches nearest-anchoring cannot
+// place: a batch delivered ~0.9 of a flip step late sits nearer its successor's flip than
+// its own, and the spacing/4 confidence bound around the batch start caps the readable
+// offset at a quarter step - so the late deliveries that motivate measuring lateness at
+// all are the ones a stateless nearest-anchor mis-places.
+struct AnchorChain {
+    int64_t lastAnchorTs = 0;
+    bool valid = false;
+    // Batches remaining before the chain is trusted for CORRECTIONS. A re-acquired anchor
+    // came from the stateless quarter-step rule during exactly the unsteady delivery that
+    // broke the chain, so its first predictions ride an anchor of weaker provenance; the
+    // stride must prove itself before stamps move on its word. Measured cost of skipping
+    // this: one stall recovery grew from 50 presents to 72, because corrections landed in
+    // the window where the lock was re-seeding its phase from the same stamps.
+    int warmup = 0;
+};
+
+// Anchor a batch on the flip grid with stride prediction, falling back to the stateless
+// nearest-anchor rule (and re-acquiring the chain) when prediction finds no flip. The
+// prediction window is a half step - wider than PairBatchMember's quarter step because the
+// predicted position already removes the batch-start ambiguity the quarter step guards
+// against, and two flip steps of real grid jitter must fit inside it. anchorOffset is
+// batch start minus the anchored flip and is the batch's DELIVERY LATENESS, unbounded by
+// the prediction window; displayTs is the anchor flip itself. A stall (no flip within
+// half a source period of prediction or batch start) invalidates the chain and reports
+// unpaired, which is the correct answer during one.
+FlipPairing AnchorBatch(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
+                        AnchorChain& chain, int64_t cadenceWindow);
+
+// The stage-6 decision: how much delivery lateness to subtract from a batch's stamps.
+struct LateCorrection {
+    // Flip data for this batch has not been delivered yet. The chain is sequential state,
+    // so the caller must retry THIS batch next present rather than skipping past it.
+    bool dataPending = false;
+    int64_t correctionTicks = 0;   // subtract from the batch's stamps; 0 = leave them
+};
+
+// Measure a batch's delivery lateness and decide whether its stamps should move. LATE
+// ONLY, an eighth of a step past the grid: lateness is physically one-sided (a frame
+// cannot reach the capture API much before its flip), so a batch reading "early" past
+// the gate is a mis-anchored prediction and correcting it fabricates jitter - measured
+// as a passthrough-gate dwell entered 9 presents early. Corrections are also refused
+// until the chain's stride has held for a warm-up after re-acquisition. The caller owns
+// two further gates this layer cannot see: the coherence rule (never move a stamp across
+// a target the policy has consumed) and lock calm (never move stamps while the phase
+// lock is riding out or converging from a stall).
+LateCorrection MeasureLateness(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
+                               AnchorChain& chain, int64_t cadenceWindow);
 
 // Selection memory across presents. lastShownTs strictly advances except on Repeat;
 // the two bools are the Schmitt states (stickiness side, advance gate).
