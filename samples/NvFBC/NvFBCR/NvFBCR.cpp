@@ -99,6 +99,10 @@ bool g_etw = false;
 // build confounds the join with everything else that changed, and the -etw off path logs no
 // flips at all, so it cannot answer questions about the flip grid itself.
 bool g_noJoin = false;
+// -dejit: subtract each capture batch's measured delivery lateness from its ring stamps
+// (needs -etw with the join on). The phantom-blend fix: a frame handed over late is stamped
+// where its flip says it belongs, so the ring stops recording delivery delay as motion.
+bool g_dejitter = false;
 
 // Optional count for -mark: burn only the first N presents (a head burst that aligns a
 // stream VOD without marking watched gameplay), then run clean. 0 = every present (the
@@ -144,7 +148,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             _stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0 ||
             _stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
-                                           kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin);
+                                           kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
+                                           g_dejitter);
         }
 
         // QPC-timer present (t:60 / b:60 / o:60 format).
@@ -152,7 +157,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             float framerate;
             if (ParseFps(modeStr.substr(2), &framerate)) {
                 return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
-                                               kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin);
+                                               kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
+                                               g_dejitter);
             }
         }
     }
@@ -192,6 +198,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  -tint          - Border-tint synthesized frames red (blend mode, debug); off by default");
     LOGERR("  -etw           - Log the display driver's true scanout times alongside capture (debug); off by default");
     LOGERR("  -nojoin        - With -etw: log flips but skip the per-present grid lookup (debug A/B control)");
+    LOGERR("  -dejit         - With -etw: re-stamp late-delivered capture batches onto the flip grid (phantom-blend fix)");
     return NULL;
 }
 
@@ -455,6 +462,10 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         g_noJoin = true;
         return 1;
     }
+    if (tokens[i] == "-dejit") {
+        g_dejitter = true;
+        return 1;
+    }
     if (tokens[i] == "-mark") {
         g_mark = true;
         // Optional frame count: consume the next token as N only if it is all digits, so
@@ -668,10 +679,13 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     else if (g_markFrames) snprintf(markDesc, sizeof(markDesc), "on (first %u presents)", g_markFrames);
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
     LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s, "
-        "etw flip capture %s, flip join %s",
+        "etw flip capture %s, flip join %s, dejitter %s",
         g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
         g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off",
-        !g_etw ? "off (no -etw)" : (g_noJoin ? "OFF (-nojoin)" : "on"));
+        !g_etw ? "off (no -etw)" : (g_noJoin ? "OFF (-nojoin)" : "on"),
+        !g_dejitter ? "off"
+                    : (g_etw && !g_noJoin ? "ON (-dejit)"
+                                          : "REFUSED (-dejit needs -etw with the join on)"));
 
     BUF_WIDTH = target.position.right - target.position.left;
     BUF_HEIGHT = target.position.bottom - target.position.top;

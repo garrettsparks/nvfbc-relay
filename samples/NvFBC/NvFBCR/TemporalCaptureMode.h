@@ -62,6 +62,14 @@ private:
     // whether the join affects the flip grid, and an older build differs by more than the
     // join. This is the only arrangement where one binary in one session isolates it.
     bool m_noJoin;
+    // -dejit: subtract each batch's measured delivery lateness from its ring stamps (stage 6,
+    // the phantom-blend fix). Requires -etw with the join on; off, the correction pass never
+    // runs and the ring behaves exactly as before this existed.
+    bool m_dejitter;
+    policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
+    LONGLONG m_lastBatchCorrected = 0;   // newest batch start the correction pass has settled
+    LONGLONG m_maxTargetQpc = 0;         // newest target consumed; the coherence-rule fence
+    long long m_stampsCorrected = 0;     // batches whose stamps moved (summary telemetry)
     EtwFlipConsumer m_etwConsumer;  // inert unless m_etw; nothing in the policy reads it
     // How far back PairBatchMember measures the flip grid's step, in QPC ticks. The
     // confidence bound it accepts is derived from that measurement, so nothing here needs to
@@ -77,7 +85,7 @@ public:
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
                         bool lock = false, CompositorKind compositor = kCompositorNearest,
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
-                        bool etw = false, bool noJoin = false);
+                        bool etw = false, bool noJoin = false, bool dejitter = false);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

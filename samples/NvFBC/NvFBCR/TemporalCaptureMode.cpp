@@ -19,7 +19,7 @@ static const float kDefaultAssumedSrcFps = 60.0f;
 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
-                                         bool tint, bool etw, bool noJoin)
+                                         bool tint, bool etw, bool noJoin, bool dejitter)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_compositor(NULL)
@@ -31,6 +31,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_tint(tint)
     , m_etw(etw)
     , m_noJoin(noJoin)
+    , m_dejitter(dejitter && etw && !noJoin)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_srcRateHint(srcRateHint)
@@ -108,6 +109,10 @@ bool TemporalCaptureMode::Setup() {
         (m_srcRateHint > 0.0f) ? "-src " : ">= ", assumedFps);
     LOG("Selection stickiness band: %lld us (anti flip-flop at bracket midpoint)",
         m_policyCfg.stickinessQpc * 1000000 / m_scheduler.Freq());
+    if (m_dejitter) {
+        LOG("Delivery-lateness correction ACTIVE (-dejit): late batches re-stamped onto the "
+            "flip grid; dejit: lines mark each correction");
+    }
 
     // PHASE COMB LOCK (see docs/phase-comb-lock-spec.md). Each present the target's phase
     // within a source interval advances by (presentP mod srcP); at a rational rate ratio
@@ -246,6 +251,18 @@ void TemporalCaptureMode::Run(
         // pull was computed from LAST present's bracket (closed loop, one-present latency
         // in the control path - negligible at 25 us/present slew).
         const LONGLONG target = deadline - (m_bracketingDelayQpc + m_lockState.pullQpc);
+
+        // Stage 6: settle delivery-lateness corrections BEFORE the bracket reads the ring.
+        // The fence (the newest target ever used) is the coherence rule; lock calm keeps
+        // stamps still while the phase lock is riding out or converging from a stall.
+        if (m_dejitter) {
+            if (target > m_maxTargetQpc) m_maxTargetQpc = target;
+            const bool lockCalm =
+                (m_lockState.stallRun == 0 && m_lockState.recoverRun == 0);
+            m_stampsCorrected += m_ring.CorrectLateStamps(
+                m_maxTargetQpc, &m_lastBatchCorrected, &m_etwConsumer, &m_anchorChain,
+                m_flipCadenceWindowQpc, lockCalm);
+        }
 
         FrameBracket bracket;
         m_ring.FindBracket(target, &bracket);
@@ -429,6 +446,9 @@ void TemporalCaptureMode::Run(
         if (m_ring.HasStopped()) break;  // capture thread hit a fatal error
     }
 
+    if (m_dejitter) {
+        LOG("dejit: %lld batches had late stamps corrected this session", m_stampsCorrected);
+    }
     m_ring.Stop();
 }
 

@@ -53,6 +53,13 @@ public:
     policy::FlipPairing PairCapture(uint32_t head, int64_t batchStartTs, int member,
                                     int64_t cadenceWindow) const;
 
+    // Stage-6 lateness measurement, holding the lock only for the lookup, like PairCapture.
+    // The chain is the CALLER's state (it is sequential across batches and belongs to the
+    // present thread); only the flip history is shared and locked.
+    policy::LateCorrection MeasureLateness(uint32_t head, int64_t batchStartTs,
+                                           policy::AnchorChain& chain,
+                                           int64_t cadenceWindow) const;
+
     long long Flips() const { return m_flips.load(std::memory_order_relaxed); }
     long long DecodeFailures() const { return m_decodeFail.load(std::memory_order_relaxed); }
 

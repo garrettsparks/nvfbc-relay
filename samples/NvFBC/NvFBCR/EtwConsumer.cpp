@@ -214,6 +214,13 @@ policy::FlipPairing EtwFlipConsumer::PairCapture(uint32_t head, int64_t batchSta
     return policy::PairBatchMember(m_history, head, batchStartTs, member, cadenceWindow);
 }
 
+policy::LateCorrection EtwFlipConsumer::MeasureLateness(uint32_t head, int64_t batchStartTs,
+                                                        policy::AnchorChain& chain,
+                                                        int64_t cadenceWindow) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return policy::MeasureLateness(m_history, head, batchStartTs, chain, cadenceWindow);
+}
+
 void EtwFlipConsumer::LogSummary() {
     SessionProps sp;
     FillProps(&sp);
