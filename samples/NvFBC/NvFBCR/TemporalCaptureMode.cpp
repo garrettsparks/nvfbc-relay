@@ -109,18 +109,6 @@ bool TemporalCaptureMode::Setup() {
         (m_srcRateHint > 0.0f) ? "-src " : ">= ", assumedFps);
     LOG("Selection stickiness band: %lld us (anti flip-flop at bracket midpoint)",
         m_policyCfg.stickinessQpc * 1000000 / m_scheduler.Freq());
-    // -dejit needs the comb lock: the calm gate that pauses corrections through stall
-    // recoveries reads lock state, and without a lock it is vacuously open. Refusing loudly
-    // beats running unguarded through exactly the window corrections were measured to harm.
-    if (m_dejitter && m_policyCfg.combQpc <= 0) {
-        LOGERR("-dejit REFUSED: needs the comb lock (-lock with -src) for its calm gate; "
-               "running without delivery-lateness correction");
-        m_dejitter = false;
-    }
-    if (m_dejitter) {
-        LOG("Delivery-lateness correction ACTIVE (-dejit): late batches corrected onto the "
-            "flip grid via the stamp overlay; dejit: lines mark each verdict");
-    }
 
     // PHASE COMB LOCK (see docs/phase-comb-lock-spec.md). Each present the target's phase
     // within a source interval advances by (presentP mod srcP); at a rational rate ratio
@@ -188,6 +176,25 @@ bool TemporalCaptureMode::Setup() {
     if (!m_compositor->Setup(m_device, BUF_WIDTH, BUF_HEIGHT)) {
         LOGERR("Compositor setup failed - refusing the mode");
         return false;
+    }
+
+    // RESOLVED-CONFIG VALIDATION, deliberately last: everything above may still be deciding
+    // what the config IS, so a cross-feature requirement checked earlier reads a field that
+    // has not been written yet. That exact mistake shipped once - this check sat above the
+    // comb-lock block that sets combQpc, so -dejit refused itself in EVERY configuration
+    // and a live A/B measured two identical runs.
+    //
+    // -dejit needs the comb lock: the calm gate that pauses corrections through stall
+    // recoveries reads lock state, and without a lock it is vacuously open. Refusing loudly
+    // beats running unguarded through exactly the window corrections were measured to harm.
+    if (m_dejitter && m_policyCfg.combQpc <= 0) {
+        LOGERR("-dejit REFUSED: needs the comb lock (-lock with -src) for its calm gate; "
+               "running without delivery-lateness correction");
+        m_dejitter = false;
+    }
+    if (m_dejitter) {
+        LOG("Delivery-lateness correction ACTIVE (-dejit): late batches corrected onto the "
+            "flip grid via the stamp overlay; dejit: lines mark each verdict");
     }
     return true;
 }
