@@ -1129,6 +1129,13 @@ struct TraceFixture {
     int fieldWorstRun = -1;
     int fieldLongRuns = -1;
     double fieldSynthPct = -1.0;
+    // Pairing gates, overridable per fixture because the defaults encode the x2 walks:
+    // 98% placed assumes the flip grid never pauses, but with frame generation OFF a
+    // stalled game stops presenting and the grid stops WITH it, so its transition batches
+    // have nothing to pair against - a regime property, not a join regression. A fixture
+    // that overrides these owns the explanation in a comment beside the override.
+    int minPlacedPct = 98;
+    int maxAheadPct = 2;
 };
 
 static bool ParseFixture(const std::string& path, TraceFixture* out) {
@@ -1159,6 +1166,8 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         else if (std::strcmp(tag, "field_worst_run") == 0) { num(&n); out->fieldWorstRun = (int)n; }
         else if (std::strcmp(tag, "field_long_runs") == 0) { num(&n); out->fieldLongRuns = (int)n; }
         else if (std::strcmp(tag, "field_synth_pct") == 0) { dbl(&out->fieldSynthPct); }
+        else if (std::strcmp(tag, "min_placed_pct") == 0)  { num(&n); out->minPlacedPct = (int)n; }
+        else if (std::strcmp(tag, "max_ahead_pct") == 0)   { num(&n); out->maxAheadPct = (int)n; }
         else if (std::strcmp(tag, "arrivals") == 0 || std::strcmp(tag, "presents") == 0 ||
                  std::strcmp(tag, "flips_h0") == 0) {
             std::vector<int64_t>* into = &out->presents;
@@ -1287,18 +1296,20 @@ static void ReportPairing(const TraceFixture& fx, int64_t lagFloor, int64_t batc
                 100.0 * noAnchor / (double)total);
 
     // Measured 99.5% on the walk fixture, so 98 is a regression gate rather than a hopeful
-    // one. The premise of the whole design is that the flip data arrives in time at the
-    // CURRENT lag floor; if that stops holding the number should be argued about, not
-    // quietly accepted.
-    CHECK(paired * 100 / (int)total >= 98,
-          "%s: only %d of %zu captures placed on the flip grid; the join does not hold at a "
-          "%lld us floor", fx.path.c_str(), paired, total, (long long)lagFloor);
+    // one (the default; a fixture whose REGIME cannot meet it declares its own bound with
+    // the reason - see TraceFixture::minPlacedPct). The premise of the whole design is that
+    // the flip data arrives in time at the CURRENT lag floor; if that stops holding the
+    // number should be argued about, not quietly accepted.
+    CHECK(paired * 100 / (int)total >= fx.minPlacedPct,
+          "%s: only %d of %zu captures placed on the flip grid (bound %d%%); the join does "
+          "not hold at a %lld us floor", fx.path.c_str(), paired, total, fx.minPlacedPct,
+          (long long)lagFloor);
     // Not-yet-announced is the failure the lag floor governs. It measured 0.0%, which is the
     // evidence that the floor needs no raising; a nonzero reading here is the first sign that
     // conclusion has expired.
-    CHECK(ahead * 100 / (int)total <= 2,
-          "%s: %d of %zu captures had no flip announced in time; the lag floor conclusion "
-          "no longer holds", fx.path.c_str(), ahead, total);
+    CHECK(ahead * 100 / (int)total <= fx.maxAheadPct,
+          "%s: %d of %zu captures had no flip announced in time (bound %d%%); the lag floor "
+          "conclusion no longer holds", fx.path.c_str(), ahead, total, fx.maxAheadPct);
 }
 
 static void test_replay_capture_corpus() {
