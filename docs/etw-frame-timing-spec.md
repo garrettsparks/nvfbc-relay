@@ -182,6 +182,89 @@ Consequence: `RING_SIZE` stays at 8 and `LagForSourcePeriod` stays at `srcPeriod
 tail is ever worth chasing, ~32 ms suffices. If the floor IS raised later, size the ring by
 CAPTURED frames (120/s at 60x2, 180/s at 60x3), not by source frames.
 
+## Stage 6 measured on hardware: harmless, and worth almost nothing on this content
+
+Validated live 2026-08-13 (KCD map-cycle content, `b:vsync -src 60 -lock -etw -mark -tint`,
+~3 min). Two things were established, and they point in opposite directions.
+
+**The machinery works, which is the part that matters for stage 7.** The session summary:
+`14896 batches measured, 38 late, 36 corrected, 0 fence-blocked, 2 lock-declined, 0 skipped`.
+Replay had predicted 28 late / 23 corrected on a sibling capture, so the model is sound at
+the order-of-magnitude level. The stride chain held live, the overlay applied corrections
+through a real present loop, and the one large lateness reading (7071 us) was LOCK-DECLINED
+exactly as designed - large lateness clusters near stalls, which is where corrections were
+measured to do harm.
+
+**It removes the one blend class a viewer actually notices.** Aggregate blend share is
+9.20%, inside the [8.00%, 9.33%] band two back-to-back runs of the SAME build produced - so
+by that metric it looks inert. THAT METRIC IS THE WRONG ONE, and reading it cost this project
+a session's worth of wrong conclusions. Aggregate share is dominated by map-transition
+bursts (70-75% of synthesized frames), where blends are covering real content discontinuities
+on screens nobody is judging motion on. The class that matters is the ISOLATED mid-gameplay
+blend, and there are only ~2 per 3 minutes to begin with.
+
+Replaying the live capture through the identical policy with corrections armed and not, and
+diffing PER PRESENT:
+
+| | measured |
+|---|---|
+| presents whose decision changed | 401 of 16221 |
+| blends REMOVED | **1** |
+| blends ADDED | 0 |
+| other transitions (pass-before <-> pass-after, both sharp) | 400 |
+
+The removed blend sat 185 presents clear of the previous synthesized frame and 152 clear of
+the next - three seconds of clean gameplay either side, i.e. exactly the isolated artifact
+class. It was caused by a 5032 us late delivery, corrected. Against a baseline of ~2 isolated
+gameplay blends per 3-minute run, that is roughly HALF the visible artifacts, not the
+"nothing" an aggregate read reports.
+
+**Why the earlier analysis missed it, which is the reusable lesson.** An offline pass over
+the same logs concluded "0 of 10 late blends would cross the passthrough gate". It used the
+`boff=`/`aoff=` fields, which come from the STATELESS nearest-anchor join whose confidence
+bound is spacing/4 ~= 2084 us. A 5032 us lateness is structurally invisible to it - it logs
+as `none:noanchor`. The stride chain reads up to three quarters of a batch period, which is
+why the feature finds cases its own diagnostic fields cannot. Never size a correction's value
+from the weaker instrument's fields; replay the chain.
+
+Corrections themselves are modest - 38 events, p50 lateness 1142 us - but the tail is what
+does the work.
+
+**Cost: +13 us of present-thread time per present that carries a new batch**, and this is a
+real reading rather than noise, because the breakdown separates it cleanly:
+
+| present kind | dejit off | dejit on |
+|---|---|---|
+| passthrough | jit p50 20 us | 33 us |
+| synthesized | 22 us | 30 us |
+| **hold (source stalled, NO new batches)** | **17 us** | **17 us** |
+
+Hold presents are unchanged because a stalled source delivers no batches to measure, which
+identifies the cost precisely: `MeasureLateness` calls `MedianSpacing` twice per batch, each
+insertion-sorting up to 256 gap samples. `pdt` is unaffected (16654 us against 16657), so
+pacing never sees it, and the fix if it ever matters is caching the spacing rather than
+recomputing it per batch.
+
+**The payoff is small in absolute terms and concentrated where it is visible.** The spec's
+justifying statistic (28-36% of gaps in the 1.3-2.5 source-period class are "late then catch
+up") REPRODUCES exactly - 29% and 27% on these captures - but it was WRITTEN UP misleadingly:
+that class is 0.6-0.7% of all batches, so it is 0.18% of batches overall, not "a large share
+of the blends". The correct statement is that late deliveries are rare, and that when one
+lands in steady gameplay it produces exactly the artifact this project cares about.
+
+**Verdict: keep it. On by default is defensible once a second capture confirms the rate.**
+It is do-no-harm gated (0 blends added across 16221 presents), it costs 13 us of
+present-thread time that never reaches `pdt`, it exercises the anchoring and overlay
+machinery stage 7 depends on, and it removes roughly half the isolated mid-gameplay blends.
+A future title with raggeder delivery raises its value, not lowers it; the corpus pipeline
+sizes that in one 2-minute capture.
+
+The passthrough threshold remains a separate and much larger dial for AGGREGATE blend share
+(srcP/4 -> srcP/3 would sharpen 15.5% of blends) - but it trades motion accuracy to do it,
+and it acts mostly on the map-transition bursts that nobody sees. The two are not
+alternatives: dejit makes the timeline more correct, the threshold decides how much
+incorrectness to tolerate.
+
 ## Stage 6 as built: delivery-lateness correction, not flip-stamping
 
 The architecture section below says "upgrade a slot's timestamp from estimated to measured".

@@ -13,6 +13,8 @@ field_synth_pct 1.1
 # (IQR 1610us vs 291us). A fixed 1ms flip-anchor bound placed 99.2% of batches on the clean
 # walk and only 91.5% here, which is what forced the bound to derive from the measured step.
 # The relay's own output is unaffected by the jitter, which is itself the finding.
+# Stage-6 per-present gate: on x2 the correction only ever moves frames ONTO targets.
+max_blends_added 0
 max_worst_run 7
 max_long_runs 0
 max_synth_pct 1.5
