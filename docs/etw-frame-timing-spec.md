@@ -247,13 +247,22 @@ could not reproduce. Every batch verdict is counted and logged (measured / late 
 / fence-blocked / lock-declined / skipped), so a live A/B can distinguish "no late
 deliveries" from "corrections measured and discarded".
 
-Replay-validated on the full corpus (five fixtures; `kcd_60x2_join_events` carries real
-late-delivery events WITH flip data): clean walk 1.4% -> 1.3% synth (31 corrections, all
-isolated genuine events), jitter walk 1.1% -> 1.1%, event fixture 8.4% -> 8.3% with the
-worst synth run 50 -> 45 and no runs over 50 - on 25 corrections, because the tell refuses
-the chain through stalls and the handful of decisive corrections carry the whole win.
-`test_anchor_chain` pins the three regimes the KCD corpus cannot: FG-off stride derivation,
-the dropped-batch alias, and mis-lock recovery.
+Replay-validated on the full corpus - SEVEN fixtures spanning three multiplier regimes
+(`kcd_60x2_join_events` carries real late-delivery events; `kcd_60x3_walk` and
+`kcd_60x1_fgoff` exist so an x2 assumption breaks a test instead of sitting silently inert
+elsewhere): clean walk 1.4% -> 1.3% synth (31 corrections, all isolated genuine events),
+jitter walk 1.1% -> 1.1%, event fixture 8.4% -> 8.3% with the worst synth run 50 -> 45 and
+no runs over 50 - on 25 corrections, because the tell refuses the chain through stalls and
+the handful of decisive corrections carry the whole win. At x3 the stride derives to 2 on
+the 5.6 ms grid (99.3% of 16835 batches anchored, 104 corrections, synth unchanged at
+19.0% - and that 19% IS the known x3 keep-real defect, now recorded as a bound a
+phase-aware keep-real must beat). At FG-off the stride derives to 1 (97.7% anchored, 24
+corrections) - the regime a hardcoded stride was structurally blind to. The FG-off fixture
+also owns two per-fixture gate overrides with reasons in its header: its field numbers are
+absent (nearest-mode log carries no op= labels) and its pairing bound is 95% (a stalled
+FG-off game stops presenting, so the flip grid pauses WITH it - transition batches have
+nothing to pair against). `test_anchor_chain` pins the same three regimes synthetically:
+FG-off stride derivation, the dropped-batch alias, and mis-lock recovery.
 
 ## What the scanout grid actually looks like
 

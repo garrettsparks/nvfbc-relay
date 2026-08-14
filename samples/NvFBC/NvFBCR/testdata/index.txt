@@ -13,3 +13,8 @@ kcd_60x2_walk_jitter.trace
 # Varied content WITH flip data (the walks are steady; the map cycles carry no flips): the
 # fixture that exercises stage-6 delivery-lateness correction against real late events.
 kcd_60x2_join_events.trace
+# The regimes the x2 corpus cannot gate. An x2 assumption that fails silently-inert (or
+# silently-wrong) elsewhere must break one of these instead: x3 rotates the batch
+# composition through the source period; FG-off is 1-member batches on a metronome grid.
+kcd_60x3_walk.trace
+kcd_60x1_fgoff.trace
