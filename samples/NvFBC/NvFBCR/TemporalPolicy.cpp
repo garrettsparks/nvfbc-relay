@@ -200,6 +200,22 @@ FlipPairing PairBatchMember(const FlipHistory& h, uint32_t head, int64_t batchSt
     return r;
 }
 
+// Median of the chain's recorded batch gaps: the measured batch period. Zero until enough
+// gaps exist to be a cadence rather than an anecdote.
+static int64_t ChainBatchPeriod(const AnchorChain& chain) {
+    if (chain.gapCount < 3) return 0;
+    int64_t sorted[AnchorChain::kGapWindow];
+    const int n = chain.gapCount;
+    for (int i = 0; i < n; i++) sorted[i] = chain.gaps[i];
+    for (int i = 1; i < n; i++) {
+        const int64_t v = sorted[i];
+        int j = i - 1;
+        while (j >= 0 && sorted[j] > v) { sorted[j + 1] = sorted[j]; j--; }
+        sorted[j + 1] = v;
+    }
+    return sorted[n / 2];
+}
+
 FlipPairing AnchorBatch(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
                         AnchorChain& chain, int64_t cadenceWindow) {
     static const int kLookup = 16;
@@ -208,57 +224,105 @@ FlipPairing AnchorBatch(const FlipHistory& h, uint32_t head, int64_t batchStartT
     const int64_t spacing = h.MedianSpacing(batchStartTs - cadenceWindow, batchStartTs, head);
     if (spacing <= 0) return r;
 
-    if (chain.valid) {
-        // Two flips on from the previous anchor, with a half-step window: the prediction
-        // already carries the batch-to-flip assignment, so the quarter-step confidence
-        // bound that guards a stateless search would only reject real grid jitter here
-        // (two steps of it stack, and the jittery-grid fixture runs 1.6 ms IQR per step).
-        const int64_t predicted = chain.lastAnchorTs + 2 * spacing;
-        // An empty prediction window means one of two very different things. If the
-        // history's newest flip has not REACHED the window, the data is still in flight
-        // (flips are known ~1-10 ms after they happen): report not-yet-announced and keep
-        // the chain, the caller retries. Only a window the history has moved PAST is
-        // evidence the flip never happened.
-        const Flip* newest = h.NewestAtOrBefore(INT64_MAX, head);
-        if (newest && newest->displayTs < predicted + spacing / 2) {
-            r.memberAhead = true;
-            return r;
+    // Record the batch-start gap once per batch. Guarded on the batch actually changing,
+    // because a dataPending retry re-offers the SAME batch and must not re-record it.
+    if (batchStartTs != chain.lastSeenBatchTs) {
+        if (chain.lastSeenBatchTs != 0 && batchStartTs > chain.lastSeenBatchTs) {
+            chain.gaps[chain.gapHead] = batchStartTs - chain.lastSeenBatchTs;
+            chain.gapHead = (chain.gapHead + 1) % AnchorChain::kGapWindow;
+            if (chain.gapCount < AnchorChain::kGapWindow) chain.gapCount++;
         }
-        const Flip* buf[kLookup];
-        const int n = h.InRange(predicted - spacing / 2, predicted + spacing / 2, head,
-                                buf, kLookup);
-        if (n > 0) {
-            int best = 0;
-            int64_t bestAbs = -1;
-            for (int i = 0; i < n; i++) {
-                int64_t d = predicted - buf[i]->displayTs;
-                if (d < 0) d = -d;
-                if (bestAbs < 0 || d < bestAbs) { bestAbs = d; best = i; }
-            }
-            // The lateness this exists to measure is bounded by what a late-but-rendered
-            // frame can be: within a source period. Beyond that the source is stalled and
-            // the chain is fiction; drop it and let re-acquisition decide.
-            const int64_t lateness = batchStartTs - buf[best]->displayTs;
-            if (lateness > -spacing && lateness < 2 * spacing) {
-                chain.lastAnchorTs = buf[best]->displayTs;
-                if (chain.warmup > 0) chain.warmup--;
-                r.anchorFound = true;
-                r.paired = true;
-                r.displayTs = buf[best]->displayTs;
-                r.anchorOffset = lateness;
-                r.chainWarm = (chain.warmup == 0);
+        chain.lastSeenBatchTs = batchStartTs;
+    }
+    const int64_t batchPeriod = ChainBatchPeriod(chain);
+
+    if (chain.valid && batchPeriod > 0) {
+        // The stride is DERIVED: flips advanced per batch = batch period / flip spacing,
+        // both measured (2 at 60x2 and 60x3 where submissions pair, 1 with frame
+        // generation off). How many batches this one sits past the last ANCHORED batch is
+        // measured the same way, so a dropped batch doubles the predicted advance instead
+        // of aliasing the prediction one flip short.
+        int64_t stride = (batchPeriod + spacing / 2) / spacing;
+        if (stride < 1) stride = 1;
+        if (stride > 8) stride = 8;
+        const int64_t nBatches =
+            (batchStartTs - chain.lastAnchorBatchTs + batchPeriod / 2) / batchPeriod;
+        if (nBatches >= 1 && nBatches <= 4) {
+            const int64_t predicted = chain.lastAnchorTs + nBatches * stride * spacing;
+            // An empty prediction window means one of two very different things. If the
+            // history's newest flip has not REACHED the window, the data is still in
+            // flight (flips are known ~1-10 ms after they happen): report
+            // not-yet-announced and keep the chain, the caller retries. Only a window the
+            // history has moved PAST is evidence the flip never happened.
+            const Flip* newest = h.NewestAtOrBefore(INT64_MAX, head);
+            if (newest && newest->displayTs < predicted + spacing / 2) {
+                r.memberAhead = true;
                 return r;
             }
+            const Flip* buf[kLookup];
+            const int n = h.InRange(predicted - spacing / 2, predicted + spacing / 2, head,
+                                    buf, kLookup);
+            if (n > 0) {
+                int best = 0;
+                int64_t bestAbs = -1;
+                for (int i = 0; i < n; i++) {
+                    int64_t d = predicted - buf[i]->displayTs;
+                    if (d < 0) d = -d;
+                    if (bestAbs < 0 || d < bestAbs) { bestAbs = d; best = i; }
+                }
+                // Acceptance is in BATCH periods, not flip steps, so it scales with the
+                // multiplier: the measured phantom events sit near half a batch period,
+                // and past three quarters a reading is indistinguishable from a
+                // mis-anchored prediction. Early is bounded by a half step: arrivals lead
+                // their flip by well under 100 us when they lead at all.
+                const int64_t lateness = batchStartTs - buf[best]->displayTs;
+                if (lateness > -spacing / 2 && lateness < batchPeriod * 3 / 4) {
+                    // The constant-lateness tell (see AnchorChain::lateRun): a genuine
+                    // backlog drains within a couple of batches, so a third consecutive
+                    // above-gate reading means the chain slipped a flip, not that
+                    // delivery is late. Re-acquire instead of accepting fiction.
+                    if (lateness > spacing / 8) {
+                        chain.lateRun++;
+                        if (chain.lateRun >= 3) {
+                            chain.valid = false;
+                            chain.lateRun = 0;
+                        }
+                    } else {
+                        chain.lateRun = 0;
+                    }
+                    if (chain.valid) {
+                        chain.lastAnchorTs = buf[best]->displayTs;
+                        chain.lastAnchorBatchTs = batchStartTs;
+                        if (chain.warmup > 0) chain.warmup--;
+                        r.anchorFound = true;
+                        r.paired = true;
+                        r.displayTs = buf[best]->displayTs;
+                        r.anchorOffset = lateness;
+                        r.chainWarm = (chain.warmup == 0);
+                        return r;
+                    }
+                }
+            }
+            chain.valid = false;
+        } else if (nBatches > 4) {
+            // Five-plus batch periods with no anchor between is a stall; the chain is
+            // fiction across one.
+            chain.valid = false;
         }
-        chain.valid = false;
+        // nBatches == 0: an orphan wake inside the previous batch's period (a real frame
+        // that slipped the collapse window). It has no grid slot of its own to predict;
+        // leave the chain intact for the next real batch and report it unplaced.
+        if (nBatches == 0) return r;
     }
 
     // Re-acquisition: the stateless nearest rule, which is only trustworthy when the batch
     // arrived on time - exactly the batches it accepts (quarter-step bound). Eight batches
-    // of proven stride (two flip-grid cycles at x2) before corrections trust the chain.
+    // of proven stride before corrections trust the chain; the gap window refills in
+    // parallel and ChainBatchPeriod gates prediction until it has.
     const FlipPairing acq = PairBatchMember(h, head, batchStartTs, 0, cadenceWindow);
     if (acq.paired) {
         chain.lastAnchorTs = acq.displayTs;
+        chain.lastAnchorBatchTs = batchStartTs;
         chain.valid = true;
         chain.warmup = 8;
     }

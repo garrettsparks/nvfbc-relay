@@ -197,15 +197,24 @@ struct FlipPairing {
 FlipPairing PairBatchMember(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
                             int member, int64_t cadenceWindow);
 
-// Anchor continuity across batches. Consecutive batches advance exactly 2 flips (94.9% at
-// 60x2, 96.4% at 60x3), so once one batch is anchored the next batch's flip is PREDICTED
-// rather than searched for. That matters for exactly the batches nearest-anchoring cannot
-// place: a batch delivered ~0.9 of a flip step late sits nearer its successor's flip than
-// its own, and the spacing/4 confidence bound around the batch start caps the readable
+// Anchor continuity across batches. Once one batch is anchored, the next batch's flip is
+// PREDICTED rather than searched for. That matters for exactly the batches nearest-anchoring
+// cannot place: a batch delivered ~0.9 of a flip step late sits nearer its successor's flip
+// than its own, and the spacing/4 confidence bound around the batch start caps the readable
 // offset at a quarter step - so the late deliveries that motivate measuring lateness at
 // all are the ones a stateless nearest-anchor mis-places.
+//
+// The stride (flips advanced per batch) is DERIVED, never assumed: batch period over flip
+// spacing, both measured. An earlier version hardcoded 2 - correct for the pair submission
+// measured at 60x2 AND 60x3, but structurally unable to anchor a 1-member-per-batch regime
+// (frame generation off), where it predicted one flip ahead of every batch and never warmed.
+// Deriving it also sizes the prediction for MULTI-batch gaps: a dropped batch doubles the
+// arrival gap, and predicting round(gap / batchPeriod) batches ahead prevents the one-flip
+// alias where a post-gap batch is "corrected" a full period into the past.
 struct AnchorChain {
-    int64_t lastAnchorTs = 0;
+    int64_t lastAnchorTs = 0;         // flip the last anchored batch landed on
+    int64_t lastAnchorBatchTs = 0;    // that batch's arrival, the base for gap counting
+    int64_t lastSeenBatchTs = 0;      // last batch offered, anchored or not (gap dedup)
     bool valid = false;
     // Batches remaining before the chain is trusted for CORRECTIONS. A re-acquired anchor
     // came from the stateless quarter-step rule during exactly the unsteady delivery that
@@ -214,6 +223,46 @@ struct AnchorChain {
     // this: one stall recovery grew from 50 presents to 72, because corrections landed in
     // the window where the lock was re-seeding its phase from the same stamps.
     int warmup = 0;
+    // Consecutive anchored batches reading late beyond the correction gate. Genuine
+    // lateness is a TRANSIENT - a delivery backlog that drains within a batch or two,
+    // late-then-catch-up - because the capture API holds no standing queue. A chain that
+    // has slipped one flip reads a constant +one-step lateness forever, which no physical
+    // delivery can produce, so a run of them is the chain's own tell: re-acquire through
+    // the stateless quarter-step rule, which only accepts on-grid batches and therefore
+    // restores the true residue. Measured cost of NOT having this: a mis-locked chain
+    // fabricated ~8.3 ms corrections for 11% of a steady walk and read as plausible.
+    int lateRun = 0;
+    // Recent batch-start gaps; their median is the batch period the stride derives from.
+    // A median so the late outliers this machinery exists to measure cannot skew the very
+    // cadence they are measured against.
+    static const int kGapWindow = 5;
+    int64_t gaps[kGapWindow] = {};
+    int gapCount = 0;
+    int gapHead = 0;
+};
+
+// Stage-6 corrections as metadata BESIDE the ring, never as slot mutation. FindBracket
+// subtracts CorrectionFor(stamp) at read time, so the ring slots keep exactly one writer
+// (the capture thread) and a recycled slot can never inherit a stale correction - its
+// stamp is a different key. Keyed by the batch-start stamp value, which every member of a
+// batch shares, so a member published AFTER its batch was measured inherits the correction
+// with no ordering requirement at all. Written and read on the present thread only.
+struct StampOverlay {
+    static const int kEntries = 16;   // twice the ring's batch capacity
+    int64_t keys[kEntries] = {};
+    int64_t corr[kEntries] = {};
+    int head = 0;
+    void Insert(int64_t batchStartTs, int64_t correctionTicks) {
+        keys[head] = batchStartTs;
+        corr[head] = correctionTicks;
+        head = (head + 1) % kEntries;
+    }
+    int64_t CorrectionFor(int64_t stampTs) const {
+        for (int i = 0; i < kEntries; i++) {
+            if (keys[i] == stampTs) return corr[i];
+        }
+        return 0;
+    }
 };
 
 // Anchor a batch on the flip grid with stride prediction, falling back to the stateless
@@ -221,14 +270,16 @@ struct AnchorChain {
 // prediction window is a half step - wider than PairBatchMember's quarter step because the
 // predicted position already removes the batch-start ambiguity the quarter step guards
 // against, and two flip steps of real grid jitter must fit inside it. anchorOffset is
-// batch start minus the anchored flip and is the batch's DELIVERY LATENESS, unbounded by
-// the prediction window; displayTs is the anchor flip itself. A stall (no flip within
-// half a source period of prediction or batch start) invalidates the chain and reports
-// unpaired, which is the correct answer during one.
+// batch start minus the anchored flip and is the batch's DELIVERY LATENESS, readable up to
+// three quarters of a BATCH PERIOD (derived, so it scales with the multiplier: 12.5 ms at
+// 60x2, 8.3 ms at 60x3); beyond it the reading is indistinguishable from a mis-anchored
+// prediction and the chain re-acquires. displayTs is the anchor flip itself. A stall
+// invalidates the chain and reports unpaired, which is the correct answer during one.
 FlipPairing AnchorBatch(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
                         AnchorChain& chain, int64_t cadenceWindow);
 
-// The stage-6 decision: how much delivery lateness to subtract from a batch's stamps.
+// The stage-6 decision: the delivery lateness to subtract from a batch's stamps (via the
+// overlay - see StampOverlay; nothing subtracts from slots directly).
 struct LateCorrection {
     // Flip data for this batch has not been delivered yet. The chain is sequential state,
     // so the caller must retry THIS batch next present rather than skipping past it.

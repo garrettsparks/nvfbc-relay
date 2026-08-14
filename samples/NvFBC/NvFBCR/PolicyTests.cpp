@@ -87,13 +87,14 @@ struct SimResult {
     std::vector<double> weights;
     std::vector<int64_t> outTs;       // composite output content time (Hold carries forward)
     std::vector<int64_t> minDiff;     // nearest-real-frame distance at the target (-1 if none)
-    // Stage 6 telemetry: batches whose measured lateness exceeded the correction gate, and
-    // how many of those had their slots' stamps actually moved (the rest missed the
-    // coherence window and kept today's late stamp).
+    // Stage 6 telemetry, mirroring production's dejit counters one for one so the corpus
+    // gate and a live capture's summary line are directly comparable.
+    long long measuredBatches = 0;
     long long lateBatches = 0;
     long long correctedBatches = 0;
+    long long fenceBlockedBatches = 0;
+    long long lockDeclinedBatches = 0;
     long long anchoredBatches = 0;
-    long long totalBatches = 0;
 };
 
 struct SimParams {
@@ -220,26 +221,27 @@ static SimResult Simulate(const SimParams& p) {
             if (bd.retractPrevious && i >= 1) valid[i - 1] = 0;
         }
     }
-    // Stage 6 state: flips enter history when they became KNOWN (never when they happened),
-    // exactly as ReportPairing feeds the join. Batches are anchored strictly in arrival
-    // order - the chain is sequential state - so a cursor walks them as presents pass.
+    // Stage 6 state, mirroring production's wiring exactly: flips enter history when they
+    // became KNOWN (never when they happened), batches are walked strictly in arrival
+    // order (the chain is sequential state), corrections live in the same StampOverlay
+    // production uses and are applied at bracket-read time, never by mutating stamps. An
+    // earlier version of this block mutated stamps[] behind a growing-batch guard the
+    // production side also had; an adversarial review caught the two sides modelling
+    // DIFFERENT timings, which made the gate meaningless. The overlay design has no
+    // settlement timing to diverge on: a correction is keyed by the batch-start stamp, so
+    // members published after their batch was measured inherit it by lookup.
     const bool flipDejitter = p.flipDejitter && !p.flipDisplay.empty() && !p.flipKnown.empty();
     policy::FlipHistory fliph;
     policy::AnchorChain chain;
+    policy::StampOverlay overlay;
     size_t nextFlip = 0;
     int64_t maxTarget = INT64_MIN;
     const int64_t kCadenceWindowUs = 200000;   // production's m_flipCadenceWindowQpc
-    // First slot index of each batch, in order (a batch is a maximal run of equal
-    // batchStart). batchEnd[i] is one past the batch's last slot.
+    // First slot index of each batch, in arrival order (a batch is a maximal run of equal
+    // batchStart) - the sim's stand-in for the ring's batch-start history.
     std::vector<size_t> batchFirst;
-    std::vector<size_t> batchEnd;
     for (size_t i = 0; i < arrivals.size(); i++) {
-        if (i == 0 || batchStart[i] != batchStart[i - 1]) {
-            batchFirst.push_back(i);
-            batchEnd.push_back(i + 1);
-        } else {
-            batchEnd.back() = i + 1;
-        }
+        if (i == 0 || batchStart[i] != batchStart[i - 1]) batchFirst.push_back(i);
     }
     size_t nextBatch = 0;
 
@@ -267,12 +269,12 @@ static SimResult Simulate(const SimParams& p) {
         while (published < arrivals.size() && arrivals[published] <= deadline) published++;
         const size_t oldest = published > (size_t)kRingSlots ? published - kRingSlots : 0;
 
-        // Stage 6: measure each batch's delivery lateness against its stride-anchored flip
-        // and subtract it from the batch's stamps. THE COHERENCE RULE is the guard: both
-        // the old and the corrected stamp must be strictly newer than the newest target
-        // the policy has seen, so a stamp can never move a frame across a target the
-        // policy already decided about. A batch that misses the window keeps today's late
-        // stamp - that is the entire degradation path, no separate fallback exists.
+        // Stage 6, the same sequence production runs before its bracket read: measure each
+        // batch's delivery lateness against its stride-anchored flip, gate on lock calm
+        // and THE COHERENCE RULE (both the batch stamp and its corrected value strictly
+        // newer than the newest target the policy has seen), insert survivors into the
+        // overlay. A blocked batch keeps today's late stamp - that is the entire
+        // degradation path, no separate fallback exists.
         if (flipDejitter) {
             if (target > maxTarget) maxTarget = target;
             while (nextFlip < p.flipDisplay.size() && p.flipKnown[nextFlip] <= deadline) {
@@ -285,29 +287,25 @@ static SimResult Simulate(const SimParams& p) {
             }
             while (nextBatch < batchFirst.size() &&
                    arrivals[batchFirst[nextBatch]] <= deadline) {
-                const size_t b0 = batchFirst[nextBatch];
-                const policy::LateCorrection lc = policy::MeasureLateness(
-                    fliph, 0, batchStart[b0], chain, kCadenceWindowUs);
+                const int64_t bs = batchStart[batchFirst[nextBatch]];
+                const policy::LateCorrection lc =
+                    policy::MeasureLateness(fliph, 0, bs, chain, kCadenceWindowUs);
                 // Data in flight: stop and retry this batch next present (the chain is
                 // order-dependent, so later batches wait behind it).
                 if (lc.dataPending) break;
-                r.totalBatches++;
+                r.measuredBatches++;
                 if (chain.valid) r.anchoredBatches++;
-                // The two gates the policy layer cannot see, exactly as production holds
-                // them: never move a stamp across a target the policy has consumed, and
-                // never move stamps while the lock is riding out or recovering a stall.
                 const bool lockCalm = (lock.stallRun == 0 && lock.recoverRun == 0);
-                if (lc.correctionTicks != 0 && lockCalm) {
+                if (lc.correctionTicks != 0) {
                     r.lateBatches++;
-                    bool moved = false;
-                    for (size_t i = b0; i < batchEnd[nextBatch]; i++) {
-                        if (!valid[i]) continue;
-                        const int64_t corrected = stamps[i] - lc.correctionTicks;
-                        if (stamps[i] <= maxTarget || corrected <= maxTarget) continue;
-                        stamps[i] = corrected;
-                        moved = true;
+                    if (!lockCalm) {
+                        r.lockDeclinedBatches++;
+                    } else if (bs <= maxTarget || bs - lc.correctionTicks <= maxTarget) {
+                        r.fenceBlockedBatches++;
+                    } else {
+                        overlay.Insert(bs, lc.correctionTicks);
+                        r.correctedBatches++;
                     }
-                    if (moved) r.correctedBatches++;
                 }
                 nextBatch++;
             }
@@ -323,7 +321,8 @@ static SimResult Simulate(const SimParams& p) {
         BracketInfo b;
         for (size_t i = oldest; i < published; i++) {
             if (!valid[i]) continue;
-            const int64_t ts = stamps[i];
+            int64_t ts = stamps[i];
+            if (flipDejitter) ts -= overlay.CorrectionFor(ts);
             if (ts <= target) {
                 if (!b.hasBefore || ts > b.beforeTs) { b.hasBefore = true; b.beforeTs = ts; }
             } else {
@@ -766,6 +765,98 @@ static void test_flip_history() {
 // that cannot be made must say so, because a confident wrong scanout time is worse than
 // none at all - the estimated stamp it would replace is at least honest about being an
 // estimate.
+// The anchor chain's derived stride and its failure tells, on synthetic grids where the
+// truth is known exactly. Three regimes the corpus (all 60x2 KCD) cannot gate: a 1-member-
+// per-batch cadence (frame generation off), a dropped batch (the one-flip alias trap), and
+// a chain deliberately mis-locked one flip (the constant-lateness tell).
+static void test_anchor_chain() {
+    const int64_t kWindow = 200000;
+
+    // A generic regime builder: flips every `grid`, batches every `batchPeriod`, batch
+    // starts sitting `offset` past their flip. Feeds the chain the way the walk does and
+    // returns the last verdict.
+    struct Runner {
+        policy::FlipHistory h;
+        policy::AnchorChain chain;
+        int64_t grid, base;
+        Runner(int64_t g) : grid(g), base(1000000) {
+            for (int i = 0; i < 200; i++) {
+                policy::Flip f;
+                f.displayTs = base + (int64_t)i * g;
+                f.eventTs = f.displayTs + 1300;
+                f.head = 0;
+                h.Add(f);
+            }
+        }
+        policy::LateCorrection Offer(int64_t bs) {
+            return policy::MeasureLateness(h, 0, bs, chain, 200000);
+        }
+    };
+    (void)kWindow;
+
+    // FG off: stride must derive to 1. Batches on-grid, then one late by 5 ms: the chain
+    // has to warm up (8 accepted predictions past re-acquisition + 3 gaps) and then read
+    // the lateness. The hardcoded-stride-2 version of this chain could never warm here.
+    {
+        Runner r(16667);
+        policy::LateCorrection last;
+        for (int i = 2; i < 30; i++) {
+            last = r.Offer(r.base + (int64_t)i * 16667 + 80);
+            CHECK(!last.dataPending, "x1 steady offer %d should not be pending", i);
+            CHECK(last.correctionTicks == 0, "x1 on-grid batch %d must not correct (got %lld)",
+                  i, (long long)last.correctionTicks);
+        }
+        CHECK(r.chain.valid, "x1 chain should be locked after a steady run");
+        last = r.Offer(r.base + 30 * 16667 + 5000);
+        CHECK(last.correctionTicks >= 4500 && last.correctionTicks <= 5500,
+              "x1 late batch should read ~5 ms of lateness, got %lld",
+              (long long)last.correctionTicks);
+    }
+
+    // x2 with a dropped batch: the gap doubles, the prediction must advance FOUR flips,
+    // and the post-gap on-time batch must NOT read a full period of fictional lateness
+    // (the alias the derived nBatches exists to prevent).
+    {
+        Runner r(8333);
+        for (int i = 2; i < 30; i++) {
+            (void)r.Offer(r.base + (int64_t)i * 16666 + 80);
+        }
+        CHECK(r.chain.valid, "x2 chain should be locked");
+        // Batch 30 dropped; batch 31 arrives on time.
+        const policy::LateCorrection lc = r.Offer(r.base + 31 * 16666 + 80);
+        CHECK(!lc.dataPending && lc.correctionTicks == 0,
+              "post-gap on-time batch must not correct (alias), got pending=%d corr=%lld",
+              (int)lc.dataPending, (long long)lc.correctionTicks);
+        CHECK(r.chain.valid, "a single dropped batch must not break the chain");
+    }
+
+    // The constant-lateness tell: force the chain one flip behind, then feed on-grid
+    // batches. Without the tell it reads +one-step lateness forever and corrects
+    // everything; with it, the run of identical readings kills the chain and the
+    // re-acquisition (quarter-step, on-grid only) restores the true residue.
+    {
+        Runner r(8333);
+        for (int i = 2; i < 30; i++) {
+            (void)r.Offer(r.base + (int64_t)i * 16666 + 80);
+        }
+        r.chain.lastAnchorTs -= 8333;   // the mis-lock, injected
+        long long corrected = 0;
+        for (int i = 30; i < 44; i++) {
+            const policy::LateCorrection lc = r.Offer(r.base + (int64_t)i * 16666 + 80);
+            if (lc.correctionTicks != 0) corrected++;
+        }
+        CHECK(corrected <= 2,
+              "a mis-locked chain corrected %lld on-grid batches; the constant-lateness "
+              "tell should have re-acquired within 3", corrected);
+        const policy::LateCorrection lc = r.Offer(r.base + 44 * 16666 + 80);
+        CHECK(!lc.dataPending && lc.correctionTicks == 0 && r.chain.valid,
+              "chain should be re-locked on the true residue after the tell fired");
+    }
+
+    std::printf("  anchor chain: derived stride (x1 lock + lateness), dropped-batch alias "
+                "guard, mis-lock tell + re-acquisition\n");
+}
+
 static void test_flip_pairing() {
     const int64_t kGrid = 8333;            // 60x2: 120 flips/s
     // Cadence window, in this file's microseconds. The confidence bound is derived from the
@@ -1369,9 +1460,11 @@ static void test_replay_capture_corpus() {
             if (run6 >= 50) longRuns6++;
             const double synthPct6 = 100.0 * synth6 / (double)(r6.ops.size() - kWarmup);
             std::printf("    stage6 dejitter: synth %.1f%%, runs>=50 %d, worst %d; "
-                        "batches %lld anchored %lld late %lld corrected %lld\n",
-                        synthPct6, longRuns6, worst6, r6.totalBatches, r6.anchoredBatches,
-                        r6.lateBatches, r6.correctedBatches);
+                        "batches %lld anchored %lld late %lld corrected %lld "
+                        "fence-blocked %lld lock-declined %lld\n",
+                        synthPct6, longRuns6, worst6, r6.measuredBatches,
+                        r6.anchoredBatches, r6.lateBatches, r6.correctedBatches,
+                        r6.fenceBlockedBatches, r6.lockDeclinedBatches);
             CHECK(synthPct6 <= fx.maxSynthPct,
                   "[%s] DEJITTERED synth share %.1f%% exceeds the fixture bound %.1f%%: "
                   "the correction is doing harm on a steady capture",
@@ -1379,10 +1472,10 @@ static void test_replay_capture_corpus() {
             CHECK(worst6 <= fx.maxWorstRun,
                   "[%s] DEJITTERED worst recovery %d exceeds the fixture bound %d",
                   fx.description.c_str(), worst6, fx.maxWorstRun);
-            CHECK(r6.anchoredBatches * 100 >= r6.totalBatches * 95,
+            CHECK(r6.anchoredBatches * 100 >= r6.measuredBatches * 95,
                   "[%s] only %lld of %lld batches anchored: the stride chain is not "
                   "holding on this capture",
-                  fx.description.c_str(), r6.anchoredBatches, r6.totalBatches);
+                  fx.description.c_str(), r6.anchoredBatches, r6.measuredBatches);
         }
     }
 }
@@ -2097,6 +2190,7 @@ int main(int argc, char** argv) {
 
     test_flip_history();
     test_flip_pairing();
+    test_anchor_chain();
     test_batch_collapse_keep_real();
     test_lock_reseed_wide_bracket_stall();
     test_lock_reseed_stall_paired_cadence();

@@ -109,9 +109,17 @@ bool TemporalCaptureMode::Setup() {
         (m_srcRateHint > 0.0f) ? "-src " : ">= ", assumedFps);
     LOG("Selection stickiness band: %lld us (anti flip-flop at bracket midpoint)",
         m_policyCfg.stickinessQpc * 1000000 / m_scheduler.Freq());
+    // -dejit needs the comb lock: the calm gate that pauses corrections through stall
+    // recoveries reads lock state, and without a lock it is vacuously open. Refusing loudly
+    // beats running unguarded through exactly the window corrections were measured to harm.
+    if (m_dejitter && m_policyCfg.combQpc <= 0) {
+        LOGERR("-dejit REFUSED: needs the comb lock (-lock with -src) for its calm gate; "
+               "running without delivery-lateness correction");
+        m_dejitter = false;
+    }
     if (m_dejitter) {
-        LOG("Delivery-lateness correction ACTIVE (-dejit): late batches re-stamped onto the "
-            "flip grid; dejit: lines mark each correction");
+        LOG("Delivery-lateness correction ACTIVE (-dejit): late batches corrected onto the "
+            "flip grid via the stamp overlay; dejit: lines mark each verdict");
     }
 
     // PHASE COMB LOCK (see docs/phase-comb-lock-spec.md). Each present the target's phase
@@ -253,19 +261,60 @@ void TemporalCaptureMode::Run(
         const LONGLONG target = deadline - (m_bracketingDelayQpc + m_lockState.pullQpc);
 
         // Stage 6: settle delivery-lateness corrections BEFORE the bracket reads the ring.
-        // The fence (the newest target ever used) is the coherence rule; lock calm keeps
-        // stamps still while the phase lock is riding out or converging from a stall.
+        // The walk consumes the ring's batch-start history (never slot fields, which the
+        // capture thread owns), measures each batch against the flip grid, and inserts
+        // accepted corrections into the overlay FindBracket reads through. The fence (the
+        // newest target ever consumed) is the coherence rule - once a correction would
+        // land at or behind it, the batch keeps its late stamp forever - and lock calm
+        // keeps stamps still while the phase lock is riding out or converging from a
+        // stall. Every verdict is counted; late-but-blocked is logged, because a capture
+        // where corrections were measured and discarded must not read as one with no
+        // late deliveries.
         if (m_dejitter) {
             if (target > m_maxTargetQpc) m_maxTargetQpc = target;
             const bool lockCalm =
                 (m_lockState.stallRun == 0 && m_lockState.recoverRun == 0);
-            m_stampsCorrected += m_ring.CorrectLateStamps(
-                m_maxTargetQpc, &m_lastBatchCorrected, &m_etwConsumer, &m_anchorChain,
-                m_flipCadenceWindowQpc, lockCalm);
+            const long long opens = m_ring.BatchOpens();
+            if (opens - m_nextBatch > CaptureRing::kBatchHistory - 8) {
+                // The walk was pinned (ETW outage, long stall) and the history lapped.
+                // Skip forward and drop the chain: its stride does not span the gap.
+                m_dejitSkipped += (opens - 8) - m_nextBatch;
+                m_nextBatch = opens - 8;
+                m_anchorChain = policy::AnchorChain();
+            }
+            while (m_nextBatch < opens) {
+                const LONGLONG bs = m_ring.BatchStartAt(m_nextBatch);
+                const policy::LateCorrection lc = m_etwConsumer.MeasureLateness(
+                    0, bs, m_anchorChain, m_flipCadenceWindowQpc);
+                // Flip data still in flight: retry THIS batch next present (the chain is
+                // sequential, so later batches wait behind it).
+                if (lc.dataPending) break;
+                m_dejitMeasured++;
+                if (lc.correctionTicks != 0) {
+                    m_dejitLate++;
+                    const char* verdict;
+                    if (!lockCalm) {
+                        m_dejitLockDeclined++;
+                        verdict = "lock-declined";
+                    } else if (bs <= m_maxTargetQpc ||
+                               bs - lc.correctionTicks <= m_maxTargetQpc) {
+                        m_dejitFenceBlocked++;
+                        verdict = "fence-blocked";
+                    } else {
+                        m_overlay.Insert(bs, lc.correctionTicks);
+                        m_dejitCorrected++;
+                        verdict = "corrected";
+                    }
+                    LOG("dejit: batch arr=%lldus late by %lldus, %s",
+                        (long long)((bs - m_baseQpc.QuadPart) * usPerTick),
+                        (long long)(lc.correctionTicks * usPerTick), verdict);
+                }
+                m_nextBatch++;
+            }
         }
 
         FrameBracket bracket;
-        m_ring.FindBracket(target, &bracket);
+        m_ring.FindBracket(target, m_dejitter ? &m_overlay : NULL, &bracket);
 
         // Update the comb-lock pull for the next present. Skipped when the bracket is
         // incomplete (startup, stalls): the pull freezes rather than integrating on a
@@ -447,7 +496,10 @@ void TemporalCaptureMode::Run(
     }
 
     if (m_dejitter) {
-        LOG("dejit: %lld batches had late stamps corrected this session", m_stampsCorrected);
+        LOG("dejit summary: %lld batches measured, %lld late, %lld corrected, "
+            "%lld fence-blocked, %lld lock-declined, %lld skipped",
+            m_dejitMeasured, m_dejitLate, m_dejitCorrected,
+            m_dejitFenceBlocked, m_dejitLockDeclined, m_dejitSkipped);
     }
     m_ring.Stop();
 }
