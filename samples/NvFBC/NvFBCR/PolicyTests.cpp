@@ -857,6 +857,83 @@ static void test_anchor_chain() {
                 "guard, mis-lock tell + re-acquisition\n");
 }
 
+// Stage 6 end to end on a timeline where the truth is CONSTRUCTED: a steady 60x2 source
+// whose flips sit exactly on an 8.33 ms grid, with chosen batches handed over late. A frame
+// rendered on time but delivered late is precisely that - its arrival moves, its FLIP does
+// not - so the correction has a ground truth to be measured against, which no capture can
+// provide (the live run gave exactly one such event, and only its existence, not its size).
+//
+// Sweeping the lateness answers the question captures cannot: how late must a delivery be
+// before correcting it changes an output decision? Below the passthrough gate the ring is
+// still picking the same frame either way, so the honest answer is expected to be "several
+// milliseconds", and a regression that silently narrows the correction's reach shows up
+// here as a sweep row going quiet.
+static void test_dejit_removes_late_blends() {
+    const int64_t kSrc = 16667, kFlip = 8333, kEps = 400, kDelivery = 1300;
+    const int64_t kBase = 1000000, kFrames = 400;
+
+    struct Outcome { int synthOff, synthOn, removed, added; long long corrected, late; };
+    auto run = [&](int64_t lateUs, int everyN) {
+        SimParams p;
+        p.srcPeriod = kSrc; p.presentPeriod = kSrc; p.arrivalJitter = 0;
+        p.combQpc = kSrc; p.presents = 0; p.phaseOffset = 0;
+        p.passthroughQpc = kSrc / 4; p.lagOverride = 0;
+        for (int64_t k = 0; k < kFrames; k++) {
+            // Late deliveries are periodic but sparse, so the chain stays warm between them
+            // exactly as it does in the field; a burst would test re-acquisition instead.
+            const int64_t late = (everyN > 0 && k % everyN == 0 && k > 20) ? lateUs : 0;
+            const int64_t arr = kBase + k * kSrc + late;
+            p.explicitArrivals.push_back(arr);          // generated member (batch opens)
+            p.explicitArrivals.push_back(arr + kEps);   // real member, one flip later
+            // The flips do NOT move: the frames were rendered on time and scanned out on
+            // the grid; only the handover to the capture API slipped.
+            p.flipDisplay.push_back(kBase + k * kSrc);
+            p.flipDisplay.push_back(kBase + k * kSrc + kFlip);
+            p.flipKnown.push_back(kBase + k * kSrc + kDelivery);
+            p.flipKnown.push_back(kBase + k * kSrc + kFlip + kDelivery);
+        }
+        for (int64_t i = 0; i < kFrames; i++) p.explicitPresents.push_back(kBase + i * kSrc);
+        const SimResult off = Simulate(p);
+        p.flipDejitter = true;
+        const SimResult on = Simulate(p);
+        Outcome o{0, 0, 0, 0, on.correctedBatches, on.lateBatches};
+        for (size_t i = 60; i < off.ops.size() && i < on.ops.size(); i++) {
+            const bool a = off.ops[i] == policy::CompositeOp::Synthesize;
+            const bool b = on.ops[i] == policy::CompositeOp::Synthesize;
+            if (a) o.synthOff++;
+            if (b) o.synthOn++;
+            if (a && !b) o.removed++;
+            if (!a && b) o.added++;
+        }
+        return o;
+    };
+
+    // Control: a timeline with NO late deliveries must be untouched. If the correction fires
+    // on a clean grid it is fabricating lateness, which is the failure mode that shipped
+    // once already (a mis-locked chain reading a constant offset as delivery delay).
+    const Outcome clean = run(0, 0);
+    CHECK(clean.removed == 0 && clean.added == 0,
+          "clean grid: dejit changed %d decisions (removed %d, added %d) with nothing late",
+          clean.removed + clean.added, clean.removed, clean.added);
+
+    std::printf("  dejit lateness sweep (every 40th batch late, 400 source frames):\n");
+    int sawRemoval = 0;
+    for (int64_t late : {1500, 3000, 5000, 7000, 9000}) {
+        const Outcome o = run(late, 40);
+        std::printf("      late %5lld us: synth %3d -> %3d  (removed %d, added %d, "
+                    "corrections %lld of %lld late)\n",
+                    (long long)late, o.synthOff, o.synthOn, o.removed, o.added,
+                    o.corrected, o.late);
+        CHECK(o.added == 0,
+              "lateness %lld us: dejit ADDED %d blends", (long long)late, o.added);
+        if (o.removed > 0) sawRemoval++;
+    }
+    CHECK(sawRemoval > 0,
+          "dejit removed no blends at ANY lateness from 1.5 to 9 ms: the correction is a "
+          "no-op and every do-no-harm fixture would still pass");
+    std::printf("  dejit: clean grid untouched; removals appear as lateness grows\n");
+}
+
 static void test_flip_pairing() {
     const int64_t kGrid = 8333;            // 60x2: 120 flips/s
     // Cadence window, in this file's microseconds. The confidence bound is derived from the
@@ -1136,6 +1213,15 @@ struct TraceFixture {
     // that overrides these owns the explanation in a comment beside the override.
     int minPlacedPct = 98;
     int maxAheadPct = 2;
+    // Stage-6 POSITIVE gate: blends this capture's late deliveries cost, which arming the
+    // correction must remove. Every other fixture proves dejit does no HARM; without at
+    // least one that proves it does its JOB, the whole feature could regress to a no-op and
+    // the suite would stay green. -1 = this fixture makes no such claim.
+    int minBlendsRemoved = -1;
+    // Blends the correction may ADD on this capture. 0 for the regimes where it is trusted;
+    // higher where it is measured to churn (see the x3 and FG-off fixtures, which record
+    // real numbers rather than pretending to a cleanliness they do not have). -1 disables.
+    int maxBlendsAdded = -1;
 };
 
 static bool ParseFixture(const std::string& path, TraceFixture* out) {
@@ -1168,6 +1254,12 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         else if (std::strcmp(tag, "field_synth_pct") == 0) { dbl(&out->fieldSynthPct); }
         else if (std::strcmp(tag, "min_placed_pct") == 0)  { num(&n); out->minPlacedPct = (int)n; }
         else if (std::strcmp(tag, "max_ahead_pct") == 0)   { num(&n); out->maxAheadPct = (int)n; }
+        else if (std::strcmp(tag, "min_blends_removed") == 0) {
+            num(&n); out->minBlendsRemoved = (int)n;
+        }
+        else if (std::strcmp(tag, "max_blends_added") == 0) {
+            num(&n); out->maxBlendsAdded = (int)n;
+        }
         else if (std::strcmp(tag, "arrivals") == 0 || std::strcmp(tag, "presents") == 0 ||
                  std::strcmp(tag, "flips_h0") == 0) {
             std::vector<int64_t>* into = &out->presents;
@@ -1487,6 +1579,35 @@ static void test_replay_capture_corpus() {
                   "[%s] only %lld of %lld batches anchored: the stride chain is not "
                   "holding on this capture",
                   fx.description.c_str(), r6.anchoredBatches, r6.measuredBatches);
+
+            // PER-PRESENT DIFF, because aggregates cannot see this: one blend removed here
+            // and one added there nets to zero, and the aggregate share on map-cycle content
+            // is dominated by transition bursts that swamp the isolated gameplay blends
+            // entirely. Reading the aggregate is what led this project to conclude the
+            // feature did nothing, on a capture where it removed a visible artifact.
+            int removed = 0, added = 0, sideSwitch = 0;
+            for (size_t i = kWarmup; i < r.ops.size() && i < r6.ops.size(); i++) {
+                if (r.ops[i] == r6.ops[i]) continue;
+                const bool wasSynth = r.ops[i] == policy::CompositeOp::Synthesize;
+                const bool isSynth = r6.ops[i] == policy::CompositeOp::Synthesize;
+                if (wasSynth && !isSynth) removed++;
+                else if (!wasSynth && isSynth) added++;
+                else sideSwitch++;
+            }
+            std::printf("    stage6 effect: %d blends removed, %d added, %d passthrough "
+                        "side switches\n", removed, added, sideSwitch);
+            if (fx.maxBlendsAdded >= 0) {
+                CHECK(added <= fx.maxBlendsAdded,
+                      "[%s] dejit ADDED %d blends (fixture allows %d): the correction is "
+                      "moving frames away from targets, not onto them",
+                      fx.description.c_str(), added, fx.maxBlendsAdded);
+            }
+            if (fx.minBlendsRemoved >= 0) {
+                CHECK(removed >= fx.minBlendsRemoved,
+                      "[%s] dejit removed %d blends, fixture claims at least %d: this "
+                      "capture's late deliveries are no longer being corrected",
+                      fx.description.c_str(), removed, fx.minBlendsRemoved);
+            }
         }
     }
 }
@@ -2202,6 +2323,7 @@ int main(int argc, char** argv) {
     test_flip_history();
     test_flip_pairing();
     test_anchor_chain();
+    test_dejit_removes_late_blends();
     test_batch_collapse_keep_real();
     test_lock_reseed_wide_bracket_stall();
     test_lock_reseed_stall_paired_cadence();

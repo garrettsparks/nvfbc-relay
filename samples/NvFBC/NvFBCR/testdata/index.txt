@@ -18,3 +18,7 @@ kcd_60x2_join_events.trace
 # composition through the source period; FG-off is 1-member batches on a metronome grid.
 kcd_60x3_walk.trace
 kcd_60x1_fgoff.trace
+# The live -dejit validation run: the only fixture carrying a proven blend REMOVAL (a
+# 5032us late delivery costing an isolated mid-gameplay blend). Every other fixture proves
+# the correction does no harm; this one proves it does its job.
+kcd_60x2_dejit_event.trace

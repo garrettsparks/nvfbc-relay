@@ -245,6 +245,18 @@ FlipPairing AnchorBatch(const FlipHistory& h, uint32_t head, int64_t batchStartT
         int64_t stride = (batchPeriod + spacing / 2) / spacing;
         if (stride < 1) stride = 1;
         if (stride > 8) stride = 8;
+        // KNOWN CEILING, deliberately left symmetric. The gap this divides is measured from
+        // ARRIVALS, and a late batch inflates its own gap by the lateness being measured, so
+        // a batch late by more than half a batch period reads as the NEXT batch arriving
+        // early: the chain predicts two strides ahead, finds nothing, and reports
+        // not-yet-announced. Corrections therefore reach roughly half a batch period
+        // (~8.3 ms at 60x2), not the 3/4 the acceptance bound suggests.
+        //
+        // A quarter-period down-bias fixes the synthetic sweep at 9 ms AND REGRESSES THE
+        // CORPUS: one fixture went from 0 to 10 blends ADDED, i.e. it starts mis-anchoring
+        // real captures. Do not re-apply it without a fixture that proves the wider reach is
+        // worth the mis-anchoring risk; the right shape is probably to disambiguate with the
+        // flip grid rather than to move the rounding boundary.
         const int64_t nBatches =
             (batchStartTs - chain.lastAnchorBatchTs + batchPeriod / 2) / batchPeriod;
         if (nBatches >= 1 && nBatches <= 4) {
