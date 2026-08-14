@@ -62,14 +62,25 @@ private:
     // whether the join affects the flip grid, and an older build differs by more than the
     // join. This is the only arrangement where one binary in one session isolates it.
     bool m_noJoin;
-    // -dejit: subtract each batch's measured delivery lateness from its ring stamps (stage 6,
-    // the phantom-blend fix). Requires -etw with the join on; off, the correction pass never
-    // runs and the ring behaves exactly as before this existed.
+    // -dejit: subtract each batch's measured delivery lateness from its stamps (stage 6,
+    // the phantom-blend fix). Requires -etw with the join on AND the comb lock configured
+    // (the calm gate reads lock state; without a lock it would be vacuously open, running
+    // corrections straight through the stall recoveries it exists to protect). Corrections
+    // live in the overlay, never in the slots; off, FindBracket takes the exact pre-stage-6
+    // read path.
     bool m_dejitter;
     policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
-    LONGLONG m_lastBatchCorrected = 0;   // newest batch start the correction pass has settled
+    policy::StampOverlay m_overlay;      // present-thread-owned; FindBracket reads through it
+    long long m_nextBatch = 0;           // cursor into the ring's batch-start history
     LONGLONG m_maxTargetQpc = 0;         // newest target consumed; the coherence-rule fence
-    long long m_stampsCorrected = 0;     // batches whose stamps moved (summary telemetry)
+    // Session telemetry, all logged at exit: without the blocked counts, a live A/B cannot
+    // distinguish "no late deliveries" from "corrections measured and discarded".
+    long long m_dejitMeasured = 0;
+    long long m_dejitLate = 0;
+    long long m_dejitCorrected = 0;
+    long long m_dejitFenceBlocked = 0;
+    long long m_dejitLockDeclined = 0;
+    long long m_dejitSkipped = 0;        // batches lapped past while the walk was pinned
     EtwFlipConsumer m_etwConsumer;  // inert unless m_etw; nothing in the policy reads it
     // How far back PairBatchMember measures the flip grid's step, in QPC ticks. The
     // confidence bound it accepts is derived from that measurement, so nothing here needs to

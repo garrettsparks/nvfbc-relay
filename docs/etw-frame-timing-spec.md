@@ -194,31 +194,66 @@ that structurally miss the upgrade window (a member's flip cannot be known befor
 displays, and upgrades run at present granularity) sit 8.33 ms off-base among corrected
 neighbours, poisoning every bracket they touch.
 
-**What shipped instead** (`-dejit`, requires `-etw` with the join on): measure each batch's
-delivery lateness - batch start minus its stride-anchored flip - and SUBTRACT it from the
-batch's stamps. The timeline stays on the arrival base, so the batch-start/lock-phase
-cancellation is untouched and no re-phasing exists to get wrong; on-time batches are left
-alone entirely; only the late outliers that force phantom blends move, back to where their
-frames were rendered. Four gates, each earned by a measured failure in replay:
+**What shipped instead** (`-dejit`, requires `-etw` with the join on AND `-lock -src`):
+measure each batch's delivery lateness - batch start minus its stride-anchored flip - and
+subtract it AT BRACKET-READ TIME through a correction overlay (`policy::StampOverlay`),
+keyed by the batch-start stamp every member shares. **Nothing ever mutates a ring slot**:
+the capture thread stays the slots' only writer (the first build wrote corrections into
+slots from the present thread, one slot of slack from the capture thread's write frontier -
+an unsynchronized race an adversarial review caught before any capture was spent on it).
+The overlay also removes ordering entirely: a member published after its batch was measured
+inherits the correction by lookup, and a recycled slot cannot inherit a stale one because
+its stamp is a different key. The walk reads batch starts from a small single-producer ring
+the capture thread appends at batch open, never from slot fields. The timeline stays on the
+arrival base, so the batch-start/lock-phase cancellation is untouched; on-time batches are
+left alone entirely.
+
+The gates, each earned by a measured failure in replay:
 
 - **Stride-chained anchoring** (`policy::AnchorBatch`): the median phantom event is ~7.6 ms
   late = 0.9 flip steps, which the stateless quarter-step nearest-anchor MIS-anchors by
-  construction. Prediction from the previous anchor (+2 flips, 94.9% rigid) reads the true
-  lateness; the stateless rule is only the re-acquisition path.
-- **Late-only**: lateness is physically one-sided. A batch reading "early" past the gate is
-  a mis-anchored prediction; correcting one moved an after-frame 1.28 ms LATER at a
-  passthrough-gate boundary dwell and stretched a 50-present synth dwell to 59.
-- **Chain warm-up** (8 batches after re-acquisition) and **lock calm** (no corrections while
-  the phase lock rides out or converges from a stall): the same dwell reached 72 without.
-- **The coherence rule**, unchanged from the original design: a stamp never moves unless
-  both its old and new values are strictly newer than the newest target the policy has
-  consumed.
+  construction. Prediction from the previous anchor reads the true lateness; the stateless
+  rule is only the re-acquisition path.
+- **The stride is DERIVED, never assumed**: batch period (median of recent batch-start
+  gaps) over flip spacing, both measured. The first build hardcoded 2, which is correct for
+  the pair submission at 60x2 and 60x3 but structurally unable to anchor with frame
+  generation off - it predicted one flip ahead of every batch and never warmed. Multi-batch
+  gaps predict round(gap / batch period) batches ahead, which closes the one-flip alias
+  where a post-drop batch was "corrected" a full period into the past.
+- **The constant-lateness tell**: genuine lateness is a TRANSIENT (a delivery backlog that
+  drains within a batch or two, late-then-catch-up; the capture API holds no standing
+  queue). A chain that has slipped one flip reads a constant +one-step lateness forever, so
+  three consecutive above-gate readings re-acquire through the quarter-step rule, which
+  only accepts on-grid batches and therefore restores the true residue. Without this tell a
+  mis-locked chain fabricated ~8.3 ms corrections for 11% of a steady walk - and the
+  fabrication was only visible because the replay was cross-checked against the fixture's
+  own flip list; the bounds alone had hidden it through a feedback accident.
+- **Late-only** (an eighth of a step past the grid): lateness is physically one-sided; an
+  "early" reading past the gate is a mis-anchor, and correcting one stretched a 50-present
+  synth dwell to 59.
+- **Chain warm-up** (8 batches after re-acquisition) and **lock calm** (no corrections
+  while the phase lock rides out or converges from a stall; `-dejit` without the lock is
+  REFUSED because the calm gate would be vacuously open): the same dwell reached 72 without.
+- **The coherence rule**, unchanged: a correction is inserted only while both the batch
+  stamp and its corrected value are strictly newer than the newest target the policy has
+  consumed; after insertion the effective stamp never changes again.
 
-Replay-validated on the full corpus (now five fixtures; `kcd_60x2_join_events` carries real
-late-delivery events WITH flip data): clean walk 1.4% -> 1.3% synth, jitter walk 1.1% -> 1.1%,
-event fixture 8.4% -> 8.3% with the worst synth run 50 -> 45 and no runs over 50. Every
-correction logs a `dejit:` line beside the arr= timeline it amends, and the session total
-logs at exit.
+**The sim and production share the same walk semantics by construction** (same
+`MeasureLateness`, same overlay, same fence order; the overlay design has no settlement
+timing to diverge on). This matters because the first build's sim and production DID
+diverge - production had a growing-batch wait the sim didn't model, which pushed ~95% of
+its corrections into the coherence fence; the corpus gate was green on behavior the binary
+could not reproduce. Every batch verdict is counted and logged (measured / late / corrected
+/ fence-blocked / lock-declined / skipped), so a live A/B can distinguish "no late
+deliveries" from "corrections measured and discarded".
+
+Replay-validated on the full corpus (five fixtures; `kcd_60x2_join_events` carries real
+late-delivery events WITH flip data): clean walk 1.4% -> 1.3% synth (31 corrections, all
+isolated genuine events), jitter walk 1.1% -> 1.1%, event fixture 8.4% -> 8.3% with the
+worst synth run 50 -> 45 and no runs over 50 - on 25 corrections, because the tell refuses
+the chain through stalls and the handful of decisive corrections carry the whole win.
+`test_anchor_chain` pins the three regimes the KCD corpus cannot: FG-off stride derivation,
+the dropped-batch alias, and mis-lock recovery.
 
 ## What the scanout grid actually looks like
 
