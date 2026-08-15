@@ -42,6 +42,19 @@ static const int kRecoverPresents = 16;   // about 0.27 s at 60 Hz
 static const int kRecoverAlpha    = 2;    // error-EMA divisor while recovering (16 otherwise)
 static const int kRecoverSlewDiv  = 32;   // slew cap of comb/32 while recovering
 
+// How far past a search boundary the backward flip walks keep looking before giving up.
+// Both walks rely on flips on ONE head arriving in display order - measured 0 inversions over
+// 400k flips, and counted at runtime by FlipHistory::OutOfOrder() rather than assumed - and
+// this is margin against a violation. One 30 Hz source period: ample for any reordering a
+// driver could plausibly emit, and cheap because it is a handful of extra entries either way.
+//
+// UNITS: microseconds, the one place in this file that is not unit-agnostic. That is
+// tolerable ONLY because it is slack rather than a threshold: the QPC-tick callers (10 MHz,
+// where this reads as 3.3 ms) get a tighter-but-still-ample margin instead of a wrong answer,
+// and no corpus capture's output moves when the slack is removed altogether. Widening it
+// costs only scan length. If it ever becomes a threshold, it has to become a parameter.
+static const int64_t kReorderSlack = 33333;
+
 void FlipHistory::Add(const Flip& f) {
     if (f.head < kMaxHeadsTracked) {
         if (m_lastTsByHead[f.head] != 0 && f.displayTs < m_lastTsByHead[f.head]) m_outOfOrder++;
@@ -74,7 +87,7 @@ const Flip* FlipHistory::NewestAtOrBefore(int64_t ts, uint32_t head) const {
         if (!best || f.displayTs > best->displayTs) best = &m_ring[(m_head + i) % kCapacity];
         // One full source period of older entries is ample slack to cover any reordering
         // the driver could plausibly emit; beyond that, older flips cannot win.
-        if (best && f.displayTs < best->displayTs - 33333) break;
+        if (best && f.displayTs < best->displayTs - kReorderSlack) break;
     }
     return best;
 }
@@ -96,21 +109,45 @@ int64_t FlipHistory::MedianSpacing(int64_t lo, int64_t hi, uint32_t head) const 
     // the display never ran at, and the whole point of reading these is to stop assuming.
     // Keeps the NEWEST kMaxSpacingSamples gaps, because a cadence that changed mid-window
     // should read as the current one rather than an average of two regimes.
+    //
+    // NEWEST FIRST, STOPPING EARLY, because every caller asks about a recent window: the
+    // forward scan walked all 2048 retained flips to reach the ~24 gaps a 200 ms window holds
+    // at 60x2. Measured: 2048 entries touched and 2008 ns a call, against 43 entries and
+    // 157 ns here - 12.8x, and the scan (not the sort) was the whole cost.
+    //
+    // NOT a binary search, which this ring cannot support: flips are stored in ANNOUNCEMENT
+    // order with heads interleaved, so displayTs across the whole ring is 17% inverted
+    // (measured over 400k flips, worst backward jump 45.7 ms). What the early exit needs is
+    // only PER-HEAD monotonicity - 0 inversions over the same 400k, and counted at runtime by
+    // OutOfOrder() rather than assumed - because head-matching entries then appear in
+    // decreasing displayTs and nothing older can qualify once one falls below the window.
+    //
+    // FILTERING THE HEAD BEFORE TESTING THE BOUNDARY IS LOAD-BEARING, and the corpus cannot
+    // show it: every fixture is single-head (mktrace.py keeps head 0), so no amount of
+    // replayed capture exercises an interleaved ring. Live it is interleaved, and a head-1
+    // flip is announced beside a head-0 flip displaying up to 42.8 ms later, so a boundary
+    // test that ran first would break out on a trailing head-1 entry and abandon head-0 flips
+    // still inside the window. test_flip_history pins it.
+    //
+    // kReorderSlack, by contrast, is DEFENSIVE rather than tuned: removing it entirely leaves
+    // all eight captures byte-identical, because per-head inversions do not occur. It stays
+    // because it costs nothing and the failure it guards is a quietly short window rather
+    // than a loud error.
     int64_t gaps[kMaxSpacingSamples];
-    int n = 0, write = 0;
-    int64_t prev = 0;
-    bool havePrev = false;
-    for (int i = 0; i < m_count; i++) {
+    int n = 0;
+    int64_t next = 0;
+    bool haveNext = false;
+    for (int i = m_count - 1; i >= 0; i--) {
         const Flip& f = At(i);
         if (f.head != head) continue;
+        if (f.displayTs < lo - kReorderSlack) break;
         if (f.displayTs < lo || f.displayTs > hi) continue;
-        if (havePrev && f.displayTs > prev) {
-            gaps[write] = f.displayTs - prev;
-            write = (write + 1) % kMaxSpacingSamples;
-            if (n < kMaxSpacingSamples) n++;
+        if (haveNext && next > f.displayTs) {
+            gaps[n++] = next - f.displayTs;
+            if (n == kMaxSpacingSamples) break;   // the newest cap-many, same as before
         }
-        prev = f.displayTs;
-        havePrev = true;
+        next = f.displayTs;
+        haveNext = true;
     }
     if (n == 0) return 0;
     int64_t sorted[kMaxSpacingSamples];
@@ -143,16 +180,26 @@ BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTic
     return d;
 }
 
-FlipPairing PairBatchMember(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
-                            int member, int64_t cadenceWindow) {
+// MEASURED SPACING IS PASSED, NOT RE-DERIVED. One walk of MeasureLateness used to measure
+// the grid step up to three times from identical arguments - here, in AnchorBatch, and again
+// in AnchorBatch's re-acquisition call back into this function - and each one is a full scan
+// of the flip ring. Measured at 2048 flips: 1693 ns a call, of which the sort is nothing (the
+// scan-only InRange over the same window costs 1955 ns) because a 200 ms window holds ~24
+// gaps, not the 256 the sample cap allows.
+//
+// The spacing is a private parameter rather than a public one on purpose. Every caller below
+// is inside this file and passes a value measured from the same window on the same unmutated
+// history, so the three lookups cannot disagree; a public spacing parameter would let a
+// caller pass one measured elsewhere, and a wrong grid step does not fail loudly here - it
+// mis-anchors, which is the exact shape of the bugs this file has already paid for (the
+// hardcoded stride 2, the fixed 1 ms anchor bound, the mis-locked chain fabricating 8.3 ms
+// corrections). The public entry points keep measuring it themselves.
+static FlipPairing PairBatchMemberAt(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
+                                     int member, int64_t spacing) {
     // Wide enough to hold the anchor, this member's flip, and a flip of slack on each side.
     static const int kLookup = 16;
     FlipPairing r;
-    if (member < 0 || member + 2 > kLookup || cadenceWindow <= 0) return r;
-
-    // The cadence is measured, never assumed: the flip rate is the frame-generation
-    // multiplier times the source rate and neither is declared here.
-    const int64_t spacing = h.MedianSpacing(batchStartTs - cadenceWindow, batchStartTs, head);
+    if (member < 0 || member + 2 > kLookup) return r;
     if (spacing <= 0) return r;   // no cadence yet: not an anomaly, just no data
     // Quarter of a step: ambiguity starts at half, so this keeps a 2x margin. See the header
     // for why this is derived rather than configured.
@@ -200,6 +247,15 @@ FlipPairing PairBatchMember(const FlipHistory& h, uint32_t head, int64_t batchSt
     return r;
 }
 
+FlipPairing PairBatchMember(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
+                            int member, int64_t cadenceWindow) {
+    if (cadenceWindow <= 0) return FlipPairing();
+    // The cadence is measured, never assumed: the flip rate is the frame-generation
+    // multiplier times the source rate and neither is declared here.
+    return PairBatchMemberAt(h, head, batchStartTs, member,
+                             h.MedianSpacing(batchStartTs - cadenceWindow, batchStartTs, head));
+}
+
 // Median of the chain's recorded batch gaps: the measured batch period. Zero until enough
 // gaps exist to be a cadence rather than an anecdote.
 static int64_t ChainBatchPeriod(const AnchorChain& chain) {
@@ -216,12 +272,11 @@ static int64_t ChainBatchPeriod(const AnchorChain& chain) {
     return sorted[n / 2];
 }
 
-FlipPairing AnchorBatch(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
-                        AnchorChain& chain, int64_t cadenceWindow) {
+// Spacing passed rather than re-derived; see PairBatchMemberAt for why it stays private.
+static FlipPairing AnchorBatchAt(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
+                                 AnchorChain& chain, int64_t spacing) {
     static const int kLookup = 16;
     FlipPairing r;
-    if (cadenceWindow <= 0) return r;
-    const int64_t spacing = h.MedianSpacing(batchStartTs - cadenceWindow, batchStartTs, head);
     if (spacing <= 0) return r;
 
     // Record the batch-start gap once per batch. Guarded on the batch actually changing,
@@ -331,7 +386,7 @@ FlipPairing AnchorBatch(const FlipHistory& h, uint32_t head, int64_t batchStartT
     // arrived on time - exactly the batches it accepts (quarter-step bound). Eight batches
     // of proven stride before corrections trust the chain; the gap window refills in
     // parallel and ChainBatchPeriod gates prediction until it has.
-    const FlipPairing acq = PairBatchMember(h, head, batchStartTs, 0, cadenceWindow);
+    const FlipPairing acq = PairBatchMemberAt(h, head, batchStartTs, 0, spacing);
     if (acq.paired) {
         chain.lastAnchorTs = acq.displayTs;
         chain.lastAnchorBatchTs = batchStartTs;
@@ -341,16 +396,27 @@ FlipPairing AnchorBatch(const FlipHistory& h, uint32_t head, int64_t batchStartT
     return acq;
 }
 
+FlipPairing AnchorBatch(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
+                        AnchorChain& chain, int64_t cadenceWindow) {
+    if (cadenceWindow <= 0) return FlipPairing();
+    return AnchorBatchAt(h, head, batchStartTs, chain,
+                         h.MedianSpacing(batchStartTs - cadenceWindow, batchStartTs, head));
+}
+
 LateCorrection MeasureLateness(const FlipHistory& h, uint32_t head, int64_t batchStartTs,
                                AnchorChain& chain, int64_t cadenceWindow) {
     LateCorrection out;
-    const FlipPairing fp = AnchorBatch(h, head, batchStartTs, chain, cadenceWindow);
+    if (cadenceWindow <= 0) return out;
+    // Measured ONCE for the whole walk: the anchor lookup, the re-acquisition path and the
+    // late-only gate below all read the same grid step, so measuring it per-consumer bought
+    // nothing but two extra scans of the flip ring.
+    const int64_t spacing = h.MedianSpacing(batchStartTs - cadenceWindow, batchStartTs, head);
+    const FlipPairing fp = AnchorBatchAt(h, head, batchStartTs, chain, spacing);
     if (!fp.paired) {
         out.dataPending = fp.memberAhead;
         return out;
     }
     if (!fp.chainWarm) return out;
-    const int64_t spacing = h.MedianSpacing(batchStartTs - cadenceWindow, batchStartTs, head);
     if (spacing > 0 && fp.anchorOffset > spacing / 8) out.correctionTicks = fp.anchorOffset;
     return out;
 }
