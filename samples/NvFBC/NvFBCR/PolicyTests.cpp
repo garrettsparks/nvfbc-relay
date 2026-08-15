@@ -94,6 +94,7 @@ struct SimResult {
     long long correctedBatches = 0;
     long long fenceBlockedBatches = 0;
     long long lockDeclinedBatches = 0;
+    long long churnDeclinedBatches = 0;
     long long anchoredBatches = 0;
 };
 
@@ -294,6 +295,7 @@ static SimResult Simulate(const SimParams& p) {
                 // order-dependent, so later batches wait behind it).
                 if (lc.dataPending) break;
                 r.measuredBatches++;
+                if (lc.gridChurn) r.churnDeclinedBatches++;
                 if (chain.valid) r.anchoredBatches++;
                 const bool lockCalm = (lock.stallRun == 0 && lock.recoverRun == 0);
                 if (lc.correctionTicks != 0) {
@@ -892,7 +894,15 @@ static void test_dejit_removes_late_blends() {
             p.flipKnown.push_back(kBase + k * kSrc + kDelivery);
             p.flipKnown.push_back(kBase + k * kSrc + kFlip + kDelivery);
         }
-        for (int64_t i = 0; i < kFrames; i++) p.explicitPresents.push_back(kBase + i * kSrc);
+        // Presents are PHASE-OFFSET from arrivals by half a source period. Real capture and
+        // present clocks are independent and the comb lock settles at some arbitrary phase;
+        // putting both on the identical grid makes every batch get measured at the instant
+        // it arrives, BEFORE its flip is delivered ~1.3 ms later, so the chain can only ever
+        // acquire by accident. That artifact - not the code - is why an earlier version of
+        // this sweep reported zero corrections at 3 ms and 5 ms while a standalone probe of
+        // the same function fired correctly.
+        for (int64_t i = 0; i < kFrames; i++)
+            p.explicitPresents.push_back(kBase + i * kSrc + kSrc / 2);
         const SimResult off = Simulate(p);
         p.flipDejitter = true;
         const SimResult on = Simulate(p);
@@ -1564,10 +1574,11 @@ static void test_replay_capture_corpus() {
             const double synthPct6 = 100.0 * synth6 / (double)(r6.ops.size() - kWarmup);
             std::printf("    stage6 dejitter: synth %.1f%%, runs>=50 %d, worst %d; "
                         "batches %lld anchored %lld late %lld corrected %lld "
-                        "fence-blocked %lld lock-declined %lld\n",
+                        "fence-blocked %lld lock-declined %lld churn-declined %lld\n",
                         synthPct6, longRuns6, worst6, r6.measuredBatches,
                         r6.anchoredBatches, r6.lateBatches, r6.correctedBatches,
-                        r6.fenceBlockedBatches, r6.lockDeclinedBatches);
+                        r6.fenceBlockedBatches, r6.lockDeclinedBatches,
+                        r6.churnDeclinedBatches);
             CHECK(synthPct6 <= fx.maxSynthPct,
                   "[%s] DEJITTERED synth share %.1f%% exceeds the fixture bound %.1f%%: "
                   "the correction is doing harm on a steady capture",

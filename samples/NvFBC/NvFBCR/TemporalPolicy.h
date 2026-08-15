@@ -137,7 +137,16 @@ public:
 
     // Median spacing between consecutive flips on a head inside the window, or 0 when
     // fewer than two are present. The measured cadence, never an assumed one.
-    int64_t MedianSpacing(int64_t lo, int64_t hi, uint32_t head) const;
+    //
+    // stationaryPct, when non-null, receives the percentage of the window's gaps lying
+    // within 25% of that median - whether the window saw ONE grid or a mix. A display mid
+    // regime change (alt-tab, mode switch) feeds the window flips from two cadences at
+    // once, and the median of a mixed population describes neither: measured at such a
+    // churn, gap quartiles ran 3856/25317/29474 us with only 50% of gaps near the median,
+    // against 95%+ on every healthy grid (including the jittery ones). The median alone
+    // cannot report its own uselessness; this can.
+    int64_t MedianSpacing(int64_t lo, int64_t hi, uint32_t head,
+                          int* stationaryPct = 0) const;
 
 private:
     Flip m_ring[kCapacity];
@@ -159,6 +168,9 @@ struct FlipPairing {
     bool anchorFound = false;  // a flip sat near the batch start
     bool memberAhead = false;  // anchor found, but this member's flip is not announced yet
     bool gridGap = false;      // anchor found and the member's flip is missing from the grid
+    // AnchorBatch only: the cadence window straddles a grid regime change, so the batch was
+    // declined without touching the chain. Not a failure to anchor; a refusal to.
+    bool gridChurn = false;
     // AnchorBatch only: this anchor came from a chain whose stride has held since its last
     // re-acquisition long enough to be trusted for stamp corrections.
     bool chainWarm = false;
@@ -284,6 +296,11 @@ struct LateCorrection {
     // Flip data for this batch has not been delivered yet. The chain is sequential state,
     // so the caller must retry THIS batch next present rather than skipping past it.
     bool dataPending = false;
+    // The batch was declined because the cadence window straddles a grid regime change
+    // (see FlipPairing::gridChurn). Counted so a live run can tell "nothing was late"
+    // from "the gate was closed" - a gate that can decline silently is a gate that can
+    // decline everything silently.
+    bool gridChurn = false;
     int64_t correctionTicks = 0;   // subtract from the batch's stamps; 0 = leave them
 };
 

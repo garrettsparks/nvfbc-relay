@@ -13,15 +13,23 @@ Bounds are deliberately NOT written here: they describe the model, which only th
 can measure. Run the suite once and it prints the lines to paste.
 
   usage: uv run samples/NvFBC/NvFBCR/testdata/mktrace.py \
-             <log> samples/NvFBC/NvFBCR/testdata/<name>.trace "<description>" [--skip-us N]
+             <log> samples/NvFBC/NvFBCR/testdata/<name>.trace "<description>"
+             [--skip-us N] [--until-us N]
   then add <name>.trace to index.txt and run the suite: it prints the bounds.
 
---skip-us drops everything before an absolute log time, for a fixture that must isolate one
-regime. A capture whose early minutes carry source hitches reports the hitch recovery as its
-headline synth share, which buries a steady-state regression: measured on the 60x2 walk,
-whole-log synth is 9.1% against 1.1% past the hitches, so a steady-state doubling would sit
-inside any bound loose enough to hold the whole log. Trim only when another fixture already
-covers the regime being cut; stall recovery lives in the map-cycle fixtures.
+--skip-us drops everything before an absolute log time, and --until-us everything at or
+after one, for a fixture that must isolate one regime. A capture whose early minutes carry
+source hitches reports the hitch recovery as its headline synth share, which buries a
+steady-state regression: measured on the 60x2 walk, whole-log synth is 9.1% against 1.1%
+past the hitches, so a steady-state doubling would sit inside any bound loose enough to hold
+the whole log. Trim only when another fixture already covers the regime being cut; stall
+recovery lives in the map-cycle fixtures.
+
+A long session usually needs BOTH ends cut, because the desktop before and after the game
+is a different regime at a different rate: on the hour-long gameplay capture the post-exit
+240 Hz tail was 6% of presents but 28% of all synthesized frames, and the replay model
+tracks it far worse than gameplay (74% of synth decisions against 97%). Left in, it sets
+every bound in the fixture and gates nothing anyone plays through.
 """
 import re, sys, os
 
@@ -35,10 +43,18 @@ WARMUP = 200          # must match the test: skips the lock's cold-start acquisi
 def main():
     argv = [a for a in sys.argv[1:]]
     skip_us = 0
+    until_us = None
     if "--skip-us" in argv:
         i = argv.index("--skip-us")
         skip_us = int(argv[i + 1])
         del argv[i:i + 2]
+    if "--until-us" in argv:
+        i = argv.index("--until-us")
+        until_us = int(argv[i + 1])
+        del argv[i:i + 2]
+
+    def keep(v):
+        return v >= skip_us and (until_us is None or v < until_us)
     if len(argv) < 2:
         print(__doc__); return 2
     src, out = argv[0], argv[1]
@@ -53,19 +69,19 @@ def main():
         m = CAP.search(line)
         if m:
             v = int(m.group(1))
-            if v >= skip_us: arr.append(v)
+            if keep(v): arr.append(v)
             continue
         m = PRE.search(line)
         if m:
             v = int(m.group(1))
-            if v >= skip_us:
+            if keep(v):
                 pres.append(v)
                 synth.append("op=synth" in line)
             continue
         m = FLIP.search(line)
         if m and m.group(4) == "0":
             disp, evt, lag = int(m.group(1)), int(m.group(2)), m.group(3)
-            if disp < skip_us:
+            if not keep(disp):
                 continue
             flips.append(disp)
             if lag is None:

@@ -297,6 +297,7 @@ void TemporalCaptureMode::Run(
                 // sequential, so later batches wait behind it).
                 if (lc.dataPending) break;
                 m_dejitMeasured++;
+                if (lc.gridChurn) m_dejitChurnDeclined++;
                 if (lc.correctionTicks != 0) {
                     m_dejitLate++;
                     const char* verdict;
@@ -504,9 +505,9 @@ void TemporalCaptureMode::Run(
 
     if (m_dejitter) {
         LOG("dejit summary: %lld batches measured, %lld late, %lld corrected, "
-            "%lld fence-blocked, %lld lock-declined, %lld skipped",
+            "%lld fence-blocked, %lld lock-declined, %lld churn-declined, %lld skipped",
             m_dejitMeasured, m_dejitLate, m_dejitCorrected,
-            m_dejitFenceBlocked, m_dejitLockDeclined, m_dejitSkipped);
+            m_dejitFenceBlocked, m_dejitLockDeclined, m_dejitChurnDeclined, m_dejitSkipped);
     }
     m_ring.Stop();
 }

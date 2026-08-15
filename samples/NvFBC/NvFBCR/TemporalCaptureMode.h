@@ -80,6 +80,7 @@ private:
     long long m_dejitCorrected = 0;
     long long m_dejitFenceBlocked = 0;
     long long m_dejitLockDeclined = 0;
+    long long m_dejitChurnDeclined = 0;  // cadence window straddled a grid regime change
     long long m_dejitSkipped = 0;        // batches lapped past while the walk was pinned
     EtwFlipConsumer m_etwConsumer;  // inert unless m_etw; nothing in the policy reads it
     // How far back PairBatchMember measures the flip grid's step, in QPC ticks. The

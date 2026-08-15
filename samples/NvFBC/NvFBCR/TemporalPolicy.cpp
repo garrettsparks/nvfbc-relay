@@ -91,7 +91,9 @@ int FlipHistory::InRange(int64_t lo, int64_t hi, uint32_t head,
     return n;
 }
 
-int64_t FlipHistory::MedianSpacing(int64_t lo, int64_t hi, uint32_t head) const {
+int64_t FlipHistory::MedianSpacing(int64_t lo, int64_t hi, uint32_t head,
+                                   int* stationaryPct) const {
+    if (stationaryPct) *stationaryPct = 0;
     // Median, not mean: one dropped or duplicated flip would drag a mean toward a cadence
     // the display never ran at, and the whole point of reading these is to stop assuming.
     // Keeps the NEWEST kMaxSpacingSamples gaps, because a cadence that changed mid-window
@@ -121,7 +123,14 @@ int64_t FlipHistory::MedianSpacing(int64_t lo, int64_t hi, uint32_t head) const 
         while (j >= 0 && sorted[j] > v) { sorted[j + 1] = sorted[j]; j--; }
         sorted[j + 1] = v;
     }
-    return sorted[n / 2];
+    const int64_t median = sorted[n / 2];
+    if (stationaryPct) {
+        int near = 0;
+        for (int i = 0; i < n; i++)
+            if (sorted[i] >= median - median / 4 && sorted[i] <= median + median / 4) near++;
+        *stationaryPct = (near * 100) / n;
+    }
+    return median;
 }
 
 BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTicks) {
@@ -221,8 +230,30 @@ FlipPairing AnchorBatch(const FlipHistory& h, uint32_t head, int64_t batchStartT
     static const int kLookup = 16;
     FlipPairing r;
     if (cadenceWindow <= 0) return r;
-    const int64_t spacing = h.MedianSpacing(batchStartTs - cadenceWindow, batchStartTs, head);
+    int stationaryPct = 0;
+    const int64_t spacing = h.MedianSpacing(batchStartTs - cadenceWindow, batchStartTs, head,
+                                            &stationaryPct);
     if (spacing <= 0) return r;
+
+    // GRID STATIONARITY GATE: while the cadence window straddles a regime change (alt-tab,
+    // mode switch), decline the batch outright - no anchor, no gap recorded, no chain
+    // verdict. Everything below divides by or compares against this spacing (the stride,
+    // the prediction window, the acceptance bound, the batch period's own gaps), so when
+    // the window mixes two grids they are all fiction at once and the chain accepts anchors
+    // it should refuse: measured at an FG-off alt-tab, every added blend sat inside the one
+    // second the mixed window lasted, with frames moved 5-9 ms AWAY from their targets.
+    //
+    // Declining is deliberately NOT invalidation. Invalidation was tried and does not fix
+    // this, because the chain then re-acquires DURING the churn and locks onto a spacing
+    // measured from the corrupted window - corrupted compared against corrupted. The chain
+    // instead waits the window out untouched; lastSeenBatchTs stays current so the first
+    // post-churn gap is measured clean instead of spanning the declined stretch.
+    static const int kMinStationaryPct = 80;   // healthy grids run 95%+, a churn ~50%
+    if (stationaryPct < kMinStationaryPct) {
+        chain.lastSeenBatchTs = batchStartTs;
+        r.gridChurn = true;
+        return r;
+    }
 
     // Record the batch-start gap once per batch. Guarded on the batch actually changing,
     // because a dataPending retry re-offers the SAME batch and must not re-record it.
@@ -347,6 +378,7 @@ LateCorrection MeasureLateness(const FlipHistory& h, uint32_t head, int64_t batc
     const FlipPairing fp = AnchorBatch(h, head, batchStartTs, chain, cadenceWindow);
     if (!fp.paired) {
         out.dataPending = fp.memberAhead;
+        out.gridChurn = fp.gridChurn;
         return out;
     }
     if (!fp.chainWarm) return out;
