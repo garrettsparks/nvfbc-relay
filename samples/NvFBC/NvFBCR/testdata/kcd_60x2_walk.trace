@@ -16,6 +16,7 @@ field_synth_pct 1.1
 # fixtures already cover twice, and leaving them in put whole-log synth at 9.1%.
 # Stage-6 per-present gate: on x2 the correction only ever moves frames ONTO targets.
 max_blends_added 0
+min_blends_removed 8
 max_worst_run 8
 max_long_runs 0
 max_synth_pct 1.8

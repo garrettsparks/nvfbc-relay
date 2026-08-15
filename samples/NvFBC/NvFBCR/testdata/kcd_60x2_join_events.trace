@@ -8,7 +8,12 @@ field_worst_run 50
 field_long_runs 1
 field_synth_pct 7.7
 # Stage-6 per-present gate: on x2 the correction only ever moves frames ONTO targets.
+# The removal floor is load-bearing: an anchoring change once cut this fixture's removals
+# 7 -> 2 while every declared bound stayed green, because only the additions were gated.
+# This fixture's removals live at hitch/stall neighborhoods, so it is the first to starve
+# when a gate declines ragged-but-real content.
 max_blends_added 0
+min_blends_removed 7
 max_worst_run 50
 max_long_runs 1
 max_synth_pct 8.8
