@@ -22,3 +22,10 @@ kcd_60x1_fgoff.trace
 # 5032us late delivery costing an isolated mid-gameplay blend). Every other fixture proves
 # the correction does no harm; this one proves it does its job.
 kcd_60x2_dejit_event.trace
+# 69 minutes of real streamed gameplay, desktop trimmed off both ends. Every other fixture
+# is minutes of map cycles or walking at 8-9% synth; this one is an hour of the content the
+# relay actually ships, at 0.6%, where blends are ISOLATED events rather than transition
+# bursts. It is the only fixture long enough to measure the isolated-blend rate at all
+# (75 removals, 73 of them single-frame events), and the only one carrying the once-per-
+# second NvFBC delivery hitch that produces half of them.
+gm_60x2_gameplay_hour.trace

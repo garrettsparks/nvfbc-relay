@@ -892,7 +892,15 @@ static void test_dejit_removes_late_blends() {
             p.flipKnown.push_back(kBase + k * kSrc + kDelivery);
             p.flipKnown.push_back(kBase + k * kSrc + kFlip + kDelivery);
         }
-        for (int64_t i = 0; i < kFrames; i++) p.explicitPresents.push_back(kBase + i * kSrc);
+        // Presents are PHASE-OFFSET from arrivals by half a source period. Real capture and
+        // present clocks are independent and the comb lock settles at some arbitrary phase;
+        // putting both on the identical grid makes every batch get measured at the instant
+        // it arrives, BEFORE its flip is delivered ~1.3 ms later, so the chain can only ever
+        // acquire by accident. That artifact - not the code - is why an earlier version of
+        // this sweep reported zero corrections at 3 ms and 5 ms while a standalone probe of
+        // the same function fired correctly.
+        for (int64_t i = 0; i < kFrames; i++)
+            p.explicitPresents.push_back(kBase + i * kSrc + kSrc / 2);
         const SimResult off = Simulate(p);
         p.flipDejitter = true;
         const SimResult on = Simulate(p);

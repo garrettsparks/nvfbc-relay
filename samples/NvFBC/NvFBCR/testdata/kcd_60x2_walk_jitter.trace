@@ -15,6 +15,7 @@ field_synth_pct 1.1
 # The relay's own output is unaffected by the jitter, which is itself the finding.
 # Stage-6 per-present gate: on x2 the correction only ever moves frames ONTO targets.
 max_blends_added 0
+min_blends_removed 2
 max_worst_run 7
 max_long_runs 0
 max_synth_pct 1.5
