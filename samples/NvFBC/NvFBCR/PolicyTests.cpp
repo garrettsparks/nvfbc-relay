@@ -1571,9 +1571,21 @@ static void test_replay_capture_corpus() {
         for (size_t i = kWarmup; i < r.snapped.size(); i++) if (r.snapped[i]) reseeds++;
         const double synthPct = 100.0 * synth / (double)(r.ops.size() - kWarmup);
 
+        // The fixture's own time window, printed because every wrong verdict this project has
+        // reached came from comparing two populations windowed differently. Twice it was a
+        // corpus number set beside a whole-run log summary: a fixture trimmed to gameplay was
+        // read against a log covering the desktop at both ends, and the difference was
+        // reported as a model divergence that did not exist. The rule "window every capture
+        // identically" was already written down both times. A number on the line is harder to
+        // skip than a rule you have to remember, so before setting anything here beside a
+        // figure from an NvFBCR.log, check the log covers THIS span and no more.
+        const double spanStart = fx.presents.empty() ? 0.0 : fx.presents.front() / 1e6;
+        const double spanEnd = fx.presents.empty() ? 0.0 : fx.presents.back() / 1e6;
         std::printf("  corpus [%s]\n"
+                    "    window: log t %.1fs..%.1fs (%.1f min, %zu presents)\n"
                     "    replay: synth %.1f%%, runs>=50 %d, worst %d, re-seeds %d\n",
                     fx.description.empty() ? path.c_str() : fx.description.c_str(),
+                    spanStart, spanEnd, (spanEnd - spanStart) / 60.0, fx.presents.size(),
                     synthPct, longRuns, worst, reseeds);
         if (fx.fieldWorstRun >= 0) {
             std::printf("    field : synth %.1f%%, runs>=50 %d, worst %d\n",
