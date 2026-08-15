@@ -723,6 +723,72 @@ static void test_flip_history() {
           "head 1 cadence should be the source period %lld, got %lld",
           (long long)kSrc, (long long)h.MedianSpacing(0, 10000000, 1));
 
+    // The cadence walk runs NEWEST-FIRST and stops early, so it depends on flips of one head
+    // arriving in display order - which is a property of the ring, not an assumption the
+    // walk may make for free. These pin the two halves of that.
+    //
+    // (a) A WINDOW ENTIRELY IN THE PAST STILL RESOLVES. This is the one that bites: the walk
+    // starts at the NEWEST flip, so entries above the window must be skipped on their way
+    // down while only entries below it end the walk. A walk that broke on either side reads
+    // an empty window for every historical query - mutation-tested, it fails 38 assertions
+    // here and changes the replayed output of all eight captures.
+    CHECK(h.MedianSpacing(100000, 100000 + 10 * kHalf, 0) == kHalf,
+          "an old window must measure its own cadence, got %lld",
+          (long long)h.MedianSpacing(100000, 100000 + 10 * kHalf, 0));
+
+    // (b) THE HEAD FILTER MUST PRECEDE THE EARLY EXIT, and only a unit test can say so: every
+    // corpus fixture is SINGLE-HEAD (mktrace.py keeps head 0 only), so replaying captures
+    // cannot exercise this no matter how many hours of them there are. Live, the ring is
+    // interleaved, and a head-1 flip is announced beside a head-0 flip whose display time is
+    // up to 42.8 ms newer (measured over 200k flips; median 2.9 ms). So a walk that tested
+    // the window boundary BEFORE the head would break out on a head-1 entry that is merely
+    // trailing, abandoning head-0 flips it still needs - and would report a cadence built
+    // from too few samples, or none.
+    //
+    // The 45 ms lag and the narrow window below are the combination that makes the mistake
+    // visible: a wide window hides it, because dropping the oldest one or two gaps leaves the
+    // median unmoved. That is exactly why this must be pinned rather than reasoned about.
+    policy::FlipHistory heads;
+    const int64_t kBase = 400000, kLag = 45000;
+    for (int i = 0; i < 20; i++) {
+        policy::Flip a;
+        a.displayTs = kBase + (int64_t)i * kHalf;
+        a.eventTs = a.displayTs - 5000;
+        a.head = 0;
+        heads.Add(a);
+        policy::Flip b;                      // announced next, but displaying well earlier
+        b.displayTs = a.displayTs - kLag;
+        b.eventTs = b.displayTs - 5000;
+        b.head = 1;
+        heads.Add(b);
+    }
+    const int64_t kNewest = kBase + 19 * kHalf;
+    CHECK(heads.MedianSpacing(kNewest - 2 * kHalf, kNewest, 0) == kHalf,
+          "a narrow head-0 window must measure %lld across interleaved head-1 flips that "
+          "trail it past the reorder slack, got %lld",
+          (long long)kHalf, (long long)heads.MedianSpacing(kNewest - 2 * kHalf, kNewest, 0));
+
+    // (c) A REORDERED FLIP MUST NOT MOVE THE CADENCE. Reordering is also COUNTED rather than
+    // assumed away - see the OutOfOrder checks further down.
+    policy::FlipHistory rewound;
+    for (int i = 0; i < 8; i++) {
+        policy::Flip a;
+        a.displayTs = 100000 + (int64_t)i * kHalf;
+        a.eventTs = a.displayTs - 5000;
+        a.head = 0;
+        rewound.Add(a);
+    }
+    policy::Flip back;
+    back.displayTs = 100000 + 3 * kHalf;   // backwards against the newest
+    back.eventTs = back.displayTs - 5000;
+    back.head = 0;
+    rewound.Add(back);
+    CHECK(rewound.OutOfOrder() == 1, "a backward flip must be counted, got %lld",
+          rewound.OutOfOrder());
+    CHECK(rewound.MedianSpacing(100000, 100000 + 8 * kHalf, 0) == kHalf,
+          "a single reordered flip must not change the measured cadence, got %lld",
+          (long long)rewound.MedianSpacing(100000, 100000 + 8 * kHalf, 0));
+
     // Lookup must not leak one head's timeline into the other's.
     const policy::Flip* f = h.NewestAtOrBefore(100000 + 5 * kHalf + 10, 0);
     CHECK(f && f->displayTs == 100000 + 5 * kHalf, "wrong flip for head 0");
@@ -749,7 +815,11 @@ static void test_flip_history() {
     CHECK(h.OutOfOrder() == 0, "an in-order feed must report no reordering, got %lld",
           h.OutOfOrder());
     // A driver that ever emits a head out of order must be visible, not silently absorbed:
-    // a later binary search over this history would depend on the ordering holding.
+    // MedianSpacing's newest-first walk stops early on the assumption that a head's flips
+    // arrive in display order, so this counter is how a violation becomes findable rather
+    // than showing up as a quietly short cadence window. (Ordering holds only PER HEAD - the
+    // ring interleaves heads and is heavily inverted overall, which is why no lookup here
+    // may binary search it.)
     policy::FlipHistory ooo;
     policy::Flip p1; p1.displayTs = 2000; p1.head = 0; ooo.Add(p1);
     policy::Flip p2; p2.displayTs = 1000; p2.head = 0; ooo.Add(p2);
