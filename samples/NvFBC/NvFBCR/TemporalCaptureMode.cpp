@@ -19,7 +19,8 @@ static const float kDefaultAssumedSrcFps = 60.0f;
 
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
-                                         bool tint, bool etw, bool noJoin, bool dejitter)
+                                         bool tint, bool etw, bool noJoin, bool dejitter,
+                                         bool fgPhase)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_compositor(NULL)
@@ -32,6 +33,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_etw(etw)
     , m_noJoin(noJoin)
     , m_dejitter(dejitter && etw && !noJoin)
+    , m_fgPhase(fgPhase)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_srcRateHint(srcRateHint)
@@ -68,6 +70,10 @@ UINT TemporalCaptureMode::GetPresentationInterval() const {
 bool TemporalCaptureMode::Setup() {
     m_device = g_pD3D9Device;
 
+    // Before the ring starts: the instrument allocates its readback resources in Start.
+    if (m_fgPhase) {
+        m_ring.EnableFgPhase();
+    }
     if (!m_ring.Setup(m_device, BUF_WIDTH, BUF_HEIGHT)) {
         return false;
     }

@@ -104,6 +104,15 @@ public:
     // Shared handle of slot i, for opening the same texture on another API's device.
     HANDLE SlotSharedHandle(int i) const { return m_ring[i].sharedHandle; }
 
+    // Request the content-phase instrument (-fgphase) before Start. Per batch it measures
+    // WHERE BETWEEN ITS REAL NEIGHBOURS the generated member's content sits (the fraction f
+    // in the stage-7 gate: does content phase track display phase?), by projecting the
+    // generated frame onto the previous-real -> current-real axis in downscaled luma. One
+    // fgphase: log line per measured batch; the display fraction g is joined OFFLINE from
+    // the flip lines, so nothing here reads ETW. Instrument runs are instrument runs, not
+    // reference runs: the readback stalls the capture thread on the GPU once per wake.
+    void EnableFgPhase() { m_fgPhaseRequested = true; }
+
 private:
     struct Slot {
         IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
@@ -117,6 +126,29 @@ private:
     };
 
     void CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
+
+    // Content-phase instrument (-fgphase). Working geometry is a 320x180 GPU downscale:
+    // small enough that the sync readback costs ~230 KB a wake, large enough that the
+    // estimator's validated displacement envelope (exact to 8 source px, mean error under
+    // 0.05 out to 128) comfortably covers real pan motion.
+    static const int kFgW = 320;
+    static const int kFgH = 180;
+    bool ReadFgLuma(IDirect3DSurface9* src, float* out);
+    void FgPhaseOnWake(int member, int slot, LONGLONG batchStartUs);
+
+    bool m_fgPhaseRequested = false;
+    bool m_fgPhaseActive = false;
+    IDirect3DSurface9* m_fgSmallRT = NULL;   // capture device, StretchRect destination
+    IDirect3DSurface9* m_fgSmallSys = NULL;  // sysmem twin for GetRenderTargetData
+    // Rotating wake buffers plus the last KEPT frame's luma. A member-0 wake is only known
+    // to be a kept single when the NEXT wake fails to retract it, so promotion to "kept"
+    // is deferred one wake.
+    float* m_fgLumWake[2] = { NULL, NULL };
+    float* m_fgLumKept = NULL;
+    int m_fgWakeParity = 0;
+    int m_fgPrevMember = -1;
+    bool m_fgKeptValid = false;
+    bool m_fgPrevWakeValid = false;
 
     Slot m_ring[RING_SIZE];
     IDirect3DSurface9* m_captureTarget;   // on the capture device; NvFBC writes here
