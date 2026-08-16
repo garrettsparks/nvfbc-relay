@@ -241,6 +241,76 @@ struct AnchorChain {
     int gapHead = 0;
 };
 
+// WHICH MEMBER OF A BATCH HOLDS THE REAL FRAME, when that rotates.
+//
+// Under frame generation the capture wakes in epsilon-batches that advance a fixed stride
+// along the flip grid, so a batch's composition depends on where it lands within a source
+// period. At x2 the two coincide - every batch is [generated, real], which is why keep-real
+// can simply retain member 1. At x3 the batch stride (2 flips) and the source period (3
+// flips) are coprime, so composition ROTATES with period 3: [real,gen], [gen,real],
+// [gen,gen]. Retaining member 1 unconditionally therefore keeps the real frame in only one
+// of those, and the kept sequence runs gen, real, gen, gen, real, gen - 2 real frames in
+// every 6 outputs where 4 are available.
+//
+// The rotation phase is READ from arrival timing, and the reading is anchored by a control
+// rather than assumed. A batch led by a REAL frame wakes slightly BEFORE its flip (the game
+// submits on its own render schedule): measured aoff p50 -43/-61/-105 us across three x3
+// captures. A batch led by a GENERATED frame wakes just after (+76/+77/+78), on the driver's
+// metering schedule. The anchor: at x2 every batch is known to be [gen,real], and five x2
+// captures read +72..+74 - the gen-led signature - with nothing resembling the negative
+// class. So the class that wakes early is the one led by a real frame, and the tiling fixes
+// the rest (+1 rotation step = real-trailing, +2 = all-generated).
+//
+// ENSEMBLE, NEVER PER-BATCH: the distributions overlap badly (one class's p95 sits above
+// another's p05). Only the aggregate separates, so this votes over tens of batches and the
+// caller dead-reckons on the stride between re-votes. Until the vote is decisive the caller
+// must fall back to plain keep-real, which is what the relay did before this existed.
+struct RotationPhase {
+    // Rotation length in BATCHES. 1 means composition never rotates (x2, and frame
+    // generation off), and this whole mechanism stays inert. Derived, never assumed.
+    static const int kMaxPeriod = 8;
+    int period = 1;
+    int stride = 0;           // flips a batch advances, measured
+    int flipsPerSource = 0;   // flips in one source period, measured
+    int64_t offsetSum[kMaxPeriod] = {};
+    int32_t offsetCount[kMaxPeriod] = {};
+    bool valid = false;
+    int realLedResidue = -1;   // batchIndex % period of the [real, gen] class
+};
+
+// Rotation length for a stride over a source period, in batches: how many batches before
+// composition repeats. flipsPerSource and stride are both MEASURED by the caller (source
+// period and batch period over the flip spacing), so x2, x3, x4 and frame-generation-off
+// all fall out of the same arithmetic instead of being special-cased.
+int RotationPeriodBatches(int flipsPerSource, int stride);
+
+// Fold one anchored batch's arrival offset into the vote. batchIndex is the ring's
+// monotonic batch counter, which both threads agree on; anchorOffset is batch start minus
+// its anchor flip, the same quantity stage 6 measures.
+void RotationObserve(RotationPhase& p, long long batchIndex, int64_t anchorOffset);
+
+// Drop the vote. The caller MUST do this whenever batch-to-flip continuity breaks (a stall,
+// a dropped batch, an anchor-chain re-acquisition): batch index residue only tracks grid
+// position while the stride holds, and a stale residue would confidently retain the wrong
+// member. Cheap to rebuild - a vote converges in tens of batches at x3's ~90 batches/s.
+// stride and flipsPerSource are the same measurements the period was derived from.
+void RotationReset(RotationPhase& p, int stride, int flipsPerSource);
+
+// WHICH MEMBER of this batch carries the real frame: 0, 1, ... or a value past the batch's
+// member count when this batch has NO real frame at all. -1 when the vote is not
+// trustworthy, which means the caller must fall back to plain keep-real.
+//
+// Real frames sit at flips congruent to one phase P modulo flipsPerSource, and member m of
+// batch b sits at flip b*stride + m, so the real member is (P - b*stride) mod
+// flipsPerSource. The vote supplies P by naming the batch residue whose member 0 is real.
+// At x3 that cycles 0, 1, 2 - and the 2 is the [gen,gen] batch, whose "real member" does
+// not exist, so a caller with 2 members keeps NOTHING from it. That is the point: those two
+// frames are both generated, dropping them leaves the ring holding exactly the real frames
+// at exactly their own flip times, and a 60 fps output then finds one real frame per
+// present instead of a 90/s mixture. Keeping one anyway is what makes the kept cadence
+// uneven (3, 2, 1 flips instead of a uniform 3).
+int RotationRealMember(const RotationPhase& p, long long batchIndex);
+
 // Stage-6 corrections as metadata BESIDE the ring, never as slot mutation. FindBracket
 // subtracts CorrectionFor(stamp) at read time, so the ring slots keep exactly one writer
 // (the capture thread) and a recycled slot can never inherit a stale correction - its

@@ -214,6 +214,14 @@ policy::FlipPairing EtwFlipConsumer::PairCapture(uint32_t head, int64_t batchSta
     return policy::PairBatchMember(m_history, head, batchStartTs, member, cadenceWindow);
 }
 
+long long EtwFlipConsumer::MedianFlipSpacing(uint32_t head, int64_t cadenceWindow) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const policy::Flip* newest = m_history.NewestAtOrBefore(INT64_MAX, head);
+    if (!newest) return 0;
+    return (long long)m_history.MedianSpacing(newest->displayTs - cadenceWindow,
+                                              newest->displayTs, head);
+}
+
 policy::LateCorrection EtwFlipConsumer::MeasureLateness(uint32_t head, int64_t batchStartTs,
                                                         policy::AnchorChain& chain,
                                                         int64_t cadenceWindow) const {
