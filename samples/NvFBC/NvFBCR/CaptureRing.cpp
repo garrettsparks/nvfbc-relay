@@ -1,6 +1,8 @@
 #include "CaptureRing.h"
 #include <SimpleLogger.h>
 #include <limits.h>
+#include <math.h>
+#include <string.h>
 
 // External globals (NvFBCR.cpp). Start() rebinds the NvFBC session to the capture device and
 // must update the global so WinMain's Cleanup releases the right session.
@@ -53,6 +55,11 @@ CaptureRing::~CaptureRing() {
         m_captureTarget->Release();
         m_captureTarget = NULL;
     }
+    if (m_fgSmallRT)  { m_fgSmallRT->Release();  m_fgSmallRT = NULL; }
+    if (m_fgSmallSys) { m_fgSmallSys->Release(); m_fgSmallSys = NULL; }
+    delete[] m_fgLumWake[0]; m_fgLumWake[0] = NULL;
+    delete[] m_fgLumWake[1]; m_fgLumWake[1] = NULL;
+    delete[] m_fgLumKept;    m_fgLumKept = NULL;
     if (m_capSync) {
         m_capSync->Release();
         m_capSync = NULL;
@@ -150,6 +157,31 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
         if (FAILED(hr)) {
             LOGERR("CaptureRing: failed to get present-side ring surface %d (error: 0x%08x)", i, hr);
             return false;
+        }
+    }
+
+    // ---- Content-phase instrument resources (-fgphase). ----
+    // A failed setup disables the instrument, never the relay: it is a measurement rig.
+    if (m_fgPhaseRequested) {
+        hr = m_capDevice->CreateRenderTarget(kFgW, kFgH, D3DFMT_A2B10G10R10,
+                                             D3DMULTISAMPLE_NONE, 0, FALSE,
+                                             &m_fgSmallRT, NULL);
+        if (SUCCEEDED(hr)) {
+            hr = m_capDevice->CreateOffscreenPlainSurface(kFgW, kFgH, D3DFMT_A2B10G10R10,
+                                                          D3DPOOL_SYSTEMMEM,
+                                                          &m_fgSmallSys, NULL);
+        }
+        if (SUCCEEDED(hr)) {
+            m_fgLumWake[0] = new float[kFgW * kFgH];
+            m_fgLumWake[1] = new float[kFgW * kFgH];
+            m_fgLumKept = new float[kFgW * kFgH];
+            m_fgPhaseActive = true;
+            LOG("fgphase instrument ACTIVE: per-batch content phase f of the generated "
+                "member against its real neighbours, %dx%d luma; join f to the flip lines "
+                "offline for g. Readback stalls the capture thread once per wake - "
+                "instrument runs are not reference runs.", kFgW, kFgH);
+        } else {
+            LOGERR("fgphase instrument DISABLED: small-surface setup failed (0x%08x)", hr);
         }
     }
 
@@ -312,7 +344,138 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             (long long)(dt * usPerTick),
             (long long)flushUs,
             collapsed);
+
+        if (m_fgPhaseActive) {
+            FgPhaseOnWake(batch.member, slot,
+                          (LONGLONG)((batch.stampTs - m_baseQpc.QuadPart) * usPerTick));
+        }
     }
+}
+
+// Downscale a ring surface on the GPU, read it back, convert to blurred luma. The blur
+// (separable Gaussian, sigma 2) is part of the validated estimator configuration: it is
+// irrelevant to lerp recovery but extends the first-order range for WARPED content, which
+// is what driver-generated frames are suspected to be at x3.
+bool CaptureRing::ReadFgLuma(IDirect3DSurface9* src, float* out) {
+    if (FAILED(m_capDevice->StretchRect(src, NULL, m_fgSmallRT, NULL, D3DTEXF_LINEAR)))
+        return false;
+    if (FAILED(m_capDevice->GetRenderTargetData(m_fgSmallRT, m_fgSmallSys)))
+        return false;
+    D3DLOCKED_RECT lr;
+    if (FAILED(m_fgSmallSys->LockRect(&lr, NULL, D3DLOCK_READONLY)))
+        return false;
+    for (int y = 0; y < kFgH; y++) {
+        const DWORD* row = (const DWORD*)((const BYTE*)lr.pBits + y * lr.Pitch);
+        float* dst = out + y * kFgW;
+        for (int x = 0; x < kFgW; x++) {
+            const DWORD v = row[x];   // A2B10G10R10: R low, then G, then B
+            const float r = (float)(v & 0x3FF);
+            const float g = (float)((v >> 10) & 0x3FF);
+            const float b = (float)((v >> 20) & 0x3FF);
+            dst[x] = (2.0f * r + 5.0f * g + b) * 0.125f;
+        }
+    }
+    m_fgSmallSys->UnlockRect();
+
+    // Separable Gaussian, sigma 2, radius 6; kernel constants fixed at compile time.
+    static const float k[7] = { 0.19967f, 0.17603f, 0.12098f, 0.06476f,
+                                0.02700f, 0.00874f, 0.00220f };
+    float line[kFgW > kFgH ? kFgW : kFgH];
+    for (int y = 0; y < kFgH; y++) {
+        float* rowp = out + y * kFgW;
+        for (int x = 0; x < kFgW; x++) line[x] = rowp[x];
+        for (int x = 0; x < kFgW; x++) {
+            float acc = k[0] * line[x];
+            for (int t = 1; t <= 6; t++) {
+                const int lo = x - t < 0 ? 0 : x - t;
+                const int hi = x + t >= kFgW ? kFgW - 1 : x + t;
+                acc += k[t] * (line[lo] + line[hi]);
+            }
+            rowp[x] = acc;
+        }
+    }
+    for (int x = 0; x < kFgW; x++) {
+        for (int y = 0; y < kFgH; y++) line[y] = out[y * kFgW + x];
+        for (int y = 0; y < kFgH; y++) {
+            float acc = k[0] * line[y];
+            for (int t = 1; t <= 6; t++) {
+                const int lo = y - t < 0 ? 0 : y - t;
+                const int hi = y + t >= kFgH ? kFgH - 1 : y + t;
+                acc += k[t] * (line[lo] + line[hi]);
+            }
+            out[y * kFgW + x] = acc;
+        }
+    }
+    return true;
+}
+
+void CaptureRing::FgPhaseOnWake(int member, int slot, LONGLONG batchStartUs) {
+    float* L = m_fgLumWake[m_fgWakeParity];
+    if (!ReadFgLuma(m_ring[slot].capSurface, L)) {
+        LOGERR("fgphase: readback failed, instrument disabled");
+        m_fgPhaseActive = false;
+        return;
+    }
+    const float* prevWake = m_fgLumWake[1 - m_fgWakeParity];
+
+    if (member >= 1) {
+        // This wake retracted the previous one: prev wake = the generated member, this
+        // wake = the real member. Measure the generated frame's content phase between the
+        // last KEPT real frame and this one. Only the first retraction of a batch measures
+        // (a third member's semantics are not a bracket).
+        if (member == 1 && m_fgPrevWakeValid && m_fgKeptValid) {
+            static const int kMx = kFgW / 20, kMy = kFgH / 20;   // 5% margins
+            double sgd = 0.0, sdd = 0.0, sgr = 0.0;
+            for (int y = kMy; y < kFgH - kMy; y++) {
+                const int base = y * kFgW;
+                for (int x = kMx; x < kFgW - kMx; x++) {
+                    const double d = L[base + x] - m_fgLumKept[base + x];
+                    const double gd = prevWake[base + x] - m_fgLumKept[base + x];
+                    const double gr = prevWake[base + x] - L[base + x];
+                    sgd += gd * d;
+                    sdd += d * d;
+                    sgr += gr * gr;
+                }
+            }
+            const int n = (kFgW - 2 * kMx) * (kFgH - 2 * kMy);
+            const double motion = sqrt(sdd / n);
+            if (sdd > 0.0) {
+                const double f = sgd / sdd;
+                double srr = 0.0;
+                for (int y = kMy; y < kFgH - kMy; y++) {
+                    const int base = y * kFgW;
+                    for (int x = kMx; x < kFgW - kMx; x++) {
+                        const double d = L[base + x] - m_fgLumKept[base + x];
+                        const double r = (prevWake[base + x] - m_fgLumKept[base + x]) - f * d;
+                        srr += r * r;
+                    }
+                }
+                // Raw per-batch readings; the offline pass owns the gates (motion floor,
+                // residual ceiling) so thresholds can be tuned without a rebuild. gdiff is
+                // the gen-vs-real pixel distance, the discriminator the offline pass needs
+                // because the NvFBC race and dup-pairs both put REAL pixels in the gen
+                // slot 33-50% of the time: those batches read f~1 with gdiff~0 and are a
+                // different population, not evidence about generated content.
+                LOG("fgphase: arr=%lldus f=%.4f motion=%.2f resid=%.3f gdiff=%.2f",
+                    (long long)batchStartUs, f, motion,
+                    motion > 0.0 ? sqrt(srr / n) / motion : 0.0,
+                    sqrt(sgr / n));
+            }
+        }
+        // Whatever its index, the retaining member is now the kept frame.
+        memcpy(m_fgLumKept, L, sizeof(float) * kFgW * kFgH);
+        m_fgKeptValid = true;
+    } else if (m_fgPrevMember == 0 && m_fgPrevWakeValid) {
+        // The previous wake opened a batch and was never retracted: a kept single
+        // (coalesced real, or FG off). Promote it - one wake late, which is the earliest
+        // the fact is knowable.
+        memcpy(m_fgLumKept, prevWake, sizeof(float) * kFgW * kFgH);
+        m_fgKeptValid = true;
+    }
+
+    m_fgPrevMember = member;
+    m_fgPrevWakeValid = true;
+    m_fgWakeParity ^= 1;
 }
 
 void CaptureRing::FindBracket(LONGLONG targetQpc, const policy::StampOverlay* overlay,

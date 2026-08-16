@@ -103,6 +103,12 @@ bool g_noJoin = false;
 // (needs -etw with the join on). The phantom-blend fix: a frame handed over late is stamped
 // where its flip says it belongs, so the ring stops recording delivery delay as motion.
 bool g_dejitter = false;
+// -fgphase: the stage-7 gate instrument. Per capture batch, measure the CONTENT phase f of
+// the generated member between its real neighbours (projection in downscaled luma, ring
+// side); the DISPLAY phase g joins offline from the -etw flip lines. If f does not track g,
+// generated frames are mistimed at the content level and no capture backend can fix it.
+// Instrument runs are instrument runs: the readback stalls the capture thread each wake.
+bool g_fgPhase = false;
 
 // Optional count for -mark: burn only the first N presents (a head burst that aligns a
 // stream VOD without marking watched gameplay), then run clean. 0 = every present (the
@@ -149,7 +155,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             _stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
                                            kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
-                                           g_dejitter);
+                                           g_dejitter, g_fgPhase);
         }
 
         // QPC-timer present (t:60 / b:60 / o:60 format).
@@ -158,7 +164,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             if (ParseFps(modeStr.substr(2), &framerate)) {
                 return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
                                                kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
-                                               g_dejitter);
+                                               g_dejitter, g_fgPhase);
             }
         }
     }
@@ -199,6 +205,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  -etw           - Log the display driver's true scanout times alongside capture (debug); off by default");
     LOGERR("  -nojoin        - With -etw: log flips but skip the per-present grid lookup (debug A/B control)");
     LOGERR("  -dejit         - With -etw: re-stamp late-delivered capture batches onto the flip grid (phantom-blend fix)");
+    LOGERR("  -fgphase       - Content-phase instrument: log per-batch f of generated frames (stage-7 gate; run with -etw for the offline g join)");
     return NULL;
 }
 
@@ -466,6 +473,10 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         g_dejitter = true;
         return 1;
     }
+    if (tokens[i] == "-fgphase") {
+        g_fgPhase = true;
+        return 1;
+    }
     if (tokens[i] == "-mark") {
         g_mark = true;
         // Optional frame count: consume the next token as N only if it is all digits, so
@@ -679,13 +690,14 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     else if (g_markFrames) snprintf(markDesc, sizeof(markDesc), "on (first %u presents)", g_markFrames);
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
     LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s, "
-        "etw flip capture %s, flip join %s, dejitter %s",
+        "etw flip capture %s, flip join %s, dejitter %s, fgphase %s",
         g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
         g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off",
         !g_etw ? "off (no -etw)" : (g_noJoin ? "OFF (-nojoin)" : "on"),
         !g_dejitter ? "off"
                     : (g_etw && !g_noJoin ? "ON (-dejit)"
-                                          : "REFUSED (-dejit needs -etw with the join on)"));
+                                          : "REFUSED (-dejit needs -etw with the join on)"),
+        g_fgPhase ? "requested (-fgphase; ACTIVE only when the instrument line follows)" : "off");
 
     BUF_WIDTH = target.position.right - target.position.left;
     BUF_HEIGHT = target.position.bottom - target.position.top;

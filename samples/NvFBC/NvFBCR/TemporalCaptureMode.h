@@ -69,6 +69,7 @@ private:
     // live in the overlay, never in the slots; off, FindBracket takes the exact pre-stage-6
     // read path.
     bool m_dejitter;
+    bool m_fgPhase;                 // -fgphase: per-batch content-phase instrument (ring-side)
     policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
     policy::StampOverlay m_overlay;      // present-thread-owned; FindBracket reads through it
     long long m_nextBatch = 0;           // cursor into the ring's batch-start history
@@ -96,7 +97,8 @@ public:
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
                         bool lock = false, CompositorKind compositor = kCompositorNearest,
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
-                        bool etw = false, bool noJoin = false, bool dejitter = false);
+                        bool etw = false, bool noJoin = false, bool dejitter = false,
+                        bool fgPhase = false);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

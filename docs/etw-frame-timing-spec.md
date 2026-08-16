@@ -7,15 +7,17 @@ and 97.9% at 60x3, anchor offset p50 +69 us, and no measurable pacing cost (pres
 against a 3 us baseline). The flip timestamps are corroborated by a SECOND, independent provider -
 see "What the scanout grid actually looks like".
 
-Stage 6 is BUILT (2026-08-10) as DELIVERY-LATENESS CORRECTION behind `-dejit`, replay-validated
-against the corpus, awaiting a live capture. It is deliberately NOT the flip-stamping this
-document originally specified - see "Stage 6 as built" for why the literal design measured
-3-4x worse in replay and what shipped instead. What remains unbuilt is stage 7 (selection
-preferring real frames), whose gating question is untouched: whether a generated frame's
-CONTENT phase matches its DISPLAY phase. The real-vs-generated label is CLOSED for ETW (the
-2026-08-10 multiplier sweep killed both DxgKrnl candidates at the mechanism level, see
-"Settled"); at x2 batch position remains the label, and at x3 the rotation phase is readable
-from arrival timing (see open question 3).
+Stage 6 is DONE: built (2026-08-10) as DELIVERY-LATENESS CORRECTION behind `-dejit`,
+live-validated, and value-proven on an hour of real streamed gameplay (2026-08-13: 75 blends
+removed / 1 added, 73 of the 75 isolated single-frame events, cutting the isolated-event rate
+54%; the fixture gates that number). It is deliberately NOT the flip-stamping this document
+originally specified - see "Stage 6 as built" for why the literal design measured 3-4x worse in
+replay and what shipped instead. What remains is stage 7 (selection preferring real frames,
+falling back to generated), now planned in its own section: the content-phase-vs-display-phase
+measurement gates the generated-frame half, and the x3 keep-real phase defect is the ungated
+half. The real-vs-generated label is CLOSED for ETW (the 2026-08-10 multiplier sweep killed both
+DxgKrnl candidates at the mechanism level, see "Settled"); at x2 batch position remains the
+label, and at x3 the rotation phase is readable from arrival timing (see open question 3).
 Companions: `dxgi-native-pipeline-spec.md`, `nvfbc-capture-pacing.md`, `frame-marker-spec.md`.
 
 ## The problem
@@ -140,7 +142,13 @@ upgrades. At 20 ms the upgrade almost always arrives after the slot was used and
 separate fallback code exists; the ordering rule produces both behaviours.
 
 For generated frames specifically: with ETW they get a measured stamp and are kept; without, no
-stamp arrives in time and keep-real retracts them as today. 120 usable frames/s with, 60 without.
+stamp arrives in time and keep-real retracts them as today. **"120 usable frames/s with" was
+written before the FG characterization and overstates what NvFBC can deliver.** The grab returns
+the frontbuffer at grab time, so a generated frame's PIXELS survive only when the grab wins a race
+with the real flip - measured 50-67% by run, ceiling ~70-75%, and the priority chapter is closed
+in both directions (boost made it worse). A stamped slot is only usable if its pixels are the
+generated frame's; at NvFBC's hit rate that is a coin flip per batch. What this does and does not
+rule out is worked through in the stage 7 section.
 
 **Sizing.** ETW history is metadata, so size it by TIME, not by ring slots:
 
@@ -346,6 +354,97 @@ absent (nearest-mode log carries no op= labels) and its pairing bound is 95% (a 
 FG-off game stops presenting, so the flip grid pauses WITH it - transition batches have
 nothing to pair against). `test_anchor_chain` pins the same three regimes synthetically:
 FG-off stride derivation, the dropped-batch alias, and mis-lock recovery.
+
+## Stage 7: two candidates, and the measurement that gates the bigger one
+
+Stage 7 is "selection prefers real, falls back to generated". Written 2026-08-14, after stage 6
+closed. Three measurements made since the architecture section was drafted change stage 7's
+shape, and one open question gates its larger half. This is the plan of record.
+
+**What changed under the design:**
+
+1. **Wholesale flip-stamping was tried for stage 6 and rejected on measurement** (see "Stage 6 as
+   built"): synth 1.4% -> 4.4% and 1.1% -> 5.0% in replay, from flip-jitter inheritance and the
+   ~4% of slots that structurally miss the upgrade window sitting 8.33 ms off-base. Stage 6
+   shipped as an overlay on the ARRIVAL base instead. That escape is not available to stage 7: a
+   generated frame's arrival stamp is a submission epsilon from its real twin's, so the flip grid
+   is the only base it can meaningfully live on - the exact base the stage-6 attempt showed
+   poisons a mixed timeline. The unsolved design problem is therefore a mixed-base ring: real
+   frames on the arrival base (the batch-start/lock-phase cancellation is load-bearing and stays),
+   generated frames on the flip base, and brackets that can hold one of each. Flagged, not solved;
+   nothing here is worth designing further until the gate below passes.
+
+2. **There is no per-frame real-vs-generated label** (see "Settled"). At x2 the label is batch
+   position. At x3 the residue phase is readable from arrival timing but only as an ENSEMBLE -
+   a vote over hundreds of batches, dead-reckoned on the 96%-rigid stride - so a per-present
+   selection rule must consume a slowly-updated phase estimate, never a per-frame flag.
+
+3. **NvFBC captures generated pixels at 50-67%, and that is a ceiling, not a bug.** The grab
+   returns the frontbuffer at grab time; generated content survives only when the grab wins the
+   race with the real flip. Ceiling ~70-75%; the thread-priority chapter is closed in both
+   directions. Keep-real at x2 was proven optimal against exactly this.
+
+**The 90x2 -> 60 case, concretely.** 90x2 is a 180 flips/s grid (5.56 ms); a 60 Hz present lands
+every 3rd flip; real frames tile one parity of the stride-2 grid, so successive presents alternate
+real-flip / generated-flip. Half the output frames would NEED a generated frame, and NvFBC
+delivers each one at 50-67% - a third to a half of every other output frame missing, which is
+structurally worse than not trying. Two routes stay live:
+
+- **Relay-side synthesis needs no driver frames.** At -src 90 the off-parity present sits 5.56 ms
+  from the nearest real frame against a srcP/4 = 2.78 ms passthrough gate, so b: blends (and o:
+  warps) every other present at a CONSTANT phase - even and predictable, with today's capture
+  path. This is the cheap version of 90x2 -> 60 and it is not gated on anything below.
+- **DXGI Desktop Duplication captures both pair members where NvFBC races.** The 2026-07-23
+  DdProbe run delivered accum=1 on 99.87% of 20847 presents, with 42.4% of present deltas at
+  p50 235 us - the epsilon pair, both members, individually. DD was shelved because its
+  LastPresentTime batches the pair (~250 us apart against 8.33 ms scanout): right pixels, wrong
+  clock. ETW is precisely the missing clock, which makes DD+ETW a THIRD motivation for the DXGI
+  backend that did not exist when it was judged not worth the rewrite. Still a render-backend
+  reskin (D3D11 capture and compositor surfaces; PresentScheduler, policy, ring selection,
+  FlowWarpEngine reuse), and not worth costing until the gate passes.
+
+**THE GATE: does content phase track display phase?** (Open question 0.) A generated frame's
+content is an interpolation at some fraction f between its real neighbours; the driver displays it
+at fraction g of the real-to-real interval, and g measurably wanders (hundreds of us, over 1 ms in
+the high-jitter regime). If f != g, placing the frame at its flip time puts its MOTION at the
+wrong instant by (g - f) of a source period - silently, on every generated frame, on ANY capture
+backend. DXGI cannot fix an f/g divergence; nothing downstream of the driver can. So it is
+measured before any backend or selection work:
+
+- **In-relay, log-only.** Output video cannot answer this: keep-real discards the generated
+  member and the marker burns only into presented output. The measurement reads the ring.
+- **f from block displacement, not a blend fit.** At x2 generated frames read blend-like (hf ~3x
+  below real), but x3's second generated frame is hf-SHARP, warp-suspected. A blend-model fit
+  assumes the mechanism; displacement against the two real neighbours under constant motion does
+  not. Starting point: the archived per-batch content instrument at
+  archive/fg-and-dupe-content-probe.
+- **Content: constant-yaw pan.** Forward motion is radial flow and center blocks fall below
+  threshold (measured in the July probe work).
+- **g from the existing join.** The batch's anchor flip and its member-stepped successor bound the
+  real-to-real interval; the generated member's flip position inside it is g. Already logged.
+- **Validate the estimator on known ground truth FIRST.** b: mode writes frames whose blend
+  weight w is known exactly; the estimator must recover w across its range before any driver
+  frame is measured. Without this, "f does not track g" and "the estimator is broken" are
+  indistinguishable and a null result is uninterpretable.
+- **Pass criterion:** f tracks g per batch with residual comparable to the placement wander ETW
+  already measures (hundreds of us of source period, not milliseconds). PASS: the generated-frame
+  half of stage 7 proceeds and the DXGI backend becomes worth costing. FAIL: generated frames are
+  mistimed at the content level, the branch dies for every backend, and stage 7 reduces to the
+  candidate below.
+
+**Candidate (b), independent of the gate: the x3 keep-real phase defect.** Keep-real retains
+member 1 of each batch, which at x3 holds the real frame only in [gen,real] batches - one source
+period in two - and DISCARDS the real frame in [real,gen] batches. kcd_60x3_walk records the
+consequence as a bound: 18.0% field synth that a phase-aware keep-real must beat. The residue
+phase is readable as an ensemble (real-led batches wake ~-50 us vs +76 us gen-led; vote plus
+stride dead-reckoning). No generated-frame usage, no new label, no backend - and replay-verifiable
+against an existing fixture. One caveat to carry: the NvFBC race biases captured pixels toward the
+real frame, so "kept the wrong member" often still shows real pixels - the 18% bound is the
+honest field measurement of what actually got through.
+
+**Order of work (decided 2026-08-14): the f/g measurement first** - the cheapest step that can
+kill the most downstream work. Then (b). Only on a PASS, and with (b) landed, the mixed-base
+design and the DXGI costing.
 
 ## What the scanout grid actually looks like
 
@@ -623,7 +722,8 @@ lose zero events across seven runs, but that is a property of a measured workloa
    generated frame sits at some fraction between its neighbours, and the July `-probe` work
    already measured generated-frame content (archived at `archive/fg-and-dupe-content-probe`).
    Measure content fraction against ETW display fraction on the same frames; if they track, stage
-   7 is safe.
+   7 is safe. **The measurement is now specified - method, ground-truth validation and pass
+   criterion are in the stage 7 section, and it is the first work item of the stage.**
 
 1. **Raw ETW delivery lag. MEASURED - and the session must be configured for it.** Left at
    defaults, real-time ETW delivers on a ~1 s cadence and hands over the PREVIOUS period's buffer,
