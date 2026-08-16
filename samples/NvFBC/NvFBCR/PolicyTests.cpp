@@ -938,6 +938,148 @@ static void test_anchor_chain() {
 // still picking the same frame either way, so the honest answer is expected to be "several
 // milliseconds", and a regression that silently narrows the correction's reach shows up
 // here as a sweep row going quiet.
+// The rotation-phase vote: does it find the real-led class, refuse when there is nothing to
+// find, and stay silent until it is sure? Built from the MEASURED signature (real-led
+// batches wake ~-50 us before their flip, generated-led ~+75 us after, with distributions
+// that overlap heavily), because the whole point is that no single batch is decisive.
+static void test_rotation_phase() {
+    // Period arithmetic first: derived from measured stride and flips-per-source-period, so
+    // every multiplier falls out of one rule instead of being special-cased.
+    CHECK(policy::RotationPeriodBatches(2, 2) == 1, "x2 (2 flips, stride 2) must not rotate");
+    CHECK(policy::RotationPeriodBatches(3, 2) == 3, "x3 (3 flips, stride 2) rotates over 3");
+    CHECK(policy::RotationPeriodBatches(4, 2) == 2, "x4 (4 flips, stride 2) rotates over 2");
+    CHECK(policy::RotationPeriodBatches(1, 1) == 1, "FG off cannot rotate");
+    CHECK(policy::RotationPeriodBatches(9, 2) == 1,
+          "a rotation longer than the vote can hold must report inert, not overflow");
+
+    // A deterministic stand-in for the measured spread: alternating +-90 us around each
+    // class mean, so every class's samples straddle the others' and only the AGGREGATE
+    // separates. A per-batch rule would be wrong about half the time on this input.
+    const int64_t kRealLed = -50, kGenLed = 75, kSpread = 90;
+    auto sample = [&](int residue, int realLed, long long i) {
+        const int64_t mean = (residue == realLed) ? kRealLed : kGenLed;
+        return mean + ((i % 2) ? kSpread : -kSpread);
+    };
+    auto vote = [&](policy::RotationPhase& p, int realLed, int n) {
+        for (long long i = 0; i < n; i++) {
+            policy::RotationObserve(p, i, sample((int)(i % p.period), realLed, i));
+        }
+    };
+
+    {   // x3, the regime this exists for. THE CASE THAT DECIDES THE DESIGN is the third
+        // class: both its members are generated, so the real member index runs past the
+        // batch and the caller keeps NOTHING. Keeping one anyway leaves the ring holding
+        // frames 3, 2 and 1 flips apart; dropping it leaves exactly the real frames, one
+        // per source period, uniformly spaced - which is what a 60 fps output wants.
+        policy::RotationPhase p;
+        policy::RotationReset(p, /*stride=*/2, /*flipsPerSource=*/3);
+        CHECK(p.period == 3, "x3 must rotate over 3 batches, got %d", p.period);
+        CHECK(!p.valid, "a fresh vote is not valid");
+        vote(p, 1, 120);
+        CHECK(p.valid, "120 batches must decide a 3-class vote");
+        CHECK(p.realLedResidue == 1, "planted real-led residue 1, got %d", p.realLedResidue);
+        CHECK(policy::RotationRealMember(p, 1) == 0,
+              "the real-led batch keeps member 0, got %d", policy::RotationRealMember(p, 1));
+        CHECK(policy::RotationRealMember(p, 2) == 1,
+              "the next batch keeps member 1, got %d", policy::RotationRealMember(p, 2));
+        CHECK(policy::RotationRealMember(p, 3) >= 2,
+              "the all-generated batch must name no member a 2-member batch has, got %d",
+              policy::RotationRealMember(p, 3));
+        CHECK(policy::RotationRealMember(p, 4) == 0, "the rotation must repeat");
+
+        // Over one full rotation exactly one source period's real frames are kept, and the
+        // kept flips are one source period apart - the property that makes the cadence
+        // uniform rather than 3/2/1.
+        int kept = 0, lastFlip = -1, firstGap = -1;
+        for (long long b = 1; b <= 6; b++) {
+            const int m = policy::RotationRealMember(p, b);
+            if (m < 0 || m >= 2) continue;
+            const int flip = (int)(b * 2 + m);
+            if (lastFlip >= 0 && firstGap < 0) firstGap = flip - lastFlip;
+            if (lastFlip >= 0) {
+                CHECK(flip - lastFlip == firstGap,
+                      "kept frames must be evenly spaced, saw %d then %d flips",
+                      firstGap, flip - lastFlip);
+            }
+            lastFlip = flip;
+            kept++;
+        }
+        CHECK(kept == 4, "6 x3 batches carry 4 real frames, kept %d", kept);
+        CHECK(firstGap == 3, "kept frames must sit one source period apart, got %d", firstGap);
+    }
+
+    {   // NEGATIVE CONTROL, the one that matters: at x2 every batch is [gen,real], so there
+        // is no real-led class to find. A vote that "finds" one anyway would retain the
+        // wrong member on a third of x2 batches - actively worse than what it replaces.
+        policy::RotationPhase p;
+        policy::RotationReset(p, 2, 3);          // force a 3-class vote over uniform data
+        for (long long i = 0; i < 300; i++) {
+            policy::RotationObserve(p, i, kGenLed + ((i % 2) ? kSpread : -kSpread));
+        }
+        CHECK(!p.valid, "a uniform population must never decide a winner");
+        CHECK(policy::RotationRealMember(p, 0) < 0, "undecided must read as plain keep-real");
+    }
+
+    {   // Inert wherever composition does not rotate: x2 and frame generation off.
+        policy::RotationPhase p;
+        policy::RotationReset(p, 2, 2);
+        CHECK(p.period == 1, "x2 must not rotate");
+        for (long long i = 0; i < 300; i++) policy::RotationObserve(p, i, kRealLed);
+        CHECK(!p.valid && policy::RotationRealMember(p, 0) < 0,
+              "period 1 must stay inert: there is no rotation to read");
+    }
+
+    {   // Silence before confidence: a partial vote must not commit. Half the residues are
+        // under-sampled here, which is exactly the state after a chain re-acquisition.
+        policy::RotationPhase p;
+        policy::RotationReset(p, 2, 3);
+        for (long long i = 0; i < 30; i++) {
+            if ((i % 3) == 2) continue;          // starve residue 2
+            policy::RotationObserve(p, i, sample((int)(i % 3), 1, i));
+        }
+        CHECK(!p.valid, "an under-sampled residue must block the decision");
+    }
+
+    {   // THE VERDICT IS NOT LATCHED. A vote that converged once must give the verdict back
+        // when the evidence goes away, or a regime change leaves it steering on history.
+        policy::RotationPhase p;
+        policy::RotationReset(p, 2, 3);
+        vote(p, 1, 120);
+        CHECK(p.valid, "precondition: the vote should have decided");
+        for (long long i = 120; i < 1200; i++) {
+            policy::RotationObserve(p, i, kGenLed + ((i % 2) ? kSpread : -kSpread));
+        }
+        CHECK(!p.valid,
+              "a decided vote must lapse once the classes stop separating, not latch");
+    }
+
+    {   // Reset really resets: a stale winner surviving a stall would confidently retain the
+        // wrong member for a whole chain.
+        policy::RotationPhase p;
+        policy::RotationReset(p, 2, 3);
+        vote(p, 0, 120);
+        CHECK(p.valid && p.realLedResidue == 0, "vote should have decided residue 0");
+        policy::RotationReset(p, 2, 3);
+        CHECK(!p.valid && policy::RotationRealMember(p, 0) < 0, "reset must clear the verdict");
+    }
+
+    {   // x4: a shorter rotation, two classes, and only one of them carries a real frame.
+        // Exercises the same arithmetic at a multiplier nothing has been captured at.
+        policy::RotationPhase p;
+        policy::RotationReset(p, /*stride=*/2, /*flipsPerSource=*/4);
+        CHECK(p.period == 2, "x4 must rotate over 2 batches, got %d", p.period);
+        vote(p, 0, 120);
+        CHECK(p.valid, "x4 vote must decide");
+        CHECK(policy::RotationRealMember(p, 0) == 0, "x4 real-led batch keeps member 0");
+        CHECK(policy::RotationRealMember(p, 1) >= 2,
+              "x4's other batch is all generated, got member %d",
+              policy::RotationRealMember(p, 1));
+    }
+
+    std::printf("  rotation phase: period arithmetic, ensemble vote on overlapping classes, "
+                "all-generated batches kept empty, refusal on a uniform population\n");
+}
+
 static void test_dejit_removes_late_blends() {
     const int64_t kSrc = 16667, kFlip = 8333, kEps = 400, kDelivery = 1300;
     const int64_t kBase = 1000000, kFrames = 400;
@@ -2413,6 +2555,7 @@ int main(int argc, char** argv) {
     test_flip_history();
     test_flip_pairing();
     test_anchor_chain();
+    test_rotation_phase();
     test_dejit_removes_late_blends();
     test_batch_collapse_keep_real();
     test_lock_reseed_wide_bracket_stall();

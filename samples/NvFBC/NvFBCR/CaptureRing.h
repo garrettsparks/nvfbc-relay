@@ -104,10 +104,54 @@ public:
     // Shared handle of slot i, for opening the same texture on another API's device.
     HANDLE SlotSharedHandle(int i) const { return m_ring[i].sharedHandle; }
 
-    // Request the content-phase instrument (-fgphase) before Start. Per batch it measures
-    // WHERE BETWEEN ITS REAL NEIGHBOURS the generated member's content sits (the fraction f
-    // in the stage-7 gate: does content phase track display phase?), by projecting the
-    // generated frame onto the previous-real -> current-real axis in downscaled luma. One
+    // What the ring needs from the flip grid to read the batch-composition rotation, kept
+    // to two questions so the ring never learns about ETW. Both are answered on the CAPTURE
+    // thread at batch open, so both must be cheap and must not block: the implementation
+    // takes the flip history's lock for a single bounded lookup (measured ~160 ns since the
+    // history walk stops at the cadence window), never for a walk.
+    class IRotationOracle {
+    public:
+        virtual ~IRotationOracle() {}
+        // The CURRENT measured grid: flips a batch advances, flips in one source period,
+        // and the flip step itself. False when the grid is not known yet, which keeps the
+        // mechanism inert. The ring turns these into the rotation length and the member
+        // stamp offsets, so nothing here declares a frame-generation multiplier.
+        virtual bool Grid(long long batchPeriodTicks, int* outStride,
+                          int* outFlipsPerSource, long long* outSpacingTicks) = 0;
+        // Batch start minus its nearest flip. False when the batch cannot be placed on the
+        // grid at all, which is not an error - it just yields no vote this batch.
+        virtual bool ArrivalOffset(long long batchStartTs, long long* outOffset) = 0;
+    };
+
+    // Arm phase-aware keep-real (-phasekeep) before Start. Default keep-real retains member
+    // 1 of every batch, which is right wherever composition does not rotate; where it does
+    // (x3: batch stride 2 against a 3-flip source period) member 1 holds the real frame in
+    // only one class of three, so the kept sequence runs gen, real, gen, gen, real, gen.
+    // With the oracle the ring votes on the rotation phase and retains member 0 through the
+    // [real,gen] class instead, lifting real content from 2 of every 6 outputs to 4 of 6.
+    // Until the vote is decisive - and whenever grid continuity breaks - this falls back to
+    // plain keep-real, so the failure mode is exactly today's behaviour.
+    void EnablePhaseKeep(IRotationOracle* oracle) { m_rotationOracle = oracle; }
+
+    // Session telemetry for the phase vote, logged at exit by the owner.
+    long long PhaseKeepBatches() const { return m_phaseKeepBatches; }
+    long long PhaseKeepFlipped() const { return m_phaseKeepFlipped; }
+    long long PhaseKeepEmpty() const { return m_phaseKeepEmpty; }
+    long long PhaseKeepResets() const { return m_phaseKeepResets; }
+
+    // Request the content-phase instrument (-fgphase) before Start.
+    //
+    // IT MODELS THE [generated, real] BATCH, so it is an x2 instrument. Its f is defined
+    // against a previous-real -> current-real axis, which exists only where member 0 is the
+    // generated frame and member 1 the real one. At x3 composition rotates and no single
+    // axis holds for every batch, so an f logged there is not the quantity the stage-7 gate
+    // asks about. It composes safely with phase-aware keep-real - the reference frame
+    // follows whatever the ring actually kept - but composing safely is not the same as
+    // being meaningful, and only the x2 numbers answer the gate.
+    //
+    // Per batch it measures WHERE BETWEEN ITS REAL NEIGHBOURS the generated member's
+    // content sits (the fraction f: does content phase track display phase?), by projecting
+    // the generated frame onto the previous-real -> current-real axis in downscaled luma. One
     // fgphase: log line per measured batch; the display fraction g is joined OFFLINE from
     // the flip lines, so nothing here reads ETW. Instrument runs are instrument runs, not
     // reference runs: the readback stalls the capture thread on the GPU once per wake.
@@ -121,6 +165,13 @@ private:
         IDirect3DSurface9* mainSurface;
         HANDLE sharedHandle;              // retained for cross-API consumers
         LARGE_INTEGER timestamp;
+        // The batch this slot came from, which is the stage-6 overlay's key. Held
+        // separately because a member's TIMESTAMP may sit a flip step past its batch start
+        // (phase-aware keep-real stamps member m at its own flip so content and stamp
+        // agree), and a correction measured per batch must still find every member of it.
+        // Equal to timestamp wherever member stamps are not offset, so the pre-existing
+        // read path is bit-for-bit unchanged there.
+        LARGE_INTEGER batchStart;
         int member;                       // position inside its capture batch; 0 opens one
         bool valid;
     };
@@ -134,7 +185,20 @@ private:
     static const int kFgW = 320;
     static const int kFgH = 180;
     bool ReadFgLuma(IDirect3DSurface9* src, float* out);
-    void FgPhaseOnWake(int member, int slot, LONGLONG batchStartUs);
+    void FgPhaseOnWake(int member, int slot, LONGLONG batchStartUs, bool keptThisMember);
+
+    // Phase-aware keep-real state, capture-thread-owned end to end: the vote is fed and read
+    // on the same thread that retracts, so there is no cross-thread publication to get wrong.
+    IRotationOracle* m_rotationOracle = NULL;
+    policy::RotationPhase m_rotation;
+    long long m_phaseKeepBatches = 0;   // batches the vote was consulted for
+    long long m_phaseKeepFlipped = 0;   // batches that kept a member plain keep-real would not
+    long long m_phaseKeepEmpty = 0;     // all-generated batches dropped whole
+    long long m_phaseKeepResets = 0;    // votes dropped on a continuity break
+    // Grid measurements for the batch in flight, read once at batch open: members arrive a
+    // submission epsilon apart, so re-reading per member would only add lock traffic.
+    int m_rotRealMember = -1;           // member this batch should keep; <0 = fall back
+    LONGLONG m_rotSpacing = 0;          // flip step, for member stamp offsets
 
     bool m_fgPhaseRequested = false;
     bool m_fgPhaseActive = false;

@@ -60,6 +60,12 @@ public:
                                            policy::AnchorChain& chain,
                                            int64_t cadenceWindow) const;
 
+    // Measured flip spacing on a head over the recent window, 0 when the grid is not known
+    // yet. Same lock discipline as PairCapture: held for one bounded lookup. Exists so a
+    // caller can DERIVE the frame-generation multiplier from the grid instead of declaring
+    // it - the rotation length that phase-aware keep-real needs is one such derivation.
+    long long MedianFlipSpacing(uint32_t head, int64_t cadenceWindow) const;
+
     long long Flips() const { return m_flips.load(std::memory_order_relaxed); }
     long long DecodeFailures() const { return m_decodeFail.load(std::memory_order_relaxed); }
 

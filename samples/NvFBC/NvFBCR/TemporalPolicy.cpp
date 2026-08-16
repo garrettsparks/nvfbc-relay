@@ -421,6 +421,95 @@ LateCorrection MeasureLateness(const FlipHistory& h, uint32_t head, int64_t batc
     return out;
 }
 
+// Composition repeats once the batch stride has walked a whole number of source periods:
+// period = flipsPerSource / gcd(stride, flipsPerSource). x2 (2 flips, stride 2) gives 1, so
+// the mechanism is inert exactly where keep-real is already right; x3 (3, stride 2) gives 3;
+// x4 (4, stride 2) gives 2. Frame generation off (1 flip per source period) gives 1.
+int RotationPeriodBatches(int flipsPerSource, int stride) {
+    if (flipsPerSource <= 1 || stride <= 0) return 1;
+    int a = stride, b = flipsPerSource;
+    while (b != 0) { const int t = a % b; a = b; b = t; }
+    const int period = flipsPerSource / (a > 0 ? a : 1);
+    if (period < 1) return 1;
+    if (period > RotationPhase::kMaxPeriod) return 1;   // too long to vote on; stay inert
+    return period;
+}
+
+void RotationReset(RotationPhase& p, int stride, int flipsPerSource) {
+    p.stride = stride;
+    p.flipsPerSource = flipsPerSource;
+    p.period = RotationPeriodBatches(flipsPerSource, stride);
+    for (int i = 0; i < RotationPhase::kMaxPeriod; i++) {
+        p.offsetSum[i] = 0;
+        p.offsetCount[i] = 0;
+    }
+    p.valid = false;
+    p.realLedResidue = -1;
+}
+
+int RotationRealMember(const RotationPhase& p, long long batchIndex) {
+    if (!p.valid || p.period <= 1 || p.realLedResidue < 0 || batchIndex < 0) return -1;
+    if (p.flipsPerSource <= 1 || p.stride <= 0) return -1;
+    // The vote names the residue whose member 0 is real, which fixes the flip phase of real
+    // frames: P = realLedResidue * stride (mod flipsPerSource). Member m of batch b sits at
+    // flip b*stride + m, so the real member is P - b*stride, folded positive.
+    const long long f = p.flipsPerSource;
+    const long long phase = ((long long)p.realLedResidue * p.stride) % f;
+    long long m = (phase - (batchIndex % f) * p.stride) % f;
+    if (m < 0) m += f;
+    return (int)m;
+}
+
+void RotationObserve(RotationPhase& p, long long batchIndex, int64_t anchorOffset) {
+    if (p.period <= 1 || batchIndex < 0) return;
+    const int r = (int)(batchIndex % p.period);
+    p.offsetSum[r] += anchorOffset;
+    p.offsetCount[r]++;
+
+    // Bounded memory, so the vote can still change its mind. An accumulator that never
+    // forgets converges once and then ignores the evidence: halving both sum and count at a
+    // cap makes this an exponential window (~256 samples a class, about 8 s at x3's batch
+    // rate) rather than a lifetime average, and keeps the sum away from overflow for free.
+    static const int32_t kSampleCap = 256;
+    if (p.offsetCount[r] >= kSampleCap) {
+        p.offsetSum[r] /= 2;
+        p.offsetCount[r] /= 2;
+    }
+
+    // Decide only on a full set of well-sampled classes, and RE-DECIDE every batch: the
+    // verdict is never latched, so if the separation ever collapses this falls straight back
+    // to plain keep-real instead of steering on stale evidence. The test is on MEANS - the
+    // real-led class sits tens of microseconds BELOW zero while every generated-led class
+    // sits near +75 - because the per-batch distributions overlap and only the aggregate
+    // separates. Requiring the winner to clear the runner-up by a margin keeps a
+    // half-converged vote from committing.
+    static const int32_t kMinSamplesPerResidue = 24;
+    static const int64_t kMinSeparation = 40;   // caller's units; us in tests, QPC ticks live
+    int best = -1, second = -1;
+    int64_t bestMean = 0, secondMean = 0;
+    for (int i = 0; i < p.period; i++) {
+        if (p.offsetCount[i] < kMinSamplesPerResidue) { p.valid = false; return; }
+        const int64_t mean = p.offsetSum[i] / p.offsetCount[i];
+        if (best < 0 || mean < bestMean) {
+            second = best; secondMean = bestMean;
+            best = i; bestMean = mean;
+        } else if (second < 0 || mean < secondMean) {
+            second = i; secondMean = mean;
+        }
+    }
+    if (best < 0 || second < 0 || secondMean - bestMean < kMinSeparation) {
+        p.valid = false;         // classes not separated: there may be nothing to find
+        return;
+    }
+    p.valid = true;
+    p.realLedResidue = best;
+}
+
+bool RotationRealLeads(const RotationPhase& p, long long batchIndex) {
+    if (!p.valid || p.period <= 1 || p.realLedResidue < 0 || batchIndex < 0) return false;
+    return (int)(batchIndex % p.period) == p.realLedResidue;
+}
+
 bool BracketIsStalled(const BracketInfo& b, const PolicyConfig& cfg) {
     if (!b.hasBefore || !b.hasAfter) return true;
     if (cfg.stallSpanQpc <= 0) return false;

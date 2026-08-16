@@ -35,8 +35,15 @@ enum CompositorKind {
     kCompositorInterp = 2,
 };
 
-class TemporalCaptureMode : public IFrameCaptureMode {
+class TemporalCaptureMode : public IFrameCaptureMode,
+                            private CaptureRing::IRotationOracle {
 private:
+    // CaptureRing::IRotationOracle, answered on the CAPTURE thread. Both take the flip
+    // history's lock for one bounded lookup each; the ring calls them once per batch.
+    virtual bool Grid(long long batchPeriodTicks, int* outStride, int* outFlipsPerSource,
+                      long long* outSpacingTicks) override;
+    virtual bool ArrivalOffset(long long batchStartTs, long long* outOffset) override;
+
     PresentScheduler m_scheduler;
     CaptureRing m_ring;
     LONGLONG m_bracketingDelayQpc;  // present-target lag; static: max(present period, 1.25 x assumed source period)
@@ -70,6 +77,8 @@ private:
     // read path.
     bool m_dejitter;
     bool m_fgPhase;                 // -fgphase: per-batch content-phase instrument (ring-side)
+    bool m_phaseKeep;               // -phasekeep: phase-aware keep-real (needs -etw with the join)
+    bool m_phaseKeepRequested;      // asked for, so an unmet prerequisite can say so once
     policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
     policy::StampOverlay m_overlay;      // present-thread-owned; FindBracket reads through it
     long long m_nextBatch = 0;           // cursor into the ring's batch-start history
@@ -98,7 +107,7 @@ public:
                         bool lock = false, CompositorKind compositor = kCompositorNearest,
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
                         bool etw = false, bool noJoin = false, bool dejitter = false,
-                        bool fgPhase = false);
+                        bool fgPhase = false, bool phaseKeep = false);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

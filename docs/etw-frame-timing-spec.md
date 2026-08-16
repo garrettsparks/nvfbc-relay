@@ -433,18 +433,37 @@ measured before any backend or selection work:
   candidate below.
 
 **Candidate (b), independent of the gate: the x3 keep-real phase defect.** Keep-real retains
-member 1 of each batch, which at x3 holds the real frame only in [gen,real] batches - one source
-period in two - and DISCARDS the real frame in [real,gen] batches. kcd_60x3_walk records the
-consequence as a bound: 18.0% field synth that a phase-aware keep-real must beat. The residue
-phase is readable as an ensemble (real-led batches wake ~-50 us vs +76 us gen-led; vote plus
-stride dead-reckoning). No generated-frame usage, no new label, no backend - and replay-verifiable
-against an existing fixture. One caveat to carry: the NvFBC race biases captured pixels toward the
-real frame, so "kept the wrong member" often still shows real pixels - the 18% bound is the
-honest field measurement of what actually got through.
+member 1 of each batch, which at x3 holds the real frame only in [gen,real] batches. Working the
+tiling through (stride 2 over a 3-flip source period), the kept sequence runs gen, real, gen,
+gen, real, gen: **2 of every 6 output frames carry real pixels**. Keeping member 0 in the
+[real,gen] batches instead lifts that to 4 of 6 - the two [gen,gen] batches have no real frame to
+keep. Twice the real content.
 
-**Order of work (decided 2026-08-14): the f/g measurement first** - the cheapest step that can
-kill the most downstream work. Then (b). Only on a PASS, and with (b) landed, the mixed-base
-design and the DXGI costing.
+**The phase is READ, not guessed, and the label assignment is anchored** (2026-08-16, three x3
+captures via x3residue.py plus five x2 controls). Exactly one of the three classes wakes BEFORE
+its flip (aoff p50 -43/-61/-105 us) while the other two sit at +76/+77/+78; an independent signal
+(elevated single-wake share) names a class exactly +2 away, which is what the tiling predicts for
+real-led vs real-trailing. The assignment is fixed by a KNOWN-composition control: every x2 batch
+is [gen,real], and five x2 captures read aoff p50 +72..+74 - matching x3's gen-led classes, with
+no x2 counterpart to the negative class. So negative aoff = [real,gen], +2 = [gen,real],
++4 = [gen,gen]. Ensemble only: per-batch distributions overlap, so vote over tens of batches and
+dead-reckon on the 96%-rigid stride.
+
+**IT IS NOT REPLAY-TESTABLE, and synth share is the wrong gate for it.** Both members of a batch
+carry the SAME batch-start stamp, so which one is retracted leaves the visible timeline
+byte-identical - measured on kcd_60x3_walk, 16848 valid stamps under each rule and 0 of 16848
+differing. No bracket, no composite decision and no synth share can move. (Flipping the rule in
+the sim does print 19.0% -> 18.1%, but that is a model-edge cascade: one 8-wake window differs in
+occupancy, re-seeds go 18 -> 17, and one re-seed shifts the lock phase for a stretch.) The defect
+is a PIXEL one - the relay labels a frame op=pass while its pixels are generated - and every
+timestamp-based instrument here is blind to it by construction, the field synth number included.
+**Validation is the judder metric**: consecutive output frames show content 2/3/4 flips apart at
+x3 (p25/p50/p75 = 11378/16591/21960 us, against x2's 602 us spread), which IS the "panning does
+not move consistently" complaint. A before/after x3 capture pair measures it from video.
+
+**Order of work (revised 2026-08-16).** (b) first, since its phase question closed without a
+capture and it needs no gate. Then the f/g measurement, which still gates the generated-frame
+half. Only on a PASS, and with (b) landed, the mixed-base design and the DXGI costing.
 
 ## What the scanout grid actually looks like
 

@@ -37,6 +37,7 @@ CaptureRing::CaptureRing()
         m_ring[i].sharedHandle = NULL;
         m_ring[i].valid = false;
         m_ring[i].timestamp.QuadPart = 0;
+        m_ring[i].batchStart.QuadPart = 0;
         m_ring[i].member = 0;
     }
     m_baseQpc.QuadPart = 0;
@@ -312,9 +313,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
 
         // The intra-batch (real) member is stamped with the BATCH-START time so the ring
         // timeline stays at base cadence; everything else is stamped at its own arrival.
-        m_ring[slot].timestamp.QuadPart = batch.stampTs;
         m_ring[slot].member = batch.member;
-        m_ring[slot].valid = true;
         // Publish the batch start for the stage-6 walk. At batch OPEN only: every member
         // shares the start stamp, so one entry names the whole batch, and the release
         // store is what lets the present thread read the entry without touching slots.
@@ -322,15 +321,92 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             const long long opens = m_batchOpens.load(std::memory_order_relaxed);
             m_batchStarts[opens % kBatchHistory] = batch.stampTs;
             m_batchOpens.store(opens + 1, std::memory_order_release);
+
+            // Feed the rotation vote once per batch, at open, where the batch's grid
+            // position is defined. A batch that cannot be placed simply casts no vote; a
+            // batch that arrived off-cadence means the batch counter and the grid may have
+            // slipped apart, and residue is only meaningful while they march together, so
+            // that drops the vote rather than letting it drift.
+            m_rotRealMember = -1;
+            m_rotSpacing = 0;
+            if (m_rotationOracle) {
+                const long long batchPeriod = m_srcPeriodEmaQpc.load(std::memory_order_relaxed);
+                int stride = 0, flipsPerSource = 0;
+                long long spacing = 0;
+                if (m_rotationOracle->Grid(batchPeriod, &stride, &flipsPerSource, &spacing)) {
+                    if (stride != m_rotation.stride ||
+                        flipsPerSource != m_rotation.flipsPerSource) {
+                        policy::RotationReset(m_rotation, stride, flipsPerSource);
+                    } else if (batchPeriod > 0 && batch.batchGap > 0 &&
+                               (batch.batchGap > batchPeriod + batchPeriod / 2 ||
+                                batch.batchGap < batchPeriod / 2)) {
+                        policy::RotationReset(m_rotation, stride, flipsPerSource);
+                        m_phaseKeepResets++;
+                    } else {
+                        long long off = 0;
+                        if (m_rotationOracle->ArrivalOffset(batch.stampTs, &off)) {
+                            policy::RotationObserve(m_rotation, opens, off);
+                        }
+                    }
+                    m_rotSpacing = spacing;
+                    m_rotRealMember = policy::RotationRealMember(m_rotation, opens);
+                    if (m_rotRealMember >= 0) m_phaseKeepBatches++;
+                }
+            }
         }
 
+        // Where this member's content actually displays. Members of a batch arrive within a
+        // submission epsilon but scan out one flip apart, and the ring's default stamp
+        // (batch start, shared by every member) therefore records the LATER members early by
+        // a flip step. That is harmless while the kept member is always the same one - the
+        // offset is constant and the comb lock absorbs it - but phase-aware keep-real varies
+        // which member survives, and a varying offset is content jitter the lock cannot
+        // cancel. So when the rotation is being acted on, each member is stamped at its own
+        // flip instead. Left alone otherwise, which keeps x2's load-bearing cancellation
+        // exactly as it was.
+        LONGLONG stampTs = batch.stampTs;
+        if (m_rotRealMember >= 0 && m_rotSpacing > 0 && batch.member > 0) {
+            stampTs += (LONGLONG)batch.member * m_rotSpacing;
+        }
+
+        // Which member this batch keeps. Default keep-real retains the LAST member and
+        // retracts its predecessors, which is right wherever composition does not rotate.
+        // With the rotation read, the answer is per member instead: keep the one member the
+        // vote names real and retract every other, INCLUDING keeping none at all when the
+        // named member does not exist in this batch. That last case is the all-generated
+        // batch, and dropping it whole is the point - its two frames are both synthesized,
+        // so leaving them out is what makes the surviving cadence one real frame per source
+        // period rather than a 90/s mixture. Decided before publishing, so a batch that
+        // keeps an earlier member never briefly exposes a later one to a present in flight.
+        bool retractThis = false, retractPrev = false;
+        if (m_rotRealMember >= 0) {
+            retractThis = (batch.member != m_rotRealMember);
+            if (retractThis && batch.member > 0) {
+                // A later member arriving after the kept one: nothing to take back.
+                retractPrev = false;
+            }
+            if (batch.member == 0 && m_rotRealMember >= 2) m_phaseKeepEmpty++;
+            if (batch.retractPrevious && !retractThis) {
+                // This member is the real one and a predecessor is still standing.
+                retractPrev = true;
+            }
+            if (batch.member == 0 && m_rotRealMember == 0) m_phaseKeepFlipped++;
+        } else if (batch.retractPrevious && count >= 1) {
+            retractPrev = true;
+        }
+
+        m_ring[slot].timestamp.QuadPart = stampTs;
+        m_ring[slot].batchStart.QuadPart = batch.stampTs;
+        m_ring[slot].valid = !retractThis;
         m_writeCount = count + 1;
         m_published.store(count + 1);  // publish only after the slot write is GPU-complete
 
-        if (batch.retractPrevious && count >= 1) {
+        if (retractPrev) {
             // Retract the previous member (the generated frame): hide it from future brackets.
             // Content is never overwritten, so a present read already in flight stays coherent.
             m_ring[(int)((count - 1) % RING_SIZE)].valid = false;
+            collapsed++;
+        } else if (retractThis) {
             collapsed++;
         }
 
@@ -347,7 +423,8 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
 
         if (m_fgPhaseActive) {
             FgPhaseOnWake(batch.member, slot,
-                          (LONGLONG)((batch.stampTs - m_baseQpc.QuadPart) * usPerTick));
+                          (LONGLONG)((batch.stampTs - m_baseQpc.QuadPart) * usPerTick),
+                          !retractThis);
         }
     }
 }
@@ -409,7 +486,8 @@ bool CaptureRing::ReadFgLuma(IDirect3DSurface9* src, float* out) {
     return true;
 }
 
-void CaptureRing::FgPhaseOnWake(int member, int slot, LONGLONG batchStartUs) {
+void CaptureRing::FgPhaseOnWake(int member, int slot, LONGLONG batchStartUs,
+                                bool keptThisMember) {
     float* L = m_fgLumWake[m_fgWakeParity];
     if (!ReadFgLuma(m_ring[slot].capSurface, L)) {
         LOGERR("fgphase: readback failed, instrument disabled");
@@ -462,9 +540,17 @@ void CaptureRing::FgPhaseOnWake(int member, int slot, LONGLONG batchStartUs) {
                     sqrt(sgr / n));
             }
         }
-        // Whatever its index, the retaining member is now the kept frame.
-        memcpy(m_fgLumKept, L, sizeof(float) * kFgW * kFgH);
-        m_fgKeptValid = true;
+        // Track whatever the RING actually kept, never whatever this instrument assumed.
+        // Default keep-real retains the arriving member, but phase-aware keep-real can
+        // retain member 0 instead, and an instrument holding the other frame as its
+        // reference would measure the next batch against a frame that was thrown away.
+        if (keptThisMember) {
+            memcpy(m_fgLumKept, L, sizeof(float) * kFgW * kFgH);
+            m_fgKeptValid = true;
+        } else {
+            memcpy(m_fgLumKept, prevWake, sizeof(float) * kFgW * kFgH);
+            m_fgKeptValid = true;
+        }
     } else if (m_fgPrevMember == 0 && m_fgPrevWakeValid) {
         // The previous wake opened a batch and was never retracted: a kept single
         // (coalesced real, or FG off). Promote it - one wake late, which is the earliest
@@ -491,7 +577,11 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, const policy::StampOverlay* ov
         int slot = (int)(i % RING_SIZE);
         if (!m_ring[slot].valid) continue;
         LONGLONG ts = m_ring[slot].timestamp.QuadPart;
-        if (overlay) ts -= overlay->CorrectionFor(ts);
+        // Corrections are measured PER BATCH, so they are looked up by the slot's batch
+        // start rather than by its own stamp - the two differ only where member stamps are
+        // offset onto their own flips, and there a member would otherwise miss the
+        // correction its batch earned.
+        if (overlay) ts -= overlay->CorrectionFor(m_ring[slot].batchStart.QuadPart);
         LONGLONG diff = targetQpc - ts;
         if (diff >= 0) {
             if (diff < bestBeforeDiff) {

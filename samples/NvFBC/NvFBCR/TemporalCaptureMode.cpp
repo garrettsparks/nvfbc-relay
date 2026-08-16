@@ -20,7 +20,7 @@ static const float kDefaultAssumedSrcFps = 60.0f;
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
                                          bool tint, bool etw, bool noJoin, bool dejitter,
-                                         bool fgPhase)
+                                         bool fgPhase, bool phaseKeep)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_compositor(NULL)
@@ -34,6 +34,8 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_noJoin(noJoin)
     , m_dejitter(dejitter && etw && !noJoin)
     , m_fgPhase(fgPhase)
+    , m_phaseKeep(phaseKeep && etw && !noJoin)
+    , m_phaseKeepRequested(phaseKeep)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_srcRateHint(srcRateHint)
@@ -67,12 +69,41 @@ UINT TemporalCaptureMode::GetPresentationInterval() const {
     return m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
 }
 
+// The rotation length for the CURRENT grid, from measurements only: flips per source period
+// from the declared -src against the measured flip spacing, stride from the ring's own
+// batch-period estimate against the same spacing. x2 and frame-generation-off both yield 1
+// and the mechanism stays inert; x3 yields 3. Returning 1 whenever anything is unknown is
+// what makes "no flip data yet" indistinguishable from "cannot rotate", which is correct -
+// both mean plain keep-real.
+bool TemporalCaptureMode::Grid(long long batchPeriodTicks, int* outStride,
+                               int* outFlipsPerSource, long long* outSpacingTicks) {
+    if (!m_etw || m_noJoin || m_assumedSrcPeriodQpc <= 0 || batchPeriodTicks <= 0) return false;
+    const LONGLONG spacing = m_etwConsumer.MedianFlipSpacing(0, m_flipCadenceWindowQpc);
+    if (spacing <= 0) return false;
+    *outFlipsPerSource = (int)((m_assumedSrcPeriodQpc + spacing / 2) / spacing);
+    *outStride = (int)((batchPeriodTicks + spacing / 2) / spacing);
+    *outSpacingTicks = spacing;
+    return true;
+}
+
+bool TemporalCaptureMode::ArrivalOffset(long long batchStartTs, long long* outOffset) {
+    if (!m_etw || m_noJoin) return false;
+    const policy::FlipPairing fp =
+        m_etwConsumer.PairCapture(0, batchStartTs, 0, m_flipCadenceWindowQpc);
+    if (!fp.anchorFound) return false;
+    *outOffset = fp.anchorOffset;
+    return true;
+}
+
 bool TemporalCaptureMode::Setup() {
     m_device = g_pD3D9Device;
 
     // Before the ring starts: the instrument allocates its readback resources in Start.
     if (m_fgPhase) {
         m_ring.EnableFgPhase();
+    }
+    if (m_phaseKeep) {
+        m_ring.EnablePhaseKeep(this);
     }
     if (!m_ring.Setup(m_device, BUF_WIDTH, BUF_HEIGHT)) {
         return false;
@@ -201,6 +232,14 @@ bool TemporalCaptureMode::Setup() {
     if (m_dejitter) {
         LOG("Delivery-lateness correction ACTIVE (-dejit): late batches corrected onto the "
             "flip grid via the stamp overlay; dejit: lines mark each verdict");
+    }
+    if (m_phaseKeep) {
+        LOG("Phase-aware keep-real ACTIVE (-phasekeep): the batch-composition rotation is "
+            "voted from arrival timing, and [real,gen] batches keep member 0 instead of "
+            "member 1. Inert wherever composition does not rotate (x2, FG off).");
+    } else if (m_phaseKeepRequested) {
+        LOGERR("-phasekeep REFUSED: needs -etw with the join on (the rotation is read from "
+               "the flip grid); running plain keep-real");
     }
     return true;
 }
@@ -508,6 +547,16 @@ void TemporalCaptureMode::Run(
         if (m_ring.HasStopped()) break;  // capture thread hit a fatal error
     }
 
+    if (m_phaseKeep) {
+        // Without the flipped count, a live A/B cannot tell "the rotation was read and no
+        // batch needed flipping" from "the vote never converged and this ran as plain
+        // keep-real" - which are the pass and the silent-no-op, and they look identical in
+        // the output.
+        LOG("phasekeep summary: %lld batches steered, %lld kept an earlier member, "
+            "%lld all-generated batches dropped, %lld vote resets",
+            m_ring.PhaseKeepBatches(), m_ring.PhaseKeepFlipped(),
+            m_ring.PhaseKeepEmpty(), m_ring.PhaseKeepResets());
+    }
     if (m_dejitter) {
         LOG("dejit summary: %lld batches measured, %lld late, %lld corrected, "
             "%lld fence-blocked, %lld lock-declined, %lld skipped",
