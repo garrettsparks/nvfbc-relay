@@ -222,6 +222,28 @@ long long EtwFlipConsumer::MedianFlipSpacing(uint32_t head, int64_t cadenceWindo
                                               newest->displayTs, head);
 }
 
+int EtwFlipConsumer::CountFlipsBetween(uint32_t head, int64_t lo, int64_t hi) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    static const int kCap = 24;    // past this the caller treats the advance as unusable
+    const policy::Flip* buf[kCap];
+    const int n = m_history.InRange(lo + 1, hi, head, buf, kCap);
+    // DISTINCT display times, not records. The history does not de-duplicate on Add, and
+    // FlipHistory::MedianSpacing already skips equal display times for the same reason - so
+    // this stream is known to carry them. Counting a duplicate here would advance the
+    // caller's grid position by one flip too many, permanently and silently, which is the
+    // exact failure counting was chosen over dividing to avoid.
+    int distinct = 0;
+    int64_t prev = 0;
+    bool havePrev = false;
+    for (int i = 0; i < n; i++) {
+        if (havePrev && buf[i]->displayTs == prev) continue;
+        prev = buf[i]->displayTs;
+        havePrev = true;
+        distinct++;
+    }
+    return distinct;
+}
+
 policy::LateCorrection EtwFlipConsumer::MeasureLateness(uint32_t head, int64_t batchStartTs,
                                                         policy::AnchorChain& chain,
                                                         int64_t cadenceWindow) const {

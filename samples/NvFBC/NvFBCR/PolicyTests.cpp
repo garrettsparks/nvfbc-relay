@@ -942,6 +942,104 @@ static void test_anchor_chain() {
 // find, and stay silent until it is sure? Built from the MEASURED signature (real-led
 // batches wake ~-50 us before their flip, generated-led ~+75 us after, with distributions
 // that overlap heavily), because the whole point is that no single batch is decisive.
+// What one wake does to the ring. THE FIRST HALF IS AN EQUIVALENCE PROOF, not a behaviour
+// test: with no rotation guidance this must do exactly what the capture loop did before any
+// rotation code existed, and that is checked by exhausting every input combination rather
+// than by reading the code and reasoning about it.
+//
+// Why exhaustion: the default path is the daily driver, the corpus cannot see this decision
+// at all (the replay models the batch timeline, not the ring's per-wake retraction), and the
+// rule it replaced was three lines that had been correct for months. A restructure that
+// silently altered one case would show up as soft frames in x2 output and nothing else.
+static void test_keep_decision() {
+    const int64_t kBase = 1000000, kSpacing = 5556;
+
+    // The rule as it stood before the rotation existed, written out independently so the
+    // comparison is against a statement of the old behaviour rather than against a
+    // refactoring of the new code.
+    struct Old { int64_t stamp; bool keep; bool retract; };
+    auto oldRule = [&](const policy::BatchDecision& b, bool havePrev) {
+        Old o;
+        o.stamp = b.stampTs;                        // batch start, every member
+        o.keep = true;                              // this member always survives
+        o.retract = b.retractPrevious && havePrev;  // intra-batch wake displaces its predecessor
+        return o;
+    };
+
+    int cases = 0;
+    for (int member = 0; member <= 2; member++) {
+        for (int intra = 0; intra <= 1; intra++) {
+            for (int havePrev = 0; havePrev <= 1; havePrev++) {
+                for (int spacing = 0; spacing <= 1; spacing++) {
+                    policy::BatchDecision b;
+                    b.member = member;
+                    b.intraBatch = (intra != 0);
+                    b.retractPrevious = (intra != 0);
+                    b.stampTs = kBase;
+                    const int64_t sp = spacing ? kSpacing : 0;
+                    const policy::KeepDecision got =
+                        policy::DecideKeep(b, /*realMember=*/-1, sp, havePrev != 0);
+                    const Old want = oldRule(b, havePrev != 0);
+                    CHECK(got.stampTs == want.stamp,
+                          "no-rotation stamp must be batch start (member %d, spacing %lld): "
+                          "got %lld want %lld",
+                          member, (long long)sp, (long long)got.stampTs,
+                          (long long)want.stamp);
+                    CHECK(got.keepThis == want.keep,
+                          "no-rotation must keep every member (member %d)", member);
+                    CHECK(got.retractPrev == want.retract,
+                          "no-rotation retraction must match keep-real (member %d, intra %d, "
+                          "havePrev %d): got %d want %d",
+                          member, intra, havePrev, (int)got.retractPrev, (int)want.retract);
+                    // col= is the observable witness of this decision in every capture log,
+                    // so its accounting has to match too or an A/B against an old capture
+                    // would read as a behaviour change.
+                    CHECK(got.collapsed == want.retract,
+                          "no-rotation collapse count must match keep-real (member %d)",
+                          member);
+                    cases++;
+                }
+            }
+        }
+    }
+    CHECK(cases == 24, "expected 24 exhaustive no-rotation cases, ran %d", cases);
+
+    // With the rotation known: exactly the named member survives, and it is stamped on its
+    // own flip so content and stamp agree whichever member that is.
+    {
+        policy::BatchDecision m0;
+        m0.member = 0; m0.stampTs = kBase;
+        policy::BatchDecision m1;
+        m1.member = 1; m1.stampTs = kBase; m1.intraBatch = true; m1.retractPrevious = true;
+
+        const policy::KeepDecision k0 = policy::DecideKeep(m0, 0, kSpacing, false);
+        CHECK(k0.keepThis && k0.stampTs == kBase, "member 0 named real: keep, stamp at start");
+        const policy::KeepDecision k1 = policy::DecideKeep(m1, 0, kSpacing, true);
+        CHECK(!k1.keepThis, "member 1 must be dropped when member 0 is the real one");
+        CHECK(!k1.retractPrev,
+              "a DISCARDED member must not retract the keeper that came before it - this is "
+              "the case that would silently empty the ring at x3");
+        CHECK(k1.collapsed, "dropping a member still counts as a collapse for col=");
+
+        const policy::KeepDecision j1 = policy::DecideKeep(m1, 1, kSpacing, true);
+        CHECK(j1.keepThis && j1.retractPrev,
+              "member 1 named real: keep it and retract member 0");
+        CHECK(j1.stampTs == kBase + kSpacing,
+              "a kept later member must be stamped on its own flip, got %+lld from base",
+              (long long)(j1.stampTs - kBase));
+
+        // The all-generated batch: the named member does not exist, so nothing survives.
+        const policy::KeepDecision e0 = policy::DecideKeep(m0, 2, kSpacing, false);
+        const policy::KeepDecision e1 = policy::DecideKeep(m1, 2, kSpacing, true);
+        CHECK(!e0.keepThis && !e1.keepThis,
+              "a batch whose real member is past its members must keep nothing");
+        CHECK(!e1.retractPrev, "an empty batch has no keeper to retract toward");
+    }
+
+    std::printf("  keep decision: 24 exhaustive no-rotation cases match keep-real exactly; "
+                "rotation keeps one named member, stamps it on its own flip\n");
+}
+
 static void test_rotation_phase() {
     // Period arithmetic first: derived from measured stride and flips-per-source-period, so
     // every multiplier falls out of one rule instead of being special-cased.
@@ -952,18 +1050,67 @@ static void test_rotation_phase() {
     CHECK(policy::RotationPeriodBatches(9, 2) == 1,
           "a rotation longer than the vote can hold must report inert, not overflow");
 
-    // A deterministic stand-in for the measured spread: alternating +-90 us around each
-    // class mean, so every class's samples straddle the others' and only the AGGREGATE
-    // separates. A per-batch rule would be wrong about half the time on this input.
-    const int64_t kRealLed = -50, kGenLed = 75, kSpread = 90;
-    auto sample = [&](int residue, int realLed, long long i) {
-        const int64_t mean = (residue == realLed) ? kRealLed : kGenLed;
-        return mean + ((i % 2) ? kSpread : -kSpread);
+    // A stand-in for the MEASURED signature, not for a convenient one. Across ten captures
+    // the real-led class sits below zero (-30 to -96) and every generated-led class above
+    // it (+36 to +129), with the per-batch spread far wider than the gap between class
+    // means - so only the aggregate separates and a per-batch rule would be wrong about
+    // half the time. The sign structure is what the decision reads; these numbers put a
+    // synthetic class in each measured position.
+    const int64_t kRealLed = -60, kGenLed = 90, kSpread = 400;
+    // THE HARNESS CARRIES ITS OWN GROUND TRUTH. It tracks truePos independently and plants
+    // the real-led signal there, then asserts the code agrees. Two earlier versions of this
+    // test did not, and each hid a bug in the thing it was meant to prove: the first passed
+    // the class in directly (so it could not see that batch index is not grid position),
+    // and the second planted the signal at p.gridPos - asking the code where it thinks it
+    // is, which makes every phase assertion a tautology. Injecting an off-by-one into
+    // RotationAdvance passed both.
+    // The code's origin is ARBITRARY - RotationAdvance adopts its first anchor as position
+    // 0 - so absolute positions cannot be compared. What must hold is that the offset
+    // between the two frames of reference stays CONSTANT: that is exactly the property that
+    // breaks when position tracking loses a step, and it is invisible to a test that reads
+    // its expectations out of p.gridPos.
+    struct Harness {
+        policy::RotationPhase p;
+        int truePos = 0;          // the grid position the TEST is counting, from its own origin
+        int truePhase = 0;        // where the test planted the real-led class, in ITS frame
+        int offset = -1;          // (code position - test position) mod fps, once established
+        int64_t t = 100000;
+        int64_t spacing = 5556;
+        int fps = 3;
     };
-    auto vote = [&](policy::RotationPhase& p, int realLed, int n) {
-        for (long long i = 0; i < n; i++) {
-            policy::RotationObserve(p, i, sample((int)(i % p.period), realLed, i));
+    auto init = [](Harness& h, int stride, int fps, int truePhase, int64_t spacing) {
+        policy::RotationReset(h.p, stride, fps);
+        h.truePos = 0;
+        h.truePhase = truePhase;
+        h.offset = -1;
+        h.t = 100000;
+        h.spacing = spacing;
+        h.fps = fps;
+    };
+    // One batch: advance the test's own position, advance the code's, then plant the signal
+    // where the TEST says we are. Nothing here reads p.gridPos to decide what to plant.
+    auto step = [&](Harness& h, int steps, int i) {
+        h.t += (int64_t)steps * h.spacing;
+        h.truePos = (int)(((long long)h.truePos + steps) % h.fps);
+        if (!policy::RotationAdvance(h.p, h.t, steps)) return false;
+        if (h.offset < 0) {
+            h.offset = ((h.p.gridPos - h.truePos) % h.fps + h.fps) % h.fps;
         }
+        const int64_t mean = (h.truePos == h.truePhase) ? kRealLed : kGenLed;
+        policy::RotationObserve(h.p, mean + ((i % 2) ? kSpread : -kSpread));
+        return true;
+    };
+    // Is the code still in step with the test, whatever origin each started from?
+    auto inStep = [&](const Harness& h) {
+        if (h.offset < 0) return true;
+        return ((h.p.gridPos - h.truePos) % h.fps + h.fps) % h.fps == h.offset;
+    };
+    // The real member is FRAME-INDEPENDENT - it is a difference of two positions - so this
+    // is the assertion that means the same thing on both sides of the origin question.
+    auto trueMember = [&](const Harness& h) {
+        int m = (h.truePhase - h.truePos) % h.fps;
+        if (m < 0) m += h.fps;
+        return m;
     };
 
     {   // x3, the regime this exists for. THE CASE THAT DECIDES THE DESIGN is the third
@@ -971,30 +1118,43 @@ static void test_rotation_phase() {
         // batch and the caller keeps NOTHING. Keeping one anyway leaves the ring holding
         // frames 3, 2 and 1 flips apart; dropping it leaves exactly the real frames, one
         // per source period, uniformly spaced - which is what a 60 fps output wants.
-        policy::RotationPhase p;
-        policy::RotationReset(p, /*stride=*/2, /*flipsPerSource=*/3);
+        Harness h;
+        init(h, /*stride=*/2, /*fps=*/3, /*truePhase=*/1, 5556);
+        policy::RotationPhase& p = h.p;
         CHECK(p.period == 3, "x3 must rotate over 3 batches, got %d", p.period);
         CHECK(!p.valid, "a fresh vote is not valid");
-        vote(p, 1, 120);
-        CHECK(p.valid, "120 batches must decide a 3-class vote");
-        CHECK(p.realLedResidue == 1, "planted real-led residue 1, got %d", p.realLedResidue);
-        CHECK(policy::RotationRealMember(p, 1) == 0,
-              "the real-led batch keeps member 0, got %d", policy::RotationRealMember(p, 1));
-        CHECK(policy::RotationRealMember(p, 2) == 1,
-              "the next batch keeps member 1, got %d", policy::RotationRealMember(p, 2));
-        CHECK(policy::RotationRealMember(p, 3) >= 2,
-              "the all-generated batch must name no member a 2-member batch has, got %d",
-              policy::RotationRealMember(p, 3));
-        CHECK(policy::RotationRealMember(p, 4) == 0, "the rotation must repeat");
+        for (int i = 0; i < 200; i++) step(h, 2, i);
+        CHECK(p.valid, "200 batches must decide a 3-class vote");
+        // THE ASSERTION THE TAUTOLOGY HID: the code's position must match the test's own
+        // independent count, and the phase it names must be where the test planted it.
+        CHECK(inStep(h),
+              "the code's grid position (%d) has drifted from the test's independent count "
+              "(%d) against the offset established at the origin (%d)",
+              p.gridPos, h.truePos, h.offset);
+        CHECK(policy::RotationRealMember(p, p.gridPos) == trueMember(h),
+              "reported real member %d, test's model says %d",
+              policy::RotationRealMember(p, p.gridPos), trueMember(h));
+        // The algebra, stated relative to whatever phase the code named - the origin is
+        // arbitrary, the STRUCTURE is not: at the real phase member 0 is real, one flip
+        // earlier member 1 is, two flips earlier no member of a 2-member batch is.
+        const int rp = p.realPhase;
+        CHECK(policy::RotationRealMember(p, rp) == 0,
+              "a batch anchored at the real phase keeps member 0, got %d",
+              policy::RotationRealMember(p, rp));
+        CHECK(policy::RotationRealMember(p, (rp + 2) % 3) == 1,
+              "one flip earlier the real frame is member 1, got %d",
+              policy::RotationRealMember(p, (rp + 2) % 3));
+        CHECK(policy::RotationRealMember(p, (rp + 1) % 3) >= 2,
+              "the all-generated position must name no member a 2-member batch has, got %d",
+              policy::RotationRealMember(p, (rp + 1) % 3));
 
-        // Over one full rotation exactly one source period's real frames are kept, and the
-        // kept flips are one source period apart - the property that makes the cadence
-        // uniform rather than 3/2/1.
+        // Over one full rotation exactly the real frames are kept, one per source period -
+        // the property that makes the cadence uniform instead of 3/2/1 flips.
         int kept = 0, lastFlip = -1, firstGap = -1;
-        for (long long b = 1; b <= 6; b++) {
-            const int m = policy::RotationRealMember(p, b);
+        for (int k = 0; k < 6; k++) {          // six consecutive batches, stride 2
+            const int m = policy::RotationRealMember(p, (rp + k * 2) % 3);
             if (m < 0 || m >= 2) continue;
-            const int flip = (int)(b * 2 + m);
+            const int flip = k * 2 + m;
             if (lastFlip >= 0 && firstGap < 0) firstGap = flip - lastFlip;
             if (lastFlip >= 0) {
                 CHECK(flip - lastFlip == firstGap,
@@ -1013,71 +1173,219 @@ static void test_rotation_phase() {
         // wrong member on a third of x2 batches - actively worse than what it replaces.
         policy::RotationPhase p;
         policy::RotationReset(p, 2, 3);          // force a 3-class vote over uniform data
-        for (long long i = 0; i < 300; i++) {
-            policy::RotationObserve(p, i, kGenLed + ((i % 2) ? kSpread : -kSpread));
+        int64_t t = 100000;
+        for (long long i = 0; i < 400; i++) {
+            t += 2 * 5556;
+            policy::RotationAdvance(p, t, 2);
+            policy::RotationObserve(p, kGenLed + ((i % 2) ? kSpread : -kSpread));
         }
         CHECK(!p.valid, "a uniform population must never decide a winner");
         CHECK(policy::RotationRealMember(p, 0) < 0, "undecided must read as plain keep-real");
+    }
+
+    {   // THE OTHER HALF OF THAT CONTROL, and the one a spread test fails: classes that DO
+        // differ but are all on the same side of zero. Measured on four of the five x2
+        // captures - means like -191/-80/-124 - where a lowest-class rule would happily
+        // crown a winner. The mechanism says a real-led batch wakes BEFORE its flip, so
+        // "lowest" is not enough; it has to be negative with the others positive.
+        policy::RotationPhase p;
+        policy::RotationReset(p, 2, 3);
+        int64_t t = 100000;
+        for (long long i = 0; i < 400; i++) {
+            t += 2 * 5556;
+            if (!policy::RotationAdvance(p, t, 2)) continue;
+            const int64_t mean = (p.gridPos == 0) ? -190 : (p.gridPos == 1 ? -80 : -124);
+            policy::RotationObserve(p, mean + ((i % 2) ? kSpread : -kSpread));
+        }
+        CHECK(!p.valid,
+              "all-negative classes must not decide: the signature is one AHEAD of its "
+              "flip and the rest behind, not merely one lower than the rest");
     }
 
     {   // Inert wherever composition does not rotate: x2 and frame generation off.
         policy::RotationPhase p;
         policy::RotationReset(p, 2, 2);
         CHECK(p.period == 1, "x2 must not rotate");
-        for (long long i = 0; i < 300; i++) policy::RotationObserve(p, i, kRealLed);
+        int64_t t = 100000;
+        for (long long i = 0; i < 300; i++) {
+            t += 2 * 8333;
+            policy::RotationAdvance(p, t, 2);
+            policy::RotationObserve(p, kRealLed);
+        }
         CHECK(!p.valid && policy::RotationRealMember(p, 0) < 0,
               "period 1 must stay inert: there is no rotation to read");
     }
 
-    {   // Silence before confidence: a partial vote must not commit. Half the residues are
-        // under-sampled here, which is exactly the state after a chain re-acquisition.
+    {   // Silence before confidence: a partial vote must not commit. One class is starved
+        // here, which is exactly the state just after position is re-established.
         policy::RotationPhase p;
         policy::RotationReset(p, 2, 3);
-        for (long long i = 0; i < 30; i++) {
-            if ((i % 3) == 2) continue;          // starve residue 2
-            policy::RotationObserve(p, i, sample((int)(i % 3), 1, i));
+        int64_t t = 100000;
+        for (long long i = 0; i < 60; i++) {
+            t += 2 * 5556;
+            if (!policy::RotationAdvance(p, t, 2)) continue;
+            if (p.gridPos == 2) continue;        // starve one class
+            const int64_t mean = (p.gridPos == 1) ? kRealLed : kGenLed;
+            policy::RotationObserve(p, mean + ((i % 2) ? kSpread : -kSpread));
         }
-        CHECK(!p.valid, "an under-sampled residue must block the decision");
+        CHECK(!p.valid, "an under-sampled class must block the decision");
     }
 
     {   // THE VERDICT IS NOT LATCHED. A vote that converged once must give the verdict back
         // when the evidence goes away, or a regime change leaves it steering on history.
-        policy::RotationPhase p;
-        policy::RotationReset(p, 2, 3);
-        vote(p, 1, 120);
-        CHECK(p.valid, "precondition: the vote should have decided");
-        for (long long i = 120; i < 1200; i++) {
-            policy::RotationObserve(p, i, kGenLed + ((i % 2) ? kSpread : -kSpread));
+        Harness h;
+        init(h, 2, 3, /*truePhase=*/1, 5556);
+        for (int i = 0; i < 200; i++) step(h, 2, i);
+        CHECK(h.p.valid, "precondition: the vote should have decided");
+        for (int i = 0; i < 2000; i++) {
+            h.t += 2 * h.spacing;
+            policy::RotationAdvance(h.p, h.t, 2);
+            policy::RotationObserve(h.p, kGenLed + ((i % 2) ? kSpread : -kSpread));
         }
-        CHECK(!p.valid,
+        CHECK(!h.p.valid,
               "a decided vote must lapse once the classes stop separating, not latch");
     }
 
-    {   // Reset really resets: a stale winner surviving a stall would confidently retain the
-        // wrong member for a whole chain.
-        policy::RotationPhase p;
-        policy::RotationReset(p, 2, 3);
-        vote(p, 0, 120);
-        CHECK(p.valid && p.realLedResidue == 0, "vote should have decided residue 0");
-        policy::RotationReset(p, 2, 3);
-        CHECK(!p.valid && policy::RotationRealMember(p, 0) < 0, "reset must clear the verdict");
+    {   // Reset really resets: a stale winner surviving a mode change would confidently
+        // retain the wrong member.
+        Harness h;
+        init(h, 2, 3, /*truePhase=*/0, 5556);
+        for (int i = 0; i < 200; i++) step(h, 2, i);
+        CHECK(h.p.valid && policy::RotationRealMember(h.p, h.p.gridPos) == trueMember(h),
+              "precondition: the vote should have decided and agree with the test's model");
+        policy::RotationReset(h.p, 2, 3);
+        CHECK(!h.p.valid && policy::RotationRealMember(h.p, 0) < 0,
+              "reset must clear the verdict");
+    }
+
+    {   // A BROKEN STRIDE MUST NOT DESYNCHRONISE THE VOTE. Real captures break stride-2
+        // continuity constantly - measured, every ~89 batches - and the advance is COUNTED
+        // from the flip history precisely so a batch that skipped a beat moves the position
+        // by the right number of flips instead of silently rotating the mapping. Here every
+        // seventh batch advances 4 flips rather than 2, and the harness tracks the truth
+        // independently so a desynchronised mapping is visible rather than assumed away.
+        Harness h;
+        init(h, 2, 3, /*truePhase=*/2, 5556);
+        for (int i = 0; i < 400; i++) step(h, ((i % 7) == 6) ? 4 : 2, i);
+        CHECK(h.p.valid, "a counted advance must survive a broken stride");
+        CHECK(inStep(h),
+              "position must survive the breaks: code %d, truth %d, origin offset %d",
+              h.p.gridPos, h.truePos, h.offset);
+        CHECK(policy::RotationRealMember(h.p, h.p.gridPos) == trueMember(h),
+              "across broken strides the reported member (%d) must still match the test's "
+              "model (%d)",
+              policy::RotationRealMember(h.p, h.p.gridPos), trueMember(h));
+    }
+
+    {   // THE STALE-ORIGIN REGRESSION. A stall past the step guard re-origins the grid
+        // position, and the evidence gathered against the OLD origin must not be allowed to
+        // restore the old verdict - the phase would then be expressed against an origin that
+        // no longer exists. Measured consequence when it did: 0 real frames kept, 20
+        // generated frames kept and 10 whole batches dropped over the following 30 batches,
+        // with the telemetry reading perfectly normal throughout (PhaseKeepEmpty at exactly
+        // the designed 1/3, no resets logged). Strictly worse than the keep-real rule this
+        // replaces, for ~2.4 s per stall.
+        Harness h;
+        init(h, 2, 3, /*truePhase=*/1, 5556);
+        for (int i = 0; i < 300; i++) step(h, 2, i);
+        CHECK(h.p.valid && inStep(h), "precondition: converged and in step");
+
+        // A 200 ms stall: 36 flip steps, well past the 8-step guard. Note this does NOT
+        // trigger RotationReset in production - the source-period EMA excludes gaps over
+        // 125 ms, so stride and flipsPerSource are unchanged and the histogram survives.
+        h.t += 36 * h.spacing;
+        h.truePos = (h.truePos + 36) % h.fps;
+        CHECK(!policy::RotationAdvance(h.p, h.t, 36), "a 36-step advance must be refused");
+        CHECK(!h.p.valid, "the refusal must drop the verdict");
+
+        // One batch later. The old verdict must NOT come back: its phase was measured
+        // against an origin that has been discarded.
+        h.t += 2 * h.spacing;
+        h.truePos = (h.truePos + 2) % h.fps;
+        policy::RotationAdvance(h.p, h.t, 2);
+        policy::RotationObserve(h.p, kGenLed + kSpread);
+        CHECK(!h.p.valid,
+              "a re-origin must not restore a verdict keyed to the old origin after ONE "
+              "sample: the evidence has to be re-gathered against the new origin");
+
+        // And once it does decide again, it must agree with the test's own model.
+        for (int i = 0; i < 400; i++) step(h, 2, i);
+        CHECK(h.p.valid, "the vote must re-converge after a stall");
+        CHECK(policy::RotationRealMember(h.p, h.p.gridPos) == trueMember(h),
+              "post-stall member %d must match the test's model %d",
+              policy::RotationRealMember(h.p, h.p.gridPos), trueMember(h));
     }
 
     {   // x4: a shorter rotation, two classes, and only one of them carries a real frame.
         // Exercises the same arithmetic at a multiplier nothing has been captured at.
-        policy::RotationPhase p;
-        policy::RotationReset(p, /*stride=*/2, /*flipsPerSource=*/4);
-        CHECK(p.period == 2, "x4 must rotate over 2 batches, got %d", p.period);
-        vote(p, 0, 120);
-        CHECK(p.valid, "x4 vote must decide");
-        CHECK(policy::RotationRealMember(p, 0) == 0, "x4 real-led batch keeps member 0");
-        CHECK(policy::RotationRealMember(p, 1) >= 2,
+        Harness h;
+        init(h, /*stride=*/2, /*fps=*/4, /*truePhase=*/0, 4167);
+        CHECK(h.p.period == 2, "x4 must rotate over 2 batches, got %d", h.p.period);
+        for (int i = 0; i < 200; i++) step(h, 2, i);
+        CHECK(h.p.valid, "x4 vote must decide");
+        CHECK(policy::RotationRealMember(h.p, 0) == 0, "x4 real-led batch keeps member 0");
+        CHECK(policy::RotationRealMember(h.p, 1) >= 2,
               "x4's other batch is all generated, got member %d",
-              policy::RotationRealMember(p, 1));
+              policy::RotationRealMember(h.p, 1));
+
+        // THE LATTICE TRAP. Stride 2 over 4 flips only ever visits even positions, so the
+        // decision loop reads only those - but an odd advance moves the position off that
+        // sublattice permanently, and nothing brings it back. Left undetected, the even
+        // classes freeze at their old counts, stay above the sample floor, and hold the
+        // verdict valid FOREVER on evidence that stopped updating - while every new sample
+        // lands in a class nothing reads. Consequence measured: 50% of batches dropped,
+        // 50% keeping a generated frame, indefinitely.
+        step(h, 3, 0);            // one odd advance
+        for (int i = 0; i < 50; i++) step(h, 2, i);
+        CHECK(!h.p.valid || h.p.gridPos % 2 == 0,
+              "an odd advance must not leave the vote valid on a position the decision "
+              "loop never reads (gridPos %d, reach 2)", h.p.gridPos);
+    }
+
+    {   // THE EXTRAPOLATION IS BOUNDED. RotationPositionAt is the one place in the design
+        // that divides a time difference by the spacing, which every other path avoids
+        // because a misrounding rotates the mapping. Over the ~2 batches it is designed to
+        // span it is exact; over an unbounded gap it is not - a 300 ms unanchored run at a
+        // spacing read 3% low misrounds by 2 flips on a VRR panel, silently and confidently.
+        // Past the bound it must report "no position", which the caller reads as keep-real.
+        Harness h;
+        init(h, 2, 3, /*truePhase=*/1, 5556);
+        for (int i = 0; i < 200; i++) step(h, 2, i);
+        CHECK(h.p.valid, "precondition: converged");
+        const int64_t anchor = h.p.lastAnchorTs;
+        CHECK(policy::RotationPositionAt(h.p, anchor + 2 * h.spacing, h.spacing) >= 0,
+              "two flips out must still extrapolate");
+        CHECK(policy::RotationPositionAt(h.p, anchor + 4 * h.spacing, h.spacing) >= 0,
+              "four flips out must still extrapolate");
+        CHECK(policy::RotationPositionAt(h.p, anchor + 54 * h.spacing, h.spacing) < 0,
+              "a 300 ms unanchored gap (54 flips) must refuse to extrapolate, not guess");
+        CHECK(policy::RotationPositionAt(h.p, anchor - 2 * h.spacing, h.spacing) < 0,
+              "a time BEFORE the anchor is not a forward extrapolation");
+    }
+
+    {   // A GRID LONGER THAN THE CLASS ARRAY MUST STAY INERT. RotationPeriodBatches bounds
+        // the PERIOD, but flipsPerSource is what indexes the classes, and a short period can
+        // carry a long grid: -src 15 against an x3 flip rate gives flipsPerSource 12 with
+        // period 6. Two thirds of the reachable classes would then be unreadable, and the
+        // vote would decide on a subset - confidently naming a phase from partial evidence.
+        policy::RotationPhase p;
+        policy::RotationReset(p, /*stride=*/2, /*flipsPerSource=*/12);
+        CHECK(p.period == 1,
+              "a 12-flip grid exceeds the class array and must report inert, got period %d",
+              p.period);
+        int64_t t = 100000;
+        for (int i = 0; i < 400; i++) {
+            t += 2 * 5556;
+            policy::RotationAdvance(p, t, 2);
+            policy::RotationObserve(p, ((i % 3) == 0 ? kRealLed : kGenLed));
+        }
+        CHECK(!p.valid && policy::RotationRealMember(p, 0) < 0,
+              "an over-long grid must never decide");
     }
 
     std::printf("  rotation phase: period arithmetic, ensemble vote on overlapping classes, "
-                "all-generated batches kept empty, refusal on a uniform population\n");
+                "all-generated batches kept empty, refusal on a uniform population, "
+                "bounded extrapolation\n");
 }
 
 static void test_dejit_removes_late_blends() {
@@ -1548,6 +1856,137 @@ static std::vector<std::string> FixturePaths() {
     return out;
 }
 
+// Run the ROTATION VOTE over a real capture, through the shipped entry points, and check it
+// converges exactly where a rotation exists and refuses everywhere else.
+//
+// THIS TEST EXISTS BECAUSE ITS ABSENCE COST A CAPTURE. The vote shipped with two faults that
+// a synthetic test could not see, because the synthetic test generated its inputs from the
+// same assumptions the code made: it asked for a batch's anchor flip AT BATCH OPEN, when the
+// flip is still ~6 ms from being delivered (98% of batches unplaceable on a real log), and
+// it keyed classes by batch INDEX, which drifts from grid position every time the stride
+// breaks (~every 89 batches, measured). Both are invisible unless the data comes from a
+// capture. So this drives the fixture's own arrivals and flips, with flips entering history
+// when they became KNOWABLE, exactly as the relay sees them.
+static void ReportRotation(const TraceFixture& fx, int64_t lagFloor, int64_t batchThreshold) {
+    if (fx.flipDisplay.empty() || fx.flipKnown.empty()) return;
+
+    // Batches, by the ring's own rule.
+    std::vector<int64_t> starts;
+    for (size_t i = 0; i < fx.arrivals.size(); i++) {
+        if (i == 0 || fx.arrivals[i] - fx.arrivals[i - 1] >= batchThreshold)
+            starts.push_back(fx.arrivals[i]);
+    }
+    if (starts.size() < 200) return;
+
+    // Flips in delivery order, admitted once knowable, plus the bracketing lag - the point
+    // in time at which the relay could actually answer for this batch.
+    std::vector<std::pair<int64_t, int64_t> > byKnown;   // (known, display)
+    for (size_t i = 0; i < fx.flipDisplay.size(); i++)
+        byKnown.push_back(std::make_pair(fx.flipKnown[i], fx.flipDisplay[i]));
+    std::sort(byKnown.begin(), byKnown.end());
+
+    policy::FlipHistory h;
+    policy::RotationPhase rp;
+    size_t nf = 0;
+    int64_t ema = 0;
+    long long observed = 0, validB = 0, keepReal = 0, dropWhole = 0;
+    // The regime is the DOMINANT flip rate, not any rate ever glimpsed: every capture opens
+    // on the desktop and passes through loading, so a latch on the first x3-looking reading
+    // labels an x2 fixture x3 and then demands x3 behaviour of it.
+    long long fpsHist[16] = {0};
+    for (size_t b = 0; b < starts.size(); b++) {
+        const int64_t bs = starts[b];
+        while (nf < byKnown.size() && byKnown[nf].first <= bs + lagFloor) {
+            policy::Flip f;
+            f.displayTs = byKnown[nf].second;
+            f.eventTs = byKnown[nf].first;
+            f.head = 0;
+            h.Add(f);
+            nf++;
+        }
+        const int64_t gap = (b > 0) ? bs - starts[b - 1] : 0;
+        if (gap > 0 && gap < 1000000 / 8) ema = ema ? (ema * 7 + gap) / 8 : gap;
+        const policy::Flip* newest = h.NewestAtOrBefore(bs + lagFloor, 0);
+        if (!newest || ema <= 0) continue;
+        const int64_t sp = h.MedianSpacing(newest->displayTs - 200000, newest->displayTs, 0);
+        if (sp <= 0) continue;
+        const int fps = (int)((16667 + sp / 2) / sp);
+        const int stride = (int)((ema + sp / 2) / sp);
+        if (fps >= 0 && fps < 16) fpsHist[fps]++;
+        if (stride != rp.stride || fps != rp.flipsPerSource)
+            policy::RotationReset(rp, stride, fps);
+        // MODEL THE SHIPPING PATH, not an easier one. The relay votes on the batch TWO
+        // batches back - a batch's own anchor flip is not delivered when it opens - and then
+        // decides for the CURRENT batch by extrapolating the grid position forward. An
+        // earlier version of this check voted on the current batch and read rp.gridPos
+        // directly, which exercised neither the lag nor the extrapolation: the two faults
+        // that cost a capture both lived in exactly that gap.
+        static const size_t kVoteLagBatches = 2;
+        if (b >= kVoteLagBatches) {
+            const int64_t vbs = starts[b - kVoteLagBatches];
+            const policy::FlipPairing r = policy::PairBatchMember(h, 0, vbs, 0, 200000);
+            if (r.anchorFound) {
+                const int64_t anchorTs = vbs - r.anchorOffset;
+                const policy::Flip* buf[24];
+                int steps = 1;
+                if (rp.haveAnchor) {
+                    const int n = h.InRange(rp.lastAnchorTs + 1, anchorTs, 0, buf, 24);
+                    steps = 0;
+                    int64_t prevTs = 0;
+                    bool havePrev = false;
+                    for (int k = 0; k < n; k++) {          // distinct display times only
+                        if (havePrev && buf[k]->displayTs == prevTs) continue;
+                        prevTs = buf[k]->displayTs;
+                        havePrev = true;
+                        steps++;
+                    }
+                }
+                if (policy::RotationAdvance(rp, anchorTs, steps)) {
+                    policy::RotationObserve(rp, r.anchorOffset);
+                }
+            }
+        }
+        observed++;
+        const int pos = policy::RotationPositionAt(rp, bs, sp);
+        if (pos >= 0 && rp.valid) {
+            validB++;
+            const int m = policy::RotationRealMember(rp, pos);
+            if (m >= 2) dropWhole++;
+            else if (m >= 0) keepReal++;
+        }
+    }
+    if (observed < 200) return;
+    int dominantFps = 0;
+    for (int i = 1; i < 16; i++) if (fpsHist[i] > fpsHist[dominantFps]) dominantFps = i;
+    const double validPct = 100.0 * validB / observed;
+    std::printf("    rotation: x%d grid, %.0f%% of %lld observed batches decided"
+                " (keeps %lld, drops %lld)\n",
+                dominantFps, validPct, observed, keepReal, dropWhole);
+
+    if (dominantFps == 3) {
+        // x3 rotates, so the vote must find it. Every x3 capture measured decides on
+        // 45-80% of batches; well under a third means the signal was lost, which is what
+        // the two shipped faults looked like (0%).
+        CHECK(validPct > 30.0,
+              "[%s] x3 rotation vote decided only %.0f%% of batches: the rotation is "
+              "readable on every x3 capture measured, so this is the vote losing it",
+              fx.description.c_str(), validPct);
+        // Two keepers and one whole-batch drop per rotation is the tiling; a wildly
+        // different ratio means the phase is being read but misapplied.
+        const double ratio = dropWhole ? (double)keepReal / (double)dropWhole : 99.0;
+        CHECK(ratio > 1.4 && ratio < 2.6,
+              "[%s] keep:drop ratio %.2f is not the 2:1 the x3 tiling requires",
+              fx.description.c_str(), ratio);
+    } else {
+        // NOTHING ELSE MAY DECIDE. x2 and frame-generation-off have no rotation, and a
+        // vote that finds one would retract the wrong member on the path that ships.
+        CHECK(validB == 0,
+              "[%s] the rotation vote decided on %lld batches in a regime that does not "
+              "rotate: this is the x2 keep-real path and it must stay inert",
+              fx.description.c_str(), validB);
+    }
+}
+
 // Replay the join over a real capture, on the relay's own terms: a flip enters history when
 // the relay could FIRST HAVE KNOWN it, not when it happened, and a capture is placed on the
 // grid one bracketing lag after it arrived, which is when the policy first needs its stamp.
@@ -1681,6 +2120,7 @@ static void test_replay_capture_corpus() {
             // threshold CaptureRing uses. Both are the shipping values, so this reports what
             // the relay would actually achieve rather than what a tuned one could.
             ReportPairing(fx, 20833, 3000);
+            ReportRotation(fx, 20833, 3000);
         }
 
         SimParams p;
@@ -2555,6 +2995,7 @@ int main(int argc, char** argv) {
     test_flip_history();
     test_flip_pairing();
     test_anchor_chain();
+    test_keep_decision();
     test_rotation_phase();
     test_dejit_removes_late_blends();
     test_batch_collapse_keep_real();

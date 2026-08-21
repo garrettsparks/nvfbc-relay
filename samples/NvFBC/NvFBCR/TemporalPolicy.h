@@ -272,10 +272,21 @@ struct RotationPhase {
     int period = 1;
     int stride = 0;           // flips a batch advances, measured
     int flipsPerSource = 0;   // flips in one source period, measured
+    // WHERE IN THE SOURCE PERIOD the last observed batch anchored, 0..flipsPerSource-1.
+    // This, not a batch counter, is what composition depends on - and the two drift apart
+    // the moment a batch is dropped or the stride hiccups. Measured on a real x3 capture:
+    // stride-2 continuity broke every ~89 batches (116 chains in 190 s), and a vote keyed
+    // by batch index smeared the three classes to means 36 us apart where keying by grid
+    // position separates them by 200 us. The position is carried forward by the MEASURED
+    // anchor-to-anchor advance, so a dropped batch moves it by the right number of flips
+    // instead of desynchronising it.
+    int gridPos = 0;
+    int64_t lastAnchorTs = 0;
+    bool haveAnchor = false;
     int64_t offsetSum[kMaxPeriod] = {};
     int32_t offsetCount[kMaxPeriod] = {};
     bool valid = false;
-    int realLedResidue = -1;   // batchIndex % period of the [real, gen] class
+    int realPhase = -1;       // grid position whose member 0 carries the real frame
 };
 
 // Rotation length for a stride over a source period, in batches: how many batches before
@@ -287,29 +298,81 @@ int RotationPeriodBatches(int flipsPerSource, int stride);
 // Fold one anchored batch's arrival offset into the vote. batchIndex is the ring's
 // monotonic batch counter, which both threads agree on; anchorOffset is batch start minus
 // its anchor flip, the same quantity stage 6 measures.
-void RotationObserve(RotationPhase& p, long long batchIndex, int64_t anchorOffset);
 
-// Drop the vote. The caller MUST do this whenever batch-to-flip continuity breaks (a stall,
-// a dropped batch, an anchor-chain re-acquisition): batch index residue only tracks grid
-// position while the stride holds, and a stale residue would confidently retain the wrong
-// member. Cheap to rebuild - a vote converges in tens of batches at x3's ~90 batches/s.
-// stride and flipsPerSource are the same measurements the period was derived from.
+// Drop the vote. The caller MUST do this whenever the grid measurement itself changes
+// (a different multiplier, a mode switch). Continuity breaks WITHIN a regime do not need
+// it - RotationAdvance carries the grid position across them by measuring the advance -
+// and cheap though a rebuild is, throwing the vote away every time a batch is dropped is
+// what starves it: at x3 a chain runs ~89 batches and the vote needs ~72 to converge.
 void RotationReset(RotationPhase& p, int stride, int flipsPerSource);
 
-// WHICH MEMBER of this batch carries the real frame: 0, 1, ... or a value past the batch's
-// member count when this batch has NO real frame at all. -1 when the vote is not
-// trustworthy, which means the caller must fall back to plain keep-real.
+// Carry the grid position forward to a newly anchored batch, from the MEASURED advance
+// since the last one. Returns false when the advance is not a recognisable number of flip
+// steps (a stall, an outage, a re-acquisition), which drops the vote's confidence without
+// discarding its samples; the next recognisable advance re-establishes position.
+//
+// This is what makes the vote survive a broken stride. Counting batches cannot: two
+// batches either side of a dropped one are 4 flips apart, not 2, and a counter that does
+// not know it has skipped a beat keeps voting into the wrong class from then on.
+// flipSteps is the number of flip records between the previous anchor and this one, COUNTED
+// from the history by the caller. Counting, never dividing a time difference by the spacing:
+// a division makes a rounding decision per batch and one wrong rounding rotates the mapping
+// permanently. Measured across five x3 captures, counting beat dividing on four and tied the
+// fifth, and it needs no tolerance - the division's optimum tolerance wandered between 0.25
+// and 0.50 of a step depending on which capture it was fitted to.
+bool RotationAdvance(RotationPhase& p, int64_t anchorTs, int flipSteps);
+
+// Fold the current batch's arrival offset into the vote, at the grid position
+// RotationAdvance established. anchorOffset is batch start minus its anchor flip.
+void RotationObserve(RotationPhase& p, int64_t anchorOffset);
+
+// WHICH MEMBER of a batch anchored at gridPos carries the real frame: 0, 1, ... or a value
+// past the batch's member count when that batch has NO real frame at all. -1 when the vote
+// is not trustworthy, which means the caller must fall back to plain keep-real.
 //
 // Real frames sit at flips congruent to one phase P modulo flipsPerSource, and member m of
-// batch b sits at flip b*stride + m, so the real member is (P - b*stride) mod
-// flipsPerSource. The vote supplies P by naming the batch residue whose member 0 is real.
-// At x3 that cycles 0, 1, 2 - and the 2 is the [gen,gen] batch, whose "real member" does
-// not exist, so a caller with 2 members keeps NOTHING from it. That is the point: those two
-// frames are both generated, dropping them leaves the ring holding exactly the real frames
-// at exactly their own flip times, and a 60 fps output then finds one real frame per
-// present instead of a 90/s mixture. Keeping one anyway is what makes the kept cadence
-// uneven (3, 2, 1 flips instead of a uniform 3).
-int RotationRealMember(const RotationPhase& p, long long batchIndex);
+// a batch anchored at grid position g sits at flip g+m, so the real member is (P - g) mod
+// flipsPerSource. At x3 that cycles 0, 1, 2 - and the 2 is the [gen,gen] batch, whose
+// "real member" does not exist, so a caller with 2 members keeps NOTHING from it. That is
+// the point: those two frames are both generated, dropping them leaves the ring holding
+// exactly the real frames at exactly their own flip times, and a 60 fps output then finds
+// one real frame per present instead of a 90/s mixture.
+int RotationRealMember(const RotationPhase& p, int gridPos);
+
+// The grid position this batch anchors at, for a caller that knows only a time - the
+// capture thread, which must decide retraction before the batch's own flips have been
+// delivered. Extrapolates from the last position the vote established, so it is exact
+// while the flip step is and degrades only with the spacing estimate over a few
+// milliseconds. Returns -1 when there is no position to extrapolate from.
+int RotationPositionAt(const RotationPhase& p, int64_t ts, int64_t spacingTicks);
+
+// What one capture wake does to the ring: which stamp to publish it with, whether it
+// survives, and whether it takes back its predecessor.
+//
+// This lives here, in the layer with no windows.h and no D3D, because it is pure
+// arithmetic that decides what the relay SHOWS - and while it was inlined in the capture
+// loop nothing could test it. The corpus cannot: the replay models the batch timeline but
+// not the ring's per-wake retraction, so a change here moves no corpus number at all.
+struct KeepDecision {
+    int64_t stampTs = 0;      // publish the slot with this
+    bool keepThis = true;     // this member survives as a bracket candidate
+    bool retractPrev = false; // hide the previous member
+    bool collapsed = false;   // a member was hidden (this one or the previous), for col=
+};
+
+// realMember is which member of this batch carries the real frame, from
+// RotationRealMember, or NEGATIVE when the rotation is unknown or does not exist. Negative
+// is the ordinary case - x2, frame generation off, an unconverged vote - and it must behave
+// exactly as keep-real always has: keep this member, stamp it at batch start, retract the
+// predecessor an intra-batch wake displaces. test_keep_decision pins that exhaustively.
+//
+// When the rotation IS known, the batch keeps only the member named real, which may be no
+// member at all (the all-generated batch at x3), and each member is stamped at its own flip
+// rather than at batch start. The stamp offset matters because it varies: with a fixed kept
+// member the batch-start stamp is a CONSTANT offset the comb lock absorbs, but a varying
+// one is content jitter no lock can cancel.
+KeepDecision DecideKeep(const BatchDecision& batch, int realMember, int64_t spacingTicks,
+                        bool havePrevSlot);
 
 // Stage-6 corrections as metadata BESIDE the ring, never as slot mutation. FindBracket
 // subtracts CorrectionFor(stamp) at read time, so the ring slots keep exactly one writer
