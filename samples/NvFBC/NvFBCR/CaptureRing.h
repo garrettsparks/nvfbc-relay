@@ -233,6 +233,9 @@ private:
     int m_prevLastMember = 0;
     LONGLONG m_prevBatchStart = 0;
     LONGLONG m_prevSpacing = 0;
+    // Clamped batch-period estimate for the stride derivation only (see the wake loop for
+    // why the shared telemetry EMA cannot be used there). Capture-thread-owned.
+    LONGLONG m_rotPeriodEma = 0;
 
     bool m_fgPhaseRequested = false;
     bool m_fgPhaseActive = false;

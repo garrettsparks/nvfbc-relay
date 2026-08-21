@@ -330,7 +330,25 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             m_rotRealMember = -1;
             m_rotSpacing = 0;
             if (m_rotationOracle) {
-                const long long batchPeriod = m_srcPeriodEmaQpc.load(std::memory_order_relaxed);
+                // The batch period the STRIDE derives from is a separate, CLAMPED estimate,
+                // not m_srcPeriodEmaQpc. The shared EMA admits any gap under 125 ms, so a
+                // single ~100 ms grab-timeout stall inflates it enough to flip the derived
+                // stride 2 -> 3, which reads as a grid change, resets the vote, and the
+                // excursion takes ~46 batches to decay before flipping back - a second
+                // reset. Measured on the 2026-08-20 fix_reverse capture: 154 such gaps
+                // produced ~183 of the 224 resets, and the vote (which needs 72 batches to
+                // converge) was disrupted every ~67, so it steered 127 batches of 15366.
+                // Folding only gaps within half-to-double the current estimate keeps stall
+                // gaps out of the CADENCE while the shared EMA keeps its telemetry meaning.
+                if (batch.batchGap > 0) {
+                    if (m_rotPeriodEma == 0) {
+                        if (batch.batchGap < m_freqQuad / 8) m_rotPeriodEma = batch.batchGap;
+                    } else if (batch.batchGap > m_rotPeriodEma / 2 &&
+                               batch.batchGap < m_rotPeriodEma * 2) {
+                        m_rotPeriodEma = (m_rotPeriodEma * 7 + batch.batchGap) / 8;
+                    }
+                }
+                const long long batchPeriod = m_rotPeriodEma;
                 int stride = 0, flipsPerSource = 0;
                 long long spacing = 0;
                 if (m_rotationOracle->Grid(batchPeriod, &stride, &flipsPerSource, &spacing)) {
