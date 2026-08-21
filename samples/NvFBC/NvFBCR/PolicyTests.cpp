@@ -1557,6 +1557,27 @@ static void test_rotation_phase() {
               "loop never reads (gridPos %d, reach 2)", h.p.gridPos);
     }
 
+    {   // A LONG COUNTED ADVANCE PRESERVES PHASE. Counting certifies position exactly
+        // across any gap whose flips reached the history, so a 20-step stall must carry
+        // the vote across intact - no re-origin, no evidence loss, same verdict after.
+        // The old bound of 8 re-origined here, and real captures exceed 8 flips 137 times
+        // in two minutes: the vote never survived long enough to steer (127 of 15366
+        // batches on the 2026-08-20 fix_reverse run). Gaps past the count cap (24) are
+        // zero in the same capture, and past the cap the count could truncate, so THAT is
+        // where the re-origin belongs - pinned by the 36-step stall test below.
+        Harness h;
+        init(h, 2, 3, /*truePhase=*/1, 5556);
+        for (int i = 0; i < 300; i++) step(h, 2, i);
+        CHECK(h.p.valid, "precondition: converged");
+        CHECK(step(h, 20, 0),
+              "a 20-step counted advance must be accepted, not treated as an origin loss");
+        CHECK(h.p.valid, "the verdict must survive a 20-step counted advance");
+        for (int i = 0; i < 10; i++) step(h, 2, i);
+        CHECK(h.p.valid && policy::RotationRealMember(h.p, h.p.gridPos) == trueMember(h),
+              "phase must be INTACT after the gap: reported member %d, truth %d",
+              policy::RotationRealMember(h.p, h.p.gridPos), trueMember(h));
+    }
+
     {   // THE EXTRAPOLATION IS BOUNDED. RotationPositionAt is the one place in the design
         // that divides a time difference by the spacing, which every other path avoids
         // because a misrounding rotates the mapping. Over the ~2 batches it is designed to

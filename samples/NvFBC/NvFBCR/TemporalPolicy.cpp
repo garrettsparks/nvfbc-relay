@@ -505,11 +505,17 @@ bool RotationAdvance(RotationPhase& p, int64_t anchorTs, int flipSteps) {
     // showed the optimum wandering between 0.25 and 0.50 of a step depending on which
     // capture was measured - a parameter fitted to whichever capture came first.
     //
-    // Beyond a handful of steps the batch is on the far side of a stall, an outage or a
-    // stride hiccup, and nothing connects it to the last position: the samples already
-    // gathered stay (they describe the same grid), but position must be re-established
-    // before the vote is trusted again.
-    if (flipSteps < 1 || flipSteps > 8) {
+    // The bound is set by what COUNTING can certify, not by what feels like a long gap.
+    // Counted flips carry position EXACTLY across any gap whose flips all reached the
+    // history (ETW losses are zero, verified per session), so a 20-step advance is as
+    // sound as a 2-step one; the bound exists only because the caller's count is capped at
+    // 24 records, past which the count could be truncated and the position silently wrong.
+    // An earlier bound of 8 was inherited from the DIVISION rule's error growth and cost a
+    // capture: real batch gaps exceed 8 flips 137 times in two minutes (grab-timeout
+    // stalls), each one re-origined the vote and cleared its evidence, and the vote -
+    // needing 72 batches to converge - never survived to steer (127 of 15366 batches).
+    // Gaps past 24 flips: zero in the same capture.
+    if (flipSteps < 1 || flipSteps > 24) {
         RotationReOrigin(p, anchorTs);
         return false;
     }
