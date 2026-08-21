@@ -635,17 +635,23 @@ KeepDecision DecideKeep(const BatchDecision& batch, int realMember, int64_t spac
                         bool havePrevSlot) {
     KeepDecision d;
     d.stampTs = batch.stampTs;
+    // THE STAMP CONVENTION FOLLOWS spacingTicks, NOT realMember, and mixing the two was a
+    // field failure: with the offset applied only on steered batches, steered and unsteered
+    // frames lived on timelines one flip step apart, interleaved every few batches. The
+    // caller passes spacing whenever the ROTATION IS ARMED (the grid rotates, period > 1),
+    // so every stamp in a rotating regime sits on one content-aligned timeline whether or
+    // not this particular batch got steered; it passes 0 wherever composition does not
+    // rotate, which keeps x2's load-bearing batch-start/lock-phase cancellation untouched.
+    if (spacingTicks > 0 && batch.member > 0) {
+        d.stampTs = batch.stampTs + (int64_t)batch.member * spacingTicks;
+    }
     if (realMember < 0) {
-        // No rotation guidance: exactly the pre-rotation rule. Keep this member, stamp it
-        // at batch start, and take back the predecessor an intra-batch wake displaced.
+        // No rotation guidance: the pre-rotation keep rule. Keep this member and take back
+        // the predecessor an intra-batch wake displaced.
         d.keepThis = true;
         d.retractPrev = batch.retractPrevious && havePrevSlot;
         d.collapsed = d.retractPrev;
         return d;
-    }
-    // Each member on its own flip, so content and stamp agree whichever member survives.
-    if (spacingTicks > 0 && batch.member > 0) {
-        d.stampTs = batch.stampTs + (int64_t)batch.member * spacingTicks;
     }
     d.keepThis = (batch.member == realMember);
     // Retract the predecessor only when this member is the keeper and one is still

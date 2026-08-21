@@ -48,7 +48,13 @@ struct FrameBracket {
 // output shows tearing/partial frames inside slots, that is the cause.
 class CaptureRing {
 public:
-    static const int RING_SIZE = 8;  // generous for validation; shrink later from logged depth
+    // 16, doubled from 8 on a measured failure: at x3 with phase-aware keep-real the
+    // window must hold the bracket while a third of batches contribute no valid frame, and
+    // at 8 slots the before-frame fell off the ring on 95% of presents of a real capture
+    // (3611 of 3805 - the 2026-08-20 x3_phasekeep run). 16 slots is ~66 MB more VRAM at
+    // 1080p and doubles the recycle distance between the capture thread's writes and the
+    // oldest frame a bracket can still be reading.
+    static const int RING_SIZE = 16;
 
     CaptureRing();
     ~CaptureRing();
@@ -149,6 +155,8 @@ public:
     long long PhaseKeepBatches() const { return m_phaseKeepBatches; }
     long long PhaseKeepFlipped() const { return m_phaseKeepFlipped; }
     long long PhaseKeepEmpty() const { return m_phaseKeepEmpty; }
+    long long PhaseKeepReclaimed() const { return m_phaseKeepReclaimed; }
+    long long PhaseKeepUndecided() const { return m_phaseKeepUndecided; }
     long long PhaseKeepResets() const { return m_phaseKeepResets; }
 
     // Request the content-phase instrument (-fgphase) before Start.
@@ -213,10 +221,18 @@ private:
     // here: RotationAdvance carries the grid position across them, and when it cannot it
     // re-origins internally, which this counter does not see.
     long long m_phaseKeepResets = 0;
+    long long m_phaseKeepReclaimed = 0; // coalesced singles re-validated one batch late
+    long long m_phaseKeepUndecided = 0; // batches dropped because position was momentarily lost
     // Grid measurements for the batch in flight, read once at batch open: members arrive a
     // submission epsilon apart, so re-reading per member would only add lock traffic.
     int m_rotRealMember = -1;           // member this batch should keep; <0 = fall back
-    LONGLONG m_rotSpacing = 0;          // flip step, for member stamp offsets
+    LONGLONG m_rotSpacing = 0;          // flip step, for member stamp offsets (0 = no rotation)
+    // Previous batch, for the coalesced-single reclaim: keeper it was told to hold, last
+    // member that actually arrived, and the stamps to re-validate with.
+    int m_prevKeeper = -1;
+    int m_prevLastMember = 0;
+    LONGLONG m_prevBatchStart = 0;
+    LONGLONG m_prevSpacing = 0;
 
     bool m_fgPhaseRequested = false;
     bool m_fgPhaseActive = false;
