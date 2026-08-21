@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -46,9 +47,10 @@ static int g_failures = 0;
 static const int64_t kStickinessUs = 1000;
 static const int64_t kSlewUs = 25;
 
-// Mirrors CaptureRing::RING_SIZE: the bracket sees only the newest kRingSlots arrivals,
-// so a target lagging more than the ring window behind loses its before-frame (the
-// production ring-underrun class).
+// The ring depth the CORPUS FIXTURES were captured under - deliberately NOT mirroring
+// CaptureRing::RING_SIZE, which is now 16: every fixture's field numbers came from ring-8
+// builds, and the replay must model the relay that produced them. Fixtures captured on
+// ring-16 builds would warrant revisiting this.
 static const int kRingSlots = 8;
 
 // Deterministic LCG so every run exercises identical timelines. Every suite RESEEDS it
@@ -966,43 +968,59 @@ static void test_keep_decision() {
         return o;
     };
 
+    // THE x2 CONTRACT: spacing 0 (composition cannot rotate - the caller zeroes it whenever
+    // period is 1, which is every x2 and FG-off configuration). Every combination must match
+    // the pre-rotation rule exactly.
     int cases = 0;
     for (int member = 0; member <= 2; member++) {
         for (int intra = 0; intra <= 1; intra++) {
             for (int havePrev = 0; havePrev <= 1; havePrev++) {
-                for (int spacing = 0; spacing <= 1; spacing++) {
-                    policy::BatchDecision b;
-                    b.member = member;
-                    b.intraBatch = (intra != 0);
-                    b.retractPrevious = (intra != 0);
-                    b.stampTs = kBase;
-                    const int64_t sp = spacing ? kSpacing : 0;
-                    const policy::KeepDecision got =
-                        policy::DecideKeep(b, /*realMember=*/-1, sp, havePrev != 0);
-                    const Old want = oldRule(b, havePrev != 0);
-                    CHECK(got.stampTs == want.stamp,
-                          "no-rotation stamp must be batch start (member %d, spacing %lld): "
-                          "got %lld want %lld",
-                          member, (long long)sp, (long long)got.stampTs,
-                          (long long)want.stamp);
-                    CHECK(got.keepThis == want.keep,
-                          "no-rotation must keep every member (member %d)", member);
-                    CHECK(got.retractPrev == want.retract,
-                          "no-rotation retraction must match keep-real (member %d, intra %d, "
-                          "havePrev %d): got %d want %d",
-                          member, intra, havePrev, (int)got.retractPrev, (int)want.retract);
-                    // col= is the observable witness of this decision in every capture log,
-                    // so its accounting has to match too or an A/B against an old capture
-                    // would read as a behaviour change.
-                    CHECK(got.collapsed == want.retract,
-                          "no-rotation collapse count must match keep-real (member %d)",
-                          member);
-                    cases++;
-                }
+                policy::BatchDecision b;
+                b.member = member;
+                b.intraBatch = (intra != 0);
+                b.retractPrevious = (intra != 0);
+                b.stampTs = kBase;
+                const policy::KeepDecision got =
+                    policy::DecideKeep(b, /*realMember=*/-1, 0, havePrev != 0);
+                const Old want = oldRule(b, havePrev != 0);
+                CHECK(got.stampTs == want.stamp,
+                      "no-rotation stamp must be batch start (member %d): got %lld want %lld",
+                      member, (long long)got.stampTs, (long long)want.stamp);
+                CHECK(got.keepThis == want.keep,
+                      "no-rotation must keep every member (member %d)", member);
+                CHECK(got.retractPrev == want.retract,
+                      "no-rotation retraction must match keep-real (member %d, intra %d, "
+                      "havePrev %d): got %d want %d",
+                      member, intra, havePrev, (int)got.retractPrev, (int)want.retract);
+                // col= is the observable witness of this decision in every capture log,
+                // so its accounting has to match too or an A/B against an old capture
+                // would read as a behaviour change.
+                CHECK(got.collapsed == want.retract,
+                      "no-rotation collapse count must match keep-real (member %d)", member);
+                cases++;
             }
         }
     }
-    CHECK(cases == 24, "expected 24 exhaustive no-rotation cases, ran %d", cases);
+    CHECK(cases == 12, "expected 12 exhaustive x2-contract cases, ran %d", cases);
+
+    // THE ROTATING-REGIME FALLBACK: spacing set, but no verdict for this batch. Keep-real
+    // member selection with CONTENT-ALIGNED stamps - the stamp convention follows the
+    // regime, never the per-batch verdict. Mixing the two was the 2026-08-20 field failure:
+    // steered and unsteered frames one flip step apart on the same timeline.
+    for (int member = 0; member <= 2; member++) {
+        policy::BatchDecision b;
+        b.member = member;
+        b.intraBatch = (member > 0);
+        b.retractPrevious = (member > 0);
+        b.stampTs = kBase;
+        const policy::KeepDecision got = policy::DecideKeep(b, -1, kSpacing, member > 0);
+        CHECK(got.keepThis, "rotating-regime fallback still keeps every member");
+        CHECK(got.retractPrev == (member > 0),
+              "rotating-regime fallback still retracts like keep-real");
+        CHECK(got.stampTs == kBase + (int64_t)member * kSpacing,
+              "rotating-regime fallback stamps member %d on its own flip, got %+lld",
+              member, (long long)(got.stampTs - kBase));
+    }
 
     // With the rotation known: exactly the named member survives, and it is stamped on its
     // own flip so content and stamp agree whichever member that is.
@@ -1038,6 +1056,203 @@ static void test_keep_decision() {
 
     std::printf("  keep decision: 24 exhaustive no-rotation cases match keep-real exactly; "
                 "rotation keeps one named member, stamps it on its own flip\n");
+}
+
+// THE x3 PHASEKEEP FIELD FAILURE, reproduced end to end, then shown fixed. The 2026-08-20
+// capture produced output that ran BACKWARDS on 19% of moving steps (+20.6 px, -21.5 px,
+// +37.7 px around each event - temporal ping-pong), with 95% of presents finding no
+// before-frame in the ring at all. This models that pipeline - batches with known
+// composition and CONTENT, DecideKeep, a slot ring, bracket search, SelectFrame - and
+// measures the two symptoms directly: shown-content inversions and before-frame misses.
+// Parameterized by the three suspected causes so the same harness is both the repro and
+// the proof of fix; if the "fixed" configuration still inverted content, the fixes would
+// be theater and this test is what would say so.
+struct X3SimResult {
+    int inversions = 0;      // consecutive shown frames whose CONTENT went backwards
+    int noBefore = 0;        // presents with no before-frame in the window (starvation)
+    int genShown = 0;        // presents showing a generated frame's pixels
+    int presents = 0;
+};
+// genContentBias models WHERE a generated frame's content actually sits relative to its
+// flip. Zero is the interpolation-at-flip assumption; positive is the warp-overshoot
+// hypothesis the FG characterization suspects at x3 (gens there are hf-SHARP, unlike x2's
+// blends, and warp extrapolation overshoots). This is deliberately a PARAMETER because it
+// is unmeasured at x3 - the same open f/g question the fgphase instrument exists for - and
+// the fix must hold under EVERY hypothesis, which it does by never showing gens at all.
+static X3SimResult SimulateX3Keep(int ringSlots, bool mixedConvention, bool reclaimSingles,
+                                  int64_t effectiveLag, int64_t genContentBias) {
+    // x3 grid: real frames flip every 3rd step; batches stride 2 with 2 members; the vote
+    // steers 2 of every 3 batches (66%, the measured share) when mixedConvention is on,
+    // and every batch when off - because the FIX is not "steer more", it is "stamp the
+    // same way whether or not this batch was steered".
+    const int64_t kSpacing = 5556, kSrc = 3 * kSpacing;
+    const int kFrames = 2000;
+    struct Slot { int64_t stamp; int64_t content; bool valid; bool gen; };
+    std::vector<Slot> ring;   // grows forever; the WINDOW emulates the real ring's reach
+
+    policy::SelectionState sel;
+    policy::PolicyConfig cfg;
+    cfg.stickinessQpc = 1000;
+    X3SimResult r;
+    int64_t lastContent = -1;
+
+    // Batch composition rotates [real,gen] / [gen,real] / [gen,gen] over anchor flips
+    // f, f+2, f+4. Real member of a batch anchored at position g is (0 - g) mod 3.
+    int64_t nextPresent = 40000;
+    size_t nextBatch = 0;
+    std::vector<std::array<int64_t, 4>> batches;   // open time, anchor flip, class, single?
+    for (int b = 0; b * 2 < kFrames * 3; b++) {
+        const int64_t anchor = (int64_t)b * 2;
+        const int cls = (int)(anchor % 3);
+        // Singles cluster in [gen,real] (measured 18% there, ~2.5% elsewhere).
+        const bool single = (cls == 1) ? (b % 6 == 1) : (b % 40 == 7);
+        batches.push_back({anchor * kSpacing + 80, anchor, (int64_t)cls, (int64_t)single});
+    }
+
+    for (int present = 0; present < kFrames; present++) {
+        const int64_t now = nextPresent;
+        nextPresent += kSrc;
+        // Deliver every batch that opened before this present.
+        while (nextBatch < batches.size() && batches[nextBatch][0] <= now) {
+            const int64_t bs = batches[nextBatch][0];
+            const int64_t anchor = batches[nextBatch][1];
+            const int cls = (int)batches[nextBatch][2];
+            const bool single = batches[nextBatch][3] != 0;
+            const int realMember = (3 - cls) % 3;          // (0 - g) mod 3
+            // Steering held at the MEASURED 2/3 share in both configurations: the fix is
+            // not "steer more", and a sim that steers everything would hide the residual
+            // generated keeps on unsteered batches - the honest limit of this fix set.
+            const bool steered = (nextBatch % 3) != 2;
+            const int members = single ? 1 : 2;
+            const size_t firstSlot = ring.size();
+            for (int m = 0; m < members; m++) {
+                policy::BatchDecision bd;
+                bd.member = m;
+                bd.stampTs = bs;
+                bd.intraBatch = (m > 0);
+                bd.retractPrevious = (m > 0);
+                // The fix set, as production implements it: spacing passed for EVERY
+                // batch of the rotating regime (one stamp convention), and an unsteered
+                // batch while the vote is live keeps NOTHING (member index past the batch)
+                // rather than falling back to keep-real and risking a generated frame.
+                int member = steered ? realMember : -1;
+                if (!mixedConvention && !steered) member = 3;   // vote live, position lost
+                const policy::KeepDecision keep = policy::DecideKeep(
+                    bd, member,
+                    (steered || !mixedConvention) ? kSpacing : 0, m > 0);
+                Slot s;
+                s.stamp = keep.stampTs;
+                // CONTENT: a real member shows its own flip; a generated member is Smooth
+                // Motion's interpolation for its flip (between the neighbouring reals).
+                s.gen = ((anchor + m) % 3) != 0;
+                s.content = (anchor + m) * kSpacing + (s.gen ? genContentBias : 0);
+                s.valid = keep.keepThis;
+                if (keep.retractPrev && m > 0) ring[firstSlot + m - 1].valid = false;
+                ring.push_back(s);
+            }
+            // The reclaim fix: a single-member batch whose named keeper never arrived kept
+            // nothing, but the lone wake's pixels are the FRONTBUFFER AT GRAB - the newest
+            // flip - which in [gen,real] is the real frame (the x2-proven coalesced single).
+            if (reclaimSingles && steered && single && realMember == 1) {
+                ring[firstSlot].valid = true;
+                ring[firstSlot].stamp = bs + kSpacing;
+                ring[firstSlot].content = (anchor + 1) * kSpacing;
+                ring[firstSlot].gen = false;
+            }
+            nextBatch++;
+        }
+        if (ring.size() < 8) continue;
+        // Bracket within the ring window, exactly as FindBracket reaches p-1..p-(N-1).
+        const int64_t target = now - effectiveLag;
+        const size_t lo = ring.size() > (size_t)(ringSlots - 1)
+                              ? ring.size() - (ringSlots - 1) : 0;
+        policy::BracketInfo b;
+        size_t befIdx = 0, aftIdx = 0;
+        for (size_t i = lo; i < ring.size(); i++) {
+            if (!ring[i].valid) continue;
+            const int64_t d = target - ring[i].stamp;
+            if (d >= 0) { if (!b.hasBefore || d < b.beforeDiff) { b.hasBefore = true; b.beforeTs = ring[i].stamp; b.beforeDiff = d; befIdx = i; } }
+            else { if (!b.hasAfter || -d < b.afterDiff) { b.hasAfter = true; b.afterTs = ring[i].stamp; b.afterDiff = -d; aftIdx = i; } }
+        }
+        r.presents++;
+        if (!b.hasBefore) r.noBefore++;
+        const policy::Pick pick = policy::SelectFrame(b, sel, cfg);
+        size_t shown;
+        if (pick == policy::Pick::Before || pick == policy::Pick::BeforeAdv) shown = befIdx;
+        else if (pick == policy::Pick::After || pick == policy::Pick::AfterAdv) shown = aftIdx;
+        else continue;   // repeat: same content as last, no inversion possible
+        if (lastContent >= 0 && ring[shown].content < lastContent) r.inversions++;
+        if (ring[shown].gen) r.genShown++;
+        lastContent = ring[shown].content;
+    }
+    return r;
+}
+
+static void test_x3_phasekeep_field_failure() {
+    // WHAT THE SIM TAUGHT before any fix was written: with gen content AT its flip
+    // fraction, the shipped configuration starves (924/2000 before-frames missing) but
+    // CANNOT invert content - consecutive batches sit two flip steps apart, so a
+    // one-step stamp-convention skew never reorders them. The field's 19% backward steps
+    // therefore require generated content OFF its flip fraction, which is the warp
+    // hypothesis the FG characterization already suspected at x3 (hf-sharp gens). The
+    // backward mechanism is: starvation forces after-adv picks onto GENERATED frames,
+    // whose overshot content then steps BACK when the true real frame follows.
+    const int64_t kLag = 20833 + 12000;   // lock pull carries the target deep, as captured
+    // Gen content past its flip fraction. The sweep over this parameter put the inversion
+    // ONSET at ~8000 us (1.4 flips) in the broken configuration and the field's backward
+    // magnitude at ~1.7 source periods, so the hypothesis constant sits at the onset: if
+    // x3's generated frames are at least this far off their flip, the field reproduces.
+    const int64_t kOvershoot = 8000;
+
+    // Repro 1: starvation is unconditional in the shipped config.
+    const X3SimResult broken0 = SimulateX3Keep(8, true, false, kLag, 0);
+    CHECK(broken0.noBefore > broken0.presents / 10,
+          "the field configuration must reproduce ring starvation (got %d of %d)",
+          broken0.noBefore, broken0.presents);
+    CHECK(broken0.genShown > broken0.presents / 10,
+          "starvation must force generated frames into the output (got %d of %d) - they "
+          "are the backward-step carrier under the warp hypothesis",
+          broken0.genShown, broken0.presents);
+    CHECK(broken0.inversions == 0,
+          "with gen content AT its flip fraction the shipped config must NOT invert - "
+          "this null is what proves the backward steps came from gen content, not from "
+          "stamp order (got %d)", broken0.inversions);
+
+    // Repro 2: under the warp hypothesis the shipped config shows the field's symptom.
+    const X3SimResult broken = SimulateX3Keep(8, true, false, kLag, kOvershoot);
+    CHECK(broken.inversions > 0,
+          "under the warp hypothesis the field configuration must reproduce backward "
+          "content, got %d inversions in %d presents",
+          broken.inversions, broken.presents);
+
+    // THE FIX: ring 16, ONE stamp convention regardless of per-batch steering, coalesced
+    // singles reclaimed. It must be clean under BOTH gen-content hypotheses, because it
+    // wins by never showing generated frames at all - the only strategy that does not
+    // depend on the unmeasured answer to the x3 f/g question.
+    for (int64_t bias : {(int64_t)0, kOvershoot}) {
+        const X3SimResult fixed = SimulateX3Keep(16, false, true, kLag, bias);
+        CHECK(fixed.inversions == 0,
+              "the fixed configuration must never show backward content (bias %lld), got %d",
+              (long long)bias, fixed.inversions);
+        CHECK(fixed.noBefore <= fixed.presents / 100,
+              "the fixed configuration must not starve the ring (bias %lld, got %d of %d)",
+              (long long)bias, fixed.noBefore, fixed.presents);
+        CHECK(fixed.genShown * 20 < fixed.presents,
+              "the fixed configuration must show almost no generated frames (bias %lld, "
+              "got %d of %d)", (long long)bias, fixed.genShown, fixed.presents);
+    }
+
+    // Each fix alone is NOT sufficient - pinned so nobody ships one and calls it done.
+    const X3SimResult ringOnly = SimulateX3Keep(16, true, false, kLag, kOvershoot);
+    CHECK(ringOnly.inversions > 0 || ringOnly.genShown * 20 >= ringOnly.presents,
+          "ring size alone must not read as a full fix");
+
+    const X3SimResult fixed = SimulateX3Keep(16, false, true, kLag, kOvershoot);
+    std::printf("  x3 phasekeep field failure: broken(ring8,mixed) %d/%d starved, %d gen "
+                "shown, %d inversions under warp hypothesis; fixed(ring16,uniform,reclaim) "
+                "%d starved, %d gen, %d inversions\n",
+                broken.noBefore, broken.presents, broken.genShown, broken.inversions,
+                fixed.noBefore, fixed.genShown, fixed.inversions);
 }
 
 static void test_rotation_phase() {
@@ -2996,6 +3211,7 @@ int main(int argc, char** argv) {
     test_flip_pairing();
     test_anchor_chain();
     test_keep_decision();
+    test_x3_phasekeep_field_failure();
     test_rotation_phase();
     test_dejit_removes_late_blends();
     test_batch_collapse_keep_real();

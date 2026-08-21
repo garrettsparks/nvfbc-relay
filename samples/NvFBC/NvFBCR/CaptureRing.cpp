@@ -369,10 +369,48 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
                     const int pos = policy::RotationPositionAt(m_rotation, batch.stampTs,
                                                                spacing);
                     if (pos >= 0) m_rotRealMember = policy::RotationRealMember(m_rotation, pos);
+                    // The rotation is PROVEN LIVE but this batch cannot be placed on it
+                    // (an unplaceable vote batch left the position stale). Keeping member 1
+                    // here risks keeping a GENERATED frame - the backward-step carrier the
+                    // 2026-08-20 capture filmed - so keep NOTHING: a hole becomes a repeat
+                    // (nearest) or a blend (blend mode), both honest. Strictly gated on the
+                    // vote being currently valid: where it is not (x2, FG off, desktop, an
+                    // unconverged start) this stays plain keep-real, never a drop.
+                    if (m_rotation.valid && m_rotRealMember < 0) {
+                        m_rotRealMember = m_rotation.flipsPerSource;   // no member is real
+                        m_phaseKeepUndecided++;
+                    }
                     if (m_rotRealMember >= 0) m_phaseKeepBatches++;
+
+                    // Uniform stamp convention while the rotation is armed: pass the
+                    // spacing to the keep decision for EVERY batch of a rotating regime,
+                    // steered or not, so all stamps live on one content-aligned timeline.
+                    // Where composition cannot rotate the spacing stays 0 and stamps stay
+                    // at batch start - the x2 path, bit-for-bit.
+                    if (m_rotation.period <= 1) m_rotSpacing = 0;
                 }
             }
+
+            // Reclaim the previous batch's coalesced single. A single-member batch whose
+            // named keeper (member 1) never arrived kept nothing - but the lone wake's
+            // pixels are the FRONTBUFFER AT GRAB, i.e. the newest flip, which in the
+            // [gen,real] class is the REAL frame: the x2-proven coalesced-single mechanism,
+            // and the reason singles concentrate 7x in exactly that class (18% vs 2.5%,
+            // measured). Dropping them threw away ~5 real frames per second that were
+            // actually captured. The slot is re-validated one batch late, which is the
+            // earliest the fact is knowable and ~11 ms - well inside the bracketing lag.
+            if (m_prevKeeper == 1 && m_prevLastMember == 0 && count >= 1) {
+                const int prevSlot = (int)((count - 1) % RING_SIZE);
+                m_ring[prevSlot].timestamp.QuadPart = m_prevBatchStart + m_prevSpacing;
+                m_ring[prevSlot].valid = true;
+                m_phaseKeepReclaimed++;
+            }
+            m_prevKeeper = m_rotRealMember;
+            m_prevBatchStart = batch.stampTs;
+            m_prevSpacing = m_rotSpacing;
         }
+        if (batch.member > 0) m_prevLastMember = batch.member;
+        else m_prevLastMember = 0;
 
         // What this wake does to the ring, decided in the policy layer so it is testable at
         // all: with no rotation guidance (m_rotRealMember < 0 - x2, frame generation off, an

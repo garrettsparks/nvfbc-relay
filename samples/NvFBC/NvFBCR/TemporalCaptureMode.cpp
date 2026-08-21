@@ -172,6 +172,12 @@ bool TemporalCaptureMode::Setup() {
     // dropped frame stay under it, narrow enough that a frozen source (whose grab-timeout
     // re-grabs land ~100 ms apart) reads as stalled on the first present.
     m_policyCfg.stallSpanQpc = m_assumedSrcPeriodQpc * 2;
+    // Under phase-aware keep-real the valid-frame cadence is ONE per source period (that is
+    // the point), so a single missing real frame opens a bracket span of exactly two source
+    // periods - the 2x threshold above with one microsecond of margin, measured. 2.5x keeps
+    // one missing frame from reading as a stall while a genuinely frozen source (grab
+    // timeouts at ~100 ms) still trips it on the first present.
+    if (m_phaseKeep) m_policyCfg.stallSpanQpc = m_assumedSrcPeriodQpc * 5 / 2;
     if (m_lock && m_srcRateHint > 0.0f) {
         int combM = 1;
         bool combMatched = false;
@@ -559,9 +565,11 @@ void TemporalCaptureMode::Run(
         // keep-real" - which are the pass and the silent-no-op, and they look identical in
         // the output.
         LOG("phasekeep summary: %lld batches steered, %lld kept an earlier member, "
-            "%lld all-generated batches dropped, %lld vote resets",
+            "%lld all-generated batches dropped, %lld singles reclaimed, "
+            "%lld undecided dropped, %lld vote resets",
             m_ring.PhaseKeepBatches(), m_ring.PhaseKeepFlipped(),
-            m_ring.PhaseKeepEmpty(), m_ring.PhaseKeepResets());
+            m_ring.PhaseKeepEmpty(), m_ring.PhaseKeepReclaimed(),
+            m_ring.PhaseKeepUndecided(), m_ring.PhaseKeepResets());
     }
     if (m_dejitter) {
         LOG("dejit summary: %lld batches measured, %lld late, %lld corrected, "
