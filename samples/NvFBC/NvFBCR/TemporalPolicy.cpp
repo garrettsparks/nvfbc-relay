@@ -439,30 +439,104 @@ void RotationReset(RotationPhase& p, int stride, int flipsPerSource) {
     p.stride = stride;
     p.flipsPerSource = flipsPerSource;
     p.period = RotationPeriodBatches(flipsPerSource, stride);
+    // flipsPerSource indexes the class array, so it - not just the period - has to fit.
+    // A short period can still carry a long grid: -src 15 against an x3 flip rate gives
+    // flipsPerSource 12 with period 6, which would leave two thirds of the reachable
+    // classes unreadable and unvoted. Stay inert instead.
+    if (flipsPerSource > RotationPhase::kMaxPeriod) p.period = 1;
     for (int i = 0; i < RotationPhase::kMaxPeriod; i++) {
         p.offsetSum[i] = 0;
         p.offsetCount[i] = 0;
     }
     p.valid = false;
-    p.realLedResidue = -1;
+    p.realPhase = -1;
+    p.gridPos = 0;
+    p.lastAnchorTs = 0;
+    p.haveAnchor = false;
 }
 
-int RotationRealMember(const RotationPhase& p, long long batchIndex) {
-    if (!p.valid || p.period <= 1 || p.realLedResidue < 0 || batchIndex < 0) return -1;
-    if (p.flipsPerSource <= 1 || p.stride <= 0) return -1;
-    // The vote names the residue whose member 0 is real, which fixes the flip phase of real
-    // frames: P = realLedResidue * stride (mod flipsPerSource). Member m of batch b sits at
-    // flip b*stride + m, so the real member is P - b*stride, folded positive.
-    const long long f = p.flipsPerSource;
-    const long long phase = ((long long)p.realLedResidue * p.stride) % f;
-    long long m = (phase - (batchIndex % f) * p.stride) % f;
-    if (m < 0) m += f;
-    return (int)m;
+// Every path that moves the origin funnels through here, so no caller can forget that the
+// evidence goes with it.
+//
+// THE SAMPLES MUST BE DISCARDED, not merely distrusted. Each class sum is a mean of offsets
+// observed at one grid position, and "position" only means anything relative to the origin -
+// so after a re-origin the old sums describe DIFFERENT positions than the ones they are
+// filed under. Keeping them does two things, both bad: the old verdict is restorable from
+// evidence that no longer applies (measured at x3: the pre-stall phase returned one sample
+// later, and the next 30 batches kept 0 real frames, 20 generated, dropping 10 whole - with
+// nominal telemetry throughout), and even gated, the stale sums pollute the new means for as
+// long as the sample window takes to wash them out. Clearing costs a re-convergence, about
+// 72 batches or 0.9 s at x3, which is the right price for not steering on fiction.
+static void RotationReOrigin(RotationPhase& p, int64_t anchorTs) {
+    p.gridPos = 0;
+    p.lastAnchorTs = anchorTs;
+    p.haveAnchor = true;
+    p.valid = false;
+    p.realPhase = -1;
+    for (int i = 0; i < RotationPhase::kMaxPeriod; i++) {
+        p.offsetSum[i] = 0;
+        p.offsetCount[i] = 0;
+    }
 }
 
-void RotationObserve(RotationPhase& p, long long batchIndex, int64_t anchorOffset) {
-    if (p.period <= 1 || batchIndex < 0) return;
-    const int r = (int)(batchIndex % p.period);
+bool RotationAdvance(RotationPhase& p, int64_t anchorTs, int flipSteps) {
+    if (p.flipsPerSource <= 1) return false;
+    if (!p.haveAnchor || anchorTs <= p.lastAnchorTs) {
+        // First anchor after a reset or an outage: adopt it as the origin. Position is
+        // arbitrary until the vote names a phase against it, which is fine - the vote and
+        // the position share this origin, so only their RELATIONSHIP has to be stable.
+        RotationReOrigin(p, anchorTs);
+        return true;
+    }
+    // flipSteps is COUNTED by the caller from the flip history, never derived by dividing a
+    // time difference by the spacing. That distinction decides whether this works at all: a
+    // division makes a rounding decision on every batch, and one wrong rounding rotates the
+    // class mapping PERMANENTLY, so the errors accumulate. Measured across five x3 captures,
+    // class separation by method:
+    //
+    //   capture             time-division   flip-count
+    //   etw_x3_walk              93 us        122 us
+    //   join2_x3_on              69 us        167 us
+    //   dxgk_x3_120s            222 us        211 us
+    //   baseline_60x3           163 us        185 us
+    //   phasekeep_60x3          114 us        225 us
+    //
+    // Counting also has no tolerance to tune. The division needed one, and sweeping it
+    // showed the optimum wandering between 0.25 and 0.50 of a step depending on which
+    // capture was measured - a parameter fitted to whichever capture came first.
+    //
+    // Beyond a handful of steps the batch is on the far side of a stall, an outage or a
+    // stride hiccup, and nothing connects it to the last position: the samples already
+    // gathered stay (they describe the same grid), but position must be re-established
+    // before the vote is trusted again.
+    if (flipSteps < 1 || flipSteps > 8) {
+        RotationReOrigin(p, anchorTs);
+        return false;
+    }
+    const int next = (int)(((long long)p.gridPos + flipSteps) % p.flipsPerSource);
+    // THE LATTICE CHECK. A stride only ever visits positions that are multiples of
+    // gcd(stride, flipsPerSource) away from where it started, and the decision loop reads
+    // exactly those. An advance that lands OFF that sublattice - one duplicated or dropped
+    // flip record at x4, say - would otherwise be permanent: the classes the loop reads
+    // freeze at their old counts, stay above the sample floor, and hold the verdict valid
+    // forever on evidence that stopped updating, while every new sample lands somewhere
+    // nothing reads. Measured consequence at x4: 50% of batches dropped, 50% keeping a
+    // generated frame, indefinitely. Treat it as an origin loss instead.
+    int reach = p.stride > 0 ? p.stride : 1, f = p.flipsPerSource;
+    while (f != 0) { const int t = reach % f; reach = f; f = t; }
+    if (reach > 1 && (next % reach) != 0) {
+        RotationReOrigin(p, anchorTs);
+        return false;
+    }
+    p.gridPos = next;
+    p.lastAnchorTs = anchorTs;
+    return true;
+}
+
+void RotationObserve(RotationPhase& p, int64_t anchorOffset) {
+    if (p.period <= 1 || !p.haveAnchor) return;
+    if (p.gridPos < 0 || p.gridPos >= RotationPhase::kMaxPeriod) return;
+    const int r = p.gridPos;
     p.offsetSum[r] += anchorOffset;
     p.offsetCount[r]++;
 
@@ -476,18 +550,41 @@ void RotationObserve(RotationPhase& p, long long batchIndex, int64_t anchorOffse
         p.offsetCount[r] /= 2;
     }
 
-    // Decide only on a full set of well-sampled classes, and RE-DECIDE every batch: the
-    // verdict is never latched, so if the separation ever collapses this falls straight back
-    // to plain keep-real instead of steering on stale evidence. The test is on MEANS - the
-    // real-led class sits tens of microseconds BELOW zero while every generated-led class
-    // sits near +75 - because the per-batch distributions overlap and only the aggregate
-    // separates. Requiring the winner to clear the runner-up by a margin keeps a
-    // half-converged vote from committing.
+    // THE DECISION IS ON SHAPE, NOT ON SPREAD, and that distinction was measured rather than
+    // chosen. A batch led by a REAL frame wakes BEFORE its flip because the game submits on
+    // its own render schedule; every generated-led batch wakes AFTER, on the driver's
+    // metering schedule. So the signature is one class below zero and the rest above it -
+    // not merely "some class is lower than the others", which noise supplies for free.
+    //
+    // Across ten captures (five x3 where the rotation exists, five x2 where it cannot):
+    //
+    //   x3  +87 +92 -30 | +83 -85 +36 | +79 +128 -84 | +91 +98 -87 | +111 +129 -96
+    //   x2  -11 +48 +39 | -191 -80 -124 | -36 -180 -104 | -45 -50 -38 | -64 +38 -123
+    //
+    // Every x3 set has exactly one negative class and the rest positive. Four of the five
+    // x2 sets do not (all-negative, or two negative), and the one that does clears its
+    // runner-up by only 50 us where every x3 set clears by 117-207. A spread test alone
+    // cannot separate these populations - they overlap, 12-161 us against 122-225 - which
+    // is why the sign structure carries the decision and the margin only sizes it.
+    // Also what makes a re-origin re-earn its verdict: RotationReOrigin clears the class
+    // counts, so this floor cannot be met again until every class has been re-observed
+    // against the new origin. A separate "samples since origin" counter was tried here and
+    // removed - it could not be made to fail a test, because this floor already does its job.
     static const int32_t kMinSamplesPerResidue = 24;
-    static const int64_t kMinSeparation = 40;   // caller's units; us in tests, QPC ticks live
+    // Between the widest null (50 us) and the narrowest signal (117 us), in the caller's
+    // units: microseconds in tests, QPC ticks live, where 800 ticks is 80 us at 10 MHz.
+    static const int64_t kMinSeparation = 80;
+    // ONLY THE REACHABLE POSITIONS VOTE. A batch advances `stride` flips, so starting from
+    // one position it can only ever land on multiples of gcd(stride, flipsPerSource): at x3
+    // that is every position, but at x4 (stride 2 of 4 flips) it is only the even ones, and
+    // requiring samples in positions the stride can never visit would starve the vote
+    // forever in exactly the regimes with the shortest rotations.
+    int reach = p.stride > 0 ? p.stride : 1, f = p.flipsPerSource;
+    while (f != 0) { const int t = reach % f; reach = f; f = t; }
+    if (reach < 1) reach = 1;
     int best = -1, second = -1;
     int64_t bestMean = 0, secondMean = 0;
-    for (int i = 0; i < p.period; i++) {
+    for (int i = 0; i < p.flipsPerSource && i < RotationPhase::kMaxPeriod; i += reach) {
         if (p.offsetCount[i] < kMinSamplesPerResidue) { p.valid = false; return; }
         const int64_t mean = p.offsetSum[i] / p.offsetCount[i];
         if (best < 0 || mean < bestMean) {
@@ -497,17 +594,66 @@ void RotationObserve(RotationPhase& p, long long batchIndex, int64_t anchorOffse
             second = i; secondMean = mean;
         }
     }
-    if (best < 0 || second < 0 || secondMean - bestMean < kMinSeparation) {
-        p.valid = false;         // classes not separated: there may be nothing to find
+    if (best < 0 || second < 0) { p.valid = false; return; }
+    // One class ahead of its flip, every other behind: the mechanism's own signature.
+    const bool shaped = (bestMean < 0) && (secondMean > 0);
+    if (!shaped || secondMean - bestMean < kMinSeparation) {
+        p.valid = false;         // no rotation to read, or not enough evidence of one
         return;
     }
     p.valid = true;
-    p.realLedResidue = best;
+    p.realPhase = best;
 }
 
-bool RotationRealLeads(const RotationPhase& p, long long batchIndex) {
-    if (!p.valid || p.period <= 1 || p.realLedResidue < 0 || batchIndex < 0) return false;
-    return (int)(batchIndex % p.period) == p.realLedResidue;
+int RotationRealMember(const RotationPhase& p, int gridPos) {
+    if (!p.valid || p.period <= 1 || p.realPhase < 0 || gridPos < 0) return -1;
+    if (p.flipsPerSource <= 1) return -1;
+    int m = (p.realPhase - gridPos) % p.flipsPerSource;
+    if (m < 0) m += p.flipsPerSource;
+    return m;
+}
+
+int RotationPositionAt(const RotationPhase& p, int64_t ts, int64_t spacingTicks) {
+    if (!p.haveAnchor || p.flipsPerSource <= 1 || spacingTicks <= 0) return -1;
+    const int64_t delta = ts - p.lastAnchorTs;
+    // BOUNDED, because this is the one place in the design that divides a time difference by
+    // the spacing - the operation every other path avoids precisely because a rounding error
+    // rotates the mapping. Over the two batches it is designed to span the arithmetic is
+    // exact: both ends sit within a quarter step of a real flip, against a half-step
+    // rounding window. Over an unbounded gap it is not - a 300 ms unanchored run at a
+    // spacing read 3% low misrounds by 2 flips on a VRR panel, silently. Past the bound this
+    // reports "no position", which the caller reads as plain keep-real.
+    static const int kMaxExtrapolationSteps = 8;
+    if (delta < 0 || delta > (int64_t)kMaxExtrapolationSteps * spacingTicks) return -1;
+    int64_t steps = (delta + (delta >= 0 ? spacingTicks / 2 : -spacingTicks / 2)) / spacingTicks;
+    int64_t pos = ((long long)p.gridPos + steps) % p.flipsPerSource;
+    if (pos < 0) pos += p.flipsPerSource;
+    return (int)pos;
+}
+
+KeepDecision DecideKeep(const BatchDecision& batch, int realMember, int64_t spacingTicks,
+                        bool havePrevSlot) {
+    KeepDecision d;
+    d.stampTs = batch.stampTs;
+    if (realMember < 0) {
+        // No rotation guidance: exactly the pre-rotation rule. Keep this member, stamp it
+        // at batch start, and take back the predecessor an intra-batch wake displaced.
+        d.keepThis = true;
+        d.retractPrev = batch.retractPrevious && havePrevSlot;
+        d.collapsed = d.retractPrev;
+        return d;
+    }
+    // Each member on its own flip, so content and stamp agree whichever member survives.
+    if (spacingTicks > 0 && batch.member > 0) {
+        d.stampTs = batch.stampTs + (int64_t)batch.member * spacingTicks;
+    }
+    d.keepThis = (batch.member == realMember);
+    // Retract the predecessor only when this member is the keeper and one is still
+    // standing. A member that is itself discarded takes nothing back: the keeper may be
+    // earlier in the batch and must survive.
+    d.retractPrev = d.keepThis && batch.retractPrevious && havePrevSlot;
+    d.collapsed = d.retractPrev || !d.keepThis;
+    return d;
 }
 
 bool BracketIsStalled(const BracketInfo& b, const PolicyConfig& cfg) {

@@ -42,7 +42,8 @@ private:
     // history's lock for one bounded lookup each; the ring calls them once per batch.
     virtual bool Grid(long long batchPeriodTicks, int* outStride, int* outFlipsPerSource,
                       long long* outSpacingTicks) override;
-    virtual bool ArrivalOffset(long long batchStartTs, long long* outOffset) override;
+    virtual bool AnchorAndSteps(long long batchStartTs, long long prevAnchorTs,
+                                long long* outOffset, int* outSteps) override;
 
     PresentScheduler m_scheduler;
     CaptureRing m_ring;

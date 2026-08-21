@@ -86,12 +86,18 @@ bool TemporalCaptureMode::Grid(long long batchPeriodTicks, int* outStride,
     return true;
 }
 
-bool TemporalCaptureMode::ArrivalOffset(long long batchStartTs, long long* outOffset) {
+bool TemporalCaptureMode::AnchorAndSteps(long long batchStartTs, long long prevAnchorTs,
+                                         long long* outOffset, int* outSteps) {
     if (!m_etw || m_noJoin) return false;
     const policy::FlipPairing fp =
         m_etwConsumer.PairCapture(0, batchStartTs, 0, m_flipCadenceWindowQpc);
     if (!fp.anchorFound) return false;
     *outOffset = fp.anchorOffset;
+    *outSteps = 1;
+    if (prevAnchorTs >= 0) {
+        const long long anchorTs = batchStartTs - fp.anchorOffset;
+        *outSteps = m_etwConsumer.CountFlipsBetween(0, prevAnchorTs, anchorTs);
+    }
     return true;
 }
 

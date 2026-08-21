@@ -118,9 +118,21 @@ public:
         // stamp offsets, so nothing here declares a frame-generation multiplier.
         virtual bool Grid(long long batchPeriodTicks, int* outStride,
                           int* outFlipsPerSource, long long* outSpacingTicks) = 0;
-        // Batch start minus its nearest flip. False when the batch cannot be placed on the
-        // grid at all, which is not an error - it just yields no vote this batch.
-        virtual bool ArrivalOffset(long long batchStartTs, long long* outOffset) = 0;
+        // Batch start minus its nearest flip, AND the number of head-0 flips between the
+        // previous anchor and this one. False when the batch cannot be placed on the grid,
+        // which is not an error - it just yields no vote for this batch.
+        //
+        // The step count is COUNTED from the flip history, never derived by dividing the
+        // anchor-to-anchor time by the spacing: a division makes a rounding decision per
+        // batch, and one wrong rounding rotates the class mapping permanently. Measured
+        // across five x3 captures, counting separated the classes better on four and tied
+        // the fifth, and needs no tolerance - the division's best tolerance moved between
+        // 0.25 and 0.50 of a step depending on which capture it was fitted to.
+        //
+        // prevAnchorTs < 0 means there is no previous anchor; the count is then irrelevant
+        // and the caller adopts this anchor as the origin.
+        virtual bool AnchorAndSteps(long long batchStartTs, long long prevAnchorTs,
+                                    long long* outOffset, int* outSteps) = 0;
     };
 
     // Arm phase-aware keep-real (-phasekeep) before Start. Default keep-real retains member
@@ -194,7 +206,13 @@ private:
     long long m_phaseKeepBatches = 0;   // batches the vote was consulted for
     long long m_phaseKeepFlipped = 0;   // batches that kept a member plain keep-real would not
     long long m_phaseKeepEmpty = 0;     // all-generated batches dropped whole
-    long long m_phaseKeepResets = 0;    // votes dropped on a continuity break
+    // Votes dropped because the GRID MEASUREMENT changed (a different multiplier, a mode
+    // switch). Fires at least once per session, on the first batch, when stride and
+    // flipsPerSource go from 0 to their measured values - so a nonzero count is normal and
+    // only a growing one means anything. Continuity breaks WITHIN a regime no longer land
+    // here: RotationAdvance carries the grid position across them, and when it cannot it
+    // re-origins internally, which this counter does not see.
+    long long m_phaseKeepResets = 0;
     // Grid measurements for the batch in flight, read once at batch open: members arrive a
     // submission epsilon apart, so re-reading per member would only add lock traffic.
     int m_rotRealMember = -1;           // member this batch should keep; <0 = fall back

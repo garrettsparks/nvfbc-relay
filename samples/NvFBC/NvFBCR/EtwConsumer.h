@@ -66,6 +66,12 @@ public:
     // it - the rotation length that phase-aware keep-real needs is one such derivation.
     long long MedianFlipSpacing(uint32_t head, int64_t cadenceWindow) const;
 
+    // Head-0 flips strictly after lo, up to and including hi. Counting DISCRETE EVENTS is
+    // what lets a caller advance a grid position exactly; dividing (hi - lo) by the spacing
+    // instead makes a rounding decision that, when wrong, shifts the caller's notion of
+    // grid phase permanently. Bounded, so a wild range reports the cap rather than walking.
+    int CountFlipsBetween(uint32_t head, int64_t lo, int64_t hi) const;
+
     long long Flips() const { return m_flips.load(std::memory_order_relaxed); }
     long long DecodeFailures() const { return m_decodeFail.load(std::memory_order_relaxed); }
 

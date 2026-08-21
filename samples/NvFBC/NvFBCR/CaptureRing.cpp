@@ -337,78 +337,65 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
                     if (stride != m_rotation.stride ||
                         flipsPerSource != m_rotation.flipsPerSource) {
                         policy::RotationReset(m_rotation, stride, flipsPerSource);
-                    } else if (batchPeriod > 0 && batch.batchGap > 0 &&
-                               (batch.batchGap > batchPeriod + batchPeriod / 2 ||
-                                batch.batchGap < batchPeriod / 2)) {
-                        policy::RotationReset(m_rotation, stride, flipsPerSource);
                         m_phaseKeepResets++;
-                    } else {
-                        long long off = 0;
-                        if (m_rotationOracle->ArrivalOffset(batch.stampTs, &off)) {
-                            policy::RotationObserve(m_rotation, opens, off);
-                        }
                     }
                     m_rotSpacing = spacing;
-                    m_rotRealMember = policy::RotationRealMember(m_rotation, opens);
+
+                    // FEED THE VOTE A BATCH THAT IS OLD ENOUGH TO ANSWER FOR. A batch's own
+                    // anchor flip has NOT been delivered when it opens - measured on a real
+                    // x3 capture, the freshest flip the relay knows at batch open is 5974 us
+                    // (p50) in the past, more than one x3 flip step, and 98.2% of batches
+                    // cannot be placed at all. Asking here is what made the first build vote
+                    // on nothing and steer nothing. Two batches back is ~24 ms at x3, past
+                    // the p95 delivery lag with room to spare.
+                    static const long long kVoteLagBatches = 2;
+                    const long long voteIdx = opens - kVoteLagBatches;
+                    if (voteIdx >= 0) {
+                        const LONGLONG vbs = m_batchStarts[voteIdx % kBatchHistory];
+                        long long off = 0;
+                        int steps = 0;
+                        const long long prevAnchor =
+                            m_rotation.haveAnchor ? m_rotation.lastAnchorTs : -1;
+                        if (m_rotationOracle->AnchorAndSteps(vbs, prevAnchor, &off, &steps)) {
+                            if (policy::RotationAdvance(m_rotation, vbs - off, steps)) {
+                                policy::RotationObserve(m_rotation, off);
+                            }
+                        }
+                    }
+
+                    // Decide for THIS batch by carrying the vote's position forward over the
+                    // few milliseconds since it was last established - exact while the flip
+                    // step is, which over two batches it comfortably is.
+                    const int pos = policy::RotationPositionAt(m_rotation, batch.stampTs,
+                                                               spacing);
+                    if (pos >= 0) m_rotRealMember = policy::RotationRealMember(m_rotation, pos);
                     if (m_rotRealMember >= 0) m_phaseKeepBatches++;
                 }
             }
         }
 
-        // Where this member's content actually displays. Members of a batch arrive within a
-        // submission epsilon but scan out one flip apart, and the ring's default stamp
-        // (batch start, shared by every member) therefore records the LATER members early by
-        // a flip step. That is harmless while the kept member is always the same one - the
-        // offset is constant and the comb lock absorbs it - but phase-aware keep-real varies
-        // which member survives, and a varying offset is content jitter the lock cannot
-        // cancel. So when the rotation is being acted on, each member is stamped at its own
-        // flip instead. Left alone otherwise, which keeps x2's load-bearing cancellation
-        // exactly as it was.
-        LONGLONG stampTs = batch.stampTs;
-        if (m_rotRealMember >= 0 && m_rotSpacing > 0 && batch.member > 0) {
-            stampTs += (LONGLONG)batch.member * m_rotSpacing;
+        // What this wake does to the ring, decided in the policy layer so it is testable at
+        // all: with no rotation guidance (m_rotRealMember < 0 - x2, frame generation off, an
+        // unconverged vote) it reduces to exactly the keep-real rule this loop always had.
+        const policy::KeepDecision keep =
+            policy::DecideKeep(batch, m_rotRealMember, m_rotSpacing, count >= 1);
+        if (m_rotRealMember >= 0 && batch.member == 0) {
+            if (m_rotRealMember >= 2) m_phaseKeepEmpty++;
+            else if (m_rotRealMember == 0) m_phaseKeepFlipped++;
         }
 
-        // Which member this batch keeps. Default keep-real retains the LAST member and
-        // retracts its predecessors, which is right wherever composition does not rotate.
-        // With the rotation read, the answer is per member instead: keep the one member the
-        // vote names real and retract every other, INCLUDING keeping none at all when the
-        // named member does not exist in this batch. That last case is the all-generated
-        // batch, and dropping it whole is the point - its two frames are both synthesized,
-        // so leaving them out is what makes the surviving cadence one real frame per source
-        // period rather than a 90/s mixture. Decided before publishing, so a batch that
-        // keeps an earlier member never briefly exposes a later one to a present in flight.
-        bool retractThis = false, retractPrev = false;
-        if (m_rotRealMember >= 0) {
-            retractThis = (batch.member != m_rotRealMember);
-            if (retractThis && batch.member > 0) {
-                // A later member arriving after the kept one: nothing to take back.
-                retractPrev = false;
-            }
-            if (batch.member == 0 && m_rotRealMember >= 2) m_phaseKeepEmpty++;
-            if (batch.retractPrevious && !retractThis) {
-                // This member is the real one and a predecessor is still standing.
-                retractPrev = true;
-            }
-            if (batch.member == 0 && m_rotRealMember == 0) m_phaseKeepFlipped++;
-        } else if (batch.retractPrevious && count >= 1) {
-            retractPrev = true;
-        }
-
-        m_ring[slot].timestamp.QuadPart = stampTs;
+        m_ring[slot].timestamp.QuadPart = keep.stampTs;
         m_ring[slot].batchStart.QuadPart = batch.stampTs;
-        m_ring[slot].valid = !retractThis;
+        m_ring[slot].valid = keep.keepThis;
         m_writeCount = count + 1;
         m_published.store(count + 1);  // publish only after the slot write is GPU-complete
 
-        if (retractPrev) {
+        if (keep.retractPrev) {
             // Retract the previous member (the generated frame): hide it from future brackets.
             // Content is never overwritten, so a present read already in flight stays coherent.
             m_ring[(int)((count - 1) % RING_SIZE)].valid = false;
-            collapsed++;
-        } else if (retractThis) {
-            collapsed++;
         }
+        if (keep.collapsed) collapsed++;
 
         // Verbose: source arrival timeline (dt = inter-arrival gap ≈ source frame period);
         // flush = GPU-completion wait added by the cross-device coherency fix; col = cumulative
@@ -424,7 +411,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         if (m_fgPhaseActive) {
             FgPhaseOnWake(batch.member, slot,
                           (LONGLONG)((batch.stampTs - m_baseQpc.QuadPart) * usPerTick),
-                          !retractThis);
+                          keep.keepThis);
         }
     }
 }
