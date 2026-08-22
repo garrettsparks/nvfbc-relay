@@ -236,6 +236,9 @@ private:
     // Clamped batch-period estimate for the stride derivation only (see the wake loop for
     // why the shared telemetry EMA cannot be used there). Capture-thread-owned.
     LONGLONG m_rotPeriodEma = 0;
+    // Members per batch, Q8 fixed point: the pairing gate that keeps the vote from arming on
+    // a grid reading the declared source rate does not describe. See the wake loop.
+    LONGLONG m_batchMembersEmaQ8 = 0;
 
     bool m_fgPhaseRequested = false;
     bool m_fgPhaseActive = false;

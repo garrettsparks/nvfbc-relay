@@ -435,9 +435,10 @@ int RotationPeriodBatches(int flipsPerSource, int stride) {
     return period;
 }
 
-void RotationReset(RotationPhase& p, int stride, int flipsPerSource) {
+void RotationReset(RotationPhase& p, int stride, int flipsPerSource, int64_t minSeparation) {
     p.stride = stride;
     p.flipsPerSource = flipsPerSource;
+    p.minSeparation = minSeparation;
     p.period = RotationPeriodBatches(flipsPerSource, stride);
     // flipsPerSource indexes the class array, so it - not just the period - has to fit.
     // A short period can still carry a long grid: -src 15 against an x3 flip rate gives
@@ -578,8 +579,12 @@ void RotationObserve(RotationPhase& p, int64_t anchorOffset) {
     // removed - it could not be made to fail a test, because this floor already does its job.
     static const int32_t kMinSamplesPerResidue = 24;
     // Between the widest null (50 us) and the narrowest signal (117 us), in the caller's
-    // units: microseconds in tests, QPC ticks live, where 800 ticks is 80 us at 10 MHz.
-    static const int64_t kMinSeparation = 80;
+    // units - so it arrives as a PARAMETER (RotationReset) rather than a literal. As a
+    // literal it read 80 us to the microsecond callers and 80 ticks to the QPC caller that
+    // ships, i.e. 8 us, which passes nulls the measurement says to reject. Unset means the
+    // caller never declared its clock: refuse to validate rather than guess, so the failure
+    // is lost steering instead of false steering.
+    if (p.minSeparation <= 0) { p.valid = false; return; }
     // ONLY THE REACHABLE POSITIONS VOTE. A batch advances `stride` flips, so starting from
     // one position it can only ever land on multiples of gcd(stride, flipsPerSource): at x3
     // that is every position, but at x4 (stride 2 of 4 flips) it is only the even ones, and
@@ -603,7 +608,7 @@ void RotationObserve(RotationPhase& p, int64_t anchorOffset) {
     if (best < 0 || second < 0) { p.valid = false; return; }
     // One class ahead of its flip, every other behind: the mechanism's own signature.
     const bool shaped = (bestMean < 0) && (secondMean > 0);
-    if (!shaped || secondMean - bestMean < kMinSeparation) {
+    if (!shaped || secondMean - bestMean < p.minSeparation) {
         p.valid = false;         // no rotation to read, or not enough evidence of one
         return;
     }
