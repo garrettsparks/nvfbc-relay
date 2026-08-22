@@ -329,7 +329,43 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             // that drops the vote rather than letting it drift.
             m_rotRealMember = -1;
             m_rotSpacing = 0;
-            if (m_rotationOracle) {
+            // THE PAIRING GATE: does the capture stream actually carry epsilon PAIRS?
+            //
+            // flipsPerSource is a DECLARED source rate over a MEASURED flip spacing, so it
+            // is only meaningful while the declared rate is true. On the desktop this panel
+            // presents at 240 Hz, which against -src 60 reads as flipsPerSource 4; with
+            // stride 2 that is a rotation period of 2, and the vote ARMS on a grid where
+            // nothing rotates. With only two classes to fill it reaches the sample floor
+            // quickly and the one-negative-one-positive shape test is close to a coin flip,
+            // so it validates on noise and retracts the wrong member. Measured on the
+            // replay: 11-13% of batches on x2 and FRAME-GENERATION-OFF captures read as x4,
+            // and three of nine non-rotating captures steered batches that way.
+            //
+            // Frame generation is what produces the pairs, so their absence is an
+            // INDEPENDENT signal - not another function of the same two measurements, which
+            // is why the obvious cross-check (implied source period against the declared
+            // one) cannot help: it divides by the same spacing and passes the misread too.
+            // Measured members per batch across thirteen captures: 1.885-1.963 wherever
+            // frame generation is really running (x2 and x3 alike), 1.036-1.309 on the x4
+            // misreads, 1.009 with frame generation off. The gate sits in the middle of
+            // that gap rather than against either edge.
+            //
+            // A RUNNING estimate, never a per-batch test: at x3 about 7% of batches
+            // legitimately arrive with one member (the coalesced singles), and the reclaim
+            // that recovers 2-9% of all source periods requires those batches to have been
+            // steered. Gating per batch would refuse exactly them.
+            // batchGap is zero only where there is no previous batch to count, so it is the
+            // whole guard: m_prevLastMember still holds the PREVIOUS batch's last member
+            // index here, because the wake loop updates it after this block.
+            if (batch.batchGap > 0) {
+                const LONGLONG members = (LONGLONG)(m_prevLastMember + 1) << 8;
+                m_batchMembersEmaQ8 = m_batchMembersEmaQ8
+                                          ? (m_batchMembersEmaQ8 * 7 + members) / 8
+                                          : members;
+            }
+            static const LONGLONG kMinPairingQ8 = 410;   // 1.6 members per batch, in Q8
+            const bool paired = m_batchMembersEmaQ8 >= kMinPairingQ8;
+            if (m_rotationOracle && paired) {
                 // The batch period the STRIDE derives from is a separate, CLAMPED estimate,
                 // not m_srcPeriodEmaQpc. The shared EMA admits any gap under 125 ms, so a
                 // single ~100 ms grab-timeout stall inflates it enough to flip the derived
@@ -354,7 +390,11 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
                 if (m_rotationOracle->Grid(batchPeriod, &stride, &flipsPerSource, &spacing)) {
                     if (stride != m_rotation.stride ||
                         flipsPerSource != m_rotation.flipsPerSource) {
-                        policy::RotationReset(m_rotation, stride, flipsPerSource);
+                        // 80 us of THIS machine's QPC, derived rather than hardcoded: the
+                        // threshold is a measured margin in real time, and a tick literal
+                        // would silently mean something else on a different frequency.
+                        policy::RotationReset(m_rotation, stride, flipsPerSource,
+                                              (m_freqQuad * 80) / 1000000);
                         m_phaseKeepResets++;
                     }
                     m_rotSpacing = spacing;

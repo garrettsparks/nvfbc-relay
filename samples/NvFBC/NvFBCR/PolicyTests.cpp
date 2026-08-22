@@ -46,6 +46,11 @@ static int g_failures = 0;
 // replay must run the same convention or the suite validates an inconsistent config.
 static const int64_t kStickinessUs = 1000;
 static const int64_t kSlewUs = 25;
+// The rotation vote's class-mean margin, in this suite's microseconds. Production derives
+// the same 80 us from its QPC frequency. It is a PARAMETER precisely because this suite runs
+// in a different clock from the relay: as a literal inside the vote it meant 80 us here and
+// 8 us in the field, so the suite could not see the field's real null gate at all.
+static const int64_t kVoteMinSeparationUs = 80;
 
 // The ring depth the CORPUS FIXTURES were captured under - deliberately NOT mirroring
 // CaptureRing::RING_SIZE, which is now 16: every fixture's field numbers came from ring-8
@@ -1294,7 +1299,7 @@ static void test_rotation_phase() {
         int fps = 3;
     };
     auto init = [](Harness& h, int stride, int fps, int truePhase, int64_t spacing) {
-        policy::RotationReset(h.p, stride, fps);
+        policy::RotationReset(h.p, stride, fps, kVoteMinSeparationUs);
         h.truePos = 0;
         h.truePhase = truePhase;
         h.offset = -1;
@@ -1387,7 +1392,7 @@ static void test_rotation_phase() {
         // is no real-led class to find. A vote that "finds" one anyway would retain the
         // wrong member on a third of x2 batches - actively worse than what it replaces.
         policy::RotationPhase p;
-        policy::RotationReset(p, 2, 3);          // force a 3-class vote over uniform data
+        policy::RotationReset(p, 2, 3, kVoteMinSeparationUs);          // force a 3-class vote over uniform data
         int64_t t = 100000;
         for (long long i = 0; i < 400; i++) {
             t += 2 * 5556;
@@ -1404,7 +1409,7 @@ static void test_rotation_phase() {
         // crown a winner. The mechanism says a real-led batch wakes BEFORE its flip, so
         // "lowest" is not enough; it has to be negative with the others positive.
         policy::RotationPhase p;
-        policy::RotationReset(p, 2, 3);
+        policy::RotationReset(p, 2, 3, kVoteMinSeparationUs);
         int64_t t = 100000;
         for (long long i = 0; i < 400; i++) {
             t += 2 * 5556;
@@ -1419,7 +1424,7 @@ static void test_rotation_phase() {
 
     {   // Inert wherever composition does not rotate: x2 and frame generation off.
         policy::RotationPhase p;
-        policy::RotationReset(p, 2, 2);
+        policy::RotationReset(p, 2, 2, kVoteMinSeparationUs);
         CHECK(p.period == 1, "x2 must not rotate");
         int64_t t = 100000;
         for (long long i = 0; i < 300; i++) {
@@ -1434,7 +1439,7 @@ static void test_rotation_phase() {
     {   // Silence before confidence: a partial vote must not commit. One class is starved
         // here, which is exactly the state just after position is re-established.
         policy::RotationPhase p;
-        policy::RotationReset(p, 2, 3);
+        policy::RotationReset(p, 2, 3, kVoteMinSeparationUs);
         int64_t t = 100000;
         for (long long i = 0; i < 60; i++) {
             t += 2 * 5556;
@@ -1468,7 +1473,7 @@ static void test_rotation_phase() {
         for (int i = 0; i < 200; i++) step(h, 2, i);
         CHECK(h.p.valid && policy::RotationRealMember(h.p, h.p.gridPos) == trueMember(h),
               "precondition: the vote should have decided and agree with the test's model");
-        policy::RotationReset(h.p, 2, 3);
+        policy::RotationReset(h.p, 2, 3, kVoteMinSeparationUs);
         CHECK(!h.p.valid && policy::RotationRealMember(h.p, 0) < 0,
               "reset must clear the verdict");
     }
@@ -1605,7 +1610,7 @@ static void test_rotation_phase() {
         // period 6. Two thirds of the reachable classes would then be unreadable, and the
         // vote would decide on a subset - confidently naming a phase from partial evidence.
         policy::RotationPhase p;
-        policy::RotationReset(p, /*stride=*/2, /*flipsPerSource=*/12);
+        policy::RotationReset(p, /*stride=*/2, /*flipsPerSource=*/12, kVoteMinSeparationUs);
         CHECK(p.period == 1,
               "a 12-flip grid exceeds the class array and must report inert, got period %d",
               p.period);
@@ -2150,7 +2155,7 @@ static void ReportRotation(const TraceFixture& fx, int64_t lagFloor, int64_t bat
         const int stride = (int)((ema + sp / 2) / sp);
         if (fps >= 0 && fps < 16) fpsHist[fps]++;
         if (stride != rp.stride || fps != rp.flipsPerSource)
-            policy::RotationReset(rp, stride, fps);
+            policy::RotationReset(rp, stride, fps, kVoteMinSeparationUs);
         // MODEL THE SHIPPING PATH, not an easier one. The relay votes on the batch TWO
         // batches back - a batch's own anchor flip is not delivered when it opens - and then
         // decides for the CURRENT batch by extrapolating the grid position forward. An

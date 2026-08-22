@@ -287,6 +287,14 @@ struct RotationPhase {
     int32_t offsetCount[kMaxPeriod] = {};
     bool valid = false;
     int realPhase = -1;       // grid position whose member 0 carries the real frame
+    // Class-mean margin the vote must clear, IN THE CALLER'S TIMESTAMP UNITS. A parameter
+    // rather than a constant because it is a THRESHOLD in a file whose timestamps are
+    // unit-agnostic: as a bare literal it silently meant 80 us to the microsecond callers
+    // (tests, replay) and 80 ticks - 8 us - to the QPC caller that actually ships, which is
+    // a ten times weaker null gate than the measurement below justifies. Set by
+    // RotationReset; zero refuses to validate at all, so a caller that forgets it loses
+    // steering rather than gaining false steering.
+    int64_t minSeparation = 0;
 };
 
 // Rotation length for a stride over a source period, in batches: how many batches before
@@ -304,7 +312,13 @@ int RotationPeriodBatches(int flipsPerSource, int stride);
 // it - RotationAdvance carries the grid position across them by measuring the advance -
 // and cheap though a rebuild is, throwing the vote away every time a batch is dropped is
 // what starves it: at x3 a chain runs ~89 batches and the vote needs ~72 to converge.
-void RotationReset(RotationPhase& p, int stride, int flipsPerSource);
+// minSeparation is the class-mean margin the vote must clear, in the CALLER'S timestamp
+// units (see RotationPhase::minSeparation). Measured basis: across ten captures the widest
+// non-rotating null cleared its runner-up by 50 us and the narrowest real signal by 117 us,
+// so the threshold belongs in that gap - 80 us, expressed in whatever clock the caller
+// stamps with. It is explicit at every call site on purpose: as a literal inside the vote
+// its units were invisible and therefore wrong for the one caller that ships.
+void RotationReset(RotationPhase& p, int stride, int flipsPerSource, int64_t minSeparation);
 
 // Carry the grid position forward to a newly anchored batch, from the MEASURED advance
 // since the last one. Returns false when the advance is not a recognisable number of flip
