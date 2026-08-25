@@ -20,7 +20,7 @@ static const float kDefaultAssumedSrcFps = 60.0f;
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
                                          bool tint, bool etw, bool noJoin, bool dejitter,
-                                         bool fgPhase, bool phaseKeep)
+                                         bool fgPhase, bool phaseKeep, unsigned int extraLagMs)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_compositor(NULL)
@@ -35,6 +35,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_dejitter(dejitter && etw && !noJoin)
     , m_fgPhase(fgPhase)
     , m_phaseKeep(phaseKeep && etw && !noJoin)
+    , m_extraLagMs(extraLagMs)
     , m_phaseKeepRequested(phaseKeep)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
@@ -133,6 +134,18 @@ bool TemporalCaptureMode::Setup() {
     const float assumedFps = (m_srcRateHint > 0.0f) ? m_srcRateHint : kDefaultAssumedSrcFps;
     m_assumedSrcPeriodQpc = (LONGLONG)((double)m_scheduler.Freq() / assumedFps);
     m_bracketingDelayQpc = LagForSourcePeriod(m_assumedSrcPeriodQpc);
+    if (m_extraLagMs > 0) {
+        m_bracketingDelayQpc += (LONGLONG)m_extraLagMs * m_scheduler.Freq() / 1000;
+        // The ring must reach past the target, and NvFBC delivers in bursts (a ~100 ms pause
+        // then a flush) that consume several slots at once, so the reach needed is well over
+        // the lag alone. Replayed at lag 95.8 ms the hold rate falls off a cliff between 24
+        // and 28 slots (0.13/s -> 0.01/s), which is ~2.4x the lag in wake history; 3x is
+        // taken here so the sizing is not fitted to that one edge. Slots past the default
+        // cost VRAM only when the lag actually asks for them.
+        const LONGLONG wakePeriod = m_assumedSrcPeriodQpc / 2;   // x2 delivers ~2 wakes/frame
+        const int want = (int)((m_bracketingDelayQpc * 3) / (wakePeriod > 0 ? wakePeriod : 1));
+        m_ring.SetSlotsInUse(want);
+    }
     m_flipCadenceWindowQpc = m_scheduler.Freq() / 5;    // 200 ms; see the header for why
     m_telemetryCountdown = kTelemetryPeriodPresents;
 
@@ -150,6 +163,12 @@ bool TemporalCaptureMode::Setup() {
     LOG("Temporal lag fixed at %lld us (source assumed %s%.1f fps)",
         m_bracketingDelayQpc * 1000000 / m_scheduler.Freq(),
         (m_srcRateHint > 0.0f) ? "-src " : ">= ", assumedFps);
+    if (m_extraLagMs > 0) {
+        LOG("Extra bracketing lag ACTIVE (-lag %u): +%u ms of output latency buys fewer holds "
+            "(a hold re-presents the last output; the frame it wanted arrives late, not never). "
+            "Ring grown to %d slots so the target stays inside the search window.",
+            m_extraLagMs, m_extraLagMs, m_ring.SlotsInUse());
+    }
     LOG("Selection stickiness band: %lld us (anti flip-flop at bracket midpoint)",
         m_policyCfg.stickinessQpc * 1000000 / m_scheduler.Freq());
 
@@ -426,7 +445,7 @@ void TemporalCaptureMode::Run(
         if (!bracket.info.hasBefore) {
             // Benign while the ring is still filling at startup; once it has wrapped at least
             // once it means the target fell off the back of the ring.
-            if (m_ring.Published() >= CaptureRing::RING_SIZE) {
+            if (m_ring.Published() >= m_ring.SlotsInUse()) {
                 LOGERR("temporal: target older than ring window - ring too small / delay too large (p=%lld)",
                     m_ring.Published());
             }
@@ -536,7 +555,7 @@ void TemporalCaptureMode::Run(
                 const double estFps = (double)m_scheduler.Freq() / (double)est;
                 const LONGLONG lagForEst = LagForSourcePeriod(est);
                 const long long lagForEstUs = (long long)(lagForEst * usPerTick);
-                if (m_bracketingDelayQpc > est * CaptureRing::RING_SIZE) {
+                if (m_bracketingDelayQpc > est * m_ring.SlotsInUse()) {
                     LOGERR("temporal telemetry: lag %lld us exceeds ring history at the measured ~%.1f fps - display pinned at oldest frame; pass -src %.0f (lag %lld us)",
                         lagUs, estFps, estFps, lagForEstUs);
                 } else if (est > m_assumedSrcPeriodQpc + m_assumedSrcPeriodQpc / 8) {

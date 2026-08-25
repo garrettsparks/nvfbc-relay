@@ -79,6 +79,15 @@ private:
     bool m_dejitter;
     bool m_fgPhase;                 // -fgphase: per-batch content-phase instrument (ring-side)
     bool m_phaseKeep;               // -phasekeep: phase-aware keep-real (needs -etw with the join)
+    // -lag N: extra bracketing delay in ms, on top of the derived 1.25x source period. A HOLD
+    // is a bracket with no after-frame, and it re-presents the last output - a visible
+    // duplicate. Moving the target further into the past makes it likelier that a newer frame
+    // has already arrived, so this trades output latency for holds. Latency here is not felt
+    // by the player (the source display is direct) and only shifts the stream, which is
+    // already seconds behind. Replayed on a 55-minute capture: holds 1.23/s at +0,
+    // 0.29/s at +50 ms, 0.01/s at +75 ms; the frames those holds wanted DID arrive, just
+    // later than the target. The cost is that they become blends, not passthroughs.
+    unsigned int m_extraLagMs;
     bool m_phaseKeepRequested;      // asked for, so an unmet prerequisite can say so once
     policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
     policy::StampOverlay m_overlay;      // present-thread-owned; FindBracket reads through it
@@ -108,7 +117,8 @@ public:
                         bool lock = false, CompositorKind compositor = kCompositorNearest,
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
                         bool etw = false, bool noJoin = false, bool dejitter = false,
-                        bool fgPhase = false, bool phaseKeep = false);
+                        bool fgPhase = false, bool phaseKeep = false,
+                        unsigned int extraLagMs = 0);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

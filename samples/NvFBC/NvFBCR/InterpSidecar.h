@@ -69,6 +69,9 @@ private:
     ID3D11DeviceContext* m_ctx11;
     ID3D11Texture2D* m_ringAlias[CaptureRing::RING_SIZE];   // opened from ring shared handles
     ID3D11ShaderResourceView* m_ringSrv[CaptureRing::RING_SIZE];
+    // How many of those the ring actually allocated; the tail stays NULL. RING_SIZE is only
+    // the array bound now that the lag can grow the ring.
+    int m_ringSlots = 0;
     ID3D11VertexShader* m_convVs;
     ID3D11PixelShader* m_convPs;
     ID3D11SamplerState* m_convSampler;

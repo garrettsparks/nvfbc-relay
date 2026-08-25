@@ -132,7 +132,7 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     // Shared ring slots: create on the capture device with a shared handle, open the same
     // resource on the present device. Slots are render-target textures so consumers can
     // StretchRect the surface (temporal) or sample the texture in a shader (blend).
-    for (int i = 0; i < RING_SIZE; i++) {
+    for (int i = 0; i < m_ringSlots; i++) {
         HANDLE shared = NULL;
         hr = m_capDevice->CreateTexture(
             m_width, m_height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT,
@@ -226,13 +226,19 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     grabParams->dwFlags = NVFBC_TODX9VID_WAIT_WITH_TIMEOUT;
     grabParams->dwWaitTime = kGrabWaitMs;
 
-    LOG("CaptureRing initialized - %dx%d, %d shared slots, private capture device", m_width, m_height, RING_SIZE);
+    LOG("CaptureRing initialized - %dx%d, %d shared slots, private capture device", m_width, m_height, m_ringSlots);
 
     m_published.store(0);
     m_writeCount = 0;
     m_stop.store(false);
     m_captureThread = std::thread(&CaptureRing::CaptureLoop, this, grabParams);
     return true;
+}
+
+void CaptureRing::SetSlotsInUse(int n) {
+    if (n < kDefaultRingSlots) n = kDefaultRingSlots;
+    if (n > RING_SIZE) n = RING_SIZE;
+    m_ringSlots = n;
 }
 
 void CaptureRing::Stop() {
@@ -293,7 +299,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         }
 
         long long count = m_writeCount;
-        int slot = (int)(count % RING_SIZE);
+        int slot = (int)(count % m_ringSlots);
         m_capDevice->StretchRect(m_captureTarget, &srcRect, m_ring[slot].capSurface, &srcRect, D3DTEXF_NONE);
 
         // Force the StretchRect to complete on the capture GPU before publishing, so the
@@ -458,7 +464,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             // actually captured. The slot is re-validated one batch late, which is the
             // earliest the fact is knowable and ~11 ms - well inside the bracketing lag.
             if (m_prevKeeper == 1 && m_prevLastMember == 0 && count >= 1) {
-                const int prevSlot = (int)((count - 1) % RING_SIZE);
+                const int prevSlot = (int)((count - 1) % m_ringSlots);
                 m_ring[prevSlot].timestamp.QuadPart = m_prevBatchStart + m_prevSpacing;
                 m_ring[prevSlot].valid = true;
                 m_phaseKeepReclaimed++;
@@ -489,7 +495,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         if (keep.retractPrev) {
             // Retract the previous member (the generated frame): hide it from future brackets.
             // Content is never overwritten, so a present read already in flight stays coherent.
-            m_ring[(int)((count - 1) % RING_SIZE)].valid = false;
+            m_ring[(int)((count - 1) % m_ringSlots)].valid = false;
         }
         if (keep.collapsed) collapsed++;
 
@@ -652,12 +658,12 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, const policy::StampOverlay* ov
     *out = FrameBracket{};
 
     const long long p = m_published.load();
-    long long oldest = p - (RING_SIZE - 1);
+    long long oldest = p - (m_ringSlots - 1);
     if (oldest < 0) oldest = 0;
 
     LONGLONG bestBeforeDiff = LLONG_MAX, bestAfterDiff = LLONG_MAX;
     for (long long i = p - 1; i >= oldest; i--) {
-        int slot = (int)(i % RING_SIZE);
+        int slot = (int)(i % m_ringSlots);
         if (!m_ring[slot].valid) continue;
         LONGLONG ts = m_ring[slot].timestamp.QuadPart;
         // Corrections are measured PER BATCH, so they are looked up by the slot's batch
