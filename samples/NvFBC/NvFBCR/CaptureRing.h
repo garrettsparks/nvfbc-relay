@@ -48,13 +48,27 @@ struct FrameBracket {
 // output shows tearing/partial frames inside slots, that is the cause.
 class CaptureRing {
 public:
-    // 16, doubled from 8 on a measured failure: at x3 with phase-aware keep-real the
-    // window must hold the bracket while a third of batches contribute no valid frame, and
-    // at 8 slots the before-frame fell off the ring on 95% of presents of a real capture
-    // (3611 of 3805 - the 2026-08-20 x3_phasekeep run). 16 slots is ~66 MB more VRAM at
-    // 1080p and doubles the recycle distance between the capture thread's writes and the
-    // oldest frame a bracket can still be reading.
-    static const int RING_SIZE = 16;
+    // The ARRAY BOUND, not the number of slots in use: SlotsInUse() is what the loops walk
+    // and what Setup allocates, so raising this costs no VRAM on its own. It is a constant
+    // because InterpSidecar sizes its own alias arrays from it.
+    //
+    // 16 was itself doubled from 8 on a measured failure: at x3 with phase-aware keep-real
+    // the window must hold the bracket while a third of batches contribute no valid frame,
+    // and at 8 slots the before-frame fell off the ring on 95% of presents of a real capture
+    // (3611 of 3805 - the 2026-08-20 x3_phasekeep run).
+    static const int RING_SIZE = 32;
+
+    // Slots actually allocated and searched. The bracketing lag sets it: the ring must reach
+    // back past the target, and a burst of NvFBC deliveries can consume several slots at once
+    // (measured: a ~100 ms pause then a flush), so the reach needed is well over the lag
+    // alone. Replayed on a 55-minute capture at lag 95.8 ms, holds fall 0.22 -> 0.01/s
+    // between 24 and 28 slots - a cliff, not a slope - so the sizing rule below is generous
+    // rather than fitted to that edge.
+    static const int kDefaultRingSlots = 16;
+
+    int SlotsInUse() const { return m_ringSlots; }
+    // Before Setup only. Clamped to [kDefaultRingSlots, RING_SIZE].
+    void SetSlotsInUse(int n);
 
     CaptureRing();
     ~CaptureRing();
@@ -255,6 +269,7 @@ private:
     bool m_fgPrevWakeValid = false;
 
     Slot m_ring[RING_SIZE];
+    int m_ringSlots = kDefaultRingSlots;
     IDirect3DSurface9* m_captureTarget;   // on the capture device; NvFBC writes here
     IDirect3DDevice9Ex* m_presentDevice;
     IDirect3DDevice9Ex* m_capDevice;      // private capture device

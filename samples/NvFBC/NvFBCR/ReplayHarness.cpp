@@ -141,6 +141,8 @@ struct Capture {
     int64_t combUs = 0;
     bool phaseKeep = false;
     bool etw = false;
+    bool blend = false;
+    int64_t passthroughUs = 0;
 };
 
 // Payload of a log line: everything past the "[File.cpp:NNN] | " prefix.
@@ -256,6 +258,12 @@ bool ParseLog(const char* path, Capture* out) {
             out->phaseKeep = std::strstr(p, "phasekeep ON") != NULL;
             out->etw = std::strstr(p, "etw flip capture on") != NULL &&
                        std::strstr(p, "flip join on") != NULL;
+            continue;
+        }
+        if (std::strstr(p, "Blend compositor ACTIVE") || std::strstr(p, "Interp compositor ACTIVE")) {
+            const char* at = std::strstr(p, "threshold");
+            if (at) out->passthroughUs = (int64_t)std::strtoll(at + 9, NULL, 10);
+            out->blend = true;
             continue;
         }
         if (std::strstr(p, "Temporal lag fixed at")) {
@@ -485,6 +493,7 @@ struct PresentCensus {
     long long tsDiffOver1ms = 0;
     // The comb lock, PREDICTED here and scored against the log's tgt=/pull=. This is the
     // half that would be untested if the target were taken from the log.
+    long long opHold = 0, opPassBefore = 0, opPassAfter = 0, opSynth = 0;
     long long tgtDiffSum = 0, tgtDiffMax = 0;
     long long pullDiffSum = 0, pullDiffMax = 0;
     // Shown-stamp step census, the same six classes pacing.py prints so replayed and live
@@ -562,6 +571,8 @@ struct Config {
     int64_t phasePullSlew = 0;     // freq / 40000, i.e. 25 us per present
     int64_t stallSpan = 0;         // assumedSrcPeriod * 2, or * 5/2 under phasekeep
     int64_t lag = 0;               // the static bracketing delay
+    int64_t passthrough = 0;       // blend-mode passthrough gate
+    bool blend = false;            // the capture ran b: mode, so DecideComposite governs
     // The vote's class-mean margin, in this harness's ticks. Defaults to what production now
     // passes (80 us of QPC). Every log recorded BEFORE the units fix ran with an effective
     // 8 us, so reproducing such a run - gates 1 and 2 - needs `--sep-us 8`, and the header
@@ -605,12 +616,14 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
     RingModel ring;
     ring.Init(cfg.ringSlots);
     policy::SelectionState selState;
+    policy::CompositeState compState;
     policy::PhaseLockState lockState;
     policy::PolicyConfig pcfg;
     pcfg.stickinessQpc = cfg.stickiness;
     pcfg.combQpc = cfg.comb;
     pcfg.phasePullSlewQpc = cfg.phasePullSlew;
     pcfg.stallSpanQpc = cfg.stallSpan;
+    pcfg.passthroughQpc = cfg.passthrough;
     size_t nextPresent = 0;
     int64_t lastShownStamp = 0;
     bool haveShown = false;
@@ -643,6 +656,20 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
                 policy::UpdatePhaseLock(lockState, pcfg, b.beforeDiff, resumed);
         }
 
+        // Blend mode decides with DecideComposite, not SelectFrame - and the two differ in
+        // exactly the case that matters here: a one-sided bracket HOLDS (a duplicate) unless
+        // the single frame it has sits inside the passthrough gate, in which case it still
+        // passes through sharp. Counting "incomplete bracket" as "hold" overstates holds by
+        // that population, so the real decision is run.
+        if (cfg.blend) {
+            const policy::CompositeDecision cd = policy::DecideComposite(b, compState, pcfg);
+            switch (cd.op) {
+                case policy::CompositeOp::Hold: pc->opHold++; break;
+                case policy::CompositeOp::PassthroughBefore: pc->opPassBefore++; break;
+                case policy::CompositeOp::PassthroughAfter: pc->opPassAfter++; break;
+                case policy::CompositeOp::Synthesize: pc->opSynth++; break;
+            }
+        }
         const policy::Pick pick = policy::SelectFrame(b, selState, pcfg);
 
         if (p.logged) {
@@ -1261,6 +1288,13 @@ void ReportPresent(const PresentCensus& p) {
                 p.noBeforeLive, 100.0 * (double)p.noBeforeLive / (double)p.presents);
     std::printf("  no after-frame:  replay %lld (%.1f%%)\n", p.noAfter,
                 100.0 * (double)p.noAfter / (double)p.presents);
+    if (p.opHold + p.opPassBefore + p.opPassAfter + p.opSynth) {
+        const double s2 = p.spanS > 0 ? p.spanS : 1.0;
+        std::printf("  BLEND MODE (DecideComposite, the real decision this capture used):\n");
+        std::printf("    hold %lld (%.2f/s)  pass-before %lld  pass-after %lld  synth %lld (%.2f/s)\n",
+                    p.opHold, p.opHold / s2, p.opPassBefore, p.opPassAfter,
+                    p.opSynth, p.opSynth / s2);
+    }
     if (p.pickCompared) {
         std::printf("  against the log, on the %lld presents it logged: pick %.2f%%,"
                     " before-stamp exact %.2f%%, depth %.2f%%\n",
@@ -1499,6 +1533,7 @@ int main(int argc, char** argv) {
     long long sepUs = 80;
     int ringSlots = 16;
     long long pairingQ8 = 410;
+    long long lagAddMs = 0;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--arm") == 0) arm = true;
         else if (std::strcmp(argv[i], "--old") == 0) oldConstants = true;
@@ -1506,6 +1541,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--sep-us") == 0 && i + 1 < argc) sepUs = std::atoll(argv[++i]);
         else if (std::strcmp(argv[i], "--ring") == 0 && i + 1 < argc) ringSlots = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--no-pairing-gate") == 0) pairingQ8 = 0;
+        else if (std::strcmp(argv[i], "--lag-add") == 0 && i + 1 < argc) lagAddMs = std::atoll(argv[++i]);
         else if (argv[i][0] == '-') {
             std::fprintf(stderr, "unknown option %s\n", argv[i]);
             return 2;
@@ -1566,7 +1602,13 @@ int main(int argc, char** argv) {
     cfg.minPairingQ8 = pairingQ8;
     cfg.stickiness = cap.stickinessUs * kTicksPerUs;
     cfg.comb = cap.combUs * kTicksPerUs;
-    cfg.lag = cap.lagUs * kTicksPerUs;
+    // Extra bracketing lag to evaluate offline. A hold is a bracket with no AFTER frame;
+    // moving the target earlier makes it likelier that a newer frame has already arrived, so
+    // lag trades latency for holds. The capture stream is unchanged by this, which is what
+    // makes the question answerable from a recorded log instead of a new capture.
+    cfg.lag = (cap.lagUs + lagAddMs * 1000) * kTicksPerUs;
+    cfg.blend = cap.blend;
+    cfg.passthrough = cap.passthroughUs * kTicksPerUs;
     cfg.phasePullSlew = (int64_t)(freq / 40000.0);        // 25 us per present
     // stallSpan is widened under phasekeep (TemporalCaptureMode::Setup), because a dropped
     // all-generated batch legitimately widens the bracket.
@@ -1603,6 +1645,8 @@ int main(int argc, char** argv) {
                                       [](const FlipRec& f) { return f.head == 0; }),
                 cap.srcFps, (long long)cap.lagUs, cap.phaseKeep ? "ON" : "off",
                 (!cap.phaseKeep && arm) ? " (armed by --arm)" : "");
+    if (lagAddMs) std::printf("BRACKETING LAG: %lld us + %lld ms = %lld us\n",
+                              (long long)cap.lagUs, lagAddMs, cap.lagUs + lagAddMs * 1000);
     std::printf("vote class-mean margin: %lld us%s\n", sepUs,
                 sepUs == 8 ? "  (the PRE-FIX effective gate: use this to reproduce any log"
                              " recorded before the units fix)"

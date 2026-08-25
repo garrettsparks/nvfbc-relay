@@ -119,7 +119,10 @@ bool InterpSidecar::CreateDeviceAndRingAliases(CaptureRing* ring) {
     }
     // Open every ring slot on the interp device via the handles CaptureRing retained.
     // 10-bit cross-API sharing is a risky hand-off - fail loud here if the driver refuses.
-    for (int i = 0; i < CaptureRing::RING_SIZE; i++) {
+    // SlotsInUse, not RING_SIZE: the ring allocates only the slots the bracketing lag calls
+    // for, so the array's tail is legitimately unallocated and aliasing it would fail here.
+    m_ringSlots = ring->SlotsInUse();
+    for (int i = 0; i < m_ringSlots; i++) {
         HANDLE h = ring->SlotSharedHandle(i);
         if (!h) { LOGERR("InterpSidecar: ring slot %d has no shared handle", i); return false; }
         hr = m_dev11->OpenSharedResource(h, __uuidof(ID3D11Texture2D), (void**)&m_ringAlias[i]);
@@ -311,7 +314,7 @@ bool InterpSidecar::CreateFruc() {
 }
 
 bool InterpSidecar::ConvertSlotToBgra(int ringSlot, int inputIdx) {
-    if (ringSlot < 0 || ringSlot >= CaptureRing::RING_SIZE) return false;
+    if (ringSlot < 0 || ringSlot >= m_ringSlots) return false;
     D3D11_VIEWPORT vp = {};
     vp.Width = (FLOAT)m_width; vp.Height = (FLOAT)m_height; vp.MaxDepth = 1.0f;
     m_ctx11->OMSetRenderTargets(1, &m_frucInputRtv[inputIdx], NULL);

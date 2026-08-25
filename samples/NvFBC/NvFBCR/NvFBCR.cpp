@@ -116,6 +116,9 @@ bool g_fgPhase = false;
 // votes the rotation phase from arrival timing and keeps member 0 through the [real,gen]
 // class, lifting real content from 2 of every 6 outputs to 4 of 6. Inert at x2 and FG off.
 bool g_phaseKeep = false;
+// -lag N: extra bracketing delay in ms. Trades output latency, which the player never sees
+// (the source display is direct) and which only shifts an already-delayed stream, for holds.
+unsigned int g_extraLagMs = 0;
 
 // Optional count for -mark: burn only the first N presents (a head burst that aligns a
 // stream VOD without marking watched gameplay), then run clean. 0 = every present (the
@@ -162,7 +165,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             _stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
                                            kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
-                                           g_dejitter, g_fgPhase, g_phaseKeep);
+                                           g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs);
         }
 
         // QPC-timer present (t:60 / b:60 / o:60 format).
@@ -171,7 +174,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             if (ParseFps(modeStr.substr(2), &framerate)) {
                 return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
                                                kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
-                                               g_dejitter, g_fgPhase, g_phaseKeep);
+                                               g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs);
             }
         }
     }
@@ -500,6 +503,12 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         }
         return 1;
     }
+    if (tokens[i] == "-lag" && i + 1 < tokens.size()) {
+        const long v = strtol(tokens[i + 1].c_str(), NULL, 10);
+        if (v >= 0 && v <= 200) g_extraLagMs = (unsigned int)v;
+        else LOGERR("-lag value '%s' invalid (0-200 ms) - ignored", tokens[i + 1].c_str());
+        return 2;
+    }
     if (tokens[i] == "-src" && i + 1 < tokens.size()) {
         float v;
         if (ParseFps(tokens[i + 1], &v)) g_srcRateHint = v;
@@ -702,7 +711,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     else if (g_markFrames) snprintf(markDesc, sizeof(markDesc), "on (first %u presents)", g_markFrames);
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
     LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s, "
-        "etw flip capture %s, flip join %s, dejitter %s, fgphase %s, phasekeep %s",
+        "etw flip capture %s, flip join %s, dejitter %s, fgphase %s, phasekeep %s, extra lag %u ms",
         g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
         g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off",
         !g_etw ? "off (no -etw)" : (g_noJoin ? "OFF (-nojoin)" : "on"),
@@ -712,7 +721,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         g_fgPhase ? "requested (-fgphase; ACTIVE only when the instrument line follows)" : "off",
         !g_phaseKeep ? "off"
                      : (g_etw && !g_noJoin ? "ON (-phasekeep)"
-                                           : "REFUSED (-phasekeep needs -etw with the join on)"));
+                                           : "REFUSED (-phasekeep needs -etw with the join on)"),
+        g_extraLagMs);
 
     BUF_WIDTH = target.position.right - target.position.left;
     BUF_HEIGHT = target.position.bottom - target.position.top;
