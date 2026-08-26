@@ -1,4 +1,5 @@
 #include "FrameCompositors.h"
+#include <math.h>
 #include <SimpleLogger.h>
 
 extern int g_interpBackend;   // NvFBCR.cpp: -interp flow|fruc
@@ -94,12 +95,19 @@ SynthCompositorBase::SynthCompositorBase(const policy::PolicyConfig* cfg)
     , m_lastOutputExec(0)
     , m_lastSynthUs(-1)
     , m_lastSynthExecCode(0)
+    , m_subGen(false)
+    , m_guardRT(NULL)
+    , m_guardSys(NULL)
 {
     m_rect.left = m_rect.top = m_rect.right = m_rect.bottom = 0;
+    m_guardLuma[0] = m_guardLuma[1] = m_guardLuma[2] = NULL;
 }
 
 SynthCompositorBase::~SynthCompositorBase() {
     if (m_holdSurface) m_holdSurface->Release();
+    if (m_guardRT) m_guardRT->Release();
+    if (m_guardSys) m_guardSys->Release();
+    for (int i = 0; i < 3; i++) delete[] m_guardLuma[i];
 }
 
 bool SynthCompositorBase::Setup(IDirect3DDevice9Ex* device, int width, int height) {
@@ -123,12 +131,108 @@ bool SynthCompositorBase::Setup(IDirect3DDevice9Ex* device, int width, int heigh
         LOGERR("compositor: hold surface creation failed (hr=0x%08lx)", (unsigned long)hr);
         return false;
     }
+
+    // Content-check resources, only when the substitution is armed. A failure here disarms
+    // the substitution rather than the mode: without the check it must not run at all, and
+    // blending is a working answer.
+    if (m_subGen) {
+        hr = device->CreateRenderTarget(kGuardW, kGuardH, D3DFMT_A2R10G10B10,
+                                        D3DMULTISAMPLE_NONE, 0, FALSE, &m_guardRT, NULL);
+        if (SUCCEEDED(hr)) {
+            hr = device->CreateOffscreenPlainSurface(kGuardW, kGuardH, D3DFMT_A2R10G10B10,
+                                                     D3DPOOL_SYSTEMMEM, &m_guardSys, NULL);
+        }
+        if (SUCCEEDED(hr)) {
+            for (int i = 0; i < 3; i++) m_guardLuma[i] = new float[kGuardW * kGuardH];
+        } else {
+            LOGERR("compositor: generated-frame content check unavailable "
+                   "(hr=0x%08lx) - substitution disabled", (unsigned long)hr);
+            m_subGen = false;
+        }
+    }
     return true;
+}
+
+bool SynthCompositorBase::ReadSmallLuma(IDirect3DSurface9* src, float* out) {
+    if (FAILED(m_device->StretchRect(src, &m_rect, m_guardRT, NULL, D3DTEXF_LINEAR)))
+        return false;
+    if (FAILED(m_device->GetRenderTargetData(m_guardRT, m_guardSys)))
+        return false;
+    D3DLOCKED_RECT lr;
+    if (FAILED(m_guardSys->LockRect(&lr, NULL, D3DLOCK_READONLY)))
+        return false;
+    const unsigned char* base = (const unsigned char*)lr.pBits;
+    for (int y = 0; y < kGuardH; y++) {
+        const unsigned int* row = (const unsigned int*)(base + (size_t)y * lr.Pitch);
+        for (int x = 0; x < kGuardW; x++) {
+            // A2R10G10B10: 10 bits per channel. Rec.601 luma is plenty - the question is
+            // whether two frames differ, not what colour they are.
+            const unsigned int p = row[x];
+            const float r = (float)((p >> 20) & 0x3FF);
+            const float g = (float)((p >> 10) & 0x3FF);
+            const float b = (float)(p & 0x3FF);
+            out[y * kGuardW + x] = (0.299f * r + 0.587f * g + 0.114f * b) / 1023.0f;
+        }
+    }
+    m_guardSys->UnlockRect();
+    return true;
+}
+
+bool SynthCompositorBase::GeneratedContentUsable(const FrameBracket& bracket) {
+    if (!m_guardRT || !m_guardSys || !m_guardLuma[0]) return false;
+    if (!bracket.genSurface || !bracket.beforeSurface || !bracket.afterSurface) return false;
+
+    LARGE_INTEGER t0, t1, freq;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+
+    bool ok = ReadSmallLuma(bracket.genSurface, m_guardLuma[0]) &&
+              ReadSmallLuma(bracket.beforeSurface, m_guardLuma[1]) &&
+              ReadSmallLuma(bracket.afterSurface, m_guardLuma[2]);
+
+    QueryPerformanceCounter(&t1);
+    const long long us = (t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart;
+    m_genSub.checkUsTotal += us;
+    if (us > m_genSub.checkUsMax) m_genSub.checkUsMax = us;
+    if (!ok) return false;
+
+    // gdiff against the NEARER real neighbour, because a race duplicate copies whichever
+    // frame the capture actually had in hand; motion is the bracket pair against each
+    // other, which is the scale everything here is measured in.
+    const float* neighbour = (bracket.info.beforeDiff <= bracket.info.afterDiff)
+                                 ? m_guardLuma[1] : m_guardLuma[2];
+    double gdiff = 0.0, motion = 0.0;
+    const int n = kGuardW * kGuardH;
+    for (int i = 0; i < n; i++) {
+        gdiff += fabs((double)m_guardLuma[0][i] - (double)neighbour[i]);
+        motion += fabs((double)m_guardLuma[1][i] - (double)m_guardLuma[2][i]);
+    }
+    gdiff /= n;
+    motion /= n;
+
+    // Static content: nothing moved between the bracket frames, so a repeat cannot be seen
+    // and the ratio is a division by noise. Allow it rather than computing a random answer.
+    if (motion < kStaticMotionFloor) return true;
+    return gdiff / motion >= kMinContentRatio;
 }
 
 void SynthCompositorBase::Compose(const FrameBracket& bracket, IDirect3DSurface9* backbuffer,
                                   CompositeOutcome* out) {
-    const policy::CompositeDecision d = policy::DecideComposite(bracket.info, m_compState, *m_cfg);
+    // The generated frame is offered to the policy only after PLACEMENT says a substitution
+    // is on the table and the CONTENT check says the slot really holds a generated frame.
+    // Order matters: placement is arithmetic, the content check is a GPU readback, and
+    // asking them the other way round would pay for the readback on every present.
+    policy::BracketInfo info = bracket.info;
+    if (m_subGen && info.hasGen) {
+        if (policy::GeneratedCandidateOnTarget(info, m_compState, *m_cfg)) {
+            m_genSub.offered++;
+            info.genUsable = GeneratedContentUsable(bracket);
+            if (!info.genUsable) m_genSub.rejectedContent++;
+        }
+    } else {
+        info.hasGen = false;   // disarmed: the policy must not see a candidate at all
+    }
+    const policy::CompositeDecision d = policy::DecideComposite(info, m_compState, *m_cfg);
 
     out->pickLabel = policy::PickLabel(policy::Pick::None);
     out->opLabel = policy::CompositeLabel(d.op);
@@ -154,6 +258,17 @@ void SynthCompositorBase::Compose(const FrameBracket& bracket, IDirect3DSurface9
             m_device->StretchRect(chosen, &m_rect, backbuffer, &m_rect, D3DTEXF_NONE);
             m_lastOutput = chosen;
             m_lastOutputExec = 0;
+            break;
+        }
+        case policy::CompositeOp::PassthroughGenerated: {
+            // A frame the driver rendered at this instant, presented sharp. Its pixels are
+            // one real frame, so synthesized/pixelExec stay at the passthrough values and
+            // the marker's documented invariant holds; op=pass-gen carries the provenance.
+            m_device->StretchRect(bracket.genSurface, &m_rect, backbuffer, &m_rect,
+                                  D3DTEXF_NONE);
+            m_lastOutput = bracket.genSurface;
+            m_lastOutputExec = 0;
+            m_genSub.substituted++;
             break;
         }
         case policy::CompositeOp::Synthesize: {

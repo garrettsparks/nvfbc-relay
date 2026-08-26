@@ -29,6 +29,12 @@ struct FrameBracket {
     // flips along it scanned out.
     int beforeMember = 0;
     int afterMember = 0;
+    // The retracted generated frame nearest the target, when one is still reachable.
+    // info.hasGen says whether these are set. It is deliberately not one of the endpoints
+    // above: nothing may select it as a bracket side.
+    IDirect3DSurface9* genSurface = NULL;
+    IDirect3DTexture9* genTexture = NULL;
+    int genSlot = -1;
 };
 
 // Source-paced capture ring on its OWN D3D9Ex device (branch B: two devices).
@@ -165,6 +171,9 @@ public:
     // plain keep-real, so the failure mode is exactly today's behaviour.
     void EnablePhaseKeep(IRotationOracle* oracle) { m_rotationOracle = oracle; }
 
+    // Keep retracted generated frames reachable instead of dropping them. Before Start.
+    void EnableGeneratedSubstitution() { m_subGenArmed = true; }
+
     // Session telemetry for the phase vote, logged at exit by the owner.
     long long PhaseKeepBatches() const { return m_phaseKeepBatches; }
     long long PhaseKeepFlipped() const { return m_phaseKeepFlipped; }
@@ -208,9 +217,19 @@ private:
         LARGE_INTEGER batchStart;
         int member;                       // position inside its capture batch; 0 opens one
         bool valid;
+        // Retracted by keep-real: not a bracket endpoint, but still reachable. A slot in
+        // this state holds the driver's own generated frame, and its timestamp has been
+        // rewritten to that frame's CONTENT time (the midpoint of its two real
+        // neighbours), which is not the arrival stamp it was published with.
+        bool generated;
     };
 
     void CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
+
+    // Retract the generated member keep-real dropped, leaving it reachable but not
+    // bracketable and stamped at its content time. count is the wake that published the
+    // REAL member; the generated one is the wake before it.
+    void RetractGenerated(long long count);
 
     // Content-phase instrument (-fgphase). Working geometry is a 320x180 GPU downscale:
     // small enough that the sync readback costs ~230 KB a wake, large enough that the
@@ -253,6 +272,8 @@ private:
     // Members per batch, Q8 fixed point: the pairing gate that keeps the vote from arming on
     // a grid reading the declared source rate does not describe. See the wake loop.
     LONGLONG m_batchMembersEmaQ8 = 0;
+    // Generated-frame substitution: keep retracted members reachable and placed.
+    bool m_subGenArmed = false;
 
     bool m_fgPhaseRequested = false;
     bool m_fgPhaseActive = false;

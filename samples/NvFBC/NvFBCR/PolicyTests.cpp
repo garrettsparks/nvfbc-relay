@@ -52,10 +52,12 @@ static const int64_t kSlewUs = 25;
 // 8 us in the field, so the suite could not see the field's real null gate at all.
 static const int64_t kVoteMinSeparationUs = 80;
 
-// The ring depth the CORPUS FIXTURES were captured under - deliberately NOT mirroring
-// CaptureRing::RING_SIZE, which is now 16: every fixture's field numbers came from ring-8
-// builds, and the replay must model the relay that produced them. Fixtures captured on
-// ring-16 builds would warrant revisiting this.
+// The ring depth the CORPUS FIXTURES were captured under - deliberately NOT mirroring the
+// shipping depth: every fixture's field numbers came from ring-8 builds, and the replay
+// must model the relay that produced them. It is the DEFAULT for SimParams::ringSlots, not
+// a global: the shipping relay allocates 16 and sizes up to 32 when the lag asks for it, so
+// a suite that could only run 8 would never exercise the depth the daily driver uses.
+// Fixtures captured on deeper builds would warrant revisiting this default.
 static const int kRingSlots = 8;
 
 // Deterministic LCG so every run exercises identical timelines. Every suite RESEEDS it
@@ -153,6 +155,9 @@ struct SimParams {
     std::vector<int64_t> flipDisplay;
     std::vector<int64_t> flipKnown;
     bool flipDejitter = false;
+    // Slots the ring searches. Defaults to the corpus depth so every pinned census is
+    // unmoved; set it to run a timeline at the depth a given configuration ships with.
+    int ringSlots = kRingSlots;
 };
 
 static SimResult Simulate(const SimParams& p) {
@@ -268,13 +273,14 @@ static SimResult Simulate(const SimParams& p) {
 
         // Frames visible to the bracket: arrived by pick time (the ring can't contain
         // the future) AND still inside the ring window (each publish evicts the slot
-        // kRingSlots back). Both constraints are inert for well-configured timelines -
+        // p.ringSlots back). Both constraints are inert for well-configured timelines -
         // the lag sizing keeps the bracket well inside the window - but load-bearing
         // for hole recovery depth (a widened bracket's after endpoint may not have
         // arrived yet: those presents must hold, not synthesize) and for underruns
         // (a lag past the ring window loses the before-frame entirely).
         while (published < arrivals.size() && arrivals[published] <= deadline) published++;
-        const size_t oldest = published > (size_t)kRingSlots ? published - kRingSlots : 0;
+        const size_t oldest =
+            published > (size_t)p.ringSlots ? published - (size_t)p.ringSlots : 0;
 
         // Stage 6, the same sequence production runs before its bracket read: measure each
         // batch's delivery lateness against its stride-anchored flip, gate on lock calm
@@ -320,7 +326,7 @@ static SimResult Simulate(const SimParams& p) {
 
         // Nearest valid slot on each side of the target, which is what production's
         // ring scan returns. Retracted slots still occupy their ring position (the
-        // write counter advanced), so the window is kRingSlots WAKES wide while only
+        // write counter advanced), so the window is p.ringSlots WAKES wide while only
         // the surviving members are eligible. When everything visible is newer than
         // the target there is no before-frame and the nearest-after is the oldest
         // visible slot, the same result the production scan gives while the display
@@ -2906,6 +2912,305 @@ static void test_ring_underrun_graceful() {
     PinCensus(r, warmup, 0, 0, 2900, 0, "ring_underrun");
 }
 
+// The lag-to-depth sizing rule, pinned at the configurations that ship. Until this was a
+// function it lived inside TemporalCaptureMode::Setup, a Windows-only translation unit, so
+// the rule that decides whether the relay runs 16 slots or 32 could not be tested at all.
+static void test_ring_slots_for_lag() {
+    const int kMin = 16, kMax = 32;              // CaptureRing's kDefaultRingSlots, RING_SIZE
+    const int64_t src60 = 16667;
+    const int64_t baseLag60 = src60 + src60 / 4; // LagForSourcePeriod: 1.25 source periods
+
+    // The daily driver: -lag 75 at -src 60. The rule asks for 34 and the ceiling gives 32.
+    CHECK(policy::RingSlotsForLag(baseLag60 + 75000, src60, kMin, kMax) == kMax,
+          "-lag 75 at 60 fps must size the ring to the maximum, got %d",
+          policy::RingSlotsForLag(baseLag60 + 75000, src60, kMin, kMax));
+
+    // No extra lag: the rule asks for 7, and the floor holds it at the default. This is the
+    // case that makes resizing unconditional safe, and the reason the default exists.
+    CHECK(policy::RingSlotsForLag(baseLag60, src60, kMin, kMax) == kMin,
+          "the unextended lag must leave the ring at its default, got %d",
+          policy::RingSlotsForLag(baseLag60, src60, kMin, kMax));
+
+    // Between the two the rule is live rather than clamped, so a regression that broke the
+    // arithmetic while leaving both ends right would still be caught.
+    const int mid = policy::RingSlotsForLag(baseLag60 + 40000, src60, kMin, kMax);
+    CHECK(mid > kMin && mid < kMax,
+          "-lag 40 at 60 fps must land strictly between the bounds, got %d", mid);
+
+    // A faster declared source shortens the wake period, so the same lag needs more slots:
+    // the depth is wake history, not wall-clock reach.
+    CHECK(policy::RingSlotsForLag(baseLag60, 8333, kMin, kMax) >
+              policy::RingSlotsForLag(baseLag60, src60, kMin, kMax) ||
+          policy::RingSlotsForLag(baseLag60, src60, kMin, kMax) == kMin,
+          "halving the source period must not ask for fewer slots");
+
+    // Degenerate input must not divide by zero.
+    CHECK(policy::RingSlotsForLag(baseLag60, 0, kMin, kMax) == kMax,
+          "a zero source period must clamp rather than fault, got %d",
+          policy::RingSlotsForLag(baseLag60, 0, kMin, kMax));
+}
+
+// WHY the daily driver needs 32 slots, on a timeline rather than by arithmetic. Frame
+// generation puts two wakes in every source period, and a retracted member still occupies
+// its ring position, so the window covers half as much time as slot count against source
+// frames suggests. At the shipping lag a ring of 8 cannot reach its own target.
+//
+// The arrival pattern here is the [generated, real] pair as the ring receives it. Keep-real
+// is not modelled - the point is slot CONSUMPTION, which is identical either way.
+static void test_ring_depth_at_shipping_lag() {
+    SimParams p{};
+    p.srcPeriod = 16667;
+    p.presentPeriod = 16667;
+    p.arrivalJitter = 150;
+    p.combQpc = 0;
+    p.presents = 2000;
+    p.periodPattern = {351, 16316};     // the measured submission epsilon, then the rest
+    p.lagOverride = 16667 + 16667 / 4 + 75000;   // -lag 75 at -src 60
+    p.passthroughQpc = 4166;
+
+    const size_t warmup = 200;
+    int starved[3] = {0, 0, 0};
+    const int depths[3] = {8, 16, 32};
+    for (int d = 0; d < 3; d++) {
+        p.ringSlots = depths[d];
+        const SimResult r = Simulate(p);
+        for (size_t i = warmup; i < r.beforeDiff.size(); i++)
+            if (r.beforeDiff[i] < 0) starved[d]++;
+    }
+    const int total = (int)p.presents - (int)warmup;
+
+    CHECK(starved[0] > total / 2,
+          "a ring of 8 must starve at the shipping lag (got %d of %d) - if it does not, the "
+          "timeline is not reaching back as far as the field's",
+          starved[0], total);
+    CHECK(starved[2] == 0,
+          "a ring of 32 must never starve at the shipping lag, got %d of %d",
+          starved[2], total);
+    CHECK(starved[1] <= starved[0],
+          "depth must be monotonic: 16 starved %d where 8 starved %d",
+          starved[1], starved[0]);
+
+    // The sizing rule and the timeline must agree about which depth this configuration
+    // needs. Pinning them together is what stops one drifting from the other.
+    CHECK(policy::RingSlotsForLag(p.lagOverride, p.srcPeriod, 16, 32) == 32,
+          "the sizing rule disagrees with the depth this timeline requires");
+
+    std::printf("  ring depth at shipping lag: starved presents 8-slot %d, 16-slot %d, "
+                "32-slot %d (of %d)\n", starved[0], starved[1], starved[2], total);
+}
+
+// WHY 16 slots is not enough, which the regular-cadence timeline above cannot show. NvFBC
+// does not deliver smoothly: it pauses for around 100 ms and then flushes everything it
+// held, consuming a dozen slots in a few milliseconds. Those slots all carry stamps from
+// the flush instant, so the frames that bracket a target 95.8 ms in the past are exactly
+// the ones a shallow ring evicts. This is the shape behind the field measurement that put
+// the hold cliff between 24 and 28 slots.
+static void test_ring_depth_under_burst_delivery() {
+    const int64_t wake = 8333;        // two wakes per source period, as x2 delivers
+    const int64_t pause = 100000;     // the measured NvFBC delivery pause
+    const int64_t flushStep = 300;    // the flush itself is far faster than the cadence
+    const int64_t burstEvery = 240;   // wakes between bursts: one every 2 s
+
+    SimParams p{};
+    p.srcPeriod = 16667;
+    p.presentPeriod = 16667;
+    p.combQpc = 0;
+    p.presents = 2000;
+    p.lagOverride = 16667 + 16667 / 4 + 75000;   // -lag 75 at -src 60
+    p.passthroughQpc = 4166;
+
+    const int64_t horizon = (p.presents + 4) * p.presentPeriod;
+    int64_t t = 0;
+    for (int64_t i = 0; t < horizon; i++) {
+        if (i > 0 && i % burstEvery == 0) {
+            t += pause;
+            for (int64_t k = 0; k < pause / wake; k++)
+                p.explicitArrivals.push_back(t + k * flushStep);
+            t += (pause / wake) * flushStep;
+            continue;
+        }
+        p.explicitArrivals.push_back(t);
+        t += wake;
+    }
+
+    const size_t warmup = 200;
+    int starved[2] = {0, 0};
+    const int depths[2] = {16, 32};
+    for (int d = 0; d < 2; d++) {
+        p.ringSlots = depths[d];
+        const SimResult r = Simulate(p);
+        for (size_t i = warmup; i < r.beforeDiff.size(); i++)
+            if (r.beforeDiff[i] < 0) starved[d]++;
+    }
+
+    CHECK(starved[0] > 0,
+          "burst delivery must starve a 16-slot ring at the shipping lag - if it does not, "
+          "the burst is not consuming slots the way NvFBC does");
+    CHECK(starved[1] == 0,
+          "a 32-slot ring must survive burst delivery at the shipping lag, got %d starved",
+          starved[1]);
+
+    std::printf("  ring depth under burst delivery: starved presents 16-slot %d, "
+                "32-slot %d\n", starved[0], starved[1]);
+}
+
+// The generated-frame substitution, rule by rule, on hand-built brackets. Every case here
+// is a present that WOULD blend: one real frame a full period behind the target, another a
+// full period ahead, and a generated frame at the midpoint where the driver put it.
+static void test_generated_substitution_rules() {
+    PolicyConfig cfg;
+    cfg.stickinessQpc = kStickinessUs;
+    cfg.passthroughQpc = 4166;
+
+    // A bracket that synthesizes: both endpoints one full period from the target, which is
+    // four times the gate away.
+    const int64_t target = 100000;
+    BracketInfo base;
+    base.hasBefore = base.hasAfter = true;
+    base.beforeTs = target - 8333;
+    base.afterTs = target + 8333;
+    base.beforeDiff = 8333;
+    base.afterDiff = 8333;
+
+    {   // Disarmed (no candidate offered): the decision must be exactly what it was.
+        policy::CompositeState s;
+        const policy::CompositeDecision d = policy::DecideComposite(base, s, cfg);
+        CHECK(d.op == policy::CompositeOp::Synthesize,
+              "without a candidate the bracket must still synthesize, got %s",
+              policy::CompositeLabel(d.op));
+    }
+
+    {   // Offered and on target: substituted.
+        BracketInfo b = base;
+        b.hasGen = true;
+        b.genUsable = true;
+        b.genTs = target;
+        b.genDiff = 0;
+        policy::CompositeState s;
+        CHECK(policy::GeneratedCandidateOnTarget(b, s, cfg),
+              "a generated frame ON the target must be a candidate");
+        const policy::CompositeDecision d = policy::DecideComposite(b, s, cfg);
+        CHECK(d.op == policy::CompositeOp::PassthroughGenerated,
+              "a usable generated frame on target must be presented, got %s",
+              policy::CompositeLabel(d.op));
+        CHECK(s.lastOutputTs == target, "the output time must be the frame's content time");
+        CHECK(s.lastGenTs == target, "the substitution must be remembered for the no-reuse rule");
+    }
+
+    {   // THE CONTENT CHECK. Same bracket, the caller says the pixels are a race copy of a
+        // real frame. Placement still says yes; the decision must not.
+        BracketInfo b = base;
+        b.hasGen = true;
+        b.genUsable = false;
+        b.genTs = target;
+        b.genDiff = 0;
+        policy::CompositeState s;
+        CHECK(policy::GeneratedCandidateOnTarget(b, s, cfg),
+              "the content check must not change the PLACEMENT answer");
+        const policy::CompositeDecision d = policy::DecideComposite(b, s, cfg);
+        CHECK(d.op == policy::CompositeOp::Synthesize,
+              "a content-rejected frame must fall back to the blend, got %s",
+              policy::CompositeLabel(d.op));
+    }
+
+    {   // Outside the gate: the geometry that makes the threshold free also makes this the
+        // case where no frame sits near the target at all.
+        BracketInfo b = base;
+        b.hasGen = true;
+        b.genUsable = true;
+        b.genTs = target - 5000;
+        b.genDiff = 5000;
+        policy::CompositeState s;
+        CHECK(!policy::GeneratedCandidateOnTarget(b, s, cfg), "past the gate must not be a candidate");
+        const policy::CompositeDecision d = policy::DecideComposite(b, s, cfg);
+        CHECK(d.op == policy::CompositeOp::Synthesize, "past the gate must blend, got %s",
+              policy::CompositeLabel(d.op));
+    }
+
+    {   // NO REUSE. The same generated frame stays reachable for many presents; showing it
+        // twice is a duplicate the content check cannot see, because the pixels are good.
+        BracketInfo b = base;
+        b.hasGen = true;
+        b.genUsable = true;
+        b.genTs = target;
+        b.genDiff = 0;
+        policy::CompositeState s;
+        CHECK(policy::DecideComposite(b, s, cfg).op == policy::CompositeOp::PassthroughGenerated,
+              "first substitution must happen");
+        const policy::CompositeDecision again = policy::DecideComposite(b, s, cfg);
+        CHECK(again.op == policy::CompositeOp::Synthesize,
+              "the same generated frame must not be presented twice, got %s",
+              policy::CompositeLabel(again.op));
+    }
+
+    {   // MONOTONE. A generated frame no newer than what was already shown would step the
+        // output backward, which the composite never does. The case is built so the BLEND
+        // is still fine (it outputs at the target, which advances): only the substitution
+        // regresses, so this isolates the substitution's own rule rather than re-testing
+        // the general monotone guard.
+        BracketInfo b = base;
+        b.hasGen = true;
+        b.genUsable = true;
+        b.genTs = target - 3000;      // inside the gate, but behind what was shown
+        b.genDiff = 3000;
+        policy::CompositeState s;
+        s.lastOutputTs = target - 1000;
+        CHECK(!policy::GeneratedCandidateOnTarget(b, s, cfg),
+              "a frame older than the last output must not be a candidate");
+        const policy::CompositeDecision d = policy::DecideComposite(b, s, cfg);
+        CHECK(d.op == policy::CompositeOp::Synthesize,
+              "a backward substitution must fall back to the blend, got %s",
+              policy::CompositeLabel(d.op));
+        CHECK(s.lastGenTs == INT64_MIN,
+              "a refused substitution must not be recorded as one");
+    }
+
+    {   // A present that is behind the last output entirely still HOLDS: the substitution
+        // must not rescue a present the composite has already ruled out.
+        BracketInfo b = base;
+        b.hasGen = true;
+        b.genUsable = true;
+        b.genTs = target;
+        b.genDiff = 0;
+        policy::CompositeState s;
+        s.lastOutputTs = target + 1;
+        CHECK(policy::DecideComposite(b, s, cfg).op == policy::CompositeOp::Hold,
+              "a present behind the last output must hold");
+    }
+
+    {   // A present that PASSES THROUGH must never be diverted, however good the candidate.
+        BracketInfo b = base;
+        b.beforeTs = target - 100;
+        b.beforeDiff = 100;
+        b.hasGen = true;
+        b.genUsable = true;
+        b.genTs = target;
+        b.genDiff = 0;
+        policy::CompositeState s;
+        CHECK(!policy::GeneratedCandidateOnTarget(b, s, cfg),
+              "a real frame on target leaves nothing to substitute for");
+        CHECK(policy::DecideComposite(b, s, cfg).op == policy::CompositeOp::PassthroughBefore,
+              "passthrough must win over the substitution");
+    }
+
+    {   // A one-sided bracket holds, and holds have no generated frame to promote: the
+        // after endpoint has not arrived, so there is nothing to be between.
+        BracketInfo b;
+        b.hasBefore = true;
+        b.beforeTs = target - 50000;
+        b.beforeDiff = 50000;
+        b.hasGen = true;
+        b.genUsable = true;
+        b.genTs = target;
+        b.genDiff = 0;
+        policy::CompositeState s;
+        CHECK(!policy::GeneratedCandidateOnTarget(b, s, cfg),
+              "an incomplete bracket must not substitute");
+        CHECK(policy::DecideComposite(b, s, cfg).op == policy::CompositeOp::Hold,
+              "an incomplete bracket must still hold");
+    }
+}
+
 // Composite output content time is non-decreasing across pull wraps (the monotone
 // guard), on a run long enough to contain several beats.
 static void test_composite_monotone_output() {
@@ -3230,6 +3535,10 @@ int main(int argc, char** argv) {
     test_composite_v16_differential();
     test_composite_monotone_output();
     test_ring_underrun_graceful();
+    test_ring_slots_for_lag();
+    test_ring_depth_at_shipping_lag();
+    test_ring_depth_under_burst_delivery();
+    test_generated_substitution_rules();
     test_composite_lock_acquisition();
     test_composite_quantized_arrivals();
 
@@ -3249,6 +3558,6 @@ int main(int argc, char** argv) {
         std::printf("POLICY TESTS FAILED: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("POLICY TESTS PASSED (7 selection + 13 composite suites)\n");
+    std::printf("POLICY TESTS PASSED (7 selection + 17 composite suites)\n");
     return 0;
 }

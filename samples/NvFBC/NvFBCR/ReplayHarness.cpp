@@ -53,8 +53,8 @@
 // What is genuinely lost: the log rounds to 1 us, so the model's resolution is 10 ticks
 // where the field had 1. Class means average over at least 24 samples so the vote is
 // unaffected, and batch splitting (30000 ticks) and the grid (~55000 ticks) are orders away.
-// It WOULD matter for stage 6's 80-tick correction threshold, so dejitter replay must not be
-// added here without revisiting it.
+// It WOULD matter for the dejitter's 80-tick correction threshold, so dejitter replay must
+// not be added here without revisiting it.
 const int64_t kTicksPerUs = 10;
 
 namespace {
@@ -416,6 +416,10 @@ struct RingModel {
         int64_t batchStart = 0;
         int member = 0;
         bool valid = false;
+        // The third slot state: retracted by keep-real, so NOT a bracket endpoint, but its
+        // pixels are still in the ring and still reachable. stamp is rewritten to the
+        // midpoint of the two real neighbours when the slot enters this state.
+        bool gen = false;
     };
     std::vector<Slot> slots;
     long long published = 0;
@@ -432,20 +436,81 @@ struct RingModel {
         s.batchStart = batchStart;
         s.member = member;
         s.valid = valid;
+        s.gen = false;
         published = count + 1;
     }
-    void Retract(long long count) {
-        if (count >= 1) slots[(size_t)((count - 1) % size)].valid = false;
+    // Keep-real drops the batch's generated member. Production clears the valid bit and the
+    // slot is gone; keeping it REACHABLE is what this models, so the count of
+    // substitutions it would make can be read off an existing log.
+    //
+    // The stamp is the midpoint of the two real neighbours, never the generated frame's own
+    // flip time: the f/g measurement puts content phase at a constant 0.4952 that does not
+    // track the display, and the midpoint rule lands 259 us from it against 587 us sd for
+    // the flip time.
+    // substitutable mirrors CaptureRing::SubstitutableRegime: the caller measures the
+    // delivery structure and says whether a retracted member is a generated frame whose
+    // content is at the midpoint. Passing it in rather than recomputing it here keeps the
+    // ring model a ring model.
+    void Retract(long long count, bool substitutable, int64_t srcPeriod) {
+        if (count < 1) return;
+        slots[(size_t)((count - 1) % size)].valid = false;
+        slots[(size_t)((count - 1) % size)].gen = false;
+        if (!substitutable) return;
+
+        const int newMember = slots[(size_t)(count % size)].member;
+        const int members = newMember + 1;
+        if (newMember < 1) return;
+        const int64_t after = slots[(size_t)(count % size)].stamp;
+        long long oldest = count - (size - 1);
+        if (oldest < 0) oldest = 0;
+        int64_t before = 0;
+        bool haveBefore = false;
+        for (long long i = count - 1 - newMember; i >= oldest; i--) {
+            const Slot& s = slots[(size_t)(i % size)];
+            if (!s.valid) continue;
+            before = s.stamp;
+            haveBefore = true;
+            break;
+        }
+        if (!haveBefore || before >= after) return;
+        (void)srcPeriod;
+        for (int j = 0; j < newMember; j++) {
+            Slot& g = slots[(size_t)((count - newMember + j) % size)];
+            g.stamp = before + (after - before) * (j + 1) / members;
+            g.gen = true;
+        }
     }
     void Revalidate(long long count, int64_t stamp) {
         if (count >= 1) {
             Slot& s = slots[(size_t)((count - 1) % size)];
             s.stamp = stamp;
             s.valid = true;
+            s.gen = false;
         }
     }
+    // The reachable generated frame nearest a target. The window is FindBracket's window,
+    // not the whole array: a slot that has aged out of the search span is unreachable
+    // whether it is valid or not.
+    bool FindGenerated(int64_t target, int64_t* diffOut, int64_t* stampOut,
+                       int64_t* depthOut) const {
+        long long oldest = published - (size - 1);
+        if (oldest < 0) oldest = 0;
+        int64_t best = INT64_MAX, bestStamp = 0, bestDepth = 0;
+        for (long long i = published - 1; i >= oldest; i--) {
+            const Slot& s = slots[(size_t)(i % size)];
+            if (!s.gen) continue;
+            int64_t d = target - s.stamp;
+            if (d < 0) d = -d;
+            if (d < best) { best = d; bestStamp = s.stamp; bestDepth = published - 1 - i; }
+        }
+        if (best == INT64_MAX) return false;
+        *diffOut = best;
+        *stampOut = bestStamp;
+        *depthOut = bestDepth;
+        return true;
+    }
     // CaptureRing::FindBracket, with the overlay left out (dejitter is off on every capture
-    // this harness is pointed at, and stage 6's threshold is below the log's resolution).
+    // this harness is pointed at, and its threshold is below the log's resolution).
     void FindBracket(int64_t target, policy::BracketInfo* out, int* beforeDepth) const {
         *out = policy::BracketInfo();
         *beforeDepth = -1;
@@ -494,6 +559,42 @@ struct PresentCensus {
     // The comb lock, PREDICTED here and scored against the log's tgt=/pull=. This is the
     // half that would be untested if the target were taken from the log.
     long long opHold = 0, opPassBefore = 0, opPassAfter = 0, opSynth = 0;
+    // GENERATED-FRAME SUBSTITUTION: of the synths, how many had a retracted generated frame
+    // reachable and close enough to present sharp instead. The outcomes are kept apart
+    // because they mean different things: no generated frame reachable at all is a source
+    // that never paired (or a bracket so wide the frame aged out), while
+    // reachable-but-outside-the-gate is the substitution the passthrough threshold rejects.
+    long long genSub = 0, genSubNoGen = 0, genSubOutOfGate = 0;
+    std::vector<int64_t> genSubDiff;      // |target - generated stamp| on the accepted ones
+    // The same distance on the REFUSED ones. A refusal a few hundred us past the gate is a
+    // threshold argument; one clustered near half a source period is a different statement
+    // entirely, namely that no generated frame exists near this target at all and the
+    // nearest one belongs to another batch.
+    std::vector<int64_t> outDiff;
+    // Blends the policy's no-reuse rule saved: the same generated frame stays reachable
+    // for many presents, and showing it twice is a duplicate no content check can catch,
+    // because the pixels are perfectly good both times.
+    long long genSubRepeat = 0;
+    // Blends its monotone rule saved. A synth outputs at the target, which advances by
+    // construction; a substituted frame carries its own
+    // content time and can sit behind what was already shown. Counted separately from the
+    // repeat case because a repeat is one slot shown twice while this is a content
+    // REGRESSION, and the composite's monotonic rule does not cover a frame it never saw.
+    long long genSubBackward = 0;
+    // How far back in the ring the substituted frame sat, in wakes. This is the answer to
+    // whether retaining generated frames needs a deeper ring: they already occupy a slot
+    // today (retraction clears the valid bit, it does not free the position), so the depth
+    // reached is the whole cost.
+    std::vector<int64_t> genSubDepth;
+    // Bracket span at the synth, bucketed in QUARTER source periods (bucket 4 = exactly one
+    // period), last bucket open-ended. A single "one period" column hides the thing worth
+    // knowing: the spec's claim is GEOMETRIC - at a span of exactly one period the
+    // generated frame is inside the gate by construction - and that holds only as long as
+    // the span really is one period. A 1.4-period bracket is one late frame, not a dropped
+    // one, and its midpoint is nowhere near the target.
+    static const int kSpanBuckets = 12;
+    long long synthBySpan[kSpanBuckets] = {0}, genSubBySpan[kSpanBuckets] = {0};
+    long long noGenBySpan[kSpanBuckets] = {0}, outOfGateBySpan[kSpanBuckets] = {0};
     long long tgtDiffSum = 0, tgtDiffMax = 0;
     long long pullDiffSum = 0, pullDiffMax = 0;
     // Shown-stamp step census, the same six classes pacing.py prints so replayed and live
@@ -532,6 +633,8 @@ struct CaptureCensus {
     long long samplesShort = 0;   // some reachable residue below kMinSamplesPerResidue
     long long shapeFail = 0;      // every residue full, yet the vote refused the shape
     long long observations = 0;   // RotationObserve calls that landed
+    // Batches whose retracted member was kept reachable.
+    long long substitutableBatches = 0;
     // Grid readings actually seen, to name the regime rather than assume it.
     long long fpsHist[16] = {0};
     long long strideHist[16] = {0};
@@ -573,6 +676,10 @@ struct Config {
     int64_t lag = 0;               // the static bracketing delay
     int64_t passthrough = 0;       // blend-mode passthrough gate
     bool blend = false;            // the capture ran b: mode, so DecideComposite governs
+    // Offer the retracted generated frame to the policy. Off by default so a replay
+    // reproduces the build that recorded the log; --sub-gen answers what the change would
+    // have done to that same capture.
+    bool subGen = false;
     // The vote's class-mean margin, in this harness's ticks. Defaults to what production now
     // passes (80 us of QPC). Every log recorded BEFORE the units fix ran with an effective
     // 8 us, so reproducing such a run - gates 1 and 2 - needs `--sep-us 8`, and the header
@@ -581,6 +688,13 @@ struct Config {
     // The pairing gate (CaptureRing's m_batchMembersEmaQ8), in Q8 members per batch. 0
     // disables it, which is how the pre-guard build is reproduced for validation.
     int64_t minPairingQ8 = 410;
+    // Present-census window, in the log's OWN dl= clock, so a bound reads the same here as
+    // in a report that cites "log 2958-3043 s". Presents outside it are decided normally
+    // and counted into a discard: the comb lock and the composite Schmitt states carry
+    // across presents, so a window that skipped the policy would be scoring a different
+    // decision sequence than the one it sits inside.
+    int64_t fromTs = INT64_MIN;
+    int64_t toTs = INT64_MAX;
 };
 
 // What the live path decided for one batch, recorded so the ORACLE can mark it. Steering
@@ -608,7 +722,7 @@ struct ResetRec {
 CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
                                std::vector<ResetRec>* resets,
                                std::vector<BatchOutcome>* outcomes,
-                               PresentCensus* pc) {
+                               PresentCensus* pcOut) {
     CaptureCensus c;
 
     // Present-side state. Presents and wakes are interleaved BY TIME through one loop, so a
@@ -632,13 +746,18 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
 
     // One present against the ring as it stands. Kept as a lambda so the tail flush after
     // the last wake runs the identical path rather than a copy of it.
+    PresentCensus discard;
     auto DoPresent = [&](const PresentRec& p) {
-        if (!pc) return;
+        if (!pcOut) return;
+        const bool inWindow = p.deadline >= cfg.fromTs && p.deadline <= cfg.toTs;
+        PresentCensus* const pc = inWindow ? pcOut : &discard;
         if (!p.usable) { pc->skipped++; return; }
         pc->presents++;
         if (!p.logged) pc->noBeforeLive++;
-        if (!havePresentSpan) { firstPresentTs = p.deadline; havePresentSpan = true; }
-        lastPresentTs = p.deadline;
+        if (inWindow) {
+            if (!havePresentSpan) { firstPresentTs = p.deadline; havePresentSpan = true; }
+            lastPresentTs = p.deadline;
+        }
 
         // TemporalCaptureMode's own sequence: target from the deadline and the CURRENT pull,
         // bracket, then advance the lock for the NEXT present, then select.
@@ -662,12 +781,67 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
         // passes through sharp. Counting "incomplete bracket" as "hold" overstates holds by
         // that population, so the real decision is run.
         if (cfg.blend) {
+            const int64_t prevOut = compState.lastOutputTs;
+            const int64_t prevGen = compState.lastGenTs;
+            int64_t genDepth = -1;
+            // The generated candidate is offered to the REAL policy rather than scored by
+            // a copy of its rule here. genUsable is forced true because a log carries no
+            // pixels: the content check cannot be replayed, so this counts substitutions
+            // the guard would still be free to refuse, and the census below reports the
+            // refusals the policy itself makes.
+            if (cfg.subGen) {
+                int64_t gd = 0, gstamp = 0, gdepth = 0;
+                if (ring.FindGenerated(target, &gd, &gstamp, &gdepth)) {
+                    b.hasGen = true;
+                    b.genUsable = true;
+                    b.genTs = gstamp;
+                    b.genDiff = gd;
+                    genDepth = gdepth;
+                }
+            }
             const policy::CompositeDecision cd = policy::DecideComposite(b, compState, pcfg);
+
+            // Bracket span in quarter source periods, for both outcomes: the substitution
+            // and the blend it replaced have to be counted in the same bins or the rate
+            // per bin means nothing.
+            const int64_t span = b.beforeDiff + b.afterDiff;
+            const int64_t sp = cfg.assumedSrcPeriod;
+            int w = PresentCensus::kSpanBuckets - 1;
+            if (sp > 0) {
+                const int64_t q = span * 4 / sp;
+                if (q < w && q >= 0) w = (int)q;
+            }
+
             switch (cd.op) {
                 case policy::CompositeOp::Hold: pc->opHold++; break;
                 case policy::CompositeOp::PassthroughBefore: pc->opPassBefore++; break;
                 case policy::CompositeOp::PassthroughAfter: pc->opPassAfter++; break;
-                case policy::CompositeOp::Synthesize: pc->opSynth++; break;
+                case policy::CompositeOp::PassthroughGenerated:
+                    pc->genSub++;
+                    pc->genSubBySpan[w]++;
+                    pc->genSubDiff.push_back(b.genDiff);
+                    pc->genSubDepth.push_back(genDepth);
+                    break;
+                case policy::CompositeOp::Synthesize:
+                    pc->opSynth++;
+                    pc->synthBySpan[w]++;
+                    // WHY the policy declined, which is the whole diagnostic value: an
+                    // out-of-gate refusal argues about a threshold, a reuse or a backward
+                    // refusal is a rule doing its job, and no frame at all says the source
+                    // never paired here.
+                    if (!b.hasGen) {
+                        pc->genSubNoGen++;
+                        pc->noGenBySpan[w]++;
+                    } else if (b.genDiff > pcfg.passthroughQpc) {
+                        pc->genSubOutOfGate++;
+                        pc->outOfGateBySpan[w]++;
+                        pc->outDiff.push_back(b.genDiff);
+                    } else if (b.genTs <= prevOut) {
+                        pc->genSubBackward++;
+                    } else if (b.genTs == prevGen) {
+                        pc->genSubRepeat++;
+                    }
+                    break;
             }
         }
         const policy::Pick pick = policy::SelectFrame(b, selState, pcfg);
@@ -734,6 +908,8 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
 
     int64_t rotPeriodEma = 0;         // m_rotPeriodEma: CLAMPED, stride-derivation only
     int64_t membersEmaQ8 = 0;         // m_batchMembersEmaQ8: the pairing gate
+    // Whether retracted members are kept reachable, mirroring CaptureRing's arming.
+    bool substitutable = false;
     int rotRealMember = -1;
     int64_t rotSpacing = 0;
     int prevKeeper = -1;
@@ -801,6 +977,8 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
                 const int64_t members = (int64_t)(prevLastMember + 1) << 8;
                 membersEmaQ8 = membersEmaQ8 ? (membersEmaQ8 * 7 + members) / 8 : members;
             }
+            substitutable = cfg.subGen;
+            if (substitutable) c.substitutableBatches++;
             const bool paired = membersEmaQ8 >= cfg.minPairingQ8;
             if (!paired && cfg.phaseKeep) c.notPaired++;
             if (cfg.phaseKeep && paired) {
@@ -949,7 +1127,7 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
         if (keep.collapsed) collapsed++;
 
         ring.Write(count, keep.stampTs, batch.stampTs, batch.member, keep.keepThis);
-        if (keep.retractPrev) ring.Retract(count);
+        if (keep.retractPrev) ring.Retract(count, substitutable, cfg.assumedSrcPeriod);
 
         // Per-wake fidelity against the log's own cumulative col=.
         if (cap.wakes[i].collapsed >= 0 && cap.wakes[i].collapsed != collapsed) {
@@ -962,8 +1140,8 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
         DoPresent(cap.presents[nextPresent]);
         nextPresent++;
     }
-    if (pc && havePresentSpan) {
-        pc->spanS = (double)(lastPresentTs - firstPresentTs) / (1e6 * (double)kTicksPerUs);
+    if (pcOut && havePresentSpan) {
+        pcOut->spanS = (double)(lastPresentTs - firstPresentTs) / (1e6 * (double)kTicksPerUs);
     }
     c.collapsed = collapsed;
     return c;
@@ -1274,12 +1452,12 @@ FloorResult MeasureFloor(const Capture& cap, const Config& cfg,
     return r;
 }
 
-void ReportPresent(const PresentCensus& p) {
+void ReportPresent(const PresentCensus& p, const Config& cfg) {
     if (!p.presents) return;
     std::printf("\nPRESENT SIDE - the same ring, read from the other end\n");
     std::printf("  %lld presents over %.1f s (%.1f/s)%s\n", p.presents, p.spanS,
                 p.spanS > 0 ? p.presents / p.spanS : 0.0,
-                p.skipped ? "" : "");
+                (cfg.fromTs != INT64_MIN || cfg.toTs != INT64_MAX) ? "  [WINDOWED]" : "");
     if (p.skipped)
         std::printf("  %lld starved presents skipped: no logged neighbour to interpolate"
                     " a deadline from\n", p.skipped);
@@ -1294,6 +1472,58 @@ void ReportPresent(const PresentCensus& p) {
         std::printf("    hold %lld (%.2f/s)  pass-before %lld  pass-after %lld  synth %lld (%.2f/s)\n",
                     p.opHold, p.opHold / s2, p.opPassBefore, p.opPassAfter,
                     p.opSynth, p.opSynth / s2);
+        std::printf("  GENERATED-FRAME SUBSTITUTION (present the retracted frame instead"
+                    " of blending), gate %lld us:\n", cfg.passthrough / kTicksPerUs);
+        const long long blendClass = p.opSynth + p.genSub;
+        std::printf("    substituted %lld of %lld presents that would have blended"
+                    " (%.1f%%, %.3f/s)\n", p.genSub, blendClass,
+                    blendClass ? 100.0 * (double)p.genSub / (double)blendClass : 0.0,
+                    p.genSub / s2);
+        // The denominator is every present that WOULD have blended, which is the synths
+        // left plus the ones the substitution took: once a substitution happens that
+        // present is no longer a synth, so dividing by the survivors alone reads over 100%.
+        std::printf("    by bracket span  %9s %8s %8s %8s %8s\n",
+                    "blend-class", "sub", "rate", "no-gen", "out-gate");
+        for (int w = 0; w < PresentCensus::kSpanBuckets; w++) {
+            const long long pop = p.synthBySpan[w] + p.genSubBySpan[w];
+            if (!pop) continue;
+            char label[24];
+            if (w == PresentCensus::kSpanBuckets - 1)
+                std::snprintf(label, sizeof(label), "%.2f+ periods", w / 4.0);
+            else
+                std::snprintf(label, sizeof(label), "%.2f-%.2f periods", w / 4.0,
+                              (w + 1) / 4.0);
+            std::printf("      %-17s %8lld %8lld %7.1f%% %8lld %8lld\n", label,
+                        pop, p.genSubBySpan[w],
+                        100.0 * (double)p.genSubBySpan[w] / (double)pop,
+                        p.noGenBySpan[w], p.outOfGateBySpan[w]);
+        }
+        const double u = (double)kTicksPerUs;
+        auto pct = [&](std::vector<int64_t> d, const char* what) {
+            if (d.empty()) return;
+            std::sort(d.begin(), d.end());
+            std::printf("    |target - generated stamp| %s: p50 %.0f us  p90 %.0f us"
+                        "  max %.0f us\n", what,
+                        (double)d[d.size() / 2] / u,
+                        (double)d[(size_t)((double)d.size() * 0.9)] / u,
+                        (double)d.back() / u);
+        };
+        pct(p.genSubDiff, "substituted");
+        pct(p.outDiff, "refused   ");
+        std::printf("    refused by the policy: %lld no generated frame reachable,"
+                    " %lld outside the gate, %lld would not advance the output,"
+                    " %lld already shown\n",
+                    p.genSubNoGen, p.genSubOutOfGate, p.genSubBackward, p.genSubRepeat);
+        if (!p.genSubDepth.empty()) {
+            std::vector<int64_t> d = p.genSubDepth;
+            std::sort(d.begin(), d.end());
+            std::printf("    ring depth reached for the substituted frame: p50 %lld"
+                        "  p90 %lld  max %lld wakes (of %d slots)\n",
+                        d[d.size() / 2], d[(size_t)((double)d.size() * 0.9)], d.back(),
+                        cfg.ringSlots);
+        }
+        std::printf("    NOT modelled: the NvFBC race puts real pixels in the generated slot"
+                    " about 12%% of the time, which the guard rejects on gdiff/motion\n");
     }
     if (p.pickCompared) {
         std::printf("  against the log, on the %lld presents it logged: pick %.2f%%,"
@@ -1485,6 +1715,10 @@ void ReportCensus(const Capture& cap, const CaptureCensus& c) {
         std::printf("per-wake col= matches the log on every wake (%lld collapsed)\n",
                     c.collapsed);
     }
+    if (c.substitutableBatches) {
+        std::printf("subgen: %lld of %lld batches offered a retracted frame to the ring\n",
+                    c.substitutableBatches, c.opens);
+    }
 }
 
 void ReportResets(const std::vector<ResetRec>& resets) {
@@ -1529,11 +1763,13 @@ void ReportResets(const std::vector<ResetRec>& resets) {
 
 int main(int argc, char** argv) {
     const char* path = NULL;
-    bool arm = false, oldConstants = false, quiet = false;
+    bool arm = false, oldConstants = false, quiet = false, forceBlend = false;
+    bool subGen = false;
     long long sepUs = 80;
     int ringSlots = 16;
     long long pairingQ8 = 410;
     long long lagAddMs = 0;
+    double fromS = -1.0, toS = -1.0;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--arm") == 0) arm = true;
         else if (std::strcmp(argv[i], "--old") == 0) oldConstants = true;
@@ -1541,6 +1777,10 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--sep-us") == 0 && i + 1 < argc) sepUs = std::atoll(argv[++i]);
         else if (std::strcmp(argv[i], "--ring") == 0 && i + 1 < argc) ringSlots = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--no-pairing-gate") == 0) pairingQ8 = 0;
+        else if (std::strcmp(argv[i], "--force-blend") == 0) forceBlend = true;
+        else if (std::strcmp(argv[i], "--sub-gen") == 0) subGen = true;
+        else if (std::strcmp(argv[i], "--from") == 0 && i + 1 < argc) fromS = std::atof(argv[++i]);
+        else if (std::strcmp(argv[i], "--to") == 0 && i + 1 < argc) toS = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--lag-add") == 0 && i + 1 < argc) lagAddMs = std::atoll(argv[++i]);
         else if (argv[i][0] == '-') {
             std::fprintf(stderr, "unknown option %s\n", argv[i]);
@@ -1559,7 +1799,15 @@ int main(int argc, char** argv) {
                      "         about that unless the replay arms it.\n"
                      "  --old  superseded constants (unclamped EMA, advance bound 8), for\n"
                      "         reproducing the reset-storm collapse (spec gate 2).\n"
-                     "  --quiet  one summary line, for sweeping a directory of logs.\n",
+                     "  --quiet  one summary line, for sweeping a directory of logs.\n"
+                     "  --force-blend  run DecideComposite on a capture recorded in t:\n"
+                     "         mode. This is what exercises the substitution NULL CONTROL: an\n"
+                     "         FG-off log has no generated frames, and a t: capture never\n"
+                     "         calls DecideComposite, so without this the zero it prints\n"
+                     "         is the mode's zero rather than the absence of the frames.\n"
+                     "  --from <s> --to <s>  restrict the PRESENT census to a window of the\n"
+                     "         log's own dl= clock, to trim desktop off the ends. Every\n"
+                     "         present is still decided; only the counting is windowed.\n",
                      argv[0]);
         return 2;
     }
@@ -1607,8 +1855,15 @@ int main(int argc, char** argv) {
     // lag trades latency for holds. The capture stream is unchanged by this, which is what
     // makes the question answerable from a recorded log instead of a new capture.
     cfg.lag = (cap.lagUs + lagAddMs * 1000) * kTicksPerUs;
-    cfg.blend = cap.blend;
+    cfg.blend = cap.blend || forceBlend;
+    cfg.subGen = subGen;
     cfg.passthrough = cap.passthroughUs * kTicksPerUs;
+    // A capture recorded in t: mode carries no passthrough threshold, so a forced blend
+    // replay needs production's: a quarter of the source period, which is the 4166 us the
+    // 60 fps runs print.
+    if (cfg.blend && cfg.passthrough <= 0) cfg.passthrough = cfg.assumedSrcPeriod / 4;
+    if (fromS >= 0.0) cfg.fromTs = (int64_t)(fromS * 1e6) * kTicksPerUs;
+    if (toS >= 0.0) cfg.toTs = (int64_t)(toS * 1e6) * kTicksPerUs;
     cfg.phasePullSlew = (int64_t)(freq / 40000.0);        // 25 us per present
     // stallSpan is widened under phasekeep (TemporalCaptureMode::Setup), because a dropped
     // all-generated batch legitimately widens the bracket.
@@ -1638,6 +1893,11 @@ int main(int argc, char** argv) {
     }
 
     std::printf("%s%s\n", path, oldConstants ? "   [SUPERSEDED CONSTANTS]" : "");
+    // The ring size is printed because the log does not record it: replaying a capture at a
+    // ring the build did not use is silent and looks like a finding. A 32-slot capture
+    // replayed at the default 16 reports thousands of holds the run never had.
+    std::printf("ring: %d slots (not recorded in the log - must match the build that"
+                " captured it)\n", ringSlots);
     std::printf("parsed: %zu wakes, %zu flips (head 0: %zu), src %.1f fps, lag %lld us,"
                 " phasekeep %s%s\n",
                 cap.wakes.size(), cap.flips.size(),
@@ -1653,7 +1913,7 @@ int main(int argc, char** argv) {
                            : "  (what production passes now)");
     ReportCensus(cap, c);
     ReportResets(resets);
-    ReportPresent(pres);
+    ReportPresent(pres, cfg);
     ReportFloor(MeasureFloor(cap, cfg, outcomes));
     const int fails = ReportGate1(cap, c);
     if (fails) {
