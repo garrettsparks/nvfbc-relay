@@ -8,6 +8,10 @@
 #include "TemporalPolicy.h"
 #include "EtwConsumer.h"
 
+// Defined in FrameCompositors.h, which this header deliberately does not pull in: only the
+// implementation needs the concrete type.
+class SynthCompositorBase;
+
 // Temporal capture mode — nearest-frame selection for smooth fixed-rate capture of a
 // (possibly variable-rate) source.
 //
@@ -89,6 +93,11 @@ private:
     // later than the target. The cost is that they become blends, not passthroughs.
     unsigned int m_extraLagMs;
     bool m_phaseKeepRequested;      // asked for, so an unmet prerequisite can say so once
+    // -subgen: present the driver's retracted generated frame where a blend would go.
+    bool m_subGen;
+    // The synth compositor when one is in use, for the substitution counters. Aliases
+    // m_compositor and is never deleted through this pointer.
+    SynthCompositorBase* m_synth = NULL;
     policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
     policy::StampOverlay m_overlay;      // present-thread-owned; FindBracket reads through it
     long long m_nextBatch = 0;           // cursor into the ring's batch-start history
@@ -118,6 +127,7 @@ public:
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
                         bool etw = false, bool noJoin = false, bool dejitter = false,
                         bool fgPhase = false, bool phaseKeep = false,
+                        bool subGen = false,
                         unsigned int extraLagMs = 0);
     virtual ~TemporalCaptureMode();
 

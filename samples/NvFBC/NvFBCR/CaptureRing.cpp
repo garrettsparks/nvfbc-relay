@@ -36,6 +36,7 @@ CaptureRing::CaptureRing()
         m_ring[i].mainSurface = NULL;
         m_ring[i].sharedHandle = NULL;
         m_ring[i].valid = false;
+        m_ring[i].generated = false;
         m_ring[i].timestamp.QuadPart = 0;
         m_ring[i].batchStart.QuadPart = 0;
         m_ring[i].member = 0;
@@ -233,6 +234,78 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     m_stop.store(false);
     m_captureThread = std::thread(&CaptureRing::CaptureLoop, this, grabParams);
     return true;
+}
+
+// Keep-real has just published the batch's real member at `count` and is dropping the
+// generated member that preceded it. The slot stops being bracketable, but its pixels stay
+// where they are and stay reachable, because a frame the driver already rendered at an
+// instant beats interpolating one there.
+//
+// The stamp becomes a placement between the two real neighbours, never the generated
+// frame's own arrival or flip: the f/g measurement puts generated content at a CONSTANT
+// phase between its neighbours that does not track the display, and at x2 that placement
+// lands 259 us from the measured phase (the estimator's own floor) against 587 us sd for
+// the flip time.
+//
+// NOTHING HERE KNOWS THE MULTIPLIER, deliberately. There is no x2 path and no x3 path: a
+// batch divides the interval it spans by the number of frames it carries, so a source that
+// submits two frames per source frame and one that submits four are the same arithmetic,
+// and a multiplier that fluctuates needs no detection. What bounds the damage when the
+// placement is wrong - a capture that missed one of the driver's submissions, so the
+// interval is divided into the wrong number of parts - is not a regime test but the
+// passthrough gate downstream: a frame placed further from the target than the gate allows
+// is refused for being too far away, whatever the reason it landed there.
+//
+// Called on the capture thread only, and it writes a slot the present thread may be
+// reading. That is safe for the same reason plain retraction is: the pixels are never
+// touched, and a present that reads the old stamp gets a value that was true a moment ago
+// rather than a torn one - the write is a single aligned 64-bit store.
+void CaptureRing::RetractGenerated(long long count) {
+    if (count < 1) return;
+    const int genSlot = (int)((count - 1) % m_ringSlots);
+    m_ring[genSlot].valid = false;
+    m_ring[genSlot].generated = false;
+    if (!m_subGenArmed) return;
+
+    // Members submitted in this batch so far, counting the one just published. Frame
+    // generation submits its generated frames alongside the real one they precede, so a
+    // batch of N members carries N-1 generated frames covering the interval between the
+    // previous real frame and this one.
+    const int newMember = m_ring[(int)(count % m_ringSlots)].member;
+    const int members = newMember + 1;
+    if (newMember < 1) return;
+
+    const LONGLONG after = m_ring[(int)(count % m_ringSlots)].timestamp.QuadPart;
+    long long oldest = count - (m_ringSlots - 1);
+    if (oldest < 0) oldest = 0;
+    LONGLONG before = 0;
+    bool haveBefore = false;
+    for (long long i = count - 1 - newMember; i >= oldest; i--) {
+        const Slot& s = m_ring[(int)(i % m_ringSlots)];
+        if (!s.valid) continue;
+        before = s.timestamp.QuadPart;
+        haveBefore = true;
+        break;
+    }
+    // A pathological ordering (a stamp no older than the frame that followed it) would put
+    // the placement outside its own neighbours. Leave the slots unreachable instead.
+    if (!haveBefore || before >= after) return;
+
+    // PLACEMENT: generated member j of N sits at (j+1)/N of the way from the previous real
+    // frame to this one. At x2 that is the midpoint, which is what the f/g measurement
+    // found (content phase a constant 0.4952, against 587 us sd for using the flip time).
+    // The general form is written out rather than the x2 special case because the rule is
+    // the same physical statement at any multiplier - the driver divides the interval it
+    // is interpolating across - and only the N=2 value has been measured.
+    //
+    // Every generated member of the batch is re-placed on each arrival, because N is not
+    // known until the batch ends: the first retraction in a 3-member batch legitimately
+    // believes N is 2, and the third member is what corrects it.
+    for (int j = 0; j < newMember; j++) {
+        Slot& g = m_ring[(int)((count - newMember + j) % m_ringSlots)];
+        g.timestamp.QuadPart = before + (after - before) * (j + 1) / members;
+        g.generated = true;
+    }
 }
 
 void CaptureRing::SetSlotsInUse(int n) {
@@ -467,6 +540,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
                 const int prevSlot = (int)((count - 1) % m_ringSlots);
                 m_ring[prevSlot].timestamp.QuadPart = m_prevBatchStart + m_prevSpacing;
                 m_ring[prevSlot].valid = true;
+                m_ring[prevSlot].generated = false;   // a reclaimed single is real again
                 m_phaseKeepReclaimed++;
             }
             m_prevKeeper = m_rotRealMember;
@@ -489,13 +563,14 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         m_ring[slot].timestamp.QuadPart = keep.stampTs;
         m_ring[slot].batchStart.QuadPart = batch.stampTs;
         m_ring[slot].valid = keep.keepThis;
+        m_ring[slot].generated = false;       // a recycled slot never inherits the flag
         m_writeCount = count + 1;
         m_published.store(count + 1);  // publish only after the slot write is GPU-complete
 
         if (keep.retractPrev) {
             // Retract the previous member (the generated frame): hide it from future brackets.
             // Content is never overwritten, so a present read already in flight stays coherent.
-            m_ring[(int)((count - 1) % m_ringSlots)].valid = false;
+            RetractGenerated(count);
         }
         if (keep.collapsed) collapsed++;
 
@@ -662,8 +737,28 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, const policy::StampOverlay* ov
     if (oldest < 0) oldest = 0;
 
     LONGLONG bestBeforeDiff = LLONG_MAX, bestAfterDiff = LLONG_MAX;
+    LONGLONG bestGenDiff = LLONG_MAX;
     for (long long i = p - 1; i >= oldest; i--) {
         int slot = (int)(i % m_ringSlots);
+        // Retracted generated frames are reachable but never endpoints, so they are
+        // collected on a separate side channel and cannot reach any caller that only reads
+        // hasBefore/hasAfter. No overlay correction is applied: the stamp is a midpoint
+        // derived from two batches, and a single batch's delivery-lateness correction does
+        // not describe it.
+        if (m_ring[slot].generated) {
+            LONGLONG d = targetQpc - m_ring[slot].timestamp.QuadPart;
+            if (d < 0) d = -d;
+            if (d < bestGenDiff) {
+                bestGenDiff = d;
+                out->info.hasGen = true;
+                out->info.genTs = m_ring[slot].timestamp.QuadPart;
+                out->info.genDiff = d;
+                out->genSurface = m_ring[slot].mainSurface;
+                out->genTexture = m_ring[slot].mainTexture;
+                out->genSlot = slot;
+            }
+            continue;
+        }
         if (!m_ring[slot].valid) continue;
         LONGLONG ts = m_ring[slot].timestamp.QuadPart;
         // Corrections are measured PER BATCH, so they are looked up by the slot's batch

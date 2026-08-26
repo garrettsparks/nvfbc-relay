@@ -20,7 +20,8 @@ static const float kDefaultAssumedSrcFps = 60.0f;
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
                                          bool tint, bool etw, bool noJoin, bool dejitter,
-                                         bool fgPhase, bool phaseKeep, unsigned int extraLagMs)
+                                         bool fgPhase, bool phaseKeep, bool subGen,
+                                         unsigned int extraLagMs)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_compositor(NULL)
@@ -37,6 +38,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_phaseKeep(phaseKeep && etw && !noJoin)
     , m_extraLagMs(extraLagMs)
     , m_phaseKeepRequested(phaseKeep)
+    , m_subGen(subGen)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_srcRateHint(srcRateHint)
@@ -136,15 +138,14 @@ bool TemporalCaptureMode::Setup() {
     m_bracketingDelayQpc = LagForSourcePeriod(m_assumedSrcPeriodQpc);
     if (m_extraLagMs > 0) {
         m_bracketingDelayQpc += (LONGLONG)m_extraLagMs * m_scheduler.Freq() / 1000;
-        // The ring must reach past the target, and NvFBC delivers in bursts (a ~100 ms pause
-        // then a flush) that consume several slots at once, so the reach needed is well over
-        // the lag alone. Replayed at lag 95.8 ms the hold rate falls off a cliff between 24
-        // and 28 slots (0.13/s -> 0.01/s), which is ~2.4x the lag in wake history; 3x is
-        // taken here so the sizing is not fitted to that one edge. Slots past the default
-        // cost VRAM only when the lag actually asks for them.
-        const LONGLONG wakePeriod = m_assumedSrcPeriodQpc / 2;   // x2 delivers ~2 wakes/frame
-        const int want = (int)((m_bracketingDelayQpc * 3) / (wakePeriod > 0 ? wakePeriod : 1));
-        m_ring.SetSlotsInUse(want);
+        // Slots past the default cost VRAM only when the lag actually asks for them. The
+        // rule itself is policy::RingSlotsForLag so the suite can pin it; only the extra-lag
+        // case resizes, because the default depth already covers the unextended lag at every
+        // source rate the relay accepts.
+        m_ring.SetSlotsInUse(policy::RingSlotsForLag(m_bracketingDelayQpc,
+                                                    m_assumedSrcPeriodQpc,
+                                                    CaptureRing::kDefaultRingSlots,
+                                                    CaptureRing::RING_SIZE));
     }
     m_flipCadenceWindowQpc = m_scheduler.Freq() / 5;    // 200 ms; see the header for why
     m_telemetryCountdown = kTelemetryPeriodPresents;
@@ -230,15 +231,31 @@ bool TemporalCaptureMode::Setup() {
                                                               : m_scheduler.PeriodQpc();
         m_policyCfg.passthroughQpc = thresholdBase / 4;
         if (m_compositorKind == kCompositorInterp) {
-            m_compositor = new InterpCompositor(&m_policyCfg);
+            m_synth = new InterpCompositor(&m_policyCfg);
             LOG("Interp compositor ACTIVE (o mode): passthrough threshold %lld us; op=/bw=/pt= on the temporal line",
                 m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq());
         } else {
-            m_compositor = new BlendCompositor(&m_policyCfg, m_tint);
+            m_synth = new BlendCompositor(&m_policyCfg, m_tint);
             LOG("Blend compositor ACTIVE (b mode): passthrough threshold %lld us; op=/bw= on the temporal line",
                 m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq());
         }
+        // Armed before Setup, which is where the content check allocates its readback
+        // resources and where it disarms itself if they cannot be created.
+        if (m_subGen) {
+            m_synth->EnableGeneratedSubstitution(true);
+            // The ring decides WHICH retracted members are substitutable, from the delivery
+            // structure: it needs the declared source period to tell x2 from x3 and from a
+            // source that pairs nothing.
+            m_ring.EnableGeneratedSubstitution();
+            LOG("Generated-frame substitution ACTIVE (-subgen): a retracted generated frame "
+                "within the passthrough threshold replaces the blend, in the x2 regime only; "
+                "op=pass-gen");
+        }
+        m_compositor = m_synth;
     } else {
+        if (m_subGen) {
+            LOG("-subgen ignored: nearest mode never blends, so there is nothing to replace");
+        }
         m_compositor = new NearestCompositor(&m_policyCfg);
     }
     if (!m_compositor->Setup(m_device, BUF_WIDTH, BUF_HEIGHT)) {
@@ -595,6 +612,16 @@ void TemporalCaptureMode::Run(
             "%lld fence-blocked, %lld lock-declined, %lld skipped",
             m_dejitMeasured, m_dejitLate, m_dejitCorrected,
             m_dejitFenceBlocked, m_dejitLockDeclined, m_dejitSkipped);
+    }
+    if (m_subGen && m_synth) {
+        // The population this feature addresses, measured in the field rather than inferred
+        // from a replay. offered counts the presents where PLACEMENT said yes, so
+        // offered - substituted - rejected is what the policy's own rules refused.
+        const SynthCompositorBase::GenSubStats& g = m_synth->GeneratedSubstitutionStats();
+        LOG("subgen summary: %lld substituted, %lld offered, %lld rejected on content, "
+            "content check %lld us worst / %lld us mean",
+            g.substituted, g.offered, g.rejectedContent, g.checkUsMax,
+            g.offered ? g.checkUsTotal / g.offered : 0);
     }
     m_ring.Stop();
 }

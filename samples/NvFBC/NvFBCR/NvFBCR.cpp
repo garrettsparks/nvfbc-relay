@@ -116,6 +116,11 @@ bool g_fgPhase = false;
 // votes the rotation phase from arrival timing and keeps member 0 through the [real,gen]
 // class, lifting real content from 2 of every 6 outputs to 4 of 6. Inert at x2 and FG off.
 bool g_phaseKeep = false;
+// -subgen: where blend mode would interpolate, present the driver-generated frame keep-real
+// retracted instead, when one sits on the target and its pixels are not a capture-race copy
+// of a real frame. Sharp where a blend doubles edges. Inert wherever nothing is retracted
+// (frame generation off, a source that pairs nothing), and inert outside blend modes.
+bool g_subGen = false;
 // -lag N: extra bracketing delay in ms. Trades output latency, which the player never sees
 // (the source display is direct) and which only shifts an already-delayed stream, for holds.
 unsigned int g_extraLagMs = 0;
@@ -165,7 +170,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             _stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
                                            kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
-                                           g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs);
+                                           g_dejitter, g_fgPhase, g_phaseKeep, g_subGen,
+                                           g_extraLagMs);
         }
 
         // QPC-timer present (t:60 / b:60 / o:60 format).
@@ -174,7 +180,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             if (ParseFps(modeStr.substr(2), &framerate)) {
                 return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
                                                kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
-                                               g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs);
+                                               g_dejitter, g_fgPhase, g_phaseKeep, g_subGen,
+                                           g_extraLagMs);
             }
         }
     }
@@ -492,6 +499,10 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         g_phaseKeep = true;
         return 1;
     }
+    if (tokens[i] == "-subgen") {
+        g_subGen = true;
+        return 1;
+    }
     if (tokens[i] == "-mark") {
         g_mark = true;
         // Optional frame count: consume the next token as N only if it is all digits, so
@@ -711,7 +722,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     else if (g_markFrames) snprintf(markDesc, sizeof(markDesc), "on (first %u presents)", g_markFrames);
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
     LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s, "
-        "etw flip capture %s, flip join %s, dejitter %s, fgphase %s, phasekeep %s, extra lag %u ms",
+        "etw flip capture %s, flip join %s, dejitter %s, fgphase %s, phasekeep %s, "
+        "generated-frame substitution %s, extra lag %u ms",
         g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
         g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off",
         !g_etw ? "off (no -etw)" : (g_noJoin ? "OFF (-nojoin)" : "on"),
@@ -722,6 +734,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         !g_phaseKeep ? "off"
                      : (g_etw && !g_noJoin ? "ON (-phasekeep)"
                                            : "REFUSED (-phasekeep needs -etw with the join on)"),
+        g_subGen ? "ON (-subgen)" : "off",
         g_extraLagMs);
 
     BUF_WIDTH = target.position.right - target.position.left;

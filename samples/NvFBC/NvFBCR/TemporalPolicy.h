@@ -43,6 +43,20 @@ struct BracketInfo {
     int64_t afterTs = 0;
     int64_t beforeDiff = 0;
     int64_t afterDiff = 0;
+    // The driver-generated frame keep-real retracted, when one is still reachable. It is
+    // NOT a bracket endpoint: selection never sees it and it can never be chosen as
+    // before/after, because treating it as real is exactly what keep-real exists to
+    // prevent. Its only use is standing in for a blend at a target it already sits on.
+    //
+    // genTs is its CONTENT time (the midpoint of its two real neighbours, not its own
+    // flip), genDiff the unsigned distance from the target. genUsable is the caller's
+    // verdict on the PIXELS: the capture API can race and leave real content in the
+    // generated slot, which only a content comparison can detect. The split is
+    // deliberate - the policy rules on placement, the caller rules on content.
+    bool hasGen = false;
+    bool genUsable = false;
+    int64_t genTs = 0;
+    int64_t genDiff = 0;
 };
 
 // Batch-collapse memory across capture wakes. Under driver-level frame generation the
@@ -478,6 +492,19 @@ struct PolicyConfig {
     int64_t stallSpanQpc = 0;   // bracket width above which the source reads as stalled; 0 = off
 };
 
+// Ring depth for a bracketing lag. The ring must reach back past the target, and NvFBC
+// delivers in bursts (a ~100 ms pause then a flush) that consume several slots at once, so
+// the reach needed is well over the lag alone: replayed at lag 95.8 ms the hold rate falls
+// off a cliff between 24 and 28 slots (0.13/s -> 0.01/s), which is ~2.4x the lag in wake
+// history, and 3x is taken so the sizing is not fitted to that one edge. The window is
+// measured in WAKES, not in valid frames, because an invalid slot still holds its position,
+// and frame generation puts about two wakes in every source period.
+//
+// Lives here rather than at the call site so it can be tested without a Windows build: it
+// is the rule that decides whether the daily driver runs 16 slots or 32.
+int RingSlotsForLag(int64_t bracketingDelayQpc, int64_t srcPeriodQpc, int minSlots,
+                    int maxSlots);
+
 // The signed distance to the nearest point on a p-periodic timeline, in [-p/2, p/2).
 int64_t WrapHalf(int64_t d, int64_t p);
 
@@ -535,6 +562,9 @@ enum class CompositeOp : int {
     Synthesize = 3,         // no real frame near the target: make one there from the
                             // bracket pair at the bracket weight (lerp, flow warp - the
                             // executor is the compositor's business, not the policy's)
+    PassthroughGenerated = 4,  // no real frame near the target, but the driver already
+                               // made one that sits on it: present that instead of
+                               // interpolating. Sharp where a blend would double-image.
 };
 
 // The log's stable op= label for each value.
@@ -554,6 +584,12 @@ struct CompositeState {
     int64_t lastOutputTs = INT64_MIN;
     bool lastPassAfter = false;
     bool lastSynth = false;
+    // Content time of the last generated frame presented. A generated frame stays
+    // reachable for many presents, so without this the same one wins the search again
+    // and again and is shown twice: a duplicate manufactured by the substitution itself,
+    // which no content check can catch because the pixels are perfectly good. Measured on
+    // an FG-off replay, where generated frames are scarce, this is 48% of substitutions.
+    int64_t lastGenTs = INT64_MIN;
 };
 
 // The per-present composite decision for blend mode. A real frame within the
@@ -576,5 +612,19 @@ struct CompositeState {
 // monotonic lastShownTs.
 CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
                                   const PolicyConfig& cfg);
+
+// Whether a generated frame could stand in for the blend this bracket would otherwise
+// produce, judged on PLACEMENT alone: this present would synthesize, a generated frame is
+// reachable, it sits inside the passthrough gate of the target, its content is strictly
+// newer than the last output, and it is not the one the previous substitution showed.
+// b.genUsable is deliberately NOT consulted.
+//
+// Exposed so the caller can run its content check ONLY where the answer could change the
+// outcome (measured: about 0.3 presents per second). A check on every capture wake is the
+// thing that must not ship - the diagnostic that does exactly that degrades output by
+// 3.4x in motion-gated duplicates. Call this, run the check, put the verdict in
+// b.genUsable, then call DecideComposite, which applies the identical rule.
+bool GeneratedCandidateOnTarget(const BracketInfo& b, const CompositeState& s,
+                                const PolicyConfig& cfg);
 
 }  // namespace policy
