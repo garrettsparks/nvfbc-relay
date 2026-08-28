@@ -136,10 +136,11 @@ bool SynthCompositorBase::Setup(IDirect3DDevice9Ex* device, int width, int heigh
     // the substitution rather than the mode: without the check it must not run at all, and
     // blending is a working answer.
     if (m_subGen) {
-        hr = device->CreateRenderTarget(kGuardW, kGuardH, D3DFMT_A2R10G10B10,
+        hr = device->CreateRenderTarget(kGuardW * kGuardTiles, kGuardH, D3DFMT_A2R10G10B10,
                                         D3DMULTISAMPLE_NONE, 0, FALSE, &m_guardRT, NULL);
         if (SUCCEEDED(hr)) {
-            hr = device->CreateOffscreenPlainSurface(kGuardW, kGuardH, D3DFMT_A2R10G10B10,
+            hr = device->CreateOffscreenPlainSurface(kGuardW * kGuardTiles, kGuardH,
+                                                     D3DFMT_A2R10G10B10,
                                                      D3DPOOL_SYSTEMMEM, &m_guardSys, NULL);
         }
         if (SUCCEEDED(hr)) {
@@ -153,9 +154,16 @@ bool SynthCompositorBase::Setup(IDirect3DDevice9Ex* device, int width, int heigh
     return true;
 }
 
-bool SynthCompositorBase::ReadSmallLuma(IDirect3DSurface9* src, float* out) {
-    if (FAILED(m_device->StretchRect(src, &m_rect, m_guardRT, NULL, D3DTEXF_LINEAR)))
-        return false;
+bool SynthCompositorBase::BlitGuardTile(IDirect3DSurface9* src, int tile) {
+    RECT dst;
+    dst.left = tile * kGuardW;
+    dst.right = dst.left + kGuardW;
+    dst.top = 0;
+    dst.bottom = kGuardH;
+    return SUCCEEDED(m_device->StretchRect(src, &m_rect, m_guardRT, &dst, D3DTEXF_LINEAR));
+}
+
+bool SynthCompositorBase::ReadGuardTiles() {
     if (FAILED(m_device->GetRenderTargetData(m_guardRT, m_guardSys)))
         return false;
     D3DLOCKED_RECT lr;
@@ -164,14 +172,21 @@ bool SynthCompositorBase::ReadSmallLuma(IDirect3DSurface9* src, float* out) {
     const unsigned char* base = (const unsigned char*)lr.pBits;
     for (int y = 0; y < kGuardH; y++) {
         const unsigned int* row = (const unsigned int*)(base + (size_t)y * lr.Pitch);
-        for (int x = 0; x < kGuardW; x++) {
-            // A2R10G10B10: 10 bits per channel. Rec.601 luma is plenty - the question is
-            // whether two frames differ, not what colour they are.
-            const unsigned int p = row[x];
-            const float r = (float)((p >> 20) & 0x3FF);
-            const float g = (float)((p >> 10) & 0x3FF);
-            const float b = (float)(p & 0x3FF);
-            out[y * kGuardW + x] = (0.299f * r + 0.587f * g + 0.114f * b) / 1023.0f;
+        for (int t = 0; t < kGuardTiles; t++) {
+            float* out = m_guardLuma[t];
+            for (int x = 0; x < kGuardW; x++) {
+                // A2R10G10B10, 10 bits per channel. Luma is the -fgphase instrument's
+                // integer weighting, kept EXACTLY, including its scale: the ratio below is
+                // scale-free so the units cannot affect it, but the motion floor is a
+                // number someone will compare against that instrument's output, and a
+                // rescaling here is what turned that floor into a magic constant once
+                // already. These are raw channel levels, same as fgphase reports.
+                const unsigned int p = row[t * kGuardW + x];
+                const float r = (float)((p >> 20) & 0x3FF);
+                const float g = (float)((p >> 10) & 0x3FF);
+                const float b = (float)(p & 0x3FF);
+                out[y * kGuardW + x] = (2.0f * r + 5.0f * g + b) * 0.125f;
+            }
         }
     }
     m_guardSys->UnlockRect();
@@ -186,9 +201,12 @@ bool SynthCompositorBase::GeneratedContentUsable(const FrameBracket& bracket) {
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
 
-    bool ok = ReadSmallLuma(bracket.genSurface, m_guardLuma[0]) &&
-              ReadSmallLuma(bracket.beforeSurface, m_guardLuma[1]) &&
-              ReadSmallLuma(bracket.afterSurface, m_guardLuma[2]);
+    // All three downscales are queued before anything is read back, so the pipeline drains
+    // once. Issuing a blit and immediately reading it forces a drain per frame.
+    const bool ok = BlitGuardTile(bracket.genSurface, 0) &&
+                    BlitGuardTile(bracket.beforeSurface, 1) &&
+                    BlitGuardTile(bracket.afterSurface, 2) &&
+                    ReadGuardTiles();
 
     QueryPerformanceCounter(&t1);
     const long long us = (t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart;
@@ -196,19 +214,29 @@ bool SynthCompositorBase::GeneratedContentUsable(const FrameBracket& bracket) {
     if (us > m_genSub.checkUsMax) m_genSub.checkUsMax = us;
     if (!ok) return false;
 
-    // gdiff against the NEARER real neighbour, because a race duplicate copies whichever
-    // frame the capture actually had in hand; motion is the bracket pair against each
-    // other, which is the scale everything here is measured in.
+    // RMS, matching the instrument the thresholds were measured on. gdiff is against the
+    // NEARER real neighbour, because a race duplicate copies whichever frame the capture
+    // actually had in hand; motion is the bracket pair against each other, which is the
+    // scale everything here is measured in. A 5% margin is cropped for the same reason the
+    // instrument crops one: edge pixels carry scaling artifacts.
     const float* neighbour = (bracket.info.beforeDiff <= bracket.info.afterDiff)
                                  ? m_guardLuma[1] : m_guardLuma[2];
-    double gdiff = 0.0, motion = 0.0;
-    const int n = kGuardW * kGuardH;
-    for (int i = 0; i < n; i++) {
-        gdiff += fabs((double)m_guardLuma[0][i] - (double)neighbour[i]);
-        motion += fabs((double)m_guardLuma[1][i] - (double)m_guardLuma[2][i]);
+    const int mx = kGuardW / 20, my = kGuardH / 20;
+    double sgg = 0.0, smm = 0.0;
+    int n = 0;
+    for (int y = my; y < kGuardH - my; y++) {
+        for (int x = mx; x < kGuardW - mx; x++) {
+            const int i = y * kGuardW + x;
+            const double g = (double)m_guardLuma[0][i] - (double)neighbour[i];
+            const double m = (double)m_guardLuma[1][i] - (double)m_guardLuma[2][i];
+            sgg += g * g;
+            smm += m * m;
+            n++;
+        }
     }
-    gdiff /= n;
-    motion /= n;
+    if (n == 0) return false;
+    const double gdiff = sqrt(sgg / n);
+    const double motion = sqrt(smm / n);
 
     // Static content: nothing moved between the bracket frames, so a repeat cannot be seen
     // and the ratio is a division by noise. Allow it rather than computing a random answer.

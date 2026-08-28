@@ -1,6 +1,7 @@
 # Generated-frame substitution: present the driver's frame instead of blending
 
-Status: BUILT, opt-in behind `-subgen`, NOT yet validated in the field. The policy layer and
+Status: BUILT, opt-in behind `-subgen`, ONE field capture taken (2026-08-26) and two
+defects found and fixed since; the fixes are UNVALIDATED. The policy layer and
 the replay model are covered by the local suite; `CaptureRing`, `FrameCompositors`,
 `TemporalCaptureMode` and `NvFBCR` compile only in CI. Every number here is measured, and the
 measurement that produced each one is named so it can be re-run or disputed.
@@ -113,7 +114,43 @@ where the truth was 11.5%. Below a motion floor the frame is static, a repeat ca
 and the ratio is a division by noise: allow it rather than computing a random answer.
 
 **It runs on the PRESENT thread, lazily, only where a substitution is already on the table** -
-measured 0.302 times per second, about once per 200 presents. The placement test in front of
+measured 0.302 times per second in replay and 0.412/s in the field, about once per 200
+presents.
+
+**FIELD CORRECTION, first capture (`subgen_kcd_0`, 2026-08-26).** Two defects, both fixed:
+
+The motion floor was 0.002, chosen as if it were a visibility threshold. Two things were
+wrong with it, and the second was hidden by the first.
+
+It was on the wrong scale. The guard normalised luma to 0-1 by dividing by 1023 (full scale
+for the 10-bit channels the ring slots use), while the instrument the thresholds came from
+reports motion in raw channel levels. So 0.002 here meant 2.05 there, above the median of
+natural gameplay (2.84), and the check short-circuited to "allow" on 19.2% of batches. In the
+field this showed as a 2.5% rejection rate against a ground truth of 8.9%.
+
+The concept was also wrong: **the floor is a division guard, not a visibility threshold.**
+Swept against the ground-truth capture, the measured duplicate rate above the floor is
+8.87-8.98% for EVERY floor from 0.0 to 5.0. The floor does not change how well the ratio
+discriminates at all; it only changes how many substitutions skip the check, and that grows
+monotonically (34 batches skipped at 0.2, 1728 at 2.0, 1807 at 5.0). The bimodal gap is empty
+in the lowest motion bands as well (0 of 6 samples below motion 0.1, 0 of 25 between 0.1 and
+0.2), so there is no level at which the ratio stops working and has to be replaced by a
+default. It is therefore set just above zero, at 0.01.
+
+**The normalisation is gone entirely.** The ratio is scale-free, so dividing by 1023 could
+never affect the discrimination - its only purpose was to let the floor be written on a 0-1
+scale, and that is precisely what turned the floor into an unreadable constant (0.000196) that
+nobody could check against a measurement. Luma is now kept in the instrument's raw units, so
+every number here can be compared to fgphase output directly, with no conversion.
+
+CAVEAT on the evidence: all of this comes from one capture, a constant-yaw pan, whose
+low-motion population is thin (31 samples below motion 0.2). The flatness of the sweep is what
+the choice rests on, not the bottom-end bimodality.
+
+The check issued a blit and immediately read it back, three times, forcing a pipeline drain
+per frame. Measured cost: 864 us mean, 26987 us worst, and 375 late presents (jit > 1 ms) in
+one hour against a baseline of ONE. The three downscales now go into three tiles of one
+render target and are read back once, so the pipeline drains once. The placement test in front of
 it is integer arithmetic. A capture-thread check would run ~60/s (every collapsed batch), and
 `-fgphase` does exactly that at 113/s and measurably degrades output: motion-gated video
 duplicates move from 0.23/s to 0.79/s. Working geometry is 64x36, not the instrument's
@@ -190,6 +227,27 @@ double image. Whether that trade is good at x3 is untested and x3 is already bro
 of this: the reason is the same one, NvFBC never delivers the third submission. If a DXGI
 backend ever delivers all submissions, the placement rule above is already correct for that
 case with no code change.
+
+## First field capture, 2026-08-26 (`subgen_kcd_0`, 65.5 min)
+
+    relay:    1618 substituted, 1659 offered, 41 rejected on content, 5 holds
+    harness:  1628 predicted on the same log, 5 holds
+    same log without the feature: synth 7958 (2.02/s), 2 holds
+    same log with it:             synth 6327 (1.61/s), 1628 substituted
+
+Model and implementation agree within 0.6% on the substitution count and exactly on holds.
+Trimmed of the loading and exit stretches (which carry 700 of the 1618) the gameplay rate is
+0.247/s against the 0.254/s predicted ceiling.
+
+The marked window decoded perfectly: 1448 consecutive presents, 0 counter repeats, 0 skips, 0
+presents missing from the file, 100% provenance agreement. The video/log offset is
+`log_time = video_time + 44.548 s`.
+
+**The visible-duplicate question is still open and the field capture cannot close it.** A
+within-capture control (substitution-dense windows against adjacent quiet ones, normalized
+for motion) found no relationship, but the expected effect is ~0.037/s against window-to-
+window variance of 0.10-0.79/s: underpowered by an order of magnitude. Settling it needs a
+paired same-content test.
 
 ## Validation plan
 
