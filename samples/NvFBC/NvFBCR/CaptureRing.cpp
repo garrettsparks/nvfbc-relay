@@ -57,6 +57,11 @@ CaptureRing::~CaptureRing() {
         m_captureTarget->Release();
         m_captureTarget = NULL;
     }
+    if (m_diffMapBuf) {
+        VirtualFree(m_diffMapBuf, 0, MEM_RELEASE);
+        m_diffMapBuf = NULL;
+        m_diffMapPtrs[0] = NULL;
+    }
     if (m_fgSmallRT)  { m_fgSmallRT->Release();  m_fgSmallRT = NULL; }
     if (m_fgSmallSys) { m_fgSmallSys->Release(); m_fgSmallSys = NULL; }
     delete[] m_fgLumWake[0]; m_fgLumWake[0] = NULL;
@@ -218,9 +223,50 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     setupParams.dwNumBuffers = 1;
     setupParams.bHDRRequest = TRUE;
 
+    // -diffmap: ask the driver for its per-block change map alongside each grab. Requested
+    // here and CONFIRMED by SetUp succeeding with it on; a driver that refuses the feature
+    // must not take the relay with it, so a failure retries without and the instrument
+    // reports itself inactive.
+    if (m_diffMapRequested) {
+        m_diffMapBuf = VirtualAlloc(NULL, NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE,
+                                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (m_diffMapBuf) {
+            m_diffMapPtrs[0] = m_diffMapBuf;
+            setupParams.bDiffMap = 1;
+            setupParams.eDiffMapBlockSize = NVFBC_TODX9VID_DIFFMAP_BLOCKSIZE_16X16;
+            setupParams.dwDiffMapBuffSize = NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE;
+            setupParams.ppDiffMap = m_diffMapPtrs;
+            const unsigned int bx = (m_width + 15) / 16, by = (m_height + 15) / 16;
+            m_diffMapBlocks = bx * by;
+            if (m_diffMapBlocks > NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE)
+                m_diffMapBlocks = NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE;
+        } else {
+            LOGERR("CaptureRing: diffmap buffer allocation failed - instrument off");
+        }
+    }
+
     if (NVFBC_SUCCESS != m_nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
-        LOGERR("CaptureRing: NvFBCToDx9VidSetUp on capture device failed");
-        return false;
+        if (setupParams.bDiffMap) {
+            LOGERR("CaptureRing: SetUp refused the diffmap - retrying without it");
+            setupParams.bDiffMap = 0;
+            setupParams.ppDiffMap = NULL;
+            setupParams.dwDiffMapBuffSize = 0;
+            if (NVFBC_SUCCESS != m_nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
+                LOGERR("CaptureRing: NvFBCToDx9VidSetUp on capture device failed");
+                return false;
+            }
+        } else {
+            LOGERR("CaptureRing: NvFBCToDx9VidSetUp on capture device failed");
+            return false;
+        }
+    }
+    m_diffMapActive = setupParams.bDiffMap != 0;
+    if (m_diffMapActive) {
+        LOG("diffmap instrument ACTIVE: 16x16 blocks, %u blocks for %dx%d; diff= on the "
+            "capture line counts blocks the driver says changed since the previous grab",
+            m_diffMapBlocks, m_width, m_height);
+    } else if (m_diffMapRequested) {
+        LOG("diffmap instrument OFF: the driver did not accept it");
     }
 
     // Fully event-driven blocking grab — safe now that the lock it holds is private.
@@ -578,12 +624,43 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         // flush = GPU-completion wait added by the cross-device coherency fix; col = cumulative
         // batch-collapsed wakes (skipped or retracted frame-gen members).
         LONGLONG dt = (prevArrival != 0) ? (now.QuadPart - prevArrival) : 0;
-        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld",
+        // diff= is the instrument's whole output: how many 16x16 blocks the driver says
+        // changed since the previous grab. Zero means this grab returned the same content
+        // as the last one, which is the capture race the content check hunts for with
+        // pixels. Appended after the existing fields so every tool that reads this line by
+        // key is unaffected.
+        // -1 when the instrument is off, so the field is always present and unambiguous.
+        //
+        // TWO counts on purpose. diff= assumes the map covers the capture dimensions at
+        // 16x16; dtot= counts every non-zero byte in the whole allocation and assumes
+        // nothing. If the driver lays the map out over the SOURCE resolution rather than
+        // the scaled capture, or packs it differently, the two disagree and the analysis
+        // uses dtot=. VirtualAlloc commits zeroed pages, so bytes the driver never writes
+        // stay zero and cannot inflate it.
+        long long changed = -1, changedAll = -1;
+        if (m_diffMapActive) {
+            const unsigned char* dm = (const unsigned char*)m_diffMapBuf;
+            changed = 0;
+            for (unsigned int b = 0; b < m_diffMapBlocks; b++) {
+                if (dm[b] != 0) changed++;
+            }
+            // Four times the expected extent rather than the whole 256 KB allocation: it
+            // covers any plausible geometry mismatch (source against scaled capture is at
+            // most ~1.8x in area here) without scanning a quarter megabyte on the capture
+            // thread 120 times a second.
+            unsigned int wide = m_diffMapBlocks * 4;
+            if (wide > NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE) wide = NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE;
+            changedAll = 0;
+            for (unsigned int b = 0; b < wide; b++) {
+                if (dm[b] != 0) changedAll++;
+            }
+        }
+        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld diff=%lld dtot=%lld",
             count,
             (long long)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
             (long long)(dt * usPerTick),
             (long long)flushUs,
-            collapsed);
+            collapsed, changed, changedAll);
 
         if (m_fgPhaseActive) {
             FgPhaseOnWake(batch.member, slot,

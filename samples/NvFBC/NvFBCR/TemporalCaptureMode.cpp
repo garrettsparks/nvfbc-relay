@@ -21,7 +21,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
                                          bool tint, bool etw, bool noJoin, bool dejitter,
                                          bool fgPhase, bool phaseKeep, bool subGen,
-                                         unsigned int extraLagMs)
+                                         bool diffMap, unsigned int extraLagMs)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_compositor(NULL)
@@ -39,6 +39,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_extraLagMs(extraLagMs)
     , m_phaseKeepRequested(phaseKeep)
     , m_subGen(subGen)
+    , m_diffMap(diffMap)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
     , m_srcRateHint(srcRateHint)
@@ -110,6 +111,9 @@ bool TemporalCaptureMode::Setup() {
     // Before the ring starts: the instrument allocates its readback resources in Start.
     if (m_fgPhase) {
         m_ring.EnableFgPhase();
+    }
+    if (m_diffMap) {
+        m_ring.EnableDiffMap();
     }
     if (m_phaseKeep) {
         m_ring.EnablePhaseKeep(this);

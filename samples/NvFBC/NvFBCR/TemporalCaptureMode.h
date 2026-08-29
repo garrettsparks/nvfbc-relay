@@ -95,6 +95,8 @@ private:
     bool m_phaseKeepRequested;      // asked for, so an unmet prerequisite can say so once
     // -subgen: present the driver's retracted generated frame where a blend would go.
     bool m_subGen;
+    // -diffmap: the NvFBC difference-map instrument, forwarded to the ring at Setup.
+    bool m_diffMap;
     // The synth compositor when one is in use, for the substitution counters. Aliases
     // m_compositor and is never deleted through this pointer.
     SynthCompositorBase* m_synth = NULL;
@@ -127,7 +129,7 @@ public:
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
                         bool etw = false, bool noJoin = false, bool dejitter = false,
                         bool fgPhase = false, bool phaseKeep = false,
-                        bool subGen = false,
+                        bool subGen = false, bool diffMap = false,
                         unsigned int extraLagMs = 0);
     virtual ~TemporalCaptureMode();
 

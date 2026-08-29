@@ -121,6 +121,13 @@ bool g_phaseKeep = false;
 // of a real frame. Sharp where a blend doubles edges. Inert wherever nothing is retracted
 // (frame generation off, a source that pairs nothing), and inert outside blend modes.
 bool g_subGen = false;
+// -diffmap: DIAGNOSTIC. Ask NvFBC for its own per-block difference map with each grab and
+// log how many blocks it reports changed (diff= on the capture line). Decides nothing. It
+// exists to test whether the driver already knows what the generated-frame content check
+// re-derives with a GPU readback: a capture-race duplicate is a grab that returned the same
+// content as the previous one, which is an all-zero map. Run with -fgphase, whose per-batch
+// gdiff is the ground truth to join against.
+bool g_diffMap = false;
 // -lag N: extra bracketing delay in ms. Trades output latency, which the player never sees
 // (the source display is direct) and which only shifts an already-delayed stream, for holds.
 unsigned int g_extraLagMs = 0;
@@ -171,7 +178,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
                                            kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
                                            g_dejitter, g_fgPhase, g_phaseKeep, g_subGen,
-                                           g_extraLagMs);
+                                           g_diffMap, g_extraLagMs);
         }
 
         // QPC-timer present (t:60 / b:60 / o:60 format).
@@ -181,7 +188,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
                 return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
                                                kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
                                                g_dejitter, g_fgPhase, g_phaseKeep, g_subGen,
-                                           g_extraLagMs);
+                                           g_diffMap, g_extraLagMs);
             }
         }
     }
@@ -503,6 +510,10 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         g_subGen = true;
         return 1;
     }
+    if (tokens[i] == "-diffmap") {
+        g_diffMap = true;
+        return 1;
+    }
     if (tokens[i] == "-mark") {
         g_mark = true;
         // Optional frame count: consume the next token as N only if it is all digits, so
@@ -723,7 +734,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
     LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s, "
         "etw flip capture %s, flip join %s, dejitter %s, fgphase %s, phasekeep %s, "
-        "generated-frame substitution %s, extra lag %u ms",
+        "generated-frame substitution %s, diffmap %s, extra lag %u ms",
         g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
         g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off",
         !g_etw ? "off (no -etw)" : (g_noJoin ? "OFF (-nojoin)" : "on"),
@@ -735,6 +746,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
                      : (g_etw && !g_noJoin ? "ON (-phasekeep)"
                                            : "REFUSED (-phasekeep needs -etw with the join on)"),
         g_subGen ? "ON (-subgen)" : "off",
+        g_diffMap ? "requested (-diffmap; ACTIVE only when the instrument line follows)" : "off",
         g_extraLagMs);
 
     BUF_WIDTH = target.position.right - target.position.left;
