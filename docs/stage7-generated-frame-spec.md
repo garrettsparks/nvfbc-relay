@@ -1,7 +1,8 @@
 # Generated-frame substitution: present the driver's frame instead of blending
 
-Status: BUILT, opt-in behind `-subgen`, ONE field capture taken (2026-08-26) and two
-defects found and fixed since; the fixes are UNVALIDATED. The policy layer and
+Status: BUILT, opt-in behind `-subgen`, TWO field captures. The floor fix is validated;
+the readback batching did not work. Output quality is confirmed; the cost to the GAME is
+unmeasured. The policy layer and
 the replay model are covered by the local suite; `CaptureRing`, `FrameCompositors`,
 `TemporalCaptureMode` and `NvFBCR` compile only in CI. Every number here is measured, and the
 measurement that produced each one is named so it can be re-run or disputed.
@@ -149,8 +150,15 @@ the choice rests on, not the bottom-end bimodality.
 
 The check issued a blit and immediately read it back, three times, forcing a pipeline drain
 per frame. Measured cost: 864 us mean, 26987 us worst, and 375 late presents (jit > 1 ms) in
-one hour against a baseline of ONE. The three downscales now go into three tiles of one
-render target and are read back once, so the pipeline drains once. The placement test in front of
+one hour against a baseline of ONE. The three downscales were changed to three tiles of one
+render target read back once.
+
+**That change did not work, and the reason is worth keeping.** Second capture: 776 us mean,
+24267 us worst, jit > 1 ms unchanged at 0.0975/s against 0.0982/s. The cost is not
+proportional to the number of readbacks - one `GetRenderTargetData` synchronises the device
+whatever is queued behind it, and the 24 ms tail is the GPU being busy with the GAME, not with
+three 64x36 blits. Batching was the wrong hypothesis. The tiling is harmless and slightly
+simpler to reason about, but it bought nothing measurable. The placement test in front of
 it is integer arithmetic. A capture-thread check would run ~60/s (every collapsed batch), and
 `-fgphase` does exactly that at 113/s and measurably degrades output: motion-gated video
 duplicates move from 0.23/s to 0.79/s. Working geometry is 64x36, not the instrument's
@@ -248,6 +256,46 @@ within-capture control (substitution-dense windows against adjacent quiet ones, 
 for motion) found no relationship, but the expected effect is ~0.037/s against window-to-
 window variance of 0.10-0.79/s: underpowered by an order of magnitude. Settling it needs a
 paired same-content test.
+
+## Second field capture, 2026-08-27 (`subgen_kcd_improved_gen_selection`, 89 min)
+
+Both fixes in. Whole run: 2670 substituted, 2930 offered, 260 rejected on content = **8.9%**,
+matching the independently measured ground-truth race rate exactly (it was 2.5% before the
+floor fix). Trimmed to gameplay (log 120-5160 s, 84 min at a locked 60.0 presents/s):
+
+    presents 302381   holds 0   backward 0.00
+    synth       1676  0.333/s
+    pass-gen    1814  0.360/s     51% of everything that would have blended
+
+Blends more than halved. The harness predicted 1840 offers on the same window against 1814
+substituted plus 26 rejected: exact.
+
+**The rejections are almost all outside gameplay.** 26 of 1840 in the gameplay window (1.4%),
+234 in the ~5 minutes of loading and desktop at the ends. That is the guard behaving
+correctly - no frame generation runs there, so every retracted slot is a paired real grab -
+but it means the 8.9% whole-run figure is an average over two very different regimes, and in
+gameplay the guard prevents about one duplicate every 200 seconds.
+
+Downstream chain clean again: 842 consecutive marked presents, 0 counter repeats, 0 skips, 0
+presents missing from the file, 100% provenance agreement. Offset `log_time = video_time +
+45.951 s`, holding to +-1 frame for 13 minutes and drifting to -9 frames by 50.
+
+**Visual check: the substituted frames were inspected in the video and look correct.** That
+closes the quality question the statistics could not reach.
+
+## The cost question, still open
+
+Every cost number in this document is RELAY-side. jit and pdt say whether the relay kept its
+own schedule, and by those measures the check is invisible: pdt is statistically identical to
+a no-substitution baseline (p50 16660 vs 16664, p99 16955 vs 17006) and this capture has FEWER
+double-interval presents than the baseline (26 vs 46). The late presents land on the same
+vsync because a blocked INTERVAL_ONE present absorbs them.
+
+**That does not mean it is free.** A `GetRenderTargetData` sync stalls the GPU pipeline the
+GAME is using, and nothing measured here would see it. The method for measuring it is
+`docs/relay-cost-spec.md`. Until that number exists, the honest position is that the guard's
+cost to the game is UNKNOWN, and its measured benefit in gameplay is 0.005/s of duplicates
+avoided.
 
 ## Validation plan
 

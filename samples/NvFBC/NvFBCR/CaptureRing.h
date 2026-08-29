@@ -174,6 +174,18 @@ public:
     // Keep retracted generated frames reachable instead of dropping them. Before Start.
     void EnableGeneratedSubstitution() { m_subGenArmed = true; }
 
+    // DIAGNOSTIC (-diffmap). Ask NvFBC for its own difference map alongside each grab and
+    // log how many blocks it says changed. Decides nothing.
+    //
+    // The question it exists to answer: the content check currently re-derives, with a GPU
+    // readback on the present thread, something the capture driver may already know. A
+    // capture-race duplicate is by definition "this grab returned the same content as the
+    // previous grab", which is exactly an all-zero difference map. If the driver's map
+    // agrees with the pixel measurement, the check moves to the capture thread and costs a
+    // CPU buffer read instead of a pipeline drain. Run alongside -fgphase, whose per-batch
+    // gdiff is the ground truth to join against.
+    void EnableDiffMap() { m_diffMapRequested = true; }
+
     // Session telemetry for the phase vote, logged at exit by the owner.
     long long PhaseKeepBatches() const { return m_phaseKeepBatches; }
     long long PhaseKeepFlipped() const { return m_phaseKeepFlipped; }
@@ -274,6 +286,14 @@ private:
     LONGLONG m_batchMembersEmaQ8 = 0;
     // Generated-frame substitution: keep retracted members reachable and placed.
     bool m_subGenArmed = false;
+
+    // -diffmap instrument. The buffer is VirtualAlloc'd because NvFBC requires it, and the
+    // pointer array is a member because SetUp keeps the array the client passes.
+    bool m_diffMapRequested = false;
+    bool m_diffMapActive = false;
+    void* m_diffMapBuf = NULL;
+    void* m_diffMapPtrs[1] = {NULL};
+    unsigned int m_diffMapBlocks = 0;   // blocks the map is expected to carry
 
     bool m_fgPhaseRequested = false;
     bool m_fgPhaseActive = false;
