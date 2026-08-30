@@ -636,7 +636,7 @@ struct PresentCensus {
     long long tsDiffOver1ms = 0;
     // The comb lock, PREDICTED here and scored against the log's tgt=/pull=. This is the
     // half that would be untested if the target were taken from the log.
-    long long opHold = 0, opPassBefore = 0, opPassAfter = 0, opSynth = 0;
+    long long opHold = 0, opHoldComb = 0, opPassBefore = 0, opPassAfter = 0, opSynth = 0;
     // GENERATED-FRAME SUBSTITUTION: of the synths, how many had a retracted generated frame
     // reachable and close enough to present sharp instead. The outcomes are kept apart
     // because they mean different things: no generated frame reachable at all is a source
@@ -760,6 +760,13 @@ struct Config {
     // reproduces the build that recorded the log; --sub-gen answers what the change would
     // have done to that same capture.
     bool subGen = false;
+    // The composite tooth guard, armed by production's own rule (comb on + at-rate
+    // source). On by default because replaying an old log then PREDICTS what the guard
+    // would have done to that capture; --no-tooth-guard reproduces builds that predate it.
+    bool toothGuard = true;
+    // Nominal present period (freq over the mode's declared rate; 60 for every blend
+    // capture so far). Only the tooth guard's sub-rate check reads it.
+    int64_t presentPeriod = 0;
     // The vote's class-mean margin, in this harness's ticks. Defaults to what production now
     // passes (80 us of QPC). Every log recorded BEFORE the units fix ran with an effective
     // 8 us, so reproducing such a run - gates 1 and 2 - needs `--sep-us 8`, and the header
@@ -818,6 +825,11 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
     pcfg.phasePullSlewQpc = cfg.phasePullSlew;
     pcfg.stallSpanQpc = cfg.stallSpan;
     pcfg.passthroughQpc = cfg.passthrough;
+    // Mirrors TemporalCaptureMode::Setup: the tooth guard rides the comb, at-rate only.
+    if (cfg.toothGuard && cfg.comb > 0 && cfg.presentPeriod > 0 &&
+        cfg.assumedSrcPeriod <= cfg.presentPeriod * 9 / 8) {
+        pcfg.srcPeriodQpc = cfg.assumedSrcPeriod;
+    }
     size_t nextPresent = 0;
     int64_t lastShownStamp = 0;
     bool haveShown = false;
@@ -910,6 +922,7 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
 
             switch (cd.op) {
                 case policy::CompositeOp::Hold: pc->opHold++; break;
+                case policy::CompositeOp::HoldComb: pc->opHoldComb++; break;
                 case policy::CompositeOp::PassthroughBefore: pc->opPassBefore++; break;
                 case policy::CompositeOp::PassthroughAfter: pc->opPassAfter++; break;
                 case policy::CompositeOp::PassthroughGenerated:
@@ -1571,12 +1584,13 @@ void ReportPresent(const PresentCensus& p, const Config& cfg) {
                 p.noBeforeLive, 100.0 * (double)p.noBeforeLive / (double)p.presents);
     std::printf("  no after-frame:  replay %lld (%.1f%%)\n", p.noAfter,
                 100.0 * (double)p.noAfter / (double)p.presents);
-    if (p.opHold + p.opPassBefore + p.opPassAfter + p.opSynth) {
+    if (p.opHold + p.opHoldComb + p.opPassBefore + p.opPassAfter + p.opSynth) {
         const double s2 = p.spanS > 0 ? p.spanS : 1.0;
         std::printf("  BLEND MODE (DecideComposite, the real decision this capture used):\n");
-        std::printf("    hold %lld (%.2f/s)  pass-before %lld  pass-after %lld  synth %lld (%.2f/s)\n",
-                    p.opHold, p.opHold / s2, p.opPassBefore, p.opPassAfter,
-                    p.opSynth, p.opSynth / s2);
+        std::printf("    hold %lld (%.2f/s)  hold-comb %lld (%.2f/s)  pass-before %lld"
+                    "  pass-after %lld  synth %lld (%.2f/s)\n",
+                    p.opHold, p.opHold / s2, p.opHoldComb, p.opHoldComb / s2,
+                    p.opPassBefore, p.opPassAfter, p.opSynth, p.opSynth / s2);
         std::printf("  GENERATED-FRAME SUBSTITUTION (present the retracted frame instead"
                     " of blending), gate %lld us:\n", cfg.passthrough / kTicksPerUs);
         const long long blendClass = p.opSynth + p.genSub;
@@ -1871,6 +1885,7 @@ int main(int argc, char** argv) {
     const char* path = NULL;
     bool arm = false, oldConstants = false, quiet = false, forceBlend = false;
     bool subGen = false;
+    bool toothGuard = true;
     long long sepUs = 80;
     int ringSlots = 16;
     long long pairingQ8 = 410;
@@ -1885,6 +1900,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--no-pairing-gate") == 0) pairingQ8 = 0;
         else if (std::strcmp(argv[i], "--force-blend") == 0) forceBlend = true;
         else if (std::strcmp(argv[i], "--sub-gen") == 0) subGen = true;
+        else if (std::strcmp(argv[i], "--no-tooth-guard") == 0) toothGuard = false;
         else if (std::strcmp(argv[i], "--from") == 0 && i + 1 < argc) fromS = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--to") == 0 && i + 1 < argc) toS = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--lag-add") == 0 && i + 1 < argc) lagAddMs = std::atoll(argv[++i]);
@@ -1913,7 +1929,11 @@ int main(int argc, char** argv) {
                      "         is the mode's zero rather than the absence of the frames.\n"
                      "  --from <s> --to <s>  restrict the PRESENT census to a window of the\n"
                      "         log's own dl= clock, to trim desktop off the ends. Every\n"
-                     "         present is still decided; only the counting is windowed.\n",
+                     "         present is still decided; only the counting is windowed.\n"
+                     "  --no-tooth-guard  disable the composite tooth guard, to reproduce\n"
+                     "         builds that predate it. Default is production's arming rule\n"
+                     "         (comb on + at-rate source), so replaying an OLD log predicts\n"
+                     "         what the guard would have done to that capture.\n",
                      argv[0]);
         return 2;
     }
@@ -1963,6 +1983,9 @@ int main(int argc, char** argv) {
     cfg.lag = (cap.lagUs + lagAddMs * 1000) * kTicksPerUs;
     cfg.blend = cap.blend || forceBlend;
     cfg.subGen = subGen;
+    cfg.toothGuard = toothGuard;
+    // Every blend capture so far presents at a nominal 60 whichever mode paces it.
+    cfg.presentPeriod = (int64_t)(freq / 60.0);
     cfg.passthrough = cap.passthroughUs * kTicksPerUs;
     // A capture recorded in t: mode carries no passthrough threshold, so a forced blend
     // replay needs production's: a quarter of the source period, which is the 4166 us the
@@ -2004,6 +2027,14 @@ int main(int argc, char** argv) {
     // replayed at the default 16 reports thousands of holds the run never had.
     std::printf("ring: %d slots (not recorded in the log - must match the build that"
                 " captured it)\n", ringSlots);
+    if (cfg.blend) {
+        const bool guardArmed = cfg.toothGuard && cfg.comb > 0 && cfg.presentPeriod > 0 &&
+                                cfg.assumedSrcPeriod <= cfg.presentPeriod * 9 / 8;
+        std::printf("tooth guard: %s (a log from a build that predates it needs"
+                    " --no-tooth-guard to be reproduced rather than predicted)\n",
+                    guardArmed ? "ARMED" : (cfg.toothGuard ? "off (no comb or sub-rate)"
+                                                           : "off (--no-tooth-guard)"));
+    }
     std::printf("parsed: %zu wakes, %zu flips (head 0: %zu), src %.1f fps, lag %lld us,"
                 " phasekeep %s%s\n",
                 cap.wakes.size(), cap.flips.size(),

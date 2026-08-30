@@ -490,6 +490,13 @@ struct PolicyConfig {
     int64_t phasePullSlewQpc = 0;
     int64_t passthroughQpc = 0;
     int64_t stallSpanQpc = 0;   // bracket width above which the source reads as stalled; 0 = off
+    // Declared source frame period, armed only alongside the comb and only for sources at
+    // or above the present rate; 0 = tooth guard off. Read by DecideComposite: a synthesis
+    // whose output would advance on the last output by less than a source period is
+    // manufacturing an instant the source comb does not contain (see HoldComb). Sub-rate
+    // sources leave it 0 because mid-tooth synthesis is that regime's entire output, not
+    // an artifact of a fast present clock.
+    int64_t srcPeriodQpc = 0;
 };
 
 // Ring depth for a bracketing lag. The ring must reach back past the target, and NvFBC
@@ -590,6 +597,11 @@ enum class CompositeOp : int {
     PassthroughGenerated = 4,  // no real frame near the target, but the driver already
                                // made one that sits on it: present that instead of
                                // interpolating. Sharp where a blend would double-image.
+    HoldComb = 5,           // the source comb owes no frame at this target: re-present
+                            // last output. Distinct from Hold so a log where the present
+                            // clock outruns the source (in-game frame generation runs the
+                            // compose clock at the DISPLAYED rate, twice the base) reads
+                            // as correct dedup rather than as a stall.
 };
 
 // The log's stable op= label for each value.
@@ -609,6 +621,11 @@ struct CompositeState {
     int64_t lastOutputTs = INT64_MIN;
     bool lastPassAfter = false;
     bool lastSynth = false;
+    // Target time of the last CONSUMED decision (pass, synthesis, or substitution; holds
+    // leave it). The tooth guard measures target advance against this, never against
+    // lastOutputTs: targets carry present-clock jitter (microseconds) where output stamps
+    // carry delivery lateness (milliseconds), and the guard's cut sits between the two.
+    int64_t lastTargetTs = INT64_MIN;
     // Content time of the last generated frame presented. A generated frame stays
     // reachable for many presents, so without this the same one wins the search again
     // and again and is shown twice: a duplicate manufactured by the substitution itself,
@@ -635,6 +652,14 @@ struct CompositeState {
 // output (pull wraps, pathological ratios) demotes to Hold: output content time is
 // non-decreasing by construction, the composite counterpart of SelectFrame's
 // monotonic lastShownTs.
+//
+// TOOTH GUARD (cfg.srcPeriodQpc > 0): a would-be synthesis whose target advances on the
+// last CONSUMED target by less than 7/8 of a source period demotes to HoldComb instead.
+// A present clock faster than the source puts targets BETWEEN teeth of the source comb,
+// where the bracket is two adjacent real frames and the mid-bracket blend is a frame the
+// source never produced; a real hole is always at least a full period of target advance
+// away. See SynthWouldManufactureTooth for the 7/8 derivation and for why the measure is
+// target advance, never output-stamp advance.
 CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
                                   const PolicyConfig& cfg);
 

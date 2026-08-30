@@ -158,6 +158,15 @@ struct SimParams {
     // Slots the ring searches. Defaults to the corpus depth so every pinned census is
     // unmoved; set it to run a timeline at the depth a given configuration ships with.
     int ringSlots = kRingSlots;
+    // Disable the composite tooth guard (production arms it whenever the comb is on and
+    // the source is at or above the OUTPUT rate). Only for differential tests that
+    // reproduce the pre-guard decision rule.
+    bool noToothGuard = false;
+    // The output rate production compares the source against when arming the guard
+    // (m_scheduler.PeriodQpc(), a nominal 60 regardless of what clock paces presents).
+    // presentPeriod above is the COMPOSE tick spacing, which under in-game frame
+    // generation runs at twice this; the two are only the same number at 1x.
+    int64_t nominalOutputPeriod = 16667;
 };
 
 static SimResult Simulate(const SimParams& p) {
@@ -168,6 +177,14 @@ static SimResult Simulate(const SimParams& p) {
     cfg.phasePullSlewQpc = kSlewUs;
     cfg.passthroughQpc = p.passthroughQpc;
     cfg.stallSpanQpc = p.srcPeriod * 2;   // production sizes this from the declared source rate
+    // The tooth guard arms by production's own rule (comb on, source at or above the
+    // OUTPUT rate) rather than by a test knob, so every composite test in this file
+    // exercises the guarded decision path and a pin failure is the guard changing a
+    // regime it was proven not to change. noToothGuard reproduces the pre-guard rule.
+    if (!p.noToothGuard && cfg.combQpc > 0 &&
+        p.srcPeriod <= p.nominalOutputPeriod * 9 / 8) {
+        cfg.srcPeriodQpc = p.srcPeriod;
+    }
 
     int64_t lag = p.srcPeriod + p.srcPeriod / 4;
     if (lag < p.presentPeriod) lag = p.presentPeriod;
@@ -2379,6 +2396,13 @@ static void test_replay_capture_corpus() {
         p.phaseOffset = 0;
         p.passthroughQpc = 4166;
         p.lagOverride = 0;
+        // Guard deliberately ARMED (production's rule) even though every fixture predates
+        // it: at a present clock matching the source rate the target advances a full
+        // period every present, so the guard must not change one decision here, and the
+        // corpus pins verify that on real captures. An earlier output-stamp-based guard
+        // failed exactly this gate - late-stamped deliveries read as sub-tooth advances
+        // and a quarter of one fixture's genuine hole covers demoted - which is why the
+        // guard measures target advance instead.
         p.explicitArrivals = fx.arrivals;
         p.explicitPresents = fx.presents;
         const SimResult r = Simulate(p);
@@ -3338,7 +3362,10 @@ static void test_composite_lock_acquisition() {
     }
     CHECK(tailPass == 1000, "steady state after acquisition: %d/1000 pass", tailPass);
     CHECK(r.engaged.back(), "lock not engaged at the end of the acquisition run");
-    PinCensus(r, warmup, 5928, 62, 0, 1, "lock_acquisition");
+    // The hold is the tooth guard on the one present after the acquisition pull snap,
+    // whose re-phased target sits sub-tooth from the last consumed one: a re-present in
+    // place of a blend during re-lock (pre-guard pin: 62 synths, 0 holds).
+    PinCensus(r, warmup, 5928, 61, 1, 1, "lock_acquisition");
 }
 
 // Display-quantized arrivals: a 90 fps source on a FIXED-REFRESH 240 Hz panel flips
@@ -3372,6 +3399,246 @@ static void test_composite_quantized_arrivals() {
     CHECK(wLo >= 0.40 && wHi <= 0.65,
           "quantized synth weights [%.3f, %.3f] not near the comb midpoint", wLo, wHi);
     PinCensus(r, warmup, 2950, 2950, 0, 5899, "quantized_arrivals");
+}
+
+// THE TOOTH GUARD at a present clock TWICE the source rate. In-game frame generation
+// presents through the game's own swapchain, so DWM's compose clock - which the vsync
+// present blocks on - runs at the DISPLAYED rate, twice the base. Every other target
+// then sits mid-tooth, where the bracket is two ADJACENT real frames and the mid-weight
+// blend is a frame the source never produced; a 60 Hz scanout downstream samples one
+// parity of the resulting alternation, all-sharp or all-blend by phase luck. Guarded,
+// the mid-tooth presents re-present (hold-comb) and every real frame still passes
+// through sharp exactly once.
+static void test_composite_tooth_guard_double_rate() {
+    SimParams p{};
+    p.srcPeriod = 16672;
+    p.presentPeriod = 8336;
+    p.arrivalJitter = 300;
+    p.combQpc = 16672;
+    p.presents = 12000;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    // Off the gate's knife edge: the default lag parks the two parities at exactly a
+    // quarter period from the teeth, where the Schmitt band latches BOTH into passing.
+    // The field runs nowhere near that edge; the offset puts one parity well inside the
+    // gate and the other mid-tooth. The comb lock itself DISENGAGES in this regime (the
+    // mid-tooth parity wraps to a half-comb error and trips the stability gate; measured
+    // lk=0 pull=0 through every field test window), so the guard must not depend on it.
+    p.phaseOffset = 3500;
+    SimResult r = Simulate(p);
+    const size_t warmup = 3000;
+    int pass = 0, synth = 0, holdComb = 0, hold = 0;
+    int64_t stepLo = INT64_MAX, stepHi = INT64_MIN;
+    int64_t prevPassOut = INT64_MIN;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        if (IsPass(r.ops[i])) {
+            pass++;
+            if (prevPassOut != INT64_MIN) {
+                const int64_t step = r.outTs[i] - prevPassOut;
+                if (step < stepLo) stepLo = step;
+                if (step > stepHi) stepHi = step;
+            }
+            prevPassOut = r.outTs[i];
+        }
+        else if (r.ops[i] == policy::CompositeOp::Synthesize) synth++;
+        else if (r.ops[i] == policy::CompositeOp::HoldComb) holdComb++;
+        else hold++;
+    }
+    const int total = pass + synth + holdComb + hold;
+    CHECK(synth == 0, "%d mid-tooth blends survived the guard", synth);
+    CHECK(hold == 0, "%d plain holds in a clean double-rate run", hold);
+    CHECK(pass * 2 >= total * 98 / 100 && pass * 2 <= total * 102 / 100,
+          "pass share %d of %d is not the on-tooth half", pass, total);
+    // Content still advances one tooth per pass: nothing skipped, nothing repeated.
+    CHECK(pass == 0 || (stepLo > 16672 - 2000 && stepHi < 16672 + 2000),
+          "pass-to-pass content steps [%lld, %lld] not one source period",
+          (long long)stepLo, (long long)stepHi);
+}
+
+// Holes are still covered at the doubled present clock: the missing tooth's target
+// advances a FULL source period past the last output, which is exactly what the guard's
+// cut admits. One blend per hole, mid-tooth neighbors guarded, no plain holds.
+static void test_composite_tooth_guard_hole_cover() {
+    SimParams p{};
+    p.srcPeriod = 16672;
+    p.presentPeriod = 8336;
+    p.arrivalJitter = 300;
+    p.combQpc = 16672;
+    p.presents = 12000;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.phaseOffset = 3500;   // off the knife edge; see the double-rate test
+    const int kHoles = 25;
+    for (int i = 0; i < kHoles; i++) p.drops.push_back(3000 + 100 * (int64_t)i);
+    SimResult r = Simulate(p);
+    const size_t warmup = 3000;
+    int blends = 0, holds = 0;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        if (r.ops[i] == policy::CompositeOp::Synthesize) blends++;
+        if (r.ops[i] == policy::CompositeOp::Hold) holds++;
+    }
+    CHECK(blends == kHoles, "%d blends for %d injected holes at the doubled clock",
+          blends, kHoles);
+    // One plain hold per hole: the mid-tooth present BEFORE the missing tooth reaches
+    // for an after endpoint two teeth out, which is beyond the 1.25x lag, so the
+    // one-sided rule holds it (same re-present the guard would produce one arm later).
+    CHECK(holds == kHoles, "%d plain holds for %d holes at the doubled clock",
+          holds, kHoles);
+}
+
+// Four presents per tooth (a composed 240 Hz desktop over a 60 fps source), zero
+// jitter so the run is deterministic. The passthrough gate spans two present periods
+// at this ratio, so two or three of the four parities legitimately PASS the same
+// tooth (repeats, not regressions) and the guard demotes only the mid-tooth
+// remainder; the largest sub-tooth advance (3/4 of a period) stays under the cut.
+// What matters is that nothing BLENDS and content still advances one tooth at a time.
+static void test_composite_tooth_guard_quad_rate() {
+    SimParams p{};
+    p.srcPeriod = 16672;
+    p.presentPeriod = 4168;
+    p.arrivalJitter = 0;
+    p.combQpc = 16672;
+    p.presents = 12000;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.phaseOffset = 3500;   // off the knife edge; see the double-rate test
+    SimResult r = Simulate(p);
+    const size_t warmup = 3000;
+    int synth = 0, holdComb = 0, hold = 0, contentSteps = 0;
+    int64_t stepLo = INT64_MAX, stepHi = INT64_MIN;
+    int64_t prevOut = INT64_MIN;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        if (r.ops[i] == policy::CompositeOp::Synthesize) synth++;
+        else if (r.ops[i] == policy::CompositeOp::HoldComb) holdComb++;
+        else if (r.ops[i] == policy::CompositeOp::Hold) hold++;
+        if (r.outTs[i] != prevOut) {
+            if (prevOut != INT64_MIN) {
+                const int64_t step = r.outTs[i] - prevOut;
+                if (step < stepLo) stepLo = step;
+                if (step > stepHi) stepHi = step;
+                contentSteps++;
+            }
+            prevOut = r.outTs[i];
+        }
+    }
+    const int total = (int)(r.ops.size() - warmup);
+    CHECK(synth == 0, "%d blends at the quad clock", synth);
+    CHECK(hold == 0, "%d plain holds at the quad clock", hold);
+    CHECK(holdComb > 0, "the guard never fired at the quad clock");
+    CHECK(contentSteps * 4 >= total * 96 / 100 && contentSteps * 4 <= total * 104 / 100,
+          "%d content advances over %d presents is not one tooth per four", contentSteps,
+          total);
+    CHECK(stepLo > 16672 - 200 && stepHi < 16672 + 200,
+          "content steps [%lld, %lld] not one source period",
+          (long long)stepLo, (long long)stepHi);
+}
+
+// The guard's exact cut, and its safety rails, pinned against hand-built brackets.
+static void test_composite_tooth_guard_boundary() {
+    policy::PolicyConfig cfg;
+    cfg.stickinessQpc = kStickinessUs;
+    cfg.passthroughQpc = 4168;
+    cfg.srcPeriodQpc = 16672;
+    const int64_t cut = (16672 * 7) / 8;
+
+    // A hole bracket: before shown at 0, after two teeth out. Sweeping the target
+    // across the cut flips the decision exactly there.
+    policy::BracketInfo hole;
+    hole.hasBefore = hole.hasAfter = true;
+    hole.beforeTs = 0;
+    hole.afterTs = 33344;
+    {
+        policy::CompositeState s;
+        s.lastOutputTs = 0;
+        s.lastTargetTs = 0;
+        policy::BracketInfo b = hole;
+        b.beforeDiff = cut - 1;
+        b.afterDiff = hole.afterTs - b.beforeDiff;
+        CHECK(policy::DecideComposite(b, s, cfg).op == policy::CompositeOp::HoldComb,
+              "one tick under the cut did not demote");
+        CHECK(s.lastOutputTs == 0, "a guarded re-present advanced composite state");
+    }
+    {
+        policy::CompositeState s;
+        s.lastOutputTs = 0;
+        s.lastTargetTs = 0;
+        policy::BracketInfo b = hole;
+        b.beforeDiff = cut;
+        b.afterDiff = hole.afterTs - b.beforeDiff;
+        CHECK(policy::DecideComposite(b, s, cfg).op == policy::CompositeOp::Synthesize,
+              "the cut itself did not synthesize");
+    }
+    {
+        // Fresh state: INT64_MIN means nothing output yet, which must synthesize
+        // rather than demote (and must not overflow the advance arithmetic).
+        policy::CompositeState s;
+        policy::BracketInfo b = hole;
+        b.beforeDiff = 8336;
+        b.afterDiff = hole.afterTs - b.beforeDiff;
+        CHECK(policy::DecideComposite(b, s, cfg).op == policy::CompositeOp::Synthesize,
+              "first output of a run was demoted");
+    }
+    {
+        // The substitution mirror: a generated frame sitting perfectly on a
+        // manufactured tooth is refused, and the decision re-presents instead. With
+        // the guard disarmed the identical bracket substitutes, pinning that the
+        // mirror is the only thing refusing it.
+        policy::CompositeState s;
+        s.lastOutputTs = 0;
+        s.lastTargetTs = 0;
+        policy::BracketInfo b;
+        b.hasBefore = b.hasAfter = true;
+        b.beforeTs = 0;
+        b.afterTs = 16672;
+        b.beforeDiff = 8336;
+        b.afterDiff = 8336;
+        b.hasGen = true;
+        b.genUsable = true;
+        b.genTs = 8336;
+        b.genDiff = 0;
+        CHECK(!policy::GeneratedCandidateOnTarget(b, s, cfg),
+              "generated candidate accepted on a manufactured tooth");
+        CHECK(policy::DecideComposite(b, s, cfg).op == policy::CompositeOp::HoldComb,
+              "manufactured tooth did not demote with a generated frame reachable");
+        policy::PolicyConfig unguarded = cfg;
+        unguarded.srcPeriodQpc = 0;
+        policy::CompositeState s2;
+        s2.lastOutputTs = 0;
+        s2.lastTargetTs = 0;
+        CHECK(policy::DecideComposite(b, s2, unguarded).op ==
+                  policy::CompositeOp::PassthroughGenerated,
+              "unguarded control did not substitute");
+    }
+}
+
+// The pre-guard rule on the identical double-rate run, as a differential: half the
+// presents blend at mid weight and nothing re-presents. This is the field shape the
+// guard was built against; if the guard path ever leaks into the unguarded rule, or
+// the simulator stops producing the pathology, this is what fails.
+static void test_composite_tooth_guard_differential() {
+    SimParams p{};
+    p.srcPeriod = 16672;
+    p.presentPeriod = 8336;
+    p.arrivalJitter = 300;
+    p.combQpc = 16672;
+    p.presents = 12000;
+    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.phaseOffset = 3500;   // off the knife edge; see the double-rate test
+    p.noToothGuard = true;
+    SimResult r = Simulate(p);
+    const size_t warmup = 3000;
+    int synth = 0, holdComb = 0, total = 0;
+    double wLo = 1.0, wHi = 0.0;
+    for (size_t i = warmup; i < r.ops.size(); i++) {
+        total++;
+        if (r.ops[i] == policy::CompositeOp::HoldComb) holdComb++;
+        if (r.ops[i] != policy::CompositeOp::Synthesize) continue;
+        synth++;
+        if (r.weights[i] < wLo) wLo = r.weights[i];
+        if (r.weights[i] > wHi) wHi = r.weights[i];
+    }
+    CHECK(holdComb == 0, "hold-comb emitted with the guard disabled");
+    CHECK(synth * 2 >= total * 96 / 100 && synth * 2 <= total * 104 / 100,
+          "unguarded synth share %d of %d is not the mid-tooth half", synth, total);
+    CHECK(synth == 0 || (wLo >= 0.35 && wHi <= 0.65),
+          "unguarded blend weights [%.3f, %.3f] not mid-tooth", wLo, wHi);
 }
 
 // ---------------------------------------------------------------------------------
@@ -3617,6 +3884,11 @@ int main(int argc, char** argv) {
     test_generated_frame_placement();
     test_composite_lock_acquisition();
     test_composite_quantized_arrivals();
+    test_composite_tooth_guard_double_rate();
+    test_composite_tooth_guard_hole_cover();
+    test_composite_tooth_guard_quad_rate();
+    test_composite_tooth_guard_boundary();
+    test_composite_tooth_guard_differential();
 
     test_flip_history();
     test_flip_pairing();

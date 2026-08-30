@@ -718,9 +718,23 @@ lose zero events across seven runs, but that is a property of a measured workloa
 
 ## Open questions
 
-0. **THE ONE THAT GATES STAGE 7: does a generated frame's CONTENT phase match its DISPLAY
-   phase?** Nothing measured so far speaks to this, and every other question here is now closed
-   enough to proceed without.
+0. **ANSWERED, 2026-08-20, and the answer was NO.** Content phase is a CONSTANT 0.4952 and does
+   not track display phase at all. The reasoning below - that a generator has every reason to
+   make content for the instant it intends to display - is exactly the kind that sounded good
+   and was wrong.
+
+   Consequences, all live in `docs/stage7-generated-frame-spec.md`: a generated frame is placed
+   between its two real NEIGHBOURS (`(j+1)/N`, the midpoint at x2), never at its flip time. The
+   midpoint rule lands 259 us from the measured phase - the estimator's own floor - against
+   587 us sd and 914 us p90 for the flip time. So flip-stamping would have been the worse
+   answer by a factor of two, and ETW is NOT needed to place a generated frame.
+
+   Note also that the "costs nothing today" paragraph below is now FALSE: `-subgen` ships and
+   selection does use generated frames, so this placement is load-bearing.
+
+   *Original question, retained for the reasoning:* does a generated frame's CONTENT phase match
+   its DISPLAY phase? Nothing measured so far speaks to this, and every other question here is
+   now closed enough to proceed without.
 
    A generated frame's content is an interpolation at some fraction between two real frames. Its
    display time is wherever the driver's metering put it, and that is measurably NOT the midpoint:
@@ -743,6 +757,23 @@ lose zero events across seven runs, but that is a property of a measured workloa
    Measure content fraction against ETW display fraction on the same frames; if they track, stage
    7 is safe. **The measurement is now specified - method, ground-truth validation and pass
    criterion are in the stage 7 section, and it is the first work item of the stage.**
+
+0b. **OPEN: is `-etw -dejit` still earning its place?** The `-lag 75` fix ate most of dejitter's
+   measured value. At the old lag it cut holds 6.05 -> 4.71/s and synths 6.06 -> 4.96/s; holds
+   are now 0 regardless, so that contribution is gone. What remains is stamp accuracy at the
+   passthrough boundary, and it is not nothing: on `subgen_kcd_implied_diffmap` dejitter
+   corrected 3432 batches (2.6%), and the corpus shows it removing 75 blends against 1 added.
+
+   It also now interacts with `-subgen`: a generated frame's placement takes the MEAN of its two
+   neighbours' corrections, so dropping dejitter makes that placement simpler (both terms zero
+   and self-consistent), not worse.
+
+   **The experiment is one capture at `-lag 75` WITHOUT `-dejit`**, compared against a run with
+   it. Note such a capture has no ETW flip stream, so the replay harness cannot read it - judge
+   it on `bpacing.py`'s own op census. If synths land at the same rate either way, the default
+   collapses to `b:vsync -src 60 -lock -lag 75 -subgen`, which is FEWER moving parts than today.
+   `-subgen` does not need ETW: the change map is an NvFBC feature and the placement comes from
+   batch structure, so this decision is orthogonal to the substitution.
 
 1. **Raw ETW delivery lag. MEASURED - and the session must be configured for it.** Left at
    defaults, real-time ETW delivers on a ~1 s cadence and hands over the PREVIOUS period's buffer,
