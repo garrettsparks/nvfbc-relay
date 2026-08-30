@@ -79,6 +79,9 @@ struct WakeRec {
     // Modelling the vote at the arrival instant instead costs one reset on the validation
     // capture, which is the whole reason this field is parsed.
     int64_t flush = 0;
+    // NvFBC's own change map for this grab: blocks that differ from the previous grab.
+    // -1 when the capture ran without the instrument.
+    int64_t changedBlocks = -1;
     long long index = 0;    // capture #N, so a divergence can be named
     long long collapsed = -1;   // col=, cumulative; -1 when the log predates the field
 };
@@ -207,6 +210,11 @@ bool ParseLog(const char* path, Capture* out) {
             w.flush *= kTicksPerUs;
             w.index = idx;
             w.collapsed = Field(p, "col=", &col) ? col : -1;
+            // The driver's change map for this grab, -1 when the instrument was off. Zero
+            // means this grab returned the same content as the previous one, which is how
+            // the ring refuses a capture-race duplicate without touching pixels.
+            int64_t diff = -1;
+            w.changedBlocks = Field(p, "diff=", &diff) ? diff : -1;
             out->wakes.push_back(w);
             continue;
         }
@@ -635,6 +643,8 @@ struct CaptureCensus {
     long long observations = 0;   // RotationObserve calls that landed
     // Batches whose retracted member was kept reachable.
     long long substitutableBatches = 0;
+    // Retractions the driver's change map refused as capture-race duplicates.
+    long long genDupRefused = 0;
     // Grid readings actually seen, to name the regime rather than assume it.
     long long fpsHist[16] = {0};
     long long strideHist[16] = {0};
@@ -1127,7 +1137,16 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
         if (keep.collapsed) collapsed++;
 
         ring.Write(count, keep.stampTs, batch.stampTs, batch.member, keep.keepThis);
-        if (keep.retractPrev) ring.Retract(count, substitutable, cfg.assumedSrcPeriod);
+        // A change map reading zero means the two members are the same frame, so the
+        // retracted one is a duplicate and never becomes reachable. Mirrors
+        // CaptureRing::RetractGenerated; -1 (no instrument) leaves the slot reachable and
+        // the compositor's own content check owns the question.
+        if (keep.retractPrev && cap.wakes[i].changedBlocks != 0) {
+            ring.Retract(count, substitutable, cfg.assumedSrcPeriod);
+        } else if (keep.retractPrev) {
+            ring.Retract(count, false, cfg.assumedSrcPeriod);
+            c.genDupRefused++;
+        }
 
         // Per-wake fidelity against the log's own cumulative col=.
         if (cap.wakes[i].collapsed >= 0 && cap.wakes[i].collapsed != collapsed) {
@@ -1716,8 +1735,9 @@ void ReportCensus(const Capture& cap, const CaptureCensus& c) {
                     c.collapsed);
     }
     if (c.substitutableBatches) {
-        std::printf("subgen: %lld of %lld batches offered a retracted frame to the ring\n",
-                    c.substitutableBatches, c.opens);
+        std::printf("subgen: %lld of %lld batches offered a retracted frame to the ring;"
+                    " %lld refused as duplicates by the driver's change map\n",
+                    c.substitutableBatches, c.opens, c.genDupRefused);
     }
 }
 

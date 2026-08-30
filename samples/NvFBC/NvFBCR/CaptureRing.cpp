@@ -306,12 +306,32 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
 // reading. That is safe for the same reason plain retraction is: the pixels are never
 // touched, and a present that reads the old stamp gets a value that was true a moment ago
 // rather than a torn one - the write is a single aligned 64-bit store.
-void CaptureRing::RetractGenerated(long long count) {
+void CaptureRing::RetractGenerated(long long count, long long changedBlocks) {
     if (count < 1) return;
     const int genSlot = (int)((count - 1) % m_ringSlots);
     m_ring[genSlot].valid = false;
     m_ring[genSlot].generated = false;
     if (!m_subGenArmed) return;
+
+    // THE CONTENT CHECK, when the driver will do it for us. changedBlocks is how many
+    // blocks NvFBC says differ between THIS grab and the previous one - that is, between
+    // the real member just published and the generated member about to be retracted. Zero
+    // means the capture race handed us the same frame twice, so the slot holds a duplicate
+    // and must not be reachable.
+    //
+    // Measured against the pixel instrument over 65619 batches: this catches 98.80% of
+    // duplicates with ZERO false positives (0 of 60711 genuine frames). The separation is
+    // total rather than tuned - duplicates sit at exactly 0 blocks and genuine frames at
+    // p10 6135 of 8160 - so there is no threshold here, and widening it to 20 blocks
+    // changes nothing. It costs a comparison on a value already computed for the log,
+    // against the GPU pipeline sync the present-thread check needs.
+    //
+    // -1 means the instrument is off (the driver refused it, or -diffmap was not asked
+    // for); the compositor's pixel check then covers this and the slot stays reachable.
+    if (changedBlocks == 0) {
+        m_genDupRefused++;
+        return;
+    }
 
     // Members submitted in this batch so far, counting the one just published. Frame
     // generation submits its generated frames alongside the real one they precede, so a
@@ -596,6 +616,28 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         if (batch.member > 0) m_prevLastMember = batch.member;
         else m_prevLastMember = 0;
 
+        // THE DRIVER'S OWN ANSWER to "did this grab return different content from the last
+        // one", read before the ring decisions because the retraction below needs it.
+        //
+        // -1 when the instrument is off, so the field is always present and unambiguous.
+        // TWO counts on purpose: diff= assumes the map covers the capture dimensions at
+        // 16x16, dtot= scans four times that extent and assumes less. They have agreed
+        // exactly on every wake measured, which is what confirmed the geometry.
+        long long changed = -1, changedAll = -1;
+        if (m_diffMapActive) {
+            const unsigned char* dm = (const unsigned char*)m_diffMapBuf;
+            changed = 0;
+            for (unsigned int b = 0; b < m_diffMapBlocks; b++) {
+                if (dm[b] != 0) changed++;
+            }
+            unsigned int wide = m_diffMapBlocks * 4;
+            if (wide > NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE) wide = NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE;
+            changedAll = 0;
+            for (unsigned int b = 0; b < wide; b++) {
+                if (dm[b] != 0) changedAll++;
+            }
+        }
+
         // What this wake does to the ring, decided in the policy layer so it is testable at
         // all: with no rotation guidance (m_rotRealMember < 0 - x2, frame generation off, an
         // unconverged vote) it reduces to exactly the keep-real rule this loop always had.
@@ -616,45 +658,15 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         if (keep.retractPrev) {
             // Retract the previous member (the generated frame): hide it from future brackets.
             // Content is never overwritten, so a present read already in flight stays coherent.
-            RetractGenerated(count);
+            RetractGenerated(count, changed);
         }
         if (keep.collapsed) collapsed++;
 
         // Verbose: source arrival timeline (dt = inter-arrival gap ≈ source frame period);
         // flush = GPU-completion wait added by the cross-device coherency fix; col = cumulative
-        // batch-collapsed wakes (skipped or retracted frame-gen members).
+        // batch-collapsed wakes (skipped or retracted frame-gen members); diff/dtot = the
+        // driver's change map, see above.
         LONGLONG dt = (prevArrival != 0) ? (now.QuadPart - prevArrival) : 0;
-        // diff= is the instrument's whole output: how many 16x16 blocks the driver says
-        // changed since the previous grab. Zero means this grab returned the same content
-        // as the last one, which is the capture race the content check hunts for with
-        // pixels. Appended after the existing fields so every tool that reads this line by
-        // key is unaffected.
-        // -1 when the instrument is off, so the field is always present and unambiguous.
-        //
-        // TWO counts on purpose. diff= assumes the map covers the capture dimensions at
-        // 16x16; dtot= counts every non-zero byte in the whole allocation and assumes
-        // nothing. If the driver lays the map out over the SOURCE resolution rather than
-        // the scaled capture, or packs it differently, the two disagree and the analysis
-        // uses dtot=. VirtualAlloc commits zeroed pages, so bytes the driver never writes
-        // stay zero and cannot inflate it.
-        long long changed = -1, changedAll = -1;
-        if (m_diffMapActive) {
-            const unsigned char* dm = (const unsigned char*)m_diffMapBuf;
-            changed = 0;
-            for (unsigned int b = 0; b < m_diffMapBlocks; b++) {
-                if (dm[b] != 0) changed++;
-            }
-            // Four times the expected extent rather than the whole 256 KB allocation: it
-            // covers any plausible geometry mismatch (source against scaled capture is at
-            // most ~1.8x in area here) without scanning a quarter megabyte on the capture
-            // thread 120 times a second.
-            unsigned int wide = m_diffMapBlocks * 4;
-            if (wide > NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE) wide = NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE;
-            changedAll = 0;
-            for (unsigned int b = 0; b < wide; b++) {
-                if (dm[b] != 0) changedAll++;
-            }
-        }
         LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld diff=%lld dtot=%lld",
             count,
             (long long)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
@@ -827,6 +839,7 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, const policy::StampOverlay* ov
             if (d < 0) d = -d;
             if (d < bestGenDiff) {
                 bestGenDiff = d;
+                out->genScreened = m_diffMapActive;
                 out->info.hasGen = true;
                 out->info.genTs = m_ring[slot].timestamp.QuadPart;
                 out->info.genDiff = d;

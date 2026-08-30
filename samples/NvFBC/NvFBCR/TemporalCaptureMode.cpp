@@ -622,10 +622,10 @@ void TemporalCaptureMode::Run(
         // from a replay. offered counts the presents where PLACEMENT said yes, so
         // offered - substituted - rejected is what the policy's own rules refused.
         const SynthCompositorBase::GenSubStats& g = m_synth->GeneratedSubstitutionStats();
-        LOG("subgen summary: %lld substituted, %lld offered, %lld rejected on content, "
-            "content check %lld us worst / %lld us mean",
-            g.substituted, g.offered, g.rejectedContent, g.checkUsMax,
-            g.offered ? g.checkUsTotal / g.offered : 0);
+        LOG("subgen summary: %lld substituted, %lld offered, %lld refused by the change map, "
+            "%lld rejected on content, content check %lld us worst / %lld us mean",
+            g.substituted, g.offered, m_ring.GeneratedDuplicatesRefused(), g.rejectedContent,
+            g.checkUsMax, g.offered ? g.checkUsTotal / g.offered : 0);
     }
     m_ring.Stop();
 }
