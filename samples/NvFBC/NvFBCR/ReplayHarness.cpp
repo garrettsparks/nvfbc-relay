@@ -517,8 +517,17 @@ struct RingModel {
         *depthOut = bestDepth;
         return true;
     }
-    // CaptureRing::FindBracket, with the overlay left out (dejitter is off on every capture
-    // this harness is pointed at, and its threshold is below the log's resolution).
+    // CaptureRing::FindBracket, with the dejitter overlay LEFT OUT - so this models a
+    // dejit-off relay whatever the capture ran.
+    //
+    // That was once true by construction (no capture this replayed used -dejit) and is not
+    // any more: every -subgen capture runs it. What the omission costs is bounded by how
+    // little dejitter does - 1120 corrected batches of 318706 on the 2026-08-27 capture,
+    // 0.35% - and the op census still agrees with the field within ~2%. What it CANNOT see
+    // is any bug in the interaction between corrections and the ring's stamps, which is
+    // exactly where one shipped: generated frames were placed on the raw timeline while
+    // their bracket endpoints were corrected. Modelling the overlay needs per-batch
+    // correction values the log does not record, so closing this means logging them first.
     void FindBracket(int64_t target, policy::BracketInfo* out, int* beforeDepth) const {
         *out = policy::BracketInfo();
         *beforeDepth = -1;

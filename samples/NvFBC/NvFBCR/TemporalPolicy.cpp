@@ -15,6 +15,19 @@ const char* PickLabel(Pick p) {
 
 // Map a tick offset into [-p/2, p/2): the signed distance to the nearest point on a
 // p-periodic timeline. C++ % truncates toward zero, so negative remainders need folding up.
+bool PlaceGeneratedFrame(int64_t beforeTs, int64_t afterTs, int member, int members,
+                         int64_t* outTs) {
+    if (members < 2 || member < 0 || member >= members - 1) return false;
+    if (beforeTs >= afterTs) return false;
+    *outTs = beforeTs + (afterTs - beforeTs) * (member + 1) / members;
+    return true;
+}
+
+int64_t CorrectGeneratedStamp(int64_t placedTs, int64_t correctionNewer,
+                              int64_t correctionOlder) {
+    return placedTs - (correctionNewer + correctionOlder) / 2;
+}
+
 int RingSlotsForLag(int64_t bracketingDelayQpc, int64_t srcPeriodQpc, int minSlots,
                     int maxSlots) {
     const int64_t wakePeriod = srcPeriodQpc / 2;   // x2 delivers ~2 wakes per source frame
