@@ -838,6 +838,7 @@ const char* CompositeLabel(CompositeOp op) {
         case CompositeOp::PassthroughAfter:    return "pass-after";
         case CompositeOp::Synthesize:          return "synth";
         case CompositeOp::PassthroughGenerated: return "pass-gen";
+        case CompositeOp::HoldComb:            return "hold-comb";
         default:                               return "hold";
     }
 }
@@ -852,6 +853,41 @@ static int64_t PassthroughGate(const CompositeState& s, const PolicyConfig& cfg)
     return s.lastSynth ? cfg.passthroughQpc : cfg.passthroughQpc + band;
 }
 
+// The tooth guard: whether synthesizing at this target would manufacture an instant the
+// source comb does not contain. A present clock faster than the source (in-game frame
+// generation runs the compose clock at the DISPLAYED rate, twice the base; a composed
+// desktop runs it at four times) puts targets between teeth, where the bracket is two
+// ADJACENT real frames and the mid-bracket blend is a frame the source never produced.
+// Worse than useless: the output then alternates real/synthetic at the compose rate, and
+// a downstream scanout at the source rate samples ONE PARITY of that stream - all-sharp
+// or all-blend decided by phase luck at startup.
+//
+// The measure is TARGET-to-target advance since the last consumed decision, never
+// output-stamp advance. Targets march on the present clock and carry microseconds of
+// jitter; output stamps carry delivery lateness, and measuring against them demoted a
+// quarter of a reference capture's genuine hole covers because the pass before the hole
+// had been stamped a few milliseconds late. On a present clock at the source rate the
+// target advances a full period every present, so the guard cannot fire there at all.
+//
+// A synthesis is legitimate only when it covers a missing tooth, and a missing tooth is
+// at least a full source period of target advance away. The cut sits at 7/8 of a period:
+// the largest sub-tooth advance a faster compose clock produces is 3/4 of a period (the
+// 4x case), the smallest legitimate cover is a full period. Compose clocks beyond 4x the
+// source would need a finer cut; none exists in this pipeline.
+//
+// Factored out for the same reason as PassthroughGate: the substitution rule and the
+// composite decision must reach the same verdict from the same bracket, or the
+// substitution re-opens the manufactured tooth the guard closed.
+static bool SynthWouldManufactureTooth(const BracketInfo& b, const CompositeState& s,
+                                       const PolicyConfig& cfg) {
+    if (cfg.srcPeriodQpc <= 0) return false;
+    // INT64_MIN marks "nothing consumed yet"; arithmetic against it would overflow, and
+    // the first decision of a run can never be a manufactured repeat.
+    if (s.lastTargetTs == INT64_MIN) return false;
+    const int64_t targetTs = b.beforeTs + b.beforeDiff;
+    return targetTs - s.lastTargetTs < (cfg.srcPeriodQpc * 7) / 8;
+}
+
 bool GeneratedCandidateOnTarget(const BracketInfo& b, const CompositeState& s,
                                 const PolicyConfig& cfg) {
     if (!b.hasGen || !b.hasBefore || !b.hasAfter) return false;
@@ -860,6 +896,12 @@ bool GeneratedCandidateOnTarget(const BracketInfo& b, const CompositeState& s,
     // already showing real pixels at the right instant and has nothing to gain.
     const int64_t gate = PassthroughGate(s, cfg);
     if (b.beforeDiff < gate || b.afterDiff < gate) return false;
+
+    // Where the tooth guard re-presents rather than blends, there is no blend to stand in
+    // for. A generated frame sits mid-tooth by construction, so without this mirror every
+    // guarded present would substitute instead, showing generated content at the compose
+    // rate - the same parity lottery the guard exists to close.
+    if (SynthWouldManufactureTooth(b, s, cfg)) return false;
 
     // The gate is the BARE threshold, deliberately not the widened band: the band exists
     // to stop a parked phase chattering between passing and synthesizing on the same
@@ -943,10 +985,18 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
         outputTs = b.genTs;
         showedGen = true;
     } else if (b.hasBefore && b.hasAfter) {
-        // No real frame near the target but both endpoints exist: synthesize at the
-        // target time (synthesis is constant-latency by construction). Holes classify
-        // here with no detection needed: a dropped source frame widens the bracket,
-        // the hole present reads mid-w, and neighbors are untouched.
+        // No real frame near the target but both endpoints exist. If the target has not
+        // advanced a tooth past the last output, the comb owes it nothing: re-present
+        // rather than manufacture a frame the source never produced. State is left
+        // untouched exactly as a Hold leaves it, so the guarded presents are invisible
+        // to the Schmitt loops and the next on-tooth present decides from clean state.
+        if (SynthWouldManufactureTooth(b, s, cfg)) {
+            d.op = CompositeOp::HoldComb;
+            return d;
+        }
+        // Synthesize at the target time (synthesis is constant-latency by construction).
+        // Holes classify here with no detection needed: a dropped source frame widens the
+        // bracket, the hole present reads mid-w, and neighbors are untouched.
         d.op = CompositeOp::Synthesize;
         synth = true;
         const int64_t span = b.beforeDiff + b.afterDiff;
@@ -977,6 +1027,7 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
     s.lastOutputTs = outputTs;
     s.lastPassAfter = passAfter;
     s.lastSynth = synth;
+    s.lastTargetTs = b.beforeTs + b.beforeDiff;
     // After the monotone guard, so a demoted present cannot record a frame it never
     // showed and lock the no-reuse rule against a substitution that never happened.
     if (showedGen) s.lastGenTs = outputTs;

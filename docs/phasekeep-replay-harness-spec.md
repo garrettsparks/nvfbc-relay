@@ -131,3 +131,44 @@ next finding - do not loosen the tolerance to pass.
 - Reclaimed singles' pixels are ASSUMED real via the x2-proven coalesced mechanism,
   unverified at x3. If the confirmation capture still ghosts at ~1.7/s events, suspect
   the reclaims first; `-fgphase`-style gdiff on reclaimed slots would settle it.
+
+## The dejitter overlay (added 2026-08-29)
+
+The harness originally left the stage-6 overlay out, on the stated grounds that no capture it
+replayed used `-dejit` and that the correction threshold sat below the log's resolution. That
+was true when written and quietly stopped being true: every `-subgen` capture runs `-dejit`.
+
+The cost was not the aggregate, which stayed inside the ~4% the harness claims. It was a blind
+spot exactly where a bug shipped. `CaptureRing::FindBracket` corrected bracket endpoints and
+skipped generated slots, so generated frames sat on the raw timeline while their neighbours
+moved - and a model that ignores corrections on BOTH cannot see the difference. The same
+omission hid a second defect in the harness itself: it published raw `beforeTs`/`afterTs`
+where the relay publishes corrected ones.
+
+It now feeds the REAL `policy::StampOverlay` from the log's own
+`dejit: batch arr=<us> late by <us>, corrected` lines - dejitter replayed, not modelled -
+inserted in present order, because the relay computes corrections DURING the present loop and a
+present must not see one that did not exist yet. No new logging was needed; those lines have
+been there since dejitter shipped.
+
+    capture                    substitutions        blend class
+    implied_diffmap (2.6%)     -7.0% -> 0.0%      +15.5% -> +0.1%
+    improved_gen_selection     +1.4% -> +1.8%      +3.4% ->  0.0%
+    subgen_kcd_0               +0.6% -> +0.3%      +1.7% -> -0.3%
+
+**Read that agreement carefully: it is partly circular.** The harness now replays the relay's
+own corrections instead of deriving them, so it can no longer check the correction
+COMPUTATION, only its application. The independent evidence is a quantity the overlay was not
+built from - the harness's bracket endpoint scored against the log's `before=` field - where
+mean error fell 2320 us -> 171 us and exact matches rose 84.6% -> 97.0%. A fitted model would
+not have moved that.
+
+Consequences for anyone using it:
+
+- Captures without `-dejit` are unaffected: output is byte-identical to the pre-overlay build
+  on `dxgk_x1`, `dxgk_x2` and the x3 fixture.
+- **`--ring 32` is mandatory on any `-lag 75` capture.** Ring size is not recorded in the log,
+  the harness defaults to 16, and a 32-slot capture replayed at 16 reports thousands of holds
+  the run never had. The header prints the ring for this reason.
+- The next agreement should be scored BLIND on a capture the model has never seen, because
+  every number above is on captures it was tuned against.

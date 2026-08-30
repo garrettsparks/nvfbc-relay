@@ -216,6 +216,13 @@ bool TemporalCaptureMode::Setup() {
         LOG("Phase comb lock ACTIVE (-lock): modulus %lld us (ratio denominator M=%d%s); pull=/lk= on the temporal line",
             m_policyCfg.combQpc * 1000000 / m_scheduler.Freq(), combM,
             combMatched ? "" : ", no rational match: M=1 fallback, stability gate decides");
+        // The composite tooth guard rides the comb, for sources at or above the present
+        // rate (an eighth of tolerance for declared-vs-nominal skew). Sub-rate sources
+        // stay unguarded: their mid-tooth synthesis is the mode's output, not an artifact
+        // of a fast compose clock.
+        if (m_assumedSrcPeriodQpc <= m_scheduler.PeriodQpc() * 9 / 8) {
+            m_policyCfg.srcPeriodQpc = m_assumedSrcPeriodQpc;
+        }
     } else {
         LOG("Phase comb lock off (%s); target rides the static lag alone",
             !m_lock ? "-lock not set" : "-lock set but no -src to derive the comb");
@@ -242,6 +249,11 @@ bool TemporalCaptureMode::Setup() {
             m_synth = new BlendCompositor(&m_policyCfg, m_tint);
             LOG("Blend compositor ACTIVE (b mode): passthrough threshold %lld us; op=/bw= on the temporal line",
                 m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq());
+        }
+        if (m_policyCfg.srcPeriodQpc > 0) {
+            LOG("Composite tooth guard ACTIVE: synthesis must advance a full source period "
+                "(%lld us teeth); op=hold-comb between teeth",
+                m_policyCfg.srcPeriodQpc * 1000000 / m_scheduler.Freq());
         }
         // Armed before Setup, which is where the content check allocates its readback
         // resources and where it disarms itself if they cannot be created.

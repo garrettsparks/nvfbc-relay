@@ -42,6 +42,25 @@ Every generated member of a batch is re-placed on each arrival, because N is not
 the batch ends: the first retraction in a 3-member batch legitimately believes N is 2, and the
 third member is what corrects it.
 
+### Placement and dejitter: both corrections, or the frame slides
+
+Dejitter corrects ring stamps PER BATCH at read time, and a placement is derived from TWO
+batches, so it takes the MEAN of their corrections (`policy::CorrectGeneratedStamp`). The slot
+records its older neighbour's batch for exactly this.
+
+**This shipped wrong and is worth remembering, because nothing would have shown it.**
+`FindBracket` corrected the bracket endpoints and skipped the generated slot, with a comment
+justifying the skip. The frame then slid relative to the very interval the 4166 us gate
+measures, and `genTs` was published raw while the endpoints were corrected, so the monotone and
+no-reuse rules were comparing across two timelines. A mis-placed substitution looks identical
+to a correct one in every aggregate the relay logs.
+
+Three test layers all missed it: PolicyTests and the corpus receive `BracketInfo` already
+filled, and the replay harness omitted the overlay entirely. The lesson is the same one
+`RingSlotsForLag` taught - **arithmetic that decides something must not live in a Windows TU** -
+and both rules are now `policy::PlaceGeneratedFrame` and `policy::CorrectGeneratedStamp` with
+tests that fail if the old behaviour returns.
+
 **What bounds the damage when the placement is wrong is the passthrough gate, not a regime
 test.** If the capture missed one of the driver's submissions, the interval gets divided into
 the wrong number of parts and the frame lands somewhere it is not. A frame placed further from
