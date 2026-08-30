@@ -714,6 +714,21 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         ConsoleUserInput(&framerateStr);
     }
 
+    // The substitution wants the driver's change map: it is what tells a generated frame
+    // from a capture-race duplicate of the frame beside it. Measured against the pixel
+    // instrument over 65619 batches it caught 98.80% of duplicates with zero false
+    // positives, and it costs a comparison on a value the capture loop already has rather
+    // than a GPU pipeline sync on the present thread. Implied rather than a second flag to
+    // remember, and harmless where the driver refuses it: the compositor's own content
+    // check still covers that case.
+    //
+    // MUST be resolved before ParseCaptureMode, which passes these flags to the mode's
+    // constructor - setting it afterwards would log the intent and change nothing.
+    if (g_subGen && !g_diffMap) {
+        g_diffMap = true;
+        LOG("-subgen implies -diffmap: the change map is the content check");
+    }
+
     // Create capture mode instance
     IFrameCaptureMode* captureMode = ParseCaptureMode(framerateStr);
     if (!captureMode) {

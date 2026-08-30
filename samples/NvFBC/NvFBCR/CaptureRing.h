@@ -35,6 +35,10 @@ struct FrameBracket {
     IDirect3DSurface9* genSurface = NULL;
     IDirect3DTexture9* genTexture = NULL;
     int genSlot = -1;
+    // The ring already screened this frame against the driver's change map, so a consumer
+    // must NOT pay for its own content check. False means no change map was available and
+    // the consumer owns the question.
+    bool genScreened = false;
 };
 
 // Source-paced capture ring on its OWN D3D9Ex device (branch B: two devices).
@@ -186,6 +190,11 @@ public:
     // gdiff is the ground truth to join against.
     void EnableDiffMap() { m_diffMapRequested = true; }
 
+    // True once SetUp has confirmed the driver gives us a change map. Only meaningful
+    // after Start. Consumers use it to skip their own content check.
+    bool DiffMapActive() const { return m_diffMapActive; }
+    long long GeneratedDuplicatesRefused() const { return m_genDupRefused; }
+
     // Session telemetry for the phase vote, logged at exit by the owner.
     long long PhaseKeepBatches() const { return m_phaseKeepBatches; }
     long long PhaseKeepFlipped() const { return m_phaseKeepFlipped; }
@@ -240,8 +249,10 @@ private:
 
     // Retract the generated member keep-real dropped, leaving it reachable but not
     // bracketable and stamped at its content time. count is the wake that published the
-    // REAL member; the generated one is the wake before it.
-    void RetractGenerated(long long count);
+    // REAL member; the generated one is the wake before it. changedBlocks is the driver's
+    // change map for THIS grab (-1 when unavailable): zero means the two members are the
+    // same frame, so the retracted one is a capture-race duplicate and stays unreachable.
+    void RetractGenerated(long long count, long long changedBlocks);
 
     // Content-phase instrument (-fgphase). Working geometry is a 320x180 GPU downscale:
     // small enough that the sync readback costs ~230 KB a wake, large enough that the
@@ -291,6 +302,8 @@ private:
     // pointer array is a member because SetUp keeps the array the client passes.
     bool m_diffMapRequested = false;
     bool m_diffMapActive = false;
+    // Retractions refused because the change map said the two members were the same frame.
+    long long m_genDupRefused = 0;
     void* m_diffMapBuf = NULL;
     void* m_diffMapPtrs[1] = {NULL};
     unsigned int m_diffMapBlocks = 0;   // blocks the map is expected to carry

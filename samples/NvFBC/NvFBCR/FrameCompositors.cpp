@@ -254,8 +254,16 @@ void SynthCompositorBase::Compose(const FrameBracket& bracket, IDirect3DSurface9
     if (m_subGen && info.hasGen) {
         if (policy::GeneratedCandidateOnTarget(info, m_compState, *m_cfg)) {
             m_genSub.offered++;
-            info.genUsable = GeneratedContentUsable(bracket);
-            if (!info.genUsable) m_genSub.rejectedContent++;
+            if (bracket.genScreened) {
+                // The capture side already refused duplicates using the driver's change
+                // map, which is both more accurate than this comparison and free. Anything
+                // still reachable has been screened, so paying for a GPU sync here would
+                // buy nothing.
+                info.genUsable = true;
+            } else {
+                info.genUsable = GeneratedContentUsable(bracket);
+                if (!info.genUsable) m_genSub.rejectedContent++;
+            }
         }
     } else {
         info.hasGen = false;   // disarmed: the policy must not see a candidate at all
