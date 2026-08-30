@@ -625,21 +625,18 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         // one", read before the ring decisions because the retraction below needs it.
         //
         // -1 when the instrument is off, so the field is always present and unambiguous.
-        // TWO counts on purpose: diff= assumes the map covers the capture dimensions at
-        // 16x16, dtot= scans four times that extent and assumes less. They have agreed
-        // exactly on every wake measured, which is what confirmed the geometry.
-        long long changed = -1, changedAll = -1;
+        //
+        // This once carried a second count over four times the extent, because the map's
+        // layout could not be verified without a capture: if the driver laid it out over
+        // the SOURCE resolution rather than the scaled one, the narrow count would have
+        // been reading half a map. The two agreed exactly on every wake of two captures,
+        // so the geometry is settled and the wide scan is gone.
+        long long changed = -1;
         if (m_diffMapActive) {
             const unsigned char* dm = (const unsigned char*)m_diffMapBuf;
             changed = 0;
             for (unsigned int b = 0; b < m_diffMapBlocks; b++) {
                 if (dm[b] != 0) changed++;
-            }
-            unsigned int wide = m_diffMapBlocks * 4;
-            if (wide > NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE) wide = NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE;
-            changedAll = 0;
-            for (unsigned int b = 0; b < wide; b++) {
-                if (dm[b] != 0) changedAll++;
             }
         }
 
@@ -669,15 +666,15 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
 
         // Verbose: source arrival timeline (dt = inter-arrival gap ≈ source frame period);
         // flush = GPU-completion wait added by the cross-device coherency fix; col = cumulative
-        // batch-collapsed wakes (skipped or retracted frame-gen members); diff/dtot = the
+        // batch-collapsed wakes (skipped or retracted frame-gen members); diff = the
         // driver's change map, see above.
         LONGLONG dt = (prevArrival != 0) ? (now.QuadPart - prevArrival) : 0;
-        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld diff=%lld dtot=%lld",
+        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld diff=%lld",
             count,
             (long long)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
             (long long)(dt * usPerTick),
             (long long)flushUs,
-            collapsed, changed, changedAll);
+            collapsed, changed);
 
         if (m_fgPhaseActive) {
             FgPhaseOnWake(batch.member, slot,

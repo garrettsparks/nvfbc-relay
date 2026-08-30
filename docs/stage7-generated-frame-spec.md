@@ -1,8 +1,9 @@
 # Generated-frame substitution: present the driver's frame instead of blending
 
-Status: BUILT, opt-in behind `-subgen`, TWO field captures. The floor fix is validated;
-the readback batching did not work. Output quality is confirmed; the cost to the GAME is
-unmeasured. The policy layer and
+Status: BUILT and VALIDATED on KCD2, opt-in behind `-subgen`, three field captures. The
+duplicate check is the driver's own difference map and costs nothing on the present path;
+output quality is confirmed by inspection. What remains unmeasured is the cost to the GAME,
+which a locked-framerate title structurally cannot show. The policy layer and
 the replay model are covered by the local suite; `CaptureRing`, `FrameCompositors`,
 `TemporalCaptureMode` and `NvFBCR` compile only in CI. Every number here is measured, and the
 measurement that produced each one is named so it can be re-run or disputed.
@@ -92,7 +93,50 @@ Rule 3 turns out to be belt-and-braces: re-offering the same frame fails rule 2 
 `already shown` counter reads 0 on every capture replayed. It is kept because it states the
 intent, and because rule 2 protecting it is a coincidence of the placement, not a contract.
 
-## The content check, and why keep-real being right does not cover it
+## The duplicate check: the driver already knows
+
+**The capture API computes this for us.** NvFBC's difference map reports which 16x16 blocks
+changed since the previous grab, and a capture-race duplicate is by definition a grab that
+returned the same content as the one before it - an all-zero map. The signal arrives on
+exactly the wake where it is needed: when the real member lands and keep-real retracts the
+generated one, that grab's map IS the comparison between the frame being published and the
+frame being retracted.
+
+Measured against the pixel instrument over 65619 batches (`subgen_kcd_diffmap`, 2026-08-29):
+
+    rule                  duplicates caught    genuine frames lost
+    diff == 0                       98.80%       0.0000%  (0 of 60711)
+    pixel gdiff/motion               ~100%       ~0%, but a GPU sync per substitution
+    ETW flip timing                    66%          37%   (refuted, see below)
+
+There is no threshold to tune: duplicates sit at exactly 0 blocks changed and genuine frames
+at p10 6135 of 8160, with nothing between. Widening to `diff <= 20` changes nothing; only at
+`<= 100` do false positives appear at all (0.12%). The 1.2% of duplicates it misses fail
+SAFE - the map says "changed", so the frame is substituted where the pixel check would have
+refused, which is 0.09% of all batches.
+
+So the check lives in `CaptureRing::RetractGenerated`, costs a comparison on a value the
+capture loop already has, and the present thread reads a bool that was decided long before.
+`-subgen` implies `-diffmap` for that reason.
+
+Cost, isolated (`subgen_kcd_implied_diffmap` against two captures without it): **+26 us per
+wake at the median flush** (123 vs 97), no change at p99, and capture cadence untouched -
+inter-arrival p50 identical to the microsecond, wake rate within noise. About 3 ms/s of
+capture-thread time, replacing a GPU pipeline sync on the present path.
+
+**A timing-only guard was tried and refuted.** The race is a timing phenomenon and the ETW
+flip stream is already there, so it looked free. Against the same ground truth it catches 66%
+of duplicates at the cost of 37% of the genuine frames. Dead, and worth recording so nobody
+re-derives it.
+
+## The pixel check, retained as the fallback
+
+Everything below describes the check that runs only where the driver gives no difference map.
+It has not executed in the field since the change map shipped (`0 rejected on content`,
+`content check 0 us worst / 0 us mean`), but it is what keeps the substitution safe on a
+driver that refuses the feature.
+
+
 
 The NvFBC race puts REAL pixels in the generated slot: 15% of epsilon pairs at x2 are `[X,X]`
 double-captures of one sharp frame, both flips having landed before the first grab sampled
@@ -283,6 +327,52 @@ presents missing from the file, 100% provenance agreement. Offset `log_time = vi
 **Visual check: the substituted frames were inspected in the video and look correct.** That
 closes the quality question the statistics could not reach.
 
+## Third field capture, 2026-08-29 (`subgen_kcd_implied_diffmap`, 37 min)
+
+The confirmation run for the change-map guard. Every condition met:
+
+    jit > 1 ms      0          (was 0.0975/s with the pixel guard; baseline 0.0001/s)
+    jit > 5 ms      0          (was 0.0123/s)
+    content check   0 us worst / 0 us mean, 0 rejected on content
+    change map      9109 retractions refused = 6.8% of batches (predicted ~7%)
+
+Not reduced, eliminated: over 37 minutes no present exceeded 1 ms of jitter, which is cleaner
+than the no-substitution baseline itself. Gameplay (log 120-2160 s, 34 min at a locked 60.0
+presents/s):
+
+    pass-gen  631  0.309/s     56.7% of everything that would have blended
+    synth     482  0.236/s
+    holds       0
+
+**The refusals are almost all outside gameplay**, as in every capture: the loading and desktop
+stretches have no frame generation, so every retracted slot there is a paired real grab and
+the map correctly refuses it.
+
+## The replay harness now models dejitter
+
+The harness omitted the dejitter overlay on the grounds that no capture it replayed used
+`-dejit`. That stopped being true and nobody noticed, and the cost was not the aggregate but a
+blind spot exactly where a bug shipped: generated frames were placed on the raw timeline while
+their bracket endpoints were corrected, and a model that ignores corrections on BOTH cannot
+see the difference.
+
+It now feeds the real `policy::StampOverlay` from the log's own `dejit: batch ... corrected`
+lines - dejitter replayed, not modelled - inserted in present order so a present sees only
+what the relay had computed by then. No new logging was needed; those lines have been there
+since dejitter shipped.
+
+    capture                    substitutions        blend class
+    implied_diffmap (2.6%)     -7.0% -> 0.0%      +15.5% -> +0.1%
+    improved_gen_selection     +1.4% -> +1.8%      +3.4% ->  0.0%
+    subgen_kcd_0               +0.6% -> +0.3%      +1.7% -> -0.3%
+
+**That agreement is partly circular and should not be read as confirmation the relay is
+right**: the harness now replays the relay's own corrections instead of deriving them, so it
+can no longer check the correction COMPUTATION, only its application. The independent evidence
+is a quantity the overlay was not built from - the harness's bracket endpoint against the
+log's `before=` field - where mean error fell 2320 us -> 171 us and exact matches rose 84.6%
+-> 97.0%. A fitted model would not have moved that.
+
 ## The cost question, still open
 
 Every cost number in this document is RELAY-side. jit and pdt say whether the relay kept its
@@ -303,7 +393,10 @@ avoided.
    KCD2 run with `-subgen`, then replay THAT log through the harness with `--sub-gen`. Same
    content, same timeline, same window: the relay's `subgen summary:` substituted count should
    match the harness's. Model against implementation on identical input, with none of the
-   windowing or motion-gating traps.
+   windowing or motion-gating traps. DONE three times; exact on the last one (631 vs 631).
+
+   The next one should be run BLIND - predict from the log before reading the relay's count -
+   because every agreement so far is on captures the model was tuned against.
 2. **The artifact question needs video.** Motion-gated duplicates must stay at 0.012/s. This
    is what the content check exists to protect and the log cannot answer it.
 3. **The content check's cost is instrumented, not assumed.** The summary line reports

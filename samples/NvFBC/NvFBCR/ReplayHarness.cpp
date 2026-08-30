@@ -131,10 +131,19 @@ struct LiveSummary {
     bool present() const { return steered >= 0; }
 };
 
+// One dejitter correction as the field applied it: which batch it keys on, how large, and
+// how many presents had already happened when it was computed.
+struct DejitRec {
+    int64_t batchStart = 0;
+    int64_t correction = 0;
+    long long afterPresents = 0;
+};
+
 struct Capture {
     std::vector<FlipRec> flips;
     std::vector<WakeRec> wakes;
     std::vector<PresentRec> presents;
+    std::vector<DejitRec> dejits;
     LiveSummary live;
     // Resolved options, read from the log rather than assumed: a harness configured by hand
     // can diverge from the run it is replaying and blame the model for it.
@@ -216,6 +225,25 @@ bool ParseLog(const char* path, Capture* out) {
             int64_t diff = -1;
             w.changedBlocks = Field(p, "diff=", &diff) ? diff : -1;
             out->wakes.push_back(w);
+            continue;
+        }
+
+        // A dejitter correction the field applied. Recorded with the number of presents
+        // seen so far, because the relay computes these DURING the present loop, so a
+        // correction is invisible to every present before the one that produced it -
+        // inserting them all up front would let earlier presents read a correction that
+        // did not exist yet.
+        if (std::strncmp(p, "dejit: batch arr=", 17) == 0) {
+            if (std::strstr(p, "corrected")) {
+                int64_t bs = 0, late = 0;
+                if (Field(p, "arr=", &bs) && Field(p, "late by ", &late)) {
+                    DejitRec d;
+                    d.batchStart = bs * kTicksPerUs;
+                    d.correction = late * kTicksPerUs;
+                    d.afterPresents = (long long)out->presents.size();
+                    out->dejits.push_back(d);
+                }
+            }
             continue;
         }
 
@@ -428,6 +456,9 @@ struct RingModel {
         // pixels are still in the ring and still reachable. stamp is rewritten to the
         // midpoint of the two real neighbours when the slot enters this state.
         bool gen = false;
+        // The batch of the older neighbour the placement used; the newer one is batchStart.
+        // Dejitter corrects per batch, and a placement between two of them needs both.
+        int64_t genPrevBatchStart = 0;
     };
     std::vector<Slot> slots;
     long long published = 0;
@@ -471,20 +502,26 @@ struct RingModel {
         const int64_t after = slots[(size_t)(count % size)].stamp;
         long long oldest = count - (size - 1);
         if (oldest < 0) oldest = 0;
-        int64_t before = 0;
+        int64_t before = 0, beforeBatch = 0;
         bool haveBefore = false;
         for (long long i = count - 1 - newMember; i >= oldest; i--) {
             const Slot& s = slots[(size_t)(i % size)];
             if (!s.valid) continue;
             before = s.stamp;
+            beforeBatch = s.batchStart;
             haveBefore = true;
             break;
         }
         if (!haveBefore || before >= after) return;
         (void)srcPeriod;
+        // The same placement the relay uses, from the same policy function rather than a
+        // copy of the arithmetic.
         for (int j = 0; j < newMember; j++) {
             Slot& g = slots[(size_t)((count - newMember + j) % size)];
-            g.stamp = before + (after - before) * (j + 1) / members;
+            int64_t placed = 0;
+            if (!policy::PlaceGeneratedFrame(before, after, j, members, &placed)) continue;
+            g.stamp = placed;
+            g.genPrevBatchStart = beforeBatch;
             g.gen = true;
         }
     }
@@ -517,39 +554,63 @@ struct RingModel {
         *depthOut = bestDepth;
         return true;
     }
-    // CaptureRing::FindBracket, with the dejitter overlay LEFT OUT - so this models a
-    // dejit-off relay whatever the capture ran.
+    // CaptureRing::FindBracket, including the dejitter overlay, which the relay reads
+    // through at present time. The overlay is the REAL policy::StampOverlay populated from
+    // the log's own `dejit: batch ... corrected` lines, so this is not a model of dejitter
+    // but dejitter itself replayed against the corrections the field actually applied.
     //
-    // That was once true by construction (no capture this replayed used -dejit) and is not
-    // any more: every -subgen capture runs it. What the omission costs is bounded by how
-    // little dejitter does - 1120 corrected batches of 318706 on the 2026-08-27 capture,
-    // 0.35% - and the op census still agrees with the field within ~2%. What it CANNOT see
-    // is any bug in the interaction between corrections and the ring's stamps, which is
-    // exactly where one shipped: generated frames were placed on the raw timeline while
-    // their bracket endpoints were corrected. Modelling the overlay needs per-batch
-    // correction values the log does not record, so closing this means logging them first.
-    void FindBracket(int64_t target, policy::BracketInfo* out, int* beforeDepth) const {
+    // It was omitted until 2026-08-29 on the grounds that no replayed capture used -dejit.
+    // That stopped being true and nobody noticed, and the cost was not the aggregate (which
+    // stayed inside ~4%) but a blind spot exactly where a bug shipped: generated frames
+    // were placed on the raw timeline while their bracket endpoints were corrected, and a
+    // model that ignores corrections on BOTH cannot see the difference.
+    void FindBracket(int64_t target, const policy::StampOverlay* overlay,
+                     policy::BracketInfo* out, int* beforeDepth) const {
         *out = policy::BracketInfo();
         *beforeDepth = -1;
         long long oldest = published - (size - 1);
         if (oldest < 0) oldest = 0;
-        int64_t bestBefore = INT64_MAX, bestAfter = INT64_MAX;
+        int64_t bestBefore = INT64_MAX, bestAfter = INT64_MAX, bestGen = INT64_MAX;
         for (long long i = published - 1; i >= oldest; i--) {
             const Slot& s = slots[(size_t)(i % size)];
+            // A generated frame's stamp is a placement between TWO batches, so it takes the
+            // mean of their corrections; correcting the endpoints and not the frame between
+            // them is the bug this replay could not previously see.
+            if (s.gen) {
+                int64_t ts = s.stamp;
+                if (overlay) {
+                    ts = policy::CorrectGeneratedStamp(
+                        ts, overlay->CorrectionFor(s.batchStart),
+                        overlay->CorrectionFor(s.genPrevBatchStart));
+                }
+                int64_t d = target - ts;
+                if (d < 0) d = -d;
+                if (d < bestGen) {
+                    bestGen = d;
+                    out->hasGen = true;
+                    out->genTs = ts;
+                    out->genDiff = d;
+                }
+                continue;
+            }
             if (!s.valid) continue;
-            const int64_t diff = target - s.stamp;
+            // Corrections are keyed by BATCH, so a member stamped at its own flip still
+            // finds the correction its batch earned.
+            const int64_t stamp =
+                overlay ? s.stamp - overlay->CorrectionFor(s.batchStart) : s.stamp;
+            const int64_t diff = target - stamp;
             if (diff >= 0) {
                 if (diff < bestBefore) {
                     bestBefore = diff;
                     out->hasBefore = true;
-                    out->beforeTs = s.stamp;
+                    out->beforeTs = stamp;   // the CORRECTED stamp, as the relay publishes
                     out->beforeDiff = diff;
                     *beforeDepth = (int)(published - 1 - i);
                 }
             } else if (-diff < bestAfter) {
                 bestAfter = -diff;
                 out->hasAfter = true;
-                out->afterTs = s.stamp;
+                out->afterTs = stamp;
                 out->afterDiff = -diff;
             }
         }
@@ -765,6 +826,12 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
 
     // One present against the ring as it stands. Kept as a lambda so the tail flush after
     // the last wake runs the identical path rather than a copy of it.
+    // The REAL overlay, fed from the log's own corrections in the order the field applied
+    // them. Not a model of dejitter: dejitter itself, replayed.
+    policy::StampOverlay overlay;
+    size_t nextDejit = 0;
+    long long presentsSeen = 0;
+
     PresentCensus discard;
     auto DoPresent = [&](const PresentRec& p) {
         if (!pcOut) return;
@@ -782,9 +849,19 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
         // bracket, then advance the lock for the NEXT present, then select.
         const int64_t target = p.deadline - (cfg.lag + lockState.pullQpc);
 
+        // Corrections the field had computed by this point in the present sequence, and no
+        // later ones: TemporalCaptureMode walks new batches and inserts before it brackets,
+        // so a present sees exactly the overlay the relay had when it ran.
+        while (nextDejit < cap.dejits.size() &&
+               cap.dejits[nextDejit].afterPresents <= presentsSeen) {
+            overlay.Insert(cap.dejits[nextDejit].batchStart, cap.dejits[nextDejit].correction);
+            nextDejit++;
+        }
+        presentsSeen++;
+
         policy::BracketInfo b;
         int depth = -1;
-        ring.FindBracket(target, &b, &depth);
+        ring.FindBracket(target, cap.dejits.empty() ? NULL : &overlay, &b, &depth);
         if (!b.hasBefore) pc->noBefore++;
         if (!b.hasAfter) pc->noAfter++;
 
