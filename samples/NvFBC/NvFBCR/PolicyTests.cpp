@@ -3211,6 +3211,81 @@ static void test_generated_substitution_rules() {
     }
 }
 
+// WHERE a generated frame is placed, and what dejitter does to that placement. Both rules
+// used to live inside CaptureRing, a Windows translation unit that compiles only in CI, so
+// neither this suite nor the replay harness could see them - and both shipped with a bug
+// that no aggregate would have shown, because a mis-placed substitution looks exactly like
+// a correct one in every count the relay logs.
+static void test_generated_frame_placement() {
+    const int64_t before = 100000, after = 116667;   // one 60 fps source period apart
+    int64_t ts = 0;
+
+    // x2: one generated frame, at the midpoint. This is the only value that has been
+    // MEASURED (content phase a constant 0.4952), so it is the anchor for the general rule.
+    CHECK(policy::PlaceGeneratedFrame(before, after, 0, 2, &ts), "x2 placement must succeed");
+    CHECK(ts == (before + after) / 2, "x2 must place at the midpoint, got %lld",
+          (long long)(ts - before));
+
+    // x3: thirds, from the same arithmetic and no multiplier detection anywhere.
+    CHECK(policy::PlaceGeneratedFrame(before, after, 0, 3, &ts), "x3 member 0 must place");
+    CHECK(ts == before + (after - before) / 3, "x3 member 0 must sit a third along");
+    CHECK(policy::PlaceGeneratedFrame(before, after, 1, 3, &ts), "x3 member 1 must place");
+    CHECK(ts == before + (after - before) * 2 / 3, "x3 member 1 must sit two thirds along");
+
+    // Every placement lands strictly INSIDE its own neighbours, at any multiplier. This is
+    // the invariant a substitution depends on: the frame stands in for a blend between
+    // these two, so outside them it is not a substitute for anything.
+    for (int n = 2; n <= 8; n++) {
+        int64_t prev = before;
+        for (int j = 0; j < n - 1; j++) {
+            CHECK(policy::PlaceGeneratedFrame(before, after, j, n, &ts),
+                  "placement %d of %d must succeed", j, n);
+            CHECK(ts > before && ts < after,
+                  "placement %d of %d escaped its neighbours", j, n);
+            CHECK(ts > prev, "placements must increase with member index (%d of %d)", j, n);
+            prev = ts;
+        }
+    }
+
+    // Degenerate intervals are refused rather than placed somewhere arbitrary.
+    CHECK(!policy::PlaceGeneratedFrame(after, before, 0, 2, &ts),
+          "reversed neighbours must be refused");
+    CHECK(!policy::PlaceGeneratedFrame(before, before, 0, 2, &ts),
+          "a zero-width interval must be refused");
+    CHECK(!policy::PlaceGeneratedFrame(before, after, 0, 1, &ts),
+          "a single-member batch has no generated frame to place");
+    CHECK(!policy::PlaceGeneratedFrame(before, after, 1, 2, &ts),
+          "the last member of a batch is the REAL frame, never a placement");
+
+    // DEJITTER. Corrections are per batch, and the placement spans two batches, so it takes
+    // their mean. With dejitter off nothing moves.
+    CHECK(policy::PlaceGeneratedFrame(before, after, 0, 2, &ts), "setup");
+    CHECK(policy::CorrectGeneratedStamp(ts, 0, 0) == ts,
+          "no correction must leave the placement alone");
+    CHECK(policy::CorrectGeneratedStamp(ts, 1000, 1000) == ts - 1000,
+          "two equal corrections must move the placement by that amount");
+    CHECK(policy::CorrectGeneratedStamp(ts, 2000, 0) == ts - 1000,
+          "one corrected neighbour must move the placement by half");
+
+    // THE BUG THIS PINS: correcting the endpoints and not the frame between them slides it
+    // relative to the interval the passthrough gate measures. Correct all three and the
+    // placement must still be the midpoint of the corrected endpoints.
+    {
+        const int64_t corrNewer = 3000, corrOlder = 0;
+        const int64_t correctedBefore = before - corrOlder;
+        const int64_t correctedAfter = after - corrNewer;
+        int64_t raw = 0;
+        CHECK(policy::PlaceGeneratedFrame(before, after, 0, 2, &raw), "setup");
+        const int64_t corrected = policy::CorrectGeneratedStamp(raw, corrNewer, corrOlder);
+        CHECK(corrected == (correctedBefore + correctedAfter) / 2,
+              "a corrected placement must equal the midpoint of the corrected endpoints "
+              "(got %lld, want %lld)",
+              (long long)corrected, (long long)((correctedBefore + correctedAfter) / 2));
+        CHECK(corrected > correctedBefore && corrected < correctedAfter,
+              "a corrected placement must stay between its corrected neighbours");
+    }
+}
+
 // Composite output content time is non-decreasing across pull wraps (the monotone
 // guard), on a run long enough to contain several beats.
 static void test_composite_monotone_output() {
@@ -3539,6 +3614,7 @@ int main(int argc, char** argv) {
     test_ring_depth_at_shipping_lag();
     test_ring_depth_under_burst_delivery();
     test_generated_substitution_rules();
+    test_generated_frame_placement();
     test_composite_lock_acquisition();
     test_composite_quantized_arrivals();
 
@@ -3558,6 +3634,6 @@ int main(int argc, char** argv) {
         std::printf("POLICY TESTS FAILED: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("POLICY TESTS PASSED (7 selection + 17 composite suites)\n");
+    std::printf("POLICY TESTS PASSED (7 selection + 18 composite suites)\n");
     return 0;
 }

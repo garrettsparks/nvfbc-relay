@@ -37,6 +37,7 @@ CaptureRing::CaptureRing()
         m_ring[i].sharedHandle = NULL;
         m_ring[i].valid = false;
         m_ring[i].generated = false;
+        m_ring[i].genPrevBatchStart.QuadPart = 0;
         m_ring[i].timestamp.QuadPart = 0;
         m_ring[i].batchStart.QuadPart = 0;
         m_ring[i].member = 0;
@@ -344,12 +345,13 @@ void CaptureRing::RetractGenerated(long long count, long long changedBlocks) {
     const LONGLONG after = m_ring[(int)(count % m_ringSlots)].timestamp.QuadPart;
     long long oldest = count - (m_ringSlots - 1);
     if (oldest < 0) oldest = 0;
-    LONGLONG before = 0;
+    LONGLONG before = 0, beforeBatch = 0;
     bool haveBefore = false;
     for (long long i = count - 1 - newMember; i >= oldest; i--) {
         const Slot& s = m_ring[(int)(i % m_ringSlots)];
         if (!s.valid) continue;
         before = s.timestamp.QuadPart;
+        beforeBatch = s.batchStart.QuadPart;
         haveBefore = true;
         break;
     }
@@ -369,7 +371,10 @@ void CaptureRing::RetractGenerated(long long count, long long changedBlocks) {
     // believes N is 2, and the third member is what corrects it.
     for (int j = 0; j < newMember; j++) {
         Slot& g = m_ring[(int)((count - newMember + j) % m_ringSlots)];
-        g.timestamp.QuadPart = before + (after - before) * (j + 1) / members;
+        LONGLONG placed = 0;
+        if (!policy::PlaceGeneratedFrame(before, after, j, members, &placed)) continue;
+        g.timestamp.QuadPart = placed;
+        g.genPrevBatchStart.QuadPart = beforeBatch;
         g.generated = true;
     }
 }
@@ -831,17 +836,29 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, const policy::StampOverlay* ov
         int slot = (int)(i % m_ringSlots);
         // Retracted generated frames are reachable but never endpoints, so they are
         // collected on a separate side channel and cannot reach any caller that only reads
-        // hasBefore/hasAfter. No overlay correction is applied: the stamp is a midpoint
-        // derived from two batches, and a single batch's delivery-lateness correction does
-        // not describe it.
+        // hasBefore/hasAfter.
+        //
+        // The correction is the MEAN of its two neighbours' corrections, because the stamp
+        // is a placement between them: correcting the endpoints while leaving the frame
+        // that sits between them alone would slide it relative to the very interval the
+        // passthrough gate measures. With dejitter off both terms are zero and this is the
+        // raw placement.
         if (m_ring[slot].generated) {
-            LONGLONG d = targetQpc - m_ring[slot].timestamp.QuadPart;
+            LONGLONG ts = m_ring[slot].timestamp.QuadPart;
+            if (overlay) {
+                ts = policy::CorrectGeneratedStamp(
+                    ts, overlay->CorrectionFor(m_ring[slot].batchStart.QuadPart),
+                    overlay->CorrectionFor(m_ring[slot].genPrevBatchStart.QuadPart));
+            }
+            LONGLONG d = targetQpc - ts;
             if (d < 0) d = -d;
             if (d < bestGenDiff) {
                 bestGenDiff = d;
                 out->genScreened = m_diffMapActive;
                 out->info.hasGen = true;
-                out->info.genTs = m_ring[slot].timestamp.QuadPart;
+                // The CORRECTED placement, on the same timeline as the endpoints above:
+                // the policy compares this against the last output and against the gate.
+                out->info.genTs = ts;
                 out->info.genDiff = d;
                 out->genSurface = m_ring[slot].mainSurface;
                 out->genTexture = m_ring[slot].mainTexture;

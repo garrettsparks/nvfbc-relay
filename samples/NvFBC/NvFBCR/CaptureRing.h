@@ -240,9 +240,15 @@ private:
         bool valid;
         // Retracted by keep-real: not a bracket endpoint, but still reachable. A slot in
         // this state holds the driver's own generated frame, and its timestamp has been
-        // rewritten to that frame's CONTENT time (the midpoint of its two real
+        // rewritten to that frame's CONTENT time (a placement between its two real
         // neighbours), which is not the arrival stamp it was published with.
         bool generated;
+        // The batch of the OTHER neighbour that placement used (the older, real one; the
+        // newer is this slot's own batchStart). Only meaningful while generated is set.
+        // Dejitter corrects stamps per batch at read time, and a placement derived from two
+        // batches needs both corrections or it drifts away from the endpoints it sits
+        // between - which is exactly the interval the passthrough gate measures.
+        LARGE_INTEGER genPrevBatchStart;
     };
 
     void CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);

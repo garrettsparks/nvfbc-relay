@@ -505,6 +505,31 @@ struct PolicyConfig {
 int RingSlotsForLag(int64_t bracketingDelayQpc, int64_t srcPeriodQpc, int minSlots,
                     int maxSlots);
 
+// WHERE A GENERATED FRAME SITS between the two real frames it was interpolated between.
+// member is its 0-based position among the batch's members, members the batch's total count
+// (the generated ones plus the real one that ends the batch), so member j of N lands at
+// (j+1)/N of the interval. At N=2 that is the midpoint, which is what the f/g measurement
+// found: content phase is a CONSTANT 0.4952 that does not track the display, so a generated
+// frame is placed between its neighbours and never at its own flip time.
+//
+// Nothing here knows the frame-generation multiplier. A batch divides the interval it spans
+// by the number of frames it carries, so two submissions per source frame and four are the
+// same arithmetic and a fluctuating multiplier needs no detection.
+//
+// Returns false on a degenerate interval (neighbours out of order, or no room), which is the
+// caller's signal to leave the frame unreachable rather than place it outside its own
+// neighbours.
+bool PlaceGeneratedFrame(int64_t beforeTs, int64_t afterTs, int member, int members,
+                         int64_t* outTs);
+
+// Dejitter corrects ring stamps PER BATCH at read time. A generated frame's stamp is a
+// placement derived from TWO batches, so it takes the mean of their corrections: correcting
+// the endpoints while leaving the frame that sits between them alone would slide it relative
+// to the interval the passthrough gate measures. Both corrections are zero with dejitter
+// off, and this returns the raw placement.
+int64_t CorrectGeneratedStamp(int64_t placedTs, int64_t correctionNewer,
+                              int64_t correctionOlder);
+
 // The signed distance to the nearest point on a p-periodic timeline, in [-p/2, p/2).
 int64_t WrapHalf(int64_t d, int64_t p);
 
