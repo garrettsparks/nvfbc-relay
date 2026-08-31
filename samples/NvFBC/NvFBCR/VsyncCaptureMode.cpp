@@ -35,9 +35,11 @@ void VsyncCaptureMode::Run(
         }
         // Ignore other errors (e.g., no new frame) - we'll just present what we have
 
-        // Present and wait for VSync - this blocks until monitor refresh
-        // This synchronizes our output with the actual display hardware
-        device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_ONE);
+        // Present and wait for VSync - this blocks until monitor refresh, because the device
+        // was CREATED with INTERVAL_ONE. dwFlags is 0 and must stay 0: it is not an interval,
+        // and D3DPRESENT_INTERVAL_ONE is numerically D3DPRESENT_DONOTWAIT, which asks the
+        // runtime to skip the present rather than wait (see TemporalCaptureMode::Run).
+        device->PresentEx(NULL, NULL, NULL, NULL, 0);
 
         // Process Windows messages
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
