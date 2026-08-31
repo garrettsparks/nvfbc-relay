@@ -159,14 +159,15 @@ struct SimParams {
     // unmoved; set it to run a timeline at the depth a given configuration ships with.
     int ringSlots = kRingSlots;
     // Disable the composite tooth guard (production arms it whenever the comb is on and
-    // the source is at or above the OUTPUT rate). Only for differential tests that
+    // the source is at or above the SINK rate). Only for differential tests that
     // reproduce the pre-guard decision rule.
     bool noToothGuard = false;
-    // The output rate production compares the source against when arming the guard
-    // (m_scheduler.PeriodQpc(), a nominal 60 regardless of what clock paces presents).
-    // presentPeriod above is the COMPOSE tick spacing, which under in-game frame
-    // generation runs at twice this; the two are only the same number at 1x.
-    int64_t nominalOutputPeriod = 16667;
+    // The SINK period: the target display's refresh, which is what production compares the
+    // source against when arming the guard. presentPeriod above is the tick spacing the
+    // present loop actually runs at - DWM's compose clock under a vsync present (twice the
+    // sink under in-game frame generation, four times it on a composed desktop), or the
+    // declared rate under a timer present. The two coincide only at 1x.
+    int64_t sinkPeriod = 16667;
 };
 
 static SimResult Simulate(const SimParams& p) {
@@ -181,9 +182,9 @@ static SimResult Simulate(const SimParams& p) {
     // OUTPUT rate) rather than by a test knob, so every composite test in this file
     // exercises the guarded decision path and a pin failure is the guard changing a
     // regime it was proven not to change. noToothGuard reproduces the pre-guard rule.
-    if (!p.noToothGuard && cfg.combQpc > 0 &&
-        p.srcPeriod <= p.nominalOutputPeriod * 9 / 8) {
-        cfg.srcPeriodQpc = p.srcPeriod;
+    if (!p.noToothGuard) {
+        cfg.srcPeriodQpc =
+            policy::ToothGuardPeriod(p.srcPeriod, p.sinkPeriod, cfg.combQpc > 0);
     }
 
     int64_t lag = p.srcPeriod + p.srcPeriod / 4;
@@ -3530,6 +3531,38 @@ static void test_composite_tooth_guard_quad_rate() {
           (long long)stepLo, (long long)stepHi);
 }
 
+// The ARMING rule, which decides whether a whole regime blends or re-presents. Pinned
+// against the SINK rate rather than the present rate: the first version compared the
+// source against the present period, which is correct only while a vsync present happens
+// to tick at the sink rate, and silently disarmed the guard under a timer present (b:120
+// into the 60 Hz card would have blended every other target - the parity lottery back).
+static void test_tooth_guard_arming() {
+    const int64_t src60 = 16667, src30 = 33333, src240 = 4166;
+    const int64_t sink60 = 16667;
+    CHECK(policy::ToothGuardPeriod(src60, sink60, true) == src60,
+          "60 fps source into a 60 Hz sink did not arm");
+    // The regime this test exists for: present rate is irrelevant, only the sink counts.
+    // b:120 and b:vsync-under-frame-generation both land here.
+    CHECK(policy::ToothGuardPeriod(src60, sink60, true) == src60,
+          "arming must not depend on the present rate");
+    CHECK(policy::ToothGuardPeriod(src240, sink60, true) == src240,
+          "a source faster than the sink did not arm");
+    // Rate conversion stays unguarded: mid-tooth synthesis is that mode's whole output.
+    CHECK(policy::ToothGuardPeriod(src30, sink60, true) == 0,
+          "a sub-rate source armed the guard, which would kill upconversion");
+    // A source declared a whisker off nominal still arms (the eighth of tolerance).
+    CHECK(policy::ToothGuardPeriod(17500, sink60, true) == 17500,
+          "a source just under nominal fell outside the tolerance");
+    CHECK(policy::ToothGuardPeriod(19000, sink60, true) == 0,
+          "a source well past the tolerance armed anyway");
+    // No comb, no teeth to be between.
+    CHECK(policy::ToothGuardPeriod(src60, sink60, false) == 0, "armed without the comb");
+    // Unknown/absent inputs never arm, so a failed refresh query degrades to today's rule
+    // rather than to a guard running on a garbage period.
+    CHECK(policy::ToothGuardPeriod(src60, 0, true) == 0, "armed with an unknown sink");
+    CHECK(policy::ToothGuardPeriod(0, sink60, true) == 0, "armed with no declared source");
+}
+
 // The guard's exact cut, and its safety rails, pinned against hand-built brackets.
 static void test_composite_tooth_guard_boundary() {
     policy::PolicyConfig cfg;
@@ -3884,6 +3917,7 @@ int main(int argc, char** argv) {
     test_generated_frame_placement();
     test_composite_lock_acquisition();
     test_composite_quantized_arrivals();
+    test_tooth_guard_arming();
     test_composite_tooth_guard_double_rate();
     test_composite_tooth_guard_hole_cover();
     test_composite_tooth_guard_quad_rate();

@@ -888,6 +888,12 @@ static bool SynthWouldManufactureTooth(const BracketInfo& b, const CompositeStat
     return targetTs - s.lastTargetTs < (cfg.srcPeriodQpc * 7) / 8;
 }
 
+int64_t ToothGuardPeriod(int64_t srcPeriodQpc, int64_t sinkPeriodQpc, bool combOn) {
+    if (!combOn || srcPeriodQpc <= 0 || sinkPeriodQpc <= 0) return 0;
+    if (srcPeriodQpc > (sinkPeriodQpc * 9) / 8) return 0;
+    return srcPeriodQpc;
+}
+
 bool GeneratedCandidateOnTarget(const BracketInfo& b, const CompositeState& s,
                                 const PolicyConfig& cfg) {
     if (!b.hasGen || !b.hasBefore || !b.hasAfter) return false;
