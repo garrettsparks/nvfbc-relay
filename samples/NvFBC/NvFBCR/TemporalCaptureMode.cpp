@@ -8,6 +8,7 @@ extern IDirect3DDevice9Ex* g_pD3D9Device;
 extern IDirect3DSurface9* g_backbuffer;
 extern int BUF_WIDTH;
 extern int BUF_HEIGHT;
+extern int g_targetRefreshHz;
 
 // Presents between estimator-vs-assumption audits (about 10 s at 60 Hz): rare enough to keep
 // the log quiet, frequent enough that a wrong -src is caught within the first minute.
@@ -216,13 +217,23 @@ bool TemporalCaptureMode::Setup() {
         LOG("Phase comb lock ACTIVE (-lock): modulus %lld us (ratio denominator M=%d%s); pull=/lk= on the temporal line",
             m_policyCfg.combQpc * 1000000 / m_scheduler.Freq(), combM,
             combMatched ? "" : ", no rational match: M=1 fallback, stability gate decides");
-        // The composite tooth guard rides the comb, for sources at or above the present
-        // rate (an eighth of tolerance for declared-vs-nominal skew). Sub-rate sources
-        // stay unguarded: their mid-tooth synthesis is the mode's output, not an artifact
-        // of a fast compose clock.
-        if (m_assumedSrcPeriodQpc <= m_scheduler.PeriodQpc() * 9 / 8) {
-            m_policyCfg.srcPeriodQpc = m_assumedSrcPeriodQpc;
-        }
+        // The composite tooth guard rides the comb, for sources at or above the SINK rate
+        // (an eighth of tolerance for declared-vs-nominal skew). The sink is what decides
+        // whether interpolating between source frames buys anything: at or below the
+        // source rate the extra frames are discarded by the display and all a mid-tooth
+        // blend does is make which frames survive a matter of sampling phase, while above
+        // it they are genuinely shown and the synthesis is rate conversion doing its job.
+        //
+        // NOT the present period, which only coincides with the sink under a vsync present
+        // whose compose clock happens to run at the sink rate. A timer present (b:120)
+        // decouples the two, and reading the present period there would disarm the guard
+        // in exactly the regime it exists for. Falls back to the present period when the
+        // refresh could not be read, which is the pre-existing behavior.
+        const LONGLONG sinkPeriodQpc = g_targetRefreshHz > 0
+                                           ? m_scheduler.Freq() / g_targetRefreshHz
+                                           : m_scheduler.PeriodQpc();
+        m_policyCfg.srcPeriodQpc =
+            policy::ToothGuardPeriod(m_assumedSrcPeriodQpc, sinkPeriodQpc, /*combOn=*/true);
     } else {
         LOG("Phase comb lock off (%s); target rides the static lag alone",
             !m_lock ? "-lock not set" : "-lock set but no -src to derive the comb");
@@ -254,6 +265,13 @@ bool TemporalCaptureMode::Setup() {
             LOG("Composite tooth guard ACTIVE: synthesis must advance a full source period "
                 "(%lld us teeth); op=hold-comb between teeth",
                 m_policyCfg.srcPeriodQpc * 1000000 / m_scheduler.Freq());
+        } else {
+            // Stated rather than left as a missing line: a run that quietly lost the guard
+            // reads as a parity-lottery blend storm with no explanation in the log.
+            LOG("Composite tooth guard off (%s); mid-tooth targets synthesize",
+                !m_lock ? "needs -lock" :
+                m_srcRateHint <= 0.0f ? "needs -src" :
+                "source is slower than the sink, so synthesis is rate conversion");
         }
         // Armed before Setup, which is where the content check allocates its readback
         // resources and where it disarms itself if they cannot be created.

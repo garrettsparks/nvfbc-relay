@@ -256,6 +256,13 @@ DisplayPosition source, target;
 // to open a private device on the capture-card adapter for GetRasterStatus probes.
 int g_targetAdapterIndex = 0;
 
+// Target display's refresh rate in Hz, 0 when it could not be read. This is the SINK rate: what
+// the capture card can actually show, which is not the rate we present at (a vsync present rides
+// DWM's compose clock, and a timer present rides -framerate). The composite tooth guard arms off
+// this, because whether interpolating between source frames buys anything is a question about the
+// sink: at or below the source rate every extra frame is discarded, above it they are shown.
+int g_targetRefreshHz = 0;
+
 vector <DisplayPosition> displays;
 
 void Cleanup()
@@ -741,6 +748,20 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     LOG("Source display: [%d] %s (%s)", source.dxAdapterIndex, source.friendlyName.c_str(), source.deviceName);
     LOG("Target display: [%d] %s (%s)", target.dxAdapterIndex, target.friendlyName.c_str(), target.deviceName);
     g_targetAdapterIndex = target.dxAdapterIndex;
+    {
+        DEVMODEA dm;
+        ZeroMemory(&dm, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsA(target.deviceName, ENUM_CURRENT_SETTINGS, &dm) &&
+            dm.dmDisplayFrequency > 1) {
+            g_targetRefreshHz = (int)dm.dmDisplayFrequency;
+            LOG("Target display refresh: %d Hz (the SINK rate; the tooth guard arms off this, "
+                "not off the present rate)", g_targetRefreshHz);
+        } else {
+            LOG("Target display refresh: UNKNOWN (EnumDisplaySettings failed); the tooth guard "
+                "falls back to the present period");
+        }
+    }
     LOG("Capture mode: %s", captureMode->GetModeName());
     // Echo resolved options so console-entered config is recoverable from the log, not just argv.
     char markDesc[48];

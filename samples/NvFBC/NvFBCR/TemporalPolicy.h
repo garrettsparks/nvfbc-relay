@@ -663,6 +663,21 @@ struct CompositeState {
 CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
                                   const PolicyConfig& cfg);
 
+// The tooth guard's ARMING rule: the value to put in PolicyConfig::srcPeriodQpc, or 0 to
+// leave the guard off. Lives here rather than at the call site because it is the decision
+// that says whether a whole regime blends or re-presents, and inlined in the capture mode
+// nothing could test it - which is how it first shipped comparing the source against the
+// PRESENT period, correct only while a vsync present happened to tick at the sink rate and
+// silently disarming under a timer present at any other rate.
+//
+// combOn because the guard rides the comb: without a declared source rate there are no
+// teeth to be between. sinkPeriodQpc is the TARGET DISPLAY's refresh - what the relay's
+// output can actually show. A source at or above it (an eighth of tolerance for
+// declared-vs-nominal skew) gains nothing from mid-tooth synthesis, because the sink
+// discards those frames and all the blend decides is which ones survive sampling phase. A
+// source below it is genuine rate conversion and stays unguarded.
+int64_t ToothGuardPeriod(int64_t srcPeriodQpc, int64_t sinkPeriodQpc, bool combOn);
+
 // Whether a generated frame could stand in for the blend this bracket would otherwise
 // produce, judged on PLACEMENT alone: this present would synthesize, a generated frame is
 // reachable, it sits inside the passthrough gate of the target, its content is strictly

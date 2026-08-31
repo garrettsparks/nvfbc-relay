@@ -764,9 +764,11 @@ struct Config {
     // source). On by default because replaying an old log then PREDICTS what the guard
     // would have done to that capture; --no-tooth-guard reproduces builds that predate it.
     bool toothGuard = true;
-    // Nominal present period (freq over the mode's declared rate; 60 for every blend
-    // capture so far). Only the tooth guard's sub-rate check reads it.
-    int64_t presentPeriod = 0;
+    // SINK period: the target display's refresh, which is what the tooth guard arms off in
+    // production (never the present rate - a timer present decouples the two). The XR1 is a
+    // 60 Hz sink and no capture has used another, so 60 is assumed; the log does not record
+    // it for captures taken before the relay started printing it.
+    int64_t sinkPeriod = 0;
     // The vote's class-mean margin, in this harness's ticks. Defaults to what production now
     // passes (80 us of QPC). Every log recorded BEFORE the units fix ran with an effective
     // 8 us, so reproducing such a run - gates 1 and 2 - needs `--sep-us 8`, and the header
@@ -825,10 +827,10 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
     pcfg.phasePullSlewQpc = cfg.phasePullSlew;
     pcfg.stallSpanQpc = cfg.stallSpan;
     pcfg.passthroughQpc = cfg.passthrough;
-    // Mirrors TemporalCaptureMode::Setup: the tooth guard rides the comb, at-rate only.
-    if (cfg.toothGuard && cfg.comb > 0 && cfg.presentPeriod > 0 &&
-        cfg.assumedSrcPeriod <= cfg.presentPeriod * 9 / 8) {
-        pcfg.srcPeriodQpc = cfg.assumedSrcPeriod;
+    // The REAL arming rule, not a copy of it (TemporalCaptureMode::Setup calls the same one).
+    if (cfg.toothGuard) {
+        pcfg.srcPeriodQpc = policy::ToothGuardPeriod(cfg.assumedSrcPeriod, cfg.sinkPeriod,
+                                                     cfg.comb > 0);
     }
     size_t nextPresent = 0;
     int64_t lastShownStamp = 0;
@@ -1984,8 +1986,9 @@ int main(int argc, char** argv) {
     cfg.blend = cap.blend || forceBlend;
     cfg.subGen = subGen;
     cfg.toothGuard = toothGuard;
-    // Every blend capture so far presents at a nominal 60 whichever mode paces it.
-    cfg.presentPeriod = (int64_t)(freq / 60.0);
+    // The XR1 is a 60 Hz sink and no capture has used another. Older logs do not record the
+    // refresh at all, so this is assumed rather than parsed.
+    cfg.sinkPeriod = (int64_t)(freq / 60.0);
     cfg.passthrough = cap.passthroughUs * kTicksPerUs;
     // A capture recorded in t: mode carries no passthrough threshold, so a forced blend
     // replay needs production's: a quarter of the source period, which is the 4166 us the
@@ -2028,8 +2031,9 @@ int main(int argc, char** argv) {
     std::printf("ring: %d slots (not recorded in the log - must match the build that"
                 " captured it)\n", ringSlots);
     if (cfg.blend) {
-        const bool guardArmed = cfg.toothGuard && cfg.comb > 0 && cfg.presentPeriod > 0 &&
-                                cfg.assumedSrcPeriod <= cfg.presentPeriod * 9 / 8;
+        const bool guardArmed =
+            cfg.toothGuard &&
+            policy::ToothGuardPeriod(cfg.assumedSrcPeriod, cfg.sinkPeriod, cfg.comb > 0) > 0;
         std::printf("tooth guard: %s (a log from a build that predates it needs"
                     " --no-tooth-guard to be reproduced rather than predicted)\n",
                     guardArmed ? "ARMED" : (cfg.toothGuard ? "off (no comb or sub-rate)"
