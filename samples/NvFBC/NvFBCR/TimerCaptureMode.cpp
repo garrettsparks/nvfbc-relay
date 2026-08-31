@@ -39,8 +39,11 @@ void TimerCaptureMode::Run(
             break;
         }
 
-        // Present immediately (non-blocking)
-        device->PresentEx(NULL, NULL, NULL, NULL, D3DPRESENT_INTERVAL_IMMEDIATE);
+        // Present immediately (non-blocking), because the device was CREATED with
+        // INTERVAL_IMMEDIATE. dwFlags is 0 and must stay 0: it is not an interval, and
+        // D3DPRESENT_INTERVAL_IMMEDIATE (0x80000000) is not even a defined flag bit
+        // (see TemporalCaptureMode::Run).
+        device->PresentEx(NULL, NULL, NULL, NULL, 0);
 
         // Process Windows messages
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))

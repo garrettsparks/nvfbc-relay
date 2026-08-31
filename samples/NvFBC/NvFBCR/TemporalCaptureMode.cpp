@@ -371,6 +371,7 @@ void TemporalCaptureMode::Run(
 
     MSG msg = {};
     LONGLONG lastPresentQpc = 0;
+    long long presentFailures = 0;
     m_scheduler.Seed();
 
     while (TRUE)
@@ -481,11 +482,30 @@ void TemporalCaptureMode::Run(
 
         LARGE_INTEGER beforePresent;
         QueryPerformanceCounter(&beforePresent);
-        // Timer: immediate (non-blocking). Vsync: INTERVAL_ONE blocks until DWM's next compose
-        // (source clock on a composed desktop; card clock under a fullscreen game) — this
-        // present IS the frame-pacing wait in vsync mode.
-        device->PresentEx(NULL, NULL, NULL, NULL,
-            m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE);
+        // Timer: immediate (non-blocking). Vsync: the device was CREATED with INTERVAL_ONE
+        // (GetPresentationInterval), so this present blocks until DWM's next compose (source
+        // clock on a composed desktop; card clock under a fullscreen game) — that is the
+        // frame-pacing wait in vsync mode.
+        //
+        // dwFlags is 0 and must stay 0. It is NOT a presentation interval: the only legal
+        // values are D3DPRESENT_DONOTWAIT and D3DPRESENT_LINEAR_CONTENT, and the interval is
+        // fixed at device creation. This argument used to receive the interval constants,
+        // which meant vsync mode silently requested DONOTWAIT (numerically identical to
+        // INTERVAL_ONE, both 1) and timer mode passed an undefined bit. Under DONOTWAIT a
+        // present that would wait returns D3DERR_WASSTILLDRAWING WITHOUT PRESENTING, which is
+        // invisible in the log (the present was counted) and shows downstream as the previous
+        // frame repeating - the exact judder signature this relay is measured against.
+        const HRESULT presentHr = device->PresentEx(NULL, NULL, NULL, NULL, 0);
+        if (FAILED(presentHr) || presentHr == S_PRESENT_MODE_CHANGED ||
+            presentHr == S_PRESENT_OCCLUDED) {
+            // Never silent: a present that did not reach the screen must be attributable, or
+            // a video-vs-log disagreement has no explanation in the log.
+            presentFailures++;
+            if (presentFailures == 1 || (presentFailures % 600) == 0) {
+                LOGERR("present returned 0x%08lx (%lld so far): the frame may not have reached "
+                       "the screen", (unsigned long)presentHr, presentFailures);
+            }
+        }
 
         // Inter-present interval (should hold steady at the present period if the scheduler works).
         LONGLONG presentDelta = (lastPresentQpc != 0) ? (beforePresent.QuadPart - lastPresentQpc) : 0;
