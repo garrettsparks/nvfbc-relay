@@ -134,6 +134,10 @@ public:
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;
+
+    // The temporal modes rebind NvFBC to CaptureRing's private capture device, so the present
+    // device is free to live on the adapter that actually owns the output window.
+    virtual bool PresentsOnTargetAdapter() const override { return true; }
     virtual bool Setup() override;
     virtual void Run(
         NvFBCToDx9Vid* nvfbcDx9,

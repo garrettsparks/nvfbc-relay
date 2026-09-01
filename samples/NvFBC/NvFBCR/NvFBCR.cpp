@@ -256,6 +256,11 @@ DisplayPosition source, target;
 // to open a private device on the capture-card adapter for GetRasterStatus probes.
 int g_targetAdapterIndex = 0;
 
+// Source display's D3D9 adapter ordinal. CaptureRing pins its capture device here EXPLICITLY
+// rather than inheriting the present device's ordinal, because the present device may sit on
+// the target adapter and NvFBC must capture the SOURCE display.
+int g_sourceAdapterIndex = 0;
+
 // Flip-mode presentation (-flipex): D3DSWAPEFFECT_FLIPEX instead of the bitblt DISCARD. Opt-in
 // because it changes how every frame reaches DWM; see the swap-chain setup for why it is wanted
 // and why the previous attempt failed. Off leaves presentation byte-identical to today.
@@ -433,19 +438,33 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
     // Flip mode hands the buffers to DWM directly, so there is nowhere to hide a conversion
     // and CreateDeviceEx refuses the mismatch outright. The ring stays 10-bit either way;
     // only this final hop follows the sink, which discards the extra bits regardless.
-    if (g_flipEx) {
+    //
+    // The mode is logged on EVERY run, not just flip mode: whether the back buffer matches the
+    // adapter it is presented on is the difference between a clean present and a converted one,
+    // and it was invisible for the whole life of this relay. Put the comparison in the log so a
+    // mismatch is read rather than deduced.
+    {
         D3DDISPLAYMODEEX mode;
         ZeroMemory(&mode, sizeof(mode));
         mode.Size = sizeof(mode);
         if (SUCCEEDED(g_pD3DEx->GetAdapterDisplayModeEx(deviceID, &mode, NULL))) {
-            LOG("Display mode on adapter %u: %ux%u @%uHz, format %d (back buffer follows it "
-                "for flip mode; bitblt would have used %d and converted per present)",
-                deviceID, mode.Width, mode.Height, mode.RefreshRate, (int)mode.Format,
-                (int)D3DFMT_A2R10G10B10);
-            d3dpp.BackBufferFormat = mode.Format;
+            const bool matches = (mode.Format == d3dpp.BackBufferFormat) &&
+                                 (mode.Width == (UINT)BUF_WIDTH) &&
+                                 (mode.Height == (UINT)BUF_HEIGHT);
+            LOG("Display mode on adapter %u: %ux%u @%uHz format %d; back buffer %dx%d format %d "
+                "-> %s", deviceID, mode.Width, mode.Height, mode.RefreshRate, (int)mode.Format,
+                BUF_WIDTH, BUF_HEIGHT, (int)d3dpp.BackBufferFormat,
+                matches ? "MATCH"
+                        : "MISMATCH (expect S_PRESENT_MODE_CHANGED and a per-present convert)");
+            // Flip mode cannot convert - it hands the buffers to DWM - so it must follow the
+            // mode exactly or CreateDeviceEx refuses outright. Bitblt keeps its historical
+            // format: changing that is a deliberate decision about the shipping path, not
+            // something to bundle into an adapter move.
+            if (g_flipEx) d3dpp.BackBufferFormat = mode.Format;
         } else {
-            LOGERR("GetAdapterDisplayModeEx failed; flip mode will try A2R10G10B10 and will "
-                   "probably be refused");
+            LOGERR("GetAdapterDisplayModeEx failed on adapter %u; cannot tell whether the back "
+                   "buffer matches the display mode%s", deviceID,
+                   g_flipEx ? " and flip mode will probably be refused" : "");
         }
     }
     d3dpp.BackBufferCount = g_flipEx ? 2 : 1;
@@ -829,6 +848,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     LOG("Source display: [%d] %s (%s)", source.dxAdapterIndex, source.friendlyName.c_str(), source.deviceName);
     LOG("Target display: [%d] %s (%s)", target.dxAdapterIndex, target.friendlyName.c_str(), target.deviceName);
     g_targetAdapterIndex = target.dxAdapterIndex;
+    g_sourceAdapterIndex = source.dxAdapterIndex;
     {
         DEVMODEA dm;
         ZeroMemory(&dm, sizeof(dm));
@@ -915,7 +935,18 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     }
 
     g_bNvFBCLibLoaded = true;
-    if (!SUCCEEDED(InitD3D9(source.dxAdapterIndex, hWnd, captureMode->GetPresentationInterval())))
+    // The present device goes on the adapter that owns the OUTPUT WINDOW when the mode can
+    // afford it (see IFrameCaptureMode::PresentsOnTargetAdapter). The legacy modes cannot:
+    // NvFBC writes their back buffer directly, so their device must stay where NvFBC captures.
+    const unsigned int presentAdapter = captureMode->PresentsOnTargetAdapter()
+                                            ? (unsigned int)target.dxAdapterIndex
+                                            : (unsigned int)source.dxAdapterIndex;
+    LOG("Present device adapter: %u (%s); capture stays on source adapter %d",
+        presentAdapter,
+        captureMode->PresentsOnTargetAdapter() ? "target - owns the output window"
+                                               : "source - mode captures into its back buffer",
+        source.dxAdapterIndex);
+    if (!SUCCEEDED(InitD3D9(presentAdapter, hWnd, captureMode->GetPresentationInterval())))
     {
         LOGERR("Unable to create D3D9Ex Device");
         delete captureMode;
