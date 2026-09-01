@@ -500,13 +500,13 @@ void TemporalCaptureMode::Run(
                        backbufferFailures);
             }
         }
-        IDirect3DSurface9* const target = backbuffer ? backbuffer : g_backbuffer;
+        IDirect3DSurface9* const presentTarget = backbuffer ? backbuffer : g_backbuffer;
 
         // The DECISION is pure policy (selection or composite, in TemporalPolicy.cpp
         // with the mechanism rationale); the compositor executes it onto the
         // backbuffer. This loop owns the timing, the present, and the log.
         CompositeOutcome outcome;
-        m_compositor->Compose(bracket, target, &outcome);
+        m_compositor->Compose(bracket, presentTarget, &outcome);
 
         // Burn the marker over the composed backbuffer, once per present (repeats
         // included: the counter identifies presented frames, not source frames).
@@ -514,7 +514,7 @@ void TemporalCaptureMode::Run(
         // A/B measures it.
         long long markN = -1;
         if (m_mark) {
-            markN = (long long)m_marker.Burn(target, outcome.pickCode, outcome.weightQ,
+            markN = (long long)m_marker.Burn(presentTarget, outcome.pickCode, outcome.weightQ,
                                              outcome.synthesized, m_compositor->Id(),
                                              outcome.pixelExec);
         }
@@ -560,7 +560,7 @@ void TemporalCaptureMode::Run(
         if (g_flipEx && presentStatsSwapChain) {
             D3DPRESENTSTATS ps;
             ZeroMemory(&ps, sizeof(ps));
-            if (SUCCEEDED(presentStatsSwapChain->GetPresentStatistics(&ps))) {
+            if (SUCCEEDED(presentStatsSwapChain->GetPresentStats(&ps))) {
                 if (lastSyncRefresh != 0 && ps.SyncRefreshCount > lastSyncRefresh) {
                     const UINT elapsed = ps.SyncRefreshCount - lastSyncRefresh;
                     // More than one sink refresh since the last present means refreshes that

@@ -433,6 +433,10 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
     // makes the D3D9 runtime serialize them safely. It only affects this process's own
     // device, not the captured game's rendering.
     DWORD dwBehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED;
+    // Present statistics are not gathered unless the device asks for them at creation, and
+    // the failure is silent: GetPresentStats would keep returning zeroes and read as "the
+    // sink never missed a refresh", which is the most misleading answer available.
+    if (g_flipEx) dwBehaviorFlags |= D3DCREATE_ENABLE_PRESENTSTATS;
 
     hr = g_pD3DEx->CreateDeviceEx(
         deviceID,
