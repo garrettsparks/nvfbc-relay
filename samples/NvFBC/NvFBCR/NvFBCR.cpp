@@ -448,6 +448,12 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
         ZeroMemory(&mode, sizeof(mode));
         mode.Size = sizeof(mode);
         if (SUCCEEDED(g_pD3DEx->GetAdapterDisplayModeEx(deviceID, &mode, NULL))) {
+            // Decided BEFORE the log, so the line describes the format actually used. Flip
+            // mode cannot convert - it hands the buffers to DWM - so it must follow the mode
+            // exactly or CreateDeviceEx refuses outright. Bitblt keeps its historical format:
+            // changing that is a deliberate decision about the shipping path, not something to
+            // bundle into an adapter move.
+            if (g_flipEx) d3dpp.BackBufferFormat = mode.Format;
             const bool matches = (mode.Format == d3dpp.BackBufferFormat) &&
                                  (mode.Width == (UINT)BUF_WIDTH) &&
                                  (mode.Height == (UINT)BUF_HEIGHT);
@@ -456,11 +462,6 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
                 BUF_WIDTH, BUF_HEIGHT, (int)d3dpp.BackBufferFormat,
                 matches ? "MATCH"
                         : "MISMATCH (expect S_PRESENT_MODE_CHANGED and a per-present convert)");
-            // Flip mode cannot convert - it hands the buffers to DWM - so it must follow the
-            // mode exactly or CreateDeviceEx refuses outright. Bitblt keeps its historical
-            // format: changing that is a deliberate decision about the shipping path, not
-            // something to bundle into an adapter move.
-            if (g_flipEx) d3dpp.BackBufferFormat = mode.Format;
         } else {
             LOGERR("GetAdapterDisplayModeEx failed on adapter %u; cannot tell whether the back "
                    "buffer matches the display mode%s", deviceID,
@@ -498,6 +499,30 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
                "interval 0x%08x, behavior 0x%08lx", (unsigned long)hr, BUF_WIDTH, BUF_HEIGHT,
                (int)d3dpp.BackBufferFormat, (int)d3dpp.SwapEffect, d3dpp.BackBufferCount,
                presentationInterval, (unsigned long)dwBehaviorFlags);
+    }
+
+    // FRAME LATENCY: how many presents may be QUEUED before PresentEx blocks. D3D9Ex defaults
+    // to 3, and under bitblt with a single back buffer that never mattered - the copy into
+    // DWM's redirection surface is synchronous enough that the present is the pacing wait.
+    // Flip mode queues instead of copying, so with the default latency the loop can run three
+    // frames ahead of the display and PresentEx stops being backpressure at all: measured, the
+    // present rate rose from ~118/s to 155-180/s and the spacing jitter roughly tripled, which
+    // is the opposite of what flip mode was adopted for.
+    //
+    // 1 means "block until the previous frame has been consumed", restoring the phase-locking
+    // backpressure that makes the vsync present a clock rather than a queue push.
+    if (SUCCEEDED(hr) && g_flipEx && g_pD3D9Device) {
+        const HRESULT lat = g_pD3D9Device->SetMaximumFrameLatency(1);
+        if (FAILED(lat)) {
+            LOGERR("SetMaximumFrameLatency(1) failed (0x%08lx); flip mode will queue up to the "
+                   "driver default and present pacing will not be trustworthy",
+                   (unsigned long)lat);
+        } else {
+            UINT got = 0;
+            g_pD3D9Device->GetMaximumFrameLatency(&got);
+            LOG("Frame latency set to 1 for flip mode (device reports %u): PresentEx blocks "
+                "until the previous frame is consumed", got);
+        }
     }
 
     // A refused FLIP MODE fails the run. It deliberately does NOT fall back to bitblt: the

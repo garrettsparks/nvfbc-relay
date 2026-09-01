@@ -543,8 +543,17 @@ void TemporalCaptureMode::Run(
             // a video-vs-log disagreement has no explanation in the log.
             presentFailures++;
             if (presentFailures == 1 || (presentFailures % 600) == 0) {
-                LOGERR("present returned 0x%08lx (%lld so far): the frame may not have reached "
-                       "the screen", (unsigned long)presentHr, presentFailures);
+                // CheckDeviceState separates the two readings of a non-OK present status that
+                // this relay cannot otherwise tell apart: an ADVISORY one (the device is fine,
+                // the runtime is just noting a conversion - which is the likely reading on a
+                // multi-monitor desktop whose displays run different modes), versus a device
+                // that genuinely wants recreating. S_OK here means the status is advisory and
+                // no Reset is owed; anything else means the swapchain is in a state that a
+                // Reset is supposed to clear, and ignoring it is a real bug rather than noise.
+                const HRESULT devState = device->CheckDeviceState(hwnd);
+                LOGERR("present returned 0x%08lx (%lld so far); CheckDeviceState 0x%08lx "
+                       "(S_OK means advisory, no Reset owed)",
+                       (unsigned long)presentHr, presentFailures, (unsigned long)devState);
             }
         }
 
