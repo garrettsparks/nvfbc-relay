@@ -424,6 +424,30 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
     // buffers plus the implicit extra, two of every three presents composited into a surface
     // that was not the current back buffer. The present loop now re-acquires the back buffer
     // every present, which is what flip mode requires.
+    //
+    // FLIPEX ALSO CONSTRAINS THE FORMAT. Bitblt tolerates a back buffer that does not match
+    // the display mode by converting on every present - which this relay has silently been
+    // doing forever: with A2R10G10B10 against an 8-bit mode, PresentEx returns
+    // S_PRESENT_MODE_CHANGED on EVERY present (27254 times in one 259 s capture), whose
+    // documented advice is "pick a back buffer format similar to the current display mode".
+    // Flip mode hands the buffers to DWM directly, so there is nowhere to hide a conversion
+    // and CreateDeviceEx refuses the mismatch outright. The ring stays 10-bit either way;
+    // only this final hop follows the sink, which discards the extra bits regardless.
+    if (g_flipEx) {
+        D3DDISPLAYMODEEX mode;
+        ZeroMemory(&mode, sizeof(mode));
+        mode.Size = sizeof(mode);
+        if (SUCCEEDED(g_pD3DEx->GetAdapterDisplayModeEx(deviceID, &mode, NULL))) {
+            LOG("Display mode on adapter %u: %ux%u @%uHz, format %d (back buffer follows it "
+                "for flip mode; bitblt would have used %d and converted per present)",
+                deviceID, mode.Width, mode.Height, mode.RefreshRate, (int)mode.Format,
+                (int)D3DFMT_A2R10G10B10);
+            d3dpp.BackBufferFormat = mode.Format;
+        } else {
+            LOGERR("GetAdapterDisplayModeEx failed; flip mode will try A2R10G10B10 and will "
+                   "probably be refused");
+        }
+    }
     d3dpp.BackBufferCount = g_flipEx ? 2 : 1;
     d3dpp.SwapEffect = g_flipEx ? D3DSWAPEFFECT_FLIPEX : D3DSWAPEFFECT_DISCARD;
     d3dpp.PresentationInterval = presentationInterval;
@@ -447,7 +471,35 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
         NULL,
         &g_pD3D9Device);
 
-    assert(SUCCEEDED(hr));
+    // The HRESULT used to be swallowed by an assert, which NDEBUG compiles out - so a refused
+    // device produced "Unable to create D3D9Ex Device" and nothing else, and the reason had to
+    // be guessed. Print the code and the parameters that can plausibly cause a refusal.
+    if (FAILED(hr)) {
+        LOGERR("CreateDeviceEx failed (0x%08lx): %dx%d fmt %d, swap effect %d, %u back buffers, "
+               "interval 0x%08x, behavior 0x%08lx", (unsigned long)hr, BUF_WIDTH, BUF_HEIGHT,
+               (int)d3dpp.BackBufferFormat, (int)d3dpp.SwapEffect, d3dpp.BackBufferCount,
+               presentationInterval, (unsigned long)dwBehaviorFlags);
+    }
+
+    // A refused FLIP MODE fails the run. It deliberately does NOT fall back to bitblt: the
+    // capture would then be a bitblt run wearing a flipex file name, and the file name outlives
+    // the log. The same rule the ETW session follows, for the same reason - "asking for -etw
+    // and silently getting a normal capture has cost a session once already" - except that a
+    // present-path substitution invalidates every number in the run rather than one instrument,
+    // so this aborts instead of warning and continuing.
+    if (FAILED(hr) && g_flipEx) {
+        LOGERR("flip mode REFUSED (0x%08lx). NOT falling back to bitblt: a run labelled flipex "
+               "that silently presented through the old path would be worse than no run.",
+               (unsigned long)hr);
+        MessageBoxA(NULL,
+                    "-flipex was requested but the device could not be created.\n\n"
+                    "The relay will NOT start. It deliberately does not fall back to the "
+                    "normal present path, because the capture would then be mislabelled.\n\n"
+                    "Most likely cause: the back buffer format does not match the display "
+                    "mode. See NvFBCR.log for the HRESULT and the parameters tried.",
+                    "NvFBCR: flip mode unavailable",
+                    MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
+    }
 
     return hr;
 }
