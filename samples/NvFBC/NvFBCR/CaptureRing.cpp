@@ -7,6 +7,7 @@
 // External globals (NvFBCR.cpp). Start() rebinds the NvFBC session to the capture device and
 // must update the global so WinMain's Cleanup releases the right session.
 extern IDirect3D9Ex* g_pD3DEx;
+extern int g_sourceAdapterIndex;
 extern NvFBCLibrary* pNVFBCLib;
 extern NvFBCToDx9Vid* NvFBCDX9;
 
@@ -93,10 +94,15 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
                         LARGE_INTEGER baseQpc, HWND hwnd) {
     m_baseQpc = baseQpc;
 
-    // ---- Create the private capture device on the same adapter as the present device. ----
-    D3DDEVICE_CREATION_PARAMETERS cp = {};
-    m_presentDevice->GetCreationParameters(&cp);
-
+    // ---- Create the private capture device on the SOURCE adapter. ----
+    // Pinned explicitly, NOT inherited from the present device: the present device may sit on
+    // the target adapter (it owns the output window), and NvFBC has to capture the SOURCE
+    // display. Inheriting would silently follow the present device to the wrong output the
+    // moment a mode opted into the move.
+    //
+    // Cross-ordinal sharing of the ring slots still works because both ordinals are the SAME
+    // PHYSICAL GPU - D3D9Ex has no cross-GPU sharing, but D3D9 hands out one adapter ordinal
+    // per OUTPUT, so two ordinals on one card share fine.
     D3DPRESENT_PARAMETERS d3dpp = {};
     d3dpp.Windowed = TRUE;
     d3dpp.BackBufferFormat = D3DFMT_A2R10G10B10;
@@ -108,11 +114,12 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     d3dpp.hDeviceWindow = hwnd;
 
     HRESULT hr = g_pD3DEx->CreateDeviceEx(
-        cp.AdapterOrdinal, D3DDEVTYPE_HAL, hwnd,
+        (UINT)g_sourceAdapterIndex, D3DDEVTYPE_HAL, hwnd,
         D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
         &d3dpp, NULL, &m_capDevice);
     if (FAILED(hr)) {
-        LOGERR("CaptureRing: failed to create capture device (error: 0x%08x)", hr);
+        LOGERR("CaptureRing: failed to create capture device on source adapter %d "
+               "(error: 0x%08x)", g_sourceAdapterIndex, hr);
         return false;
     }
 
