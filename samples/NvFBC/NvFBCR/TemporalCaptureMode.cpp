@@ -9,6 +9,7 @@ extern IDirect3DSurface9* g_backbuffer;
 extern int BUF_WIDTH;
 extern int BUF_HEIGHT;
 extern int g_targetRefreshHz;
+extern bool g_flipEx;
 
 // Presents between estimator-vs-assumption audits (about 10 s at 60 Hz): rare enough to keep
 // the log quiet, frequent enough that a wrong -src is caught within the first minute.
@@ -372,6 +373,25 @@ void TemporalCaptureMode::Run(
     MSG msg = {};
     LONGLONG lastPresentQpc = 0;
     long long presentFailures = 0;
+    long long backbufferFailures = 0;
+    // Present statistics live on the swapchain, not the device, and are only meaningful under
+    // flip mode. Acquired once: the swapchain object is stable even though its buffers rotate.
+    IDirect3DSwapChain9Ex* presentStatsSwapChain = NULL;
+    UINT lastSyncRefresh = 0;
+    long long missedRefreshes = 0, statsSamples = 0;
+    if (g_flipEx) {
+        IDirect3DSwapChain9* sc = NULL;
+        if (SUCCEEDED(device->GetSwapChain(0, &sc)) && sc) {
+            if (FAILED(sc->QueryInterface(__uuidof(IDirect3DSwapChain9Ex),
+                                          (void**)&presentStatsSwapChain))) {
+                presentStatsSwapChain = NULL;
+            }
+            sc->Release();
+        }
+        LOG("Flip-mode presentation ACTIVE (-flipex): FLIPEX swap effect, back buffer acquired "
+            "per present; present statistics %s",
+            presentStatsSwapChain ? "available (presentstats: lines follow)" : "UNAVAILABLE");
+    }
     m_scheduler.Seed();
 
     while (TRUE)
@@ -463,11 +483,30 @@ void TemporalCaptureMode::Run(
             }
         }
 
+        // The back buffer is acquired PER PRESENT, never cached. Under D3DSWAPEFFECT_DISCARD
+        // back buffer 0 is the same surface every time and this is a no-op, but under FLIPEX
+        // the runtime rotates which handle is the back buffer at presentation time, so a
+        // cached pointer composites into a surface that is no longer the one being presented -
+        // the "every third frame is blank" that made the earlier FLIPEX attempt fail. Falls
+        // back to the cached global if the call fails, so a failure degrades rather than
+        // presenting whatever the flip queue left behind.
+        IDirect3DSurface9* backbuffer = NULL;
+        if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) ||
+            !backbuffer) {
+            backbuffer = NULL;
+            backbufferFailures++;
+            if (backbufferFailures == 1 || (backbufferFailures % 600) == 0) {
+                LOGERR("GetBackBuffer failed (%lld so far); falling back to the cached surface",
+                       backbufferFailures);
+            }
+        }
+        IDirect3DSurface9* const target = backbuffer ? backbuffer : g_backbuffer;
+
         // The DECISION is pure policy (selection or composite, in TemporalPolicy.cpp
         // with the mechanism rationale); the compositor executes it onto the
         // backbuffer. This loop owns the timing, the present, and the log.
         CompositeOutcome outcome;
-        m_compositor->Compose(bracket, g_backbuffer, &outcome);
+        m_compositor->Compose(bracket, target, &outcome);
 
         // Burn the marker over the composed backbuffer, once per present (repeats
         // included: the counter identifies presented frames, not source frames).
@@ -475,7 +514,7 @@ void TemporalCaptureMode::Run(
         // A/B measures it.
         long long markN = -1;
         if (m_mark) {
-            markN = (long long)m_marker.Burn(g_backbuffer, outcome.pickCode, outcome.weightQ,
+            markN = (long long)m_marker.Burn(target, outcome.pickCode, outcome.weightQ,
                                              outcome.synthesized, m_compositor->Id(),
                                              outcome.pixelExec);
         }
@@ -496,6 +535,8 @@ void TemporalCaptureMode::Run(
         // invisible in the log (the present was counted) and shows downstream as the previous
         // frame repeating - the exact judder signature this relay is measured against.
         const HRESULT presentHr = device->PresentEx(NULL, NULL, NULL, NULL, 0);
+        // GetBackBuffer AddRefs; release after the present so the runtime can rotate it.
+        if (backbuffer) backbuffer->Release();
         if (FAILED(presentHr) || presentHr == S_PRESENT_MODE_CHANGED ||
             presentHr == S_PRESENT_OCCLUDED) {
             // Never silent: a present that did not reach the screen must be attributable, or
@@ -504,6 +545,37 @@ void TemporalCaptureMode::Run(
             if (presentFailures == 1 || (presentFailures % 600) == 0) {
                 LOGERR("present returned 0x%08lx (%lld so far): the frame may not have reached "
                        "the screen", (unsigned long)presentHr, presentFailures);
+            }
+        }
+
+        // PRESENT STATISTICS: what the SINK actually did with our frames, from the runtime
+        // rather than inferred from ETW. Only a flip-mode swapchain reports these in windowed
+        // mode - a bitblt one returns zeroes - so this is the half of -flipex that pays off
+        // whether or not DWM ever promotes the window to independent flip.
+        //
+        // PresentRefreshCount equals SyncRefreshCount when every present landed on its own
+        // vsync; when the former runs ahead, a refresh went by showing the previous frame,
+        // which is a DOWNSTREAM DUPE measured in-process. That is the same quantity a marked
+        // video plus a marker decode plus content-step analysis currently produces offline.
+        if (g_flipEx && presentStatsSwapChain) {
+            D3DPRESENTSTATS ps;
+            ZeroMemory(&ps, sizeof(ps));
+            if (SUCCEEDED(presentStatsSwapChain->GetPresentStatistics(&ps))) {
+                if (lastSyncRefresh != 0 && ps.SyncRefreshCount > lastSyncRefresh) {
+                    const UINT elapsed = ps.SyncRefreshCount - lastSyncRefresh;
+                    // More than one sink refresh since the last present means refreshes that
+                    // showed no new frame of ours.
+                    if (elapsed > 1) missedRefreshes += (elapsed - 1);
+                }
+                lastSyncRefresh = ps.SyncRefreshCount;
+                statsSamples++;
+                if ((statsSamples % 1800) == 0) {
+                    LOG("presentstats: present=%u presentRefresh=%u syncRefresh=%u "
+                        "syncQpc=%lldus missedRefreshes=%lld over %lld presents",
+                        ps.PresentCount, ps.PresentRefreshCount, ps.SyncRefreshCount,
+                        (long long)((ps.SyncQPCTime.QuadPart - m_baseQpc.QuadPart) * usPerTick),
+                        missedRefreshes, statsSamples);
+                }
             }
         }
 
@@ -647,6 +719,22 @@ void TemporalCaptureMode::Run(
         }
         if (msg.message == WM_QUIT) break;
         if (m_ring.HasStopped()) break;  // capture thread hit a fatal error
+    }
+
+    if (presentStatsSwapChain) {
+        // The whole-run figure, so a capture carries its downstream dupe count without a
+        // video: refreshes that showed no new frame of ours, over presents that reported.
+        LOG("presentstats summary: %lld refreshes showed no new frame over %lld presents "
+            "(%.3f/s at 60 Hz sink)", missedRefreshes, statsSamples,
+            statsSamples > 0 ? (double)missedRefreshes * 60.0 / (double)statsSamples : 0.0);
+        presentStatsSwapChain->Release();
+        presentStatsSwapChain = NULL;
+    }
+    if (backbufferFailures > 0) {
+        LOGERR("GetBackBuffer failed %lld times over the run", backbufferFailures);
+    }
+    if (presentFailures > 0) {
+        LOGERR("present reported a non-OK status %lld times over the run", presentFailures);
     }
 
     if (m_phaseKeep) {

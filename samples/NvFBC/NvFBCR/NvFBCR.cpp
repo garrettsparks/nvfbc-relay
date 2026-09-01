@@ -256,6 +256,11 @@ DisplayPosition source, target;
 // to open a private device on the capture-card adapter for GetRasterStatus probes.
 int g_targetAdapterIndex = 0;
 
+// Flip-mode presentation (-flipex): D3DSWAPEFFECT_FLIPEX instead of the bitblt DISCARD. Opt-in
+// because it changes how every frame reaches DWM; see the swap-chain setup for why it is wanted
+// and why the previous attempt failed. Off leaves presentation byte-identical to today.
+bool g_flipEx = false;
+
 // Target display's refresh rate in Hz, 0 when it could not be read. This is the SINK rate: what
 // the capture card can actually show, which is not the rate we present at (a vsync present rides
 // DWM's compose clock, and a timer present rides -framerate). The composite tooth guard arms off
@@ -404,8 +409,23 @@ HRESULT InitD3D9(unsigned int deviceID, HWND hwnd, UINT presentationInterval)
     d3dpp.BackBufferFormat = D3DFMT_A2R10G10B10;
     d3dpp.BackBufferWidth  = BUF_WIDTH;
     d3dpp.BackBufferHeight = BUF_HEIGHT;
-    d3dpp.BackBufferCount = 1;
-    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    // FLIP MODE (-flipex): the bitblt swap effect copies the back buffer into DWM's
+    // redirection surface on every present - a full-frame read+write the relay pays
+    // unconditionally - and it makes present statistics unavailable (a bitblt windowed
+    // swapchain reports all zeroes, which is why sink timing has had to be reconstructed
+    // from ETW). Flip mode shares the buffers with DWM instead: no copy, real present
+    // statistics, and it is the precondition for DWM promoting the window to independent
+    // flip, which would pace presents on the CARD's vblank rather than the compose clock.
+    //
+    // FLIPEX was tried once before and abandoned because "every third frame appears blank".
+    // That was this code's own bug, not a platform limit: the runtime "rotates whichever
+    // handle belongs to the buffer that becomes the front buffer at presentation time", and
+    // the back buffer was fetched ONCE at startup and cached forever, so with 2 requested
+    // buffers plus the implicit extra, two of every three presents composited into a surface
+    // that was not the current back buffer. The present loop now re-acquires the back buffer
+    // every present, which is what flip mode requires.
+    d3dpp.BackBufferCount = g_flipEx ? 2 : 1;
+    d3dpp.SwapEffect = g_flipEx ? D3DSWAPEFFECT_FLIPEX : D3DSWAPEFFECT_DISCARD;
     d3dpp.PresentationInterval = presentationInterval;
     d3dpp.hDeviceWindow = hwnd;
     // D3DCREATE_MULTITHREADED: the temporal modes drive capture on a separate thread from
@@ -519,6 +539,10 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
     }
     if (tokens[i] == "-diffmap") {
         g_diffMap = true;
+        return 1;
+    }
+    if (tokens[i] == "-flipex") {
+        g_flipEx = true;
         return 1;
     }
     if (tokens[i] == "-mark") {
@@ -638,6 +662,7 @@ void ConsoleUserInput(string* framerateStr) {
     cout << "  -interp flow|fruc - o:* synthesis engine (default flow = raw NVOFA + warp)" << endl;
     cout << "  -mark [N]      - Burn the frame-counter marker (video-to-log alignment, debug); N = first N presents only" << endl;
     cout << "  -tint          - Border-tint synthesized frames red (blend mode, debug)" << endl;
+    cout << "  -flipex        - Flip-mode presentation (no DWM copy, present statistics; experimental)" << endl;
     cout << endl;
     cout << "  diag, diag:vsync - Clock probes (DWM compose timing + card raster)" << endl;
     cout << endl;
@@ -770,7 +795,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
     LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s, "
         "etw flip capture %s, flip join %s, dejitter %s, fgphase %s, phasekeep %s, "
-        "generated-frame substitution %s, diffmap %s, extra lag %u ms",
+        "generated-frame substitution %s, diffmap %s, flip mode %s, extra lag %u ms",
         g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
         g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off",
         !g_etw ? "off (no -etw)" : (g_noJoin ? "OFF (-nojoin)" : "on"),
@@ -783,6 +808,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
                                            : "REFUSED (-phasekeep needs -etw with the join on)"),
         g_subGen ? "ON (-subgen)" : "off",
         g_diffMap ? "requested (-diffmap; ACTIVE only when the instrument line follows)" : "off",
+        g_flipEx ? "FLIPEX (-flipex)" : "bitblt (DISCARD)",
         g_extraLagMs);
 
     BUF_WIDTH = target.position.right - target.position.left;
