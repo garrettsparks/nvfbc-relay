@@ -2,7 +2,7 @@
 
 #include <windows.h>
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_3.h>
 
 #include "CaptureRing.h"
 #include "IFrameCompositor.h"
@@ -108,6 +108,7 @@ private:
     bool Draw(int slotA, int slotB, float w);
     bool DrawMarker(const bool cells[FrameMarker::kCells]);
     void SampleStats();
+    void SamplePresentationPath();
 
     // Marker compositor-ID cell: this backend is the blend pipeline.
     static const int kCompositorIdBlend = 1;
@@ -126,6 +127,11 @@ private:
     ID3D11Device* m_dev;
     ID3D11DeviceContext* m_ctx;
     IDXGISwapChain1* m_swapChain;
+    // Reports the swapchain's composition mode, an overlay plane against a composition
+    // surface. Related to whether the present path is promoted but not equivalent to it, so it
+    // informs that question rather than settling it. Purely diagnostic: NULL leaves the backend
+    // fully functional with only the mode unreported.
+    IDXGISwapChainMedia* m_swapChainMedia;
     HANDLE m_frameWait;                 // the swapchain's frame-latency waitable object
     ID3D11RenderTargetView* m_rtv;      // the current back buffer; recreated per present
 
@@ -158,6 +164,10 @@ private:
     long long m_missedRefreshes;
     long long m_statsSamples;
     long long m_statsRebases;           // refresh-counter base changes: presentation path changed
+    int m_compMode;                     // last DXGI_FRAME_PRESENTATION_MODE seen; -1 = none yet
+    long long m_compModeChanges;
+    long long m_samplesOverlay;         // presents scanned from an overlay plane
+    long long m_samplesComposed;        // presents composed by DWM
     long long m_presentFailures;
     long long m_drawFailures;
     long long m_waitTimeouts;

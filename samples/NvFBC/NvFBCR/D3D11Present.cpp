@@ -75,6 +75,22 @@ bool Compile(const char* src, const char* name, const char* profile, ID3DBlob** 
     return true;
 }
 
+// The swapchain's composition mode, reported in the API's own vocabulary and NOT translated
+// into a promotion verdict. OVERLAY means a hardware overlay plane; COMPOSED means a
+// composition surface. Neither maps cleanly onto the presentation modes an external trace
+// reports: a window can be flipped independently without occupying an overlay plane, and that
+// case is not documented to report OVERLAY. Read this as one signal about the presentation
+// path, to be calibrated against a trace, never as the answer on its own.
+const char* PresentationPathName(int mode) {
+    switch (mode) {
+        case DXGI_FRAME_PRESENTATION_MODE_COMPOSED:  return "COMPOSED (composition surface)";
+        case DXGI_FRAME_PRESENTATION_MODE_OVERLAY:   return "OVERLAY (hardware overlay plane)";
+        case DXGI_FRAME_PRESENTATION_MODE_NONE:      return "NONE (no mode reported)";
+        case DXGI_FRAME_PRESENTATION_MODE_COMPOSITION_FAILURE: return "COMPOSITION_FAILURE";
+        default: return "unrecognized";
+    }
+}
+
 const char* FormatName(DXGI_FORMAT f) {
     if (f == DXGI_FORMAT_R10G10B10A2_UNORM) return "R10G10B10A2";
     if (f == DXGI_FORMAT_B8G8R8A8_UNORM) return "B8G8R8A8";
@@ -108,11 +124,13 @@ D3D11PresentBackend::D3D11PresentBackend()
     : m_enabled(false)
     , m_width(0), m_height(0), m_ringSlots(0)
     , m_cfg(NULL), m_subGen(false)
-    , m_dev(NULL), m_ctx(NULL), m_swapChain(NULL), m_frameWait(NULL), m_rtv(NULL)
+    , m_dev(NULL), m_ctx(NULL), m_swapChain(NULL), m_swapChainMedia(NULL), m_frameWait(NULL)
+    , m_rtv(NULL)
     , m_vs(NULL), m_ps(NULL), m_markerPs(NULL), m_cb(NULL), m_sampler(NULL)
     , m_lastSlotA(-1), m_lastSlotB(-1), m_lastWeight(0.0f), m_lastExec(0), m_haveLast(false)
     , m_mark(false)
     , m_lastSyncRefresh(0), m_missedRefreshes(0), m_statsSamples(0), m_statsRebases(0)
+    , m_compMode(-1), m_compModeChanges(0), m_samplesOverlay(0), m_samplesComposed(0)
     , m_presentFailures(0), m_drawFailures(0), m_waitTimeouts(0), m_presents(0)
 {
     for (int i = 0; i < CaptureRing::RING_SIZE; i++) {
@@ -134,6 +152,7 @@ D3D11PresentBackend::~D3D11PresentBackend() {
     if (m_vs) m_vs->Release();
     if (m_rtv) m_rtv->Release();
     if (m_frameWait) CloseHandle(m_frameWait);
+    if (m_swapChainMedia) m_swapChainMedia->Release();
     if (m_swapChain) m_swapChain->Release();
     if (m_ctx) m_ctx->Release();
     if (m_dev) m_dev->Release();
@@ -244,6 +263,21 @@ bool D3D11PresentBackend::CreateDeviceAndSwapChain(HWND hwnd, int width, int hei
                    "refusing the mode", hr);
             m_swapChain->Release();
             m_swapChain = NULL;
+        }
+    }
+    if (m_swapChain) {
+        // Presentation-path reporting. The composition mode is granted and revoked silently, so
+        // without this the only in-process evidence is indirect (the refresh counter re-basing,
+        // the present spacing tightening). This interface is documented for media applications
+        // deciding whether to keep a decode swapchain, and nothing states what it reports for a
+        // window swapchain drawing ordinary content, so treat a mode it never leaves, or one
+        // that disagrees with an external trace, as this call not applying here.
+        HRESULT mhr = m_swapChain->QueryInterface(__uuidof(IDXGISwapChainMedia),
+                                                  (void**)&m_swapChainMedia);
+        if (FAILED(mhr) || !m_swapChainMedia) {
+            m_swapChainMedia = NULL;
+            LOGERR("D3D11Present: IDXGISwapChainMedia unavailable (0x%08x); the presentation "
+                   "path will not be reported, everything else is unaffected", mhr);
         }
     }
     // The relay owns alt-enter; DXGI must not transition us on its own.
@@ -437,7 +471,32 @@ bool D3D11PresentBackend::DrawMarker(const bool cells[FrameMarker::kCells]) {
     return true;
 }
 
+void D3D11PresentBackend::SamplePresentationPath() {
+    if (!m_swapChainMedia) return;
+    DXGI_FRAME_STATISTICS_MEDIA fm;
+    ZeroMemory(&fm, sizeof(fm));
+    if (FAILED(m_swapChainMedia->GetFrameStatisticsMedia(&fm))) return;
+
+    const int mode = (int)fm.CompositionMode;
+    if (mode == DXGI_FRAME_PRESENTATION_MODE_OVERLAY) m_samplesOverlay++;
+    if (mode == DXGI_FRAME_PRESENTATION_MODE_COMPOSED) m_samplesComposed++;
+    if (mode == m_compMode) return;
+
+    // Every transition is logged rather than sampled periodically: the presentation path
+    // changing mid-run is the one event that silently invalidates a pacing comparison, and it
+    // is rare enough that one line each costs nothing.
+    if (m_compMode == -1) {
+        LOG("d3d11 presentpath: %s at present %lld", PresentationPathName(mode), m_presents);
+    } else {
+        m_compModeChanges++;
+        LOG("d3d11 presentpath CHANGED: %s -> %s at present %lld",
+            PresentationPathName(m_compMode), PresentationPathName(mode), m_presents);
+    }
+    m_compMode = mode;
+}
+
 void D3D11PresentBackend::SampleStats() {
+    SamplePresentationPath();
     DXGI_FRAME_STATISTICS fs;
     ZeroMemory(&fs, sizeof(fs));
     const HRESULT hr = m_swapChain->GetFrameStatistics(&fs);
@@ -630,6 +689,14 @@ void D3D11PresentBackend::LogSummary() const {
         m_missedRefreshes, m_statsSamples,
         m_statsSamples > 0 ? (double)m_missedRefreshes * 60.0 / (double)m_statsSamples : 0.0,
         m_presents, m_presentFailures, m_drawFailures, m_waitTimeouts, m_statsRebases);
+    if (m_swapChainMedia) {
+        const long long pathed = m_samplesOverlay + m_samplesComposed;
+        LOG("d3d11 presentpath summary: %lld presents reported OVERLAY, %lld reported COMPOSED "
+            "(%.1f%% overlay), %lld mode changes; ended %s",
+            m_samplesOverlay, m_samplesComposed,
+            pathed > 0 ? 100.0 * (double)m_samplesOverlay / (double)pathed : 0.0,
+            m_compModeChanges, PresentationPathName(m_compMode));
+    }
     if (m_subGen) {
         LOG("subgen summary: %lld substituted, %lld offered, %lld skipped unscreened "
             "(no content check on the D3D11 present path)",
