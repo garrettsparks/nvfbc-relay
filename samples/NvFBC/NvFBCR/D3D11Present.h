@@ -157,6 +157,7 @@ private:
     UINT m_lastSyncRefresh;
     long long m_missedRefreshes;
     long long m_statsSamples;
+    long long m_statsRebases;           // refresh-counter base changes: presentation path changed
     long long m_presentFailures;
     long long m_drawFailures;
     long long m_waitTimeouts;
