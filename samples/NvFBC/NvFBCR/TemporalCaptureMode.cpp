@@ -434,9 +434,24 @@ void TemporalCaptureMode::Run(
         // That clock is regime-dependent: composed desktop → primary/source display; fullscreen
         // game on the source → card-locked 60 Hz (spec Rounds 5-10).
         LONGLONG deadline;
+        // How long this present's pacing wait blocked (blk= on the line). A vsync present
+        // that is doing its job spends nearly the whole period waiting; one that returns at
+        // once is not pacing anything, and pdt alone cannot tell those apart.
+        LONGLONG blockTicks = 0;
         if (m_vsyncPresent) {
             LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
+            if (m_present11) {
+                // The D3D11 path waits HERE, on the swapchain's own object, before the
+                // decision: the frame is decided against the freshest ring state and queued
+                // the instant there is room. Present itself does not block on this path.
+                LARGE_INTEGER waitStart;
+                QueryPerformanceCounter(&waitStart);
+                m_present11->WaitForFrame();
+                QueryPerformanceCounter(&now);
+                blockTicks = now.QuadPart - waitStart.QuadPart;
+            } else {
+                QueryPerformanceCounter(&now);
+            }
             deadline = now.QuadPart;
         } else {
             m_scheduler.WaitUntilDeadline();
@@ -522,20 +537,13 @@ void TemporalCaptureMode::Run(
         // the D3D9 path does the same through the compositor and PresentEx.
         CompositeOutcome outcome;
         long long markN = -1;
-        // Stamped either side of the present so the line carries how long the present BLOCKED,
-        // not just how far apart presents landed. A vsync present that is doing its job spends
-        // nearly the whole period here; one that returns immediately is not pacing anything,
-        // and pdt alone cannot tell those apart.
         LARGE_INTEGER beforePresent;
-        LARGE_INTEGER afterPresent;
         if (m_present11) {
             m_present11->Compose(bracket, &outcome);
             markN = m_present11->BurnMarker(outcome);
             QueryPerformanceCounter(&beforePresent);
-            // Under independent flip this blocks on the SINK's vblank; composed by DWM it
-            // blocks on the compose clock exactly as PresentEx does.
+            // Queues the frame; the pacing wait already happened at the top of the loop.
             m_present11->Present(m_vsyncPresent);
-            QueryPerformanceCounter(&afterPresent);
         } else {
             // The back buffer is acquired PER PRESENT, never cached. Under
             // D3DSWAPEFFECT_DISCARD back buffer 0 is the same surface every time and this is
@@ -585,7 +593,10 @@ void TemporalCaptureMode::Run(
             // downstream as the previous frame repeating - the exact judder signature this
             // relay is measured against.
             const HRESULT presentHr = device->PresentEx(NULL, NULL, NULL, NULL, 0);
+            // On this path the present IS the pacing wait, so the block is measured here.
+            LARGE_INTEGER afterPresent;
             QueryPerformanceCounter(&afterPresent);
+            blockTicks = afterPresent.QuadPart - beforePresent.QuadPart;
             // GetBackBuffer AddRefs; release after the present so the runtime can rotate it.
             if (backbuffer) backbuffer->Release();
             if (FAILED(presentHr) || presentHr == S_PRESENT_MODE_CHANGED ||
@@ -746,7 +757,7 @@ void TemporalCaptureMode::Run(
                 markN,
                 opFields,
                 flipFields,
-                (long long)((afterPresent.QuadPart - beforePresent.QuadPart) * usPerTick));
+                (long long)(blockTicks * usPerTick));
             if (!bracket.info.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }

@@ -21,11 +21,17 @@
 //
 // A flip-model swapchain whose window covers an output can be promoted by Windows to
 // INDEPENDENT FLIP, where DWM leaves the present path and the display controller scans
-// these buffers directly. Present(1, 0) then blocks on the SINK's vblank: one present per
-// sink scan, phase-locked by construction, on every title regardless of source regime. That
-// is the goal. It is NOT exclusive fullscreen: nothing here calls SetFullscreenState, and
-// failing to be promoted degrades to being composed by DWM, which is what the relay does
-// today.
+// these buffers directly. The swapchain's frame-latency waitable object then signals on the
+// SINK's vblank: one present per sink scan, phase-locked by construction, on every title
+// regardless of source regime. That is the goal. It is NOT exclusive fullscreen: nothing here
+// calls SetFullscreenState, and failing to be promoted degrades to being composed by DWM,
+// which is what the relay does today.
+//
+// THE WAIT COMES BEFORE THE DECISION, not inside Present after the draw. A present that
+// blocks after rendering settles into waiting almost a full extra frame between drawing and
+// display; waiting on the swapchain's own object first, then deciding, drawing and queueing
+// immediately, decides each frame as late as possible and shows it one sink period later
+// rather than two.
 //
 // WHAT IS CERTAIN EVEN WITHOUT PROMOTION: flip model shares buffers with DWM instead of
 // copying them into a redirection surface (one full-frame read+write removed per present),
@@ -66,8 +72,15 @@ public:
     // (mark= on the temporal line), or -1 when the marker is off.
     long long BurnMarker(const CompositeOutcome& out);
 
-    // Present the drawn back buffer. vsync selects sync interval 1, which under independent
-    // flip blocks on the sink's vblank and is the frame-pacing wait; false is immediate.
+    // THE FRAME-PACING WAIT. Blocks until the swapchain has room for the next frame, which
+    // with a latency of one is the moment the previous frame was consumed: the sink's vblank
+    // under independent flip, DWM's compose otherwise. Call at the top of every present,
+    // before the decision. Returns false on the bounded timeout, which the caller treats as
+    // a wait that did not pace anything.
+    bool WaitForFrame();
+
+    // Queue the drawn back buffer. Does not block: WaitForFrame already made room. vsync
+    // selects sync interval 1 so the flip lands on a vblank rather than tearing.
     void Present(bool vsync);
 
     // Whole-run present and substitution statistics; safe to call when disabled.
@@ -113,6 +126,7 @@ private:
     ID3D11Device* m_dev;
     ID3D11DeviceContext* m_ctx;
     IDXGISwapChain1* m_swapChain;
+    HANDLE m_frameWait;                 // the swapchain's frame-latency waitable object
     ID3D11RenderTargetView* m_rtv;      // the current back buffer; recreated per present
 
     ID3D11Texture2D* m_ringAlias[CaptureRing::RING_SIZE];
@@ -145,5 +159,6 @@ private:
     long long m_statsSamples;
     long long m_presentFailures;
     long long m_drawFailures;
+    long long m_waitTimeouts;
     long long m_presents;
 };
