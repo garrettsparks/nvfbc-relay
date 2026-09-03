@@ -112,7 +112,7 @@ D3D11PresentBackend::D3D11PresentBackend()
     , m_vs(NULL), m_ps(NULL), m_markerPs(NULL), m_cb(NULL), m_sampler(NULL)
     , m_lastSlotA(-1), m_lastSlotB(-1), m_lastWeight(0.0f), m_lastExec(0), m_haveLast(false)
     , m_mark(false)
-    , m_lastSyncRefresh(0), m_missedRefreshes(0), m_statsSamples(0)
+    , m_lastSyncRefresh(0), m_missedRefreshes(0), m_statsSamples(0), m_statsRebases(0)
     , m_presentFailures(0), m_drawFailures(0), m_waitTimeouts(0), m_presents(0)
 {
     for (int i = 0; i < CaptureRing::RING_SIZE; i++) {
@@ -447,9 +447,24 @@ void D3D11PresentBackend::SampleStats() {
         m_lastSyncRefresh = 0;
         return;
     }
-    if (m_lastSyncRefresh != 0 && fs.SyncRefreshCount > m_lastSyncRefresh) {
-        const UINT elapsed = fs.SyncRefreshCount - m_lastSyncRefresh;
-        if (elapsed > 1) m_missedRefreshes += (elapsed - 1);
+    if (m_lastSyncRefresh != 0) {
+        // The refresh counter can change BASE mid-run: the statistics come from whichever
+        // path is presenting the window, and DWM's composition and the output's own flip
+        // queue count refreshes on different origins. A jump of millions, or a step backwards,
+        // is therefore the presentation path changing under us (independent flip granted or
+        // revoked), not refreshes we missed. Ten seconds of refreshes separates the two: a
+        // genuine stall that long would be visible everywhere else in the log first.
+        static const UINT kRebaseRefreshes = 600;
+        const bool backwards = fs.SyncRefreshCount < m_lastSyncRefresh;
+        const UINT elapsed = backwards ? 0 : fs.SyncRefreshCount - m_lastSyncRefresh;
+        if (backwards || elapsed > kRebaseRefreshes) {
+            m_statsRebases++;
+            LOG("d3d11 presentstats: refresh counter re-based (%u -> %u) at present %lld; the "
+                "presentation path changed, so this is a promotion or demotion, not a stall",
+                m_lastSyncRefresh, fs.SyncRefreshCount, m_presents);
+        } else if (elapsed > 1) {
+            m_missedRefreshes += (elapsed - 1);
+        }
     }
     m_lastSyncRefresh = fs.SyncRefreshCount;
     m_statsSamples++;
@@ -611,10 +626,10 @@ void D3D11PresentBackend::LogSummary() const {
     if (!m_enabled) return;
     LOG("d3d11 presentstats summary: %lld refreshes showed no new frame over %lld sampled "
         "presents (%.3f/s at a 60 Hz sink); %lld presents, %lld reported a problem, "
-        "%lld draws failed, %lld frame waits timed out",
+        "%lld draws failed, %lld frame waits timed out, %lld presentation-path changes",
         m_missedRefreshes, m_statsSamples,
         m_statsSamples > 0 ? (double)m_missedRefreshes * 60.0 / (double)m_statsSamples : 0.0,
-        m_presents, m_presentFailures, m_drawFailures, m_waitTimeouts);
+        m_presents, m_presentFailures, m_drawFailures, m_waitTimeouts, m_statsRebases);
     if (m_subGen) {
         LOG("subgen summary: %lld substituted, %lld offered, %lld skipped unscreened "
             "(no content check on the D3D11 present path)",
