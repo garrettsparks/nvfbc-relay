@@ -8,9 +8,10 @@
 #include "TemporalPolicy.h"
 #include "EtwConsumer.h"
 
-// Defined in FrameCompositors.h, which this header deliberately does not pull in: only the
-// implementation needs the concrete type.
+// Defined in FrameCompositors.h and D3D11Present.h, which this header deliberately does not
+// pull in: only the implementation needs the concrete types.
 class SynthCompositorBase;
+class D3D11PresentBackend;
 
 // Temporal capture mode — nearest-frame selection for smooth fixed-rate capture of a
 // (possibly variable-rate) source.
@@ -100,6 +101,13 @@ private:
     // The synth compositor when one is in use, for the substitution counters. Aliases
     // m_compositor and is never deleted through this pointer.
     SynthCompositorBase* m_synth = NULL;
+    // b:flip: decide, composite and present through a D3D11 flip-model swapchain on the
+    // output window, so that Windows can promote the present to independent flip and the
+    // present blocks on the SINK's vblank instead of DWM's compose clock. Owned. When set,
+    // m_compositor is NULL: the backend owns the composite decision and the marker, and
+    // the D3D9 swapchain never presents.
+    bool m_d3d11Present;
+    D3D11PresentBackend* m_present11 = NULL;
     policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
     policy::StampOverlay m_overlay;      // present-thread-owned; FindBracket reads through it
     long long m_nextBatch = 0;           // cursor into the ring's batch-start history
@@ -130,7 +138,7 @@ public:
                         bool etw = false, bool noJoin = false, bool dejitter = false,
                         bool fgPhase = false, bool phaseKeep = false,
                         bool subGen = false, bool diffMap = false,
-                        unsigned int extraLagMs = 0);
+                        unsigned int extraLagMs = 0, bool d3d11Present = false);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;
@@ -138,6 +146,7 @@ public:
     // The temporal modes rebind NvFBC to CaptureRing's private capture device, so the present
     // device is free to live on the adapter that actually owns the output window.
     virtual bool PresentsOnTargetAdapter() const override { return true; }
+    virtual bool PresentsViaD3D11() const override { return m_d3d11Present; }
     virtual bool Setup() override;
     virtual void Run(
         NvFBCToDx9Vid* nvfbcDx9,

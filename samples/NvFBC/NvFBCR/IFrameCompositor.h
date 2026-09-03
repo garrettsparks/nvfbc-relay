@@ -25,6 +25,11 @@ struct CompositeOutcome {
                              // the held content's executor). synthesized == (pixelExec != 0).
 };
 
+// Synthesis executor codes: what actually produced a present's pixels. One vocabulary
+// across the log's sx= label and the marker's executor cells, matching the compositor
+// IDs (0 real/none, 1 blend, 2 fruc, 3 flow-warp); append-only once shipped.
+const char* SynthExecLabel(int code);
+
 // Per-present composition: turn the bracket into backbuffer pixels. One implementation
 // per output strategy (nearest copies one real frame; blend lerps the pair); the
 // present loop stays strategy-agnostic.

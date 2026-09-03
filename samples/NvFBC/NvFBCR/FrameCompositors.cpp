@@ -4,10 +4,7 @@
 
 extern int g_interpBackend;   // NvFBCR.cpp: -interp flow|fruc
 
-// Synthesis executor codes: what actually produced a present's pixels. One vocabulary
-// across the log's sx= label and the marker's executor cells, matching the compositor
-// IDs (0 real/none, 1 blend, 2 fruc, 3 flow-warp); append-only once shipped.
-static const char* SynthExecLabel(int code) {
+const char* SynthExecLabel(int code) {
     switch (code) {
         case 1:  return "blend";
         case 2:  return "fruc";

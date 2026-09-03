@@ -30,8 +30,8 @@ static const unsigned long long kExtSchema = 0;
 // bits 0-23, interp flag bit 24, weight bits 25-28, compositor bits 29-30, synthesis
 // executor bits 31-32, pick code bits 33-35, extension schema bits 36-38. The
 // checksum covers exactly that span.
-static void BuildCells(unsigned int counter, int pickCode, int weightQ, bool interp,
-                       int compositorId, int execCode, bool cells[/*kCells*/]) {
+void FrameMarker::BuildCells(unsigned int counter, int pickCode, int weightQ, bool interp,
+                             int compositorId, int execCode, bool cells[kCells]) {
     unsigned long long payload = counter & 0xFFFFFFull;
     if (interp) payload |= 1ull << 24;
     payload |= (unsigned long long)(weightQ & 0xF) << 25;
@@ -47,6 +47,21 @@ static void BuildCells(unsigned int counter, int pickCode, int weightQ, bool int
     for (int b = 0; b < 4; b++) {
         cells[40 + b] = ((checksum >> b) & 1) != 0;
     }
+}
+
+RECT FrameMarker::StripRect(int bufWidth, int bufHeight) {
+    // The marker region scales off the WIDTH alone (square cells), so the decoder can
+    // derive the full geometry from any recording's width. MulDiv rather than a
+    // truncated per-cell pixel size: the strip must end at the exact fraction the
+    // decoder computes, or cell centers drift across the strip at resolutions where
+    // width/kCellsPerWidth is fractional.
+    RECT r;
+    r.left = 0;
+    r.top = 0;
+    r.right = MulDiv(bufWidth, kGridW, kCellsPerWidth);
+    r.bottom = MulDiv(bufWidth, kGridH, kCellsPerWidth);
+    if (r.bottom > bufHeight) r.bottom = bufHeight;
+    return r;
 }
 
 FrameMarker::FrameMarker()
@@ -69,17 +84,7 @@ FrameMarker::~FrameMarker() {
 bool FrameMarker::Init(IDirect3DDevice9Ex* device, int bufWidth, int bufHeight, unsigned int maxFrames) {
     m_device = device;
     m_maxFrames = maxFrames;
-
-    // The marker region scales off the WIDTH alone (square cells), so the decoder can
-    // derive the full geometry from any recording's width. MulDiv rather than a
-    // truncated per-cell pixel size: the strip must end at the exact fraction the
-    // decoder computes, or cell centers drift across the strip at resolutions where
-    // width/kCellsPerWidth is fractional.
-    m_destRect.left = 0;
-    m_destRect.top = 0;
-    m_destRect.right = MulDiv(bufWidth, kGridW, kCellsPerWidth);
-    m_destRect.bottom = MulDiv(bufWidth, kGridH, kCellsPerWidth);
-    if (m_destRect.bottom > bufHeight) m_destRect.bottom = bufHeight;
+    m_destRect = StripRect(bufWidth, bufHeight);
 
     HRESULT hr = device->CreateOffscreenPlainSurface(
         kGridW * kTexelsPerCell, kGridH * kTexelsPerCell,
@@ -104,6 +109,32 @@ bool FrameMarker::Init(IDirect3DDevice9Ex* device, int bufWidth, int bufHeight, 
     else
         LOG("Frame marker ACTIVE (-mark): %d cells, %ldx%ld px strip at top-left; mark= on the temporal line",
             kCells, m_destRect.right, m_destRect.bottom);
+    return true;
+}
+
+void FrameMarker::InitCounter(unsigned int maxFrames) {
+    m_maxFrames = maxFrames;
+    m_active = true;
+    if (m_maxFrames)
+        LOG("Frame marker ACTIVE (-mark %u): %d cells, drawn by the present backend; burning the first %u presents, mark= on the temporal line",
+            m_maxFrames, kCells, m_maxFrames);
+    else
+        LOG("Frame marker ACTIVE (-mark): %d cells, drawn by the present backend; mark= on the temporal line",
+            kCells);
+}
+
+bool FrameMarker::Next(int pickCode, int weightQ, bool interp, int compositorId, int execCode,
+                       unsigned int* burned, bool cells[kCells]) {
+    // The counter advances even when drawing is disabled or fails, so mark= in the
+    // log stays a pure present count and a mid-run draw failure cannot shift the
+    // video-to-log join for frames already recorded.
+    *burned = m_counter;
+    m_counter = (m_counter + 1) & 0xFFFFFF;
+    if (!m_active) return false;
+    // -mark N: draw only the first N presents, then run clean; the counter above still
+    // advanced so mark= stays a continuous present count for the whole session.
+    if (m_maxFrames != 0 && *burned >= m_maxFrames) return false;
+    BuildCells(*burned, pickCode, weightQ, interp, compositorId, execCode, cells);
     return true;
 }
 
@@ -149,18 +180,10 @@ bool FrameMarker::BurnColorFill(IDirect3DSurface9* backbuffer, const bool cells[
 
 unsigned int FrameMarker::Burn(IDirect3DSurface9* backbuffer, int pickCode, int weightQ,
                                bool interp, int compositorId, int execCode) {
-    // The counter advances even when drawing is disabled or fails, so mark= in the
-    // log stays a pure present count and a mid-run draw failure cannot shift the
-    // video-to-log join for frames already recorded.
-    const unsigned int burned = m_counter;
-    m_counter = (m_counter + 1) & 0xFFFFFF;
-    if (!m_active || !backbuffer) return burned;
-    // -mark N: draw only the first N presents, then run clean; the counter above still
-    // advanced so mark= stays a continuous present count for the whole session.
-    if (m_maxFrames != 0 && burned >= m_maxFrames) return burned;
-
+    unsigned int burned = 0;
     bool cells[kCells];
-    BuildCells(burned, pickCode, weightQ, interp, compositorId, execCode, cells);
+    if (!Next(pickCode, weightQ, interp, compositorId, execCode, &burned, cells)) return burned;
+    if (!backbuffer) return burned;
 
     if (m_blitPathOk) {
         if (BurnBlit(backbuffer, cells)) return burned;
