@@ -108,12 +108,12 @@ D3D11PresentBackend::D3D11PresentBackend()
     : m_enabled(false)
     , m_width(0), m_height(0), m_ringSlots(0)
     , m_cfg(NULL), m_subGen(false)
-    , m_dev(NULL), m_ctx(NULL), m_swapChain(NULL), m_rtv(NULL)
+    , m_dev(NULL), m_ctx(NULL), m_swapChain(NULL), m_frameWait(NULL), m_rtv(NULL)
     , m_vs(NULL), m_ps(NULL), m_markerPs(NULL), m_cb(NULL), m_sampler(NULL)
     , m_lastSlotA(-1), m_lastSlotB(-1), m_lastWeight(0.0f), m_lastExec(0), m_haveLast(false)
     , m_mark(false)
     , m_lastSyncRefresh(0), m_missedRefreshes(0), m_statsSamples(0)
-    , m_presentFailures(0), m_drawFailures(0), m_presents(0)
+    , m_presentFailures(0), m_drawFailures(0), m_waitTimeouts(0), m_presents(0)
 {
     for (int i = 0; i < CaptureRing::RING_SIZE; i++) {
         m_ringAlias[i] = NULL;
@@ -133,6 +133,7 @@ D3D11PresentBackend::~D3D11PresentBackend() {
     if (m_ps) m_ps->Release();
     if (m_vs) m_vs->Release();
     if (m_rtv) m_rtv->Release();
+    if (m_frameWait) CloseHandle(m_frameWait);
     if (m_swapChain) m_swapChain->Release();
     if (m_ctx) m_ctx->Release();
     if (m_dev) m_dev->Release();
@@ -182,17 +183,6 @@ bool D3D11PresentBackend::CreateDeviceAndSwapChain(HWND hwnd, int width, int hei
         return false;
     }
 
-    // FRAME LATENCY: how many presents may be queued before Present blocks. The default of
-    // 3 lets the loop run three frames ahead of the display, at which point Present stops
-    // being backpressure and the vsync present is a queue push rather than a clock. 1 means
-    // "block until the previous frame has been consumed", which is what makes the present the
-    // frame-pacing wait.
-    hr = dxgiDev->SetMaximumFrameLatency(1);
-    if (FAILED(hr)) {
-        LOGERR("D3D11Present: SetMaximumFrameLatency(1) failed (0x%08x); presents will queue "
-               "and pacing will not be trustworthy", hr);
-    }
-
     // The swapchain follows the OUTPUT's bit depth. A back buffer the display cannot scan
     // out natively is composed by DWM with a conversion instead of flipped, which is the
     // outcome this backend exists to avoid, and an 8-bit output discards the ring's extra
@@ -221,6 +211,8 @@ bool D3D11PresentBackend::CreateDeviceAndSwapChain(HWND hwnd, int width, int hei
         // Stretching disqualifies a swapchain from independent flip, and the ring already
         // captures at the target's size, so the buffers match the output exactly.
         sd.Scaling = DXGI_SCALING_NONE;
+        // The waitable object is the pacing primitive; see WaitForFrame.
+        sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
         hr = factory->CreateSwapChainForHwnd(m_dev, hwnd, &sd, NULL, NULL, &m_swapChain);
         if (FAILED(hr)) {
             LOGERR("D3D11Present: CreateSwapChainForHwnd with %s failed (0x%08x)%s",
@@ -229,6 +221,29 @@ bool D3D11PresentBackend::CreateDeviceAndSwapChain(HWND hwnd, int width, int hei
         } else {
             LOG("D3D11Present: flip-model swapchain %dx%d, %s, 2 buffers, FLIP_DISCARD, "
                 "frame latency 1", width, height, FormatName(formats[f]));
+        }
+    }
+    if (m_swapChain) {
+        // FRAME LATENCY: how many presents may be queued before the wait blocks. A waitable
+        // swapchain carries its own setting (the device-wide one does not apply to it) and
+        // defaults to 1, but the value is load-bearing enough to set explicitly: at 3 the
+        // loop runs three frames ahead of the display and the present stops being
+        // backpressure at all. 1 means "wait until the previous frame has been consumed",
+        // which is what makes the wait a clock rather than a queue push.
+        IDXGISwapChain2* sc2 = NULL;
+        hr = m_swapChain->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2);
+        if (SUCCEEDED(hr) && sc2) {
+            hr = sc2->SetMaximumFrameLatency(1);
+            if (SUCCEEDED(hr)) m_frameWait = sc2->GetFrameLatencyWaitableObject();
+            sc2->Release();
+        }
+        if (!m_frameWait) {
+            // Without the wait there is no pacing, and a run that silently paced on nothing
+            // would be worse than no run.
+            LOGERR("D3D11Present: frame-latency waitable object unavailable (0x%08x); "
+                   "refusing the mode", hr);
+            m_swapChain->Release();
+            m_swapChain = NULL;
         }
     }
     // The relay owns alt-enter; DXGI must not transition us on its own.
@@ -558,18 +573,30 @@ long long D3D11PresentBackend::BurnMarker(const CompositeOutcome& out) {
     return burned;
 }
 
+bool D3D11PresentBackend::WaitForFrame() {
+    if (!m_enabled) return false;
+    // Bounded so that nothing the display does can hang the loop: a legitimate wait is at
+    // most about two sink periods, and the message pump behind this must keep turning even
+    // if the window is occluded and the swapchain stops completing frames. Far above any
+    // real vblank interval, far below anything a user would notice as a hang.
+    static const DWORD kWaitTimeoutMs = 250;
+    const DWORD r = WaitForSingleObject(m_frameWait, kWaitTimeoutMs);
+    if (r == WAIT_OBJECT_0) return true;
+    m_waitTimeouts++;
+    if (m_waitTimeouts == 1 || (m_waitTimeouts % 600) == 0) {
+        LOGERR("D3D11Present: frame wait returned 0x%08lx after %lu ms (%lld so far); this "
+               "present was not paced", (unsigned long)r, kWaitTimeoutMs, m_waitTimeouts);
+    }
+    return false;
+}
+
 void D3D11PresentBackend::Present(bool vsync) {
     if (!m_enabled) return;
-    // Sync interval 1 IS the frame-pacing wait, and under independent flip it is the sink's
-    // vblank rather than DWM's compose clock. That substitution is the entire point of this
-    // backend.
+    // Queues the frame; WaitForFrame already made the room, so this returns promptly. Sync
+    // interval 1 puts the flip on a vblank. Under independent flip that vblank is the sink's,
+    // which is the entire point of this backend.
     const HRESULT hr = m_swapChain->Present(vsync ? 1 : 0, 0);
     m_presents++;
-    if (hr == DXGI_STATUS_OCCLUDED) {
-        // Nothing was shown and nothing was waited on, so without this the loop spins at
-        // full speed for as long as the window stays hidden.
-        Sleep(1);
-    }
     if (FAILED(hr) || hr == DXGI_STATUS_OCCLUDED) {
         m_presentFailures++;
         if (m_presentFailures == 1 || (m_presentFailures % 600) == 0) {
@@ -584,10 +611,10 @@ void D3D11PresentBackend::LogSummary() const {
     if (!m_enabled) return;
     LOG("d3d11 presentstats summary: %lld refreshes showed no new frame over %lld sampled "
         "presents (%.3f/s at a 60 Hz sink); %lld presents, %lld reported a problem, "
-        "%lld draws failed",
+        "%lld draws failed, %lld frame waits timed out",
         m_missedRefreshes, m_statsSamples,
         m_statsSamples > 0 ? (double)m_missedRefreshes * 60.0 / (double)m_statsSamples : 0.0,
-        m_presents, m_presentFailures, m_drawFailures);
+        m_presents, m_presentFailures, m_drawFailures, m_waitTimeouts);
     if (m_subGen) {
         LOG("subgen summary: %lld substituted, %lld offered, %lld skipped unscreened "
             "(no content check on the D3D11 present path)",
