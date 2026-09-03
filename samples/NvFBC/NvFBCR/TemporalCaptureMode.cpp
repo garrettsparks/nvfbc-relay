@@ -522,7 +522,12 @@ void TemporalCaptureMode::Run(
         // the D3D9 path does the same through the compositor and PresentEx.
         CompositeOutcome outcome;
         long long markN = -1;
+        // Stamped either side of the present so the line carries how long the present BLOCKED,
+        // not just how far apart presents landed. A vsync present that is doing its job spends
+        // nearly the whole period here; one that returns immediately is not pacing anything,
+        // and pdt alone cannot tell those apart.
         LARGE_INTEGER beforePresent;
+        LARGE_INTEGER afterPresent;
         if (m_present11) {
             m_present11->Compose(bracket, &outcome);
             markN = m_present11->BurnMarker(outcome);
@@ -530,6 +535,7 @@ void TemporalCaptureMode::Run(
             // Under independent flip this blocks on the SINK's vblank; composed by DWM it
             // blocks on the compose clock exactly as PresentEx does.
             m_present11->Present(m_vsyncPresent);
+            QueryPerformanceCounter(&afterPresent);
         } else {
             // The back buffer is acquired PER PRESENT, never cached. Under
             // D3DSWAPEFFECT_DISCARD back buffer 0 is the same surface every time and this is
@@ -579,6 +585,7 @@ void TemporalCaptureMode::Run(
             // downstream as the previous frame repeating - the exact judder signature this
             // relay is measured against.
             const HRESULT presentHr = device->PresentEx(NULL, NULL, NULL, NULL, 0);
+            QueryPerformanceCounter(&afterPresent);
             // GetBackBuffer AddRefs; release after the present so the runtime can rotate it.
             if (backbuffer) backbuffer->Release();
             if (FAILED(presentHr) || presentHr == S_PRESENT_MODE_CHANGED ||
@@ -722,7 +729,10 @@ void TemporalCaptureMode::Run(
                     snprintf(opFields + n, sizeof(opFields) - n, " pt=%lld", outcome.synthUs);
                 }
             }
-            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld%s%s",
+            // blk= goes LAST, after the appended op/flip fields. The offline parsers match this
+            // line as a contiguous chain of named fields, so a field inserted between two
+            // existing ones silently drops every field after it rather than failing.
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld%s%s blk=%lldus",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((bracket.info.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
@@ -735,7 +745,8 @@ void TemporalCaptureMode::Run(
                 lkField,
                 markN,
                 opFields,
-                flipFields);
+                flipFields,
+                (long long)((afterPresent.QuadPart - beforePresent.QuadPart) * usPerTick));
             if (!bracket.info.hasAfter) {
                 LOG("temporal: no after-frame (source slower than present?) - repeating newest");
             }
