@@ -181,6 +181,23 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
                                            g_diffMap, g_extraLagMs);
         }
 
+        // D3D11 flip-model present (b:flip): the blend compositor decided and drawn on a D3D11
+        // device onto a DXGI flip-model swapchain, paced by that swapchain's vsync present so
+        // that a promotion to independent flip puts the present on the TARGET display's own
+        // vblank rather than DWM's compose clock. Blend only: nearest and interp are not ported.
+        if (modeStr.length() > 2 && modeStr[1] == ':' &&
+            _stricmp(modeStr.c_str() + 2, "flip") == 0) {
+            if (c0 != 'b') {
+                LOGERR("Invalid capture mode: '%s' (the D3D11 flip present carries the blend "
+                       "compositor only; use b:flip)", modeStr.c_str());
+                return NULL;
+            }
+            return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
+                                           kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
+                                           g_dejitter, g_fgPhase, g_phaseKeep, g_subGen,
+                                           g_diffMap, g_extraLagMs, /*d3d11Present=*/true);
+        }
+
         // QPC-timer present (t:60 / b:60 / o:60 format).
         if (modeStr.length() > 2 && (c0 == 't' || c0 == 'b' || c0 == 'o') && modeStr[1] == ':') {
             float framerate;
@@ -217,6 +234,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)");
     LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
     LOGERR("  b, b:vsync, b:60 - Temporal blend compositor (sharp passthrough at the target, lerp otherwise)");
+    LOGERR("  b:flip         - Temporal blend compositor presented through a D3D11 flip-model swapchain (independent-flip candidate)");
     LOGERR("  o, o:vsync, o:60 - Temporal interp compositor (NVOFA motion-compensated synthesis)");
     LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
@@ -265,6 +283,13 @@ int g_sourceAdapterIndex = 0;
 // because it changes how every frame reaches DWM; see the swap-chain setup for why it is wanted
 // and why the previous attempt failed. Off leaves presentation byte-identical to today.
 bool g_flipEx = false;
+
+// Hidden window hosting the D3D9 devices when the output window belongs to a D3D11 flip-model
+// swapchain (b:flip). Flip model allows one swapchain per window and no second API on it, and a
+// D3D9 device cannot exist without a device window, so the present and capture devices move
+// here and the D3D9 swapchain never presents. NULL on every other path, where the D3D9 present
+// device owns the output window as it always has.
+HWND g_d3d9HostWnd = NULL;
 
 // Target display's refresh rate in Hz, 0 when it could not be read. This is the SINK rate: what
 // the capture card can actually show, which is not the rate we present at (a vsync present rides
@@ -756,6 +781,7 @@ void ConsoleUserInput(string* framerateStr) {
     cout << "  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)" << endl;
     cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
     cout << "  b, b:vsync, b:60 - Temporal blend compositor (sharp passthrough at the target, lerp otherwise)" << endl;
+    cout << "  b:flip         - Temporal blend compositor on a D3D11 flip-model swapchain (independent-flip candidate)" << endl;
     cout << "  o, o:vsync, o:60 - Temporal interp compositor (NVOFA motion-compensated synthesis)" << endl;
     cout << "  t:60 -src 30   - Mode plus options: -src <fps> declares the source rate (lag sizing)" << endl;
     cout << "  -lock          - Enable the phase comb lock (needs -src; off by default)" << endl;
@@ -868,6 +894,12 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         Cleanup();
         return -1;
     }
+    // The D3D9 swapchain never presents on the D3D11 path, so its swap effect is moot, and a
+    // FLIPEX device on the hidden host window would only add a way for creation to fail.
+    if (captureMode->PresentsViaD3D11() && g_flipEx) {
+        LOG("-flipex ignored: b:flip presents through its own D3D11 swapchain");
+        g_flipEx = false;
+    }
 
     LOG("=== NvFBCR Starting ===");
     LOG("Source display: [%d] %s (%s)", source.dxAdapterIndex, source.friendlyName.c_str(), source.deviceName);
@@ -896,7 +928,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
     LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s, "
         "etw flip capture %s, flip join %s, dejitter %s, fgphase %s, phasekeep %s, "
-        "generated-frame substitution %s, diffmap %s, flip mode %s, extra lag %u ms",
+        "generated-frame substitution %s, diffmap %s, flip mode %s, extra lag %u ms, "
+        "present path %s",
         g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
         g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off",
         !g_etw ? "off (no -etw)" : (g_noJoin ? "OFF (-nojoin)" : "on"),
@@ -910,7 +943,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         g_subGen ? "ON (-subgen)" : "off",
         g_diffMap ? "requested (-diffmap; ACTIVE only when the instrument line follows)" : "off",
         g_flipEx ? "FLIPEX (-flipex)" : "bitblt (DISCARD)",
-        g_extraLagMs);
+        g_extraLagMs,
+        captureMode->PresentsViaD3D11() ? "D3D11 flip-model swapchain (b:flip)" : "D3D9 swapchain");
 
     BUF_WIDTH = target.position.right - target.position.left;
     BUF_HEIGHT = target.position.bottom - target.position.top;
@@ -946,6 +980,23 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 
     ShowWindow(hWnd, nCmdShow);
 
+    // On the D3D11 present path the output window belongs to the DXGI flip-model swapchain
+    // alone: flip model allows one swapchain per window and no second API on it, and a D3D9
+    // swapchain sharing the window would make a failed promotion uninterpretable. The D3D9
+    // devices (present, and the ring's capture device) take this never-shown host instead.
+    if (captureMode->PresentsViaD3D11()) {
+        g_d3d9HostWnd = CreateWindowEx(0, "WindowClass", "NvFBCR D3D9 host", WS_POPUP,
+                                       0, 0, 1, 1, NULL, NULL, hInstance, NULL);
+        if (!g_d3d9HostWnd) {
+            LOGERR("Unable to create the D3D9 host window (error %lu)", GetLastError());
+            delete captureMode;
+            Cleanup();
+            return -1;
+        }
+        LOG("D3D9 devices hosted on a hidden window; the output window is reserved for the "
+            "D3D11 flip-model swapchain");
+    }
+
     NvFBCFrameGrabInfo frameGrabInfo = { 0 };
 
     //! DX9 resources
@@ -971,7 +1022,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         captureMode->PresentsOnTargetAdapter() ? "target - owns the output window"
                                                : "source - mode captures into its back buffer",
         source.dxAdapterIndex);
-    if (!SUCCEEDED(InitD3D9(presentAdapter, hWnd, captureMode->GetPresentationInterval())))
+    if (!SUCCEEDED(InitD3D9(presentAdapter, g_d3d9HostWnd ? g_d3d9HostWnd : hWnd,
+                            captureMode->GetPresentationInterval())))
     {
         LOGERR("Unable to create D3D9Ex Device");
         delete captureMode;

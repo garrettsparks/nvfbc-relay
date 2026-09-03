@@ -38,8 +38,34 @@
 //   40-43  checksum, 4-bit XOR of the payload nibbles (cells 1-39)
 class FrameMarker {
 public:
+    // Grid geometry: cells plus a one-cell quiet zone on every side. The strip sits at a
+    // fixed fraction of the output width (kCellsPerWidth cells per width: 32 px cells at
+    // 1920) so the decoder locates cells by frame fraction at any recording resolution.
+    // Public because every draw path, on any device, must reproduce exactly this grid.
+    static const int kCells = 44;          // sync + 39 payload bits + 4 checksum
+    static const int kGridW = kCells + 2;  // quiet zone left/right
+    static const int kGridH = 3;           // quiet zone above/below
+    static const int kCellsPerWidth = 60;
+
     FrameMarker();
     ~FrameMarker();
+
+    // The marker region for an output of this size, anchored top-left.
+    static RECT StripRect(int bufWidth, int bufHeight);
+
+    // Cell values for one present: the frozen layout above, checksum included.
+    static void BuildCells(unsigned int counter, int pickCode, int weightQ, bool interp,
+                           int compositorId, int execCode, bool cells[kCells]);
+
+    // Counter-only init for a caller that draws the cells itself on another device: no
+    // D3D9 resources, the same counter and -mark N rules. Drive it with Next.
+    void InitCounter(unsigned int maxFrames = 0);
+
+    // Advances the counter for one present and builds its cells. *burned is always this
+    // present's counter value (mark=); the return says whether the cells are to be drawn
+    // (the marker is active and this present is within -mark N).
+    bool Next(int pickCode, int weightQ, bool interp, int compositorId, int execCode,
+              unsigned int* burned, bool cells[kCells]);
 
     // Creates the cell-strip surfaces on the PRESENT device. On failure the marker
     // disables itself (Burn keeps counting but draws nothing): the relay runs
@@ -58,21 +84,12 @@ public:
                       bool interp, int compositorId, int execCode);
 
 private:
-    // Grid geometry: kTexelsPerCell texels per cell plus a one-cell quiet zone on
-    // every side. The strip is blitted at a fixed fraction of the output width
-    // (kCellsPerWidth cells per width: 32 px cells at 1920) so the decoder locates
-    // cells by frame fraction at any recording resolution.
-    //
-    // Multiple texels per cell defend against the D3D9 half-texel sampling
-    // convention: driver StretchRect paths that anchor on texel centers stretch an
-    // N-texel source across N-1 texel spans, which at one texel per cell displaces
-    // far cells by a full cell width (measured: a 46x3 grid rendered as 45x2). At
-    // kTexelsPerCell the worst displacement is 1/kTexelsPerCell of a cell, inside
+    // Texels per cell in the D3D9 staging strip. Multiple texels per cell defend against
+    // the D3D9 half-texel sampling convention: driver StretchRect paths that anchor on
+    // texel centers stretch an N-texel source across N-1 texel spans, which at one texel
+    // per cell displaces far cells by a full cell width (measured: a 46x3 grid rendered as
+    // 45x2). At kTexelsPerCell the worst displacement is 1/kTexelsPerCell of a cell, inside
     // the decoder's inner-50% center-sampling margin either way.
-    static const int kCells = 44;          // sync + 39 payload bits + 4 checksum
-    static const int kGridW = kCells + 2;  // quiet zone left/right
-    static const int kGridH = 3;           // quiet zone above/below
-    static const int kCellsPerWidth = 60;
     static const int kTexelsPerCell = 8;
 
     // Primary draw path: write the grid into the sysmem strip, UpdateSurface it to

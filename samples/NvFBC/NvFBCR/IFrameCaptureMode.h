@@ -33,6 +33,13 @@ public:
     // property and not the device adapter's. Do not re-propose it as a pacing fix.
     virtual bool PresentsOnTargetAdapter() const { return false; }
 
+    // Whether the mode presents through its own D3D11 flip-model swapchain on the output
+    // window instead of the D3D9 device's swapchain. Flip model allows one swapchain per
+    // window and no second API on it, so when this is true the D3D9 devices are created on
+    // a hidden host window and the D3D9 swapchain never presents; the D3D9 device still
+    // exists because NvFBC, the ring and its aliases are D3D9 objects.
+    virtual bool PresentsViaD3D11() const { return false; }
+
     // Setup mode-specific resources
     virtual bool Setup() = 0;
 
