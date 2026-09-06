@@ -131,7 +131,8 @@ D3D11PresentBackend::D3D11PresentBackend()
     , m_mark(false)
     , m_lastSyncRefresh(0), m_missedRefreshes(0), m_statsSamples(0), m_statsRebases(0)
     , m_compMode(-1), m_compModeChanges(0), m_samplesOverlay(0), m_samplesComposed(0)
-    , m_presentFailures(0), m_drawFailures(0), m_waitTimeouts(0), m_presents(0)
+    , m_presentFailures(0), m_drawFailures(0), m_waitTimeouts(0)
+    , m_consecutiveWaitTimeouts(0), m_lastPresentHr(S_OK), m_presents(0)
 {
     for (int i = 0; i < CaptureRing::RING_SIZE; i++) {
         m_ringAlias[i] = NULL;
@@ -649,19 +650,39 @@ long long D3D11PresentBackend::BurnMarker(const CompositeOutcome& out) {
 
 bool D3D11PresentBackend::WaitForFrame() {
     if (!m_enabled) return false;
-    // Bounded so that nothing the display does can hang the loop: a legitimate wait is at
-    // most about two sink periods, and the message pump behind this must keep turning even
-    // if the window is occluded and the swapchain stops completing frames. Far above any
-    // real vblank interval, far below anything a user would notice as a hang.
-    static const DWORD kWaitTimeoutMs = 250;
     const DWORD r = WaitForSingleObject(m_frameWait, kWaitTimeoutMs);
-    if (r == WAIT_OBJECT_0) return true;
+    if (r == WAIT_OBJECT_0) {
+        // Logged on the way OUT of the condition as well as into it. A counter that prints
+        // every Nth line cannot distinguish a burst from a permanent fault, and at one
+        // timeout per wait the print rate falls exactly when the fault gets worse.
+        if (m_consecutiveWaitTimeouts > 0) {
+            LOG("D3D11Present: frame wait recovered after %lld consecutive timeouts (%.1f s "
+                "with no paced present)", m_consecutiveWaitTimeouts,
+                (double)m_consecutiveWaitTimeouts * kWaitTimeoutMs / 1000.0);
+            m_consecutiveWaitTimeouts = 0;
+        }
+        return true;
+    }
     m_waitTimeouts++;
-    if (m_waitTimeouts == 1 || (m_waitTimeouts % 600) == 0) {
-        LOGERR("D3D11Present: frame wait returned 0x%08lx after %lu ms (%lld so far); this "
-               "present was not paced", (unsigned long)r, kWaitTimeoutMs, m_waitTimeouts);
+    m_consecutiveWaitTimeouts++;
+    if (m_consecutiveWaitTimeouts == 1) {
+        LOGERR("D3D11Present: frame wait returned 0x%08lx after %lu ms; the swapchain is not "
+               "retiring frames and this present was not paced", (unsigned long)r,
+               kWaitTimeoutMs);
     }
     return false;
+}
+
+bool D3D11PresentBackend::SwapChainStalled() const {
+    // A swapchain that stops signalling never starts again on its own, and nothing else in
+    // the relay can see it: the present is silent, flip model never reports occlusion, and
+    // with the output window on a capture card there may be nothing on screen for anyone to
+    // close. Left alone the loop turns forever at the timeout rate, holding the NvFBC session
+    // against the next run. So the mode stops instead, with the reason at the end of the log.
+    //
+    // The threshold is far beyond any legitimate pause: healthy captures record ZERO timeouts
+    // end to end, and a display mode change or an alt-tab costs at most a period or two.
+    return m_consecutiveWaitTimeouts >= kStallTimeouts;
 }
 
 void D3D11PresentBackend::Present(bool vsync) {
@@ -671,13 +692,18 @@ void D3D11PresentBackend::Present(bool vsync) {
     // which is the entire point of this backend.
     const HRESULT hr = m_swapChain->Present(vsync ? 1 : 0, 0);
     m_presents++;
-    if (FAILED(hr) || hr == DXGI_STATUS_OCCLUDED) {
-        m_presentFailures++;
-        if (m_presentFailures == 1 || (m_presentFailures % 600) == 0) {
-            LOGERR("D3D11Present: Present returned 0x%08lx (%lld so far)",
-                   (unsigned long)hr, m_presentFailures);
-        }
+    const bool bad = FAILED(hr) || hr == DXGI_STATUS_OCCLUDED;
+    if (bad) m_presentFailures++;
+    // Transitions, not every Nth: the status the swapchain returns is the only account of
+    // WHEN its behaviour changed, and a periodic counter buries exactly that.
+    if (bad && m_lastPresentHr != hr) {
+        LOGERR("D3D11Present: Present now returning 0x%08lx (%lld failed so far)",
+               (unsigned long)hr, m_presentFailures);
+    } else if (!bad && m_presentFailures > 0 && m_lastPresentHr != hr) {
+        LOG("D3D11Present: Present recovered to 0x%08lx after %lld failures",
+            (unsigned long)hr, m_presentFailures);
     }
+    m_lastPresentHr = hr;
     SampleStats();
 }
 

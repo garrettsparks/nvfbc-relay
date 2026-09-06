@@ -842,6 +842,27 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+    // SINGLE INSTANCE. Two relays cannot coexist: the second cannot create an NvFBC session
+    // while the first holds one, and both write the same log beside the exe, so the newcomer
+    // truncates it and the incumbent keeps appending at its old offset - leaving a file that
+    // is part one run, part a hole of zero bytes, part the other, and binary to every tool
+    // that reads it. Refusing is the only outcome that keeps the evidence.
+    //
+    // Checked before the first log line, because opening the log is itself what destroys it.
+    // The handle is deliberately never closed: the process exiting releases it.
+    if (!CreateMutexA(NULL, TRUE, "Global\\NvFBCR_SingleInstance") ||
+        GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxA(NULL,
+                    "Another NvFBCR is already running.\n\n"
+                    "Only one can capture at a time: the second cannot open an NvFBC session, "
+                    "and starting it would overwrite the running one's log.\n\n"
+                    "Close or end the other NvFBCR.exe first. If no window is visible, look "
+                    "for the process in Task Manager.",
+                    "NvFBCR: already running",
+                    MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
+        return -1;
+    }
+
     if (!InitDisplays()) {
         LOGERR("Unable to enumerate display adapters");
         return -1;

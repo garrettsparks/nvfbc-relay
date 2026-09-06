@@ -796,6 +796,15 @@ void TemporalCaptureMode::Run(
         }
         if (msg.message == WM_QUIT) break;
         if (m_ring.HasStopped()) break;  // capture thread hit a fatal error
+        if (m_present11 && m_present11->SwapChainStalled()) {
+            // The swapchain stopped retiring frames and does not come back. Stopping is the
+            // only correct move: nothing reaches the screen either way, and a loop left
+            // turning here holds the NvFBC session against the next run while its output
+            // window may not even be somewhere a person can close it.
+            LOGERR("D3D11Present: swapchain stalled - no paced present for seconds. Stopping "
+                   "the capture so the session is released and this run ends attributably.");
+            break;
+        }
     }
 
     if (presentStatsSwapChain) {

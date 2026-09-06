@@ -79,6 +79,11 @@ public:
     // a wait that did not pace anything.
     bool WaitForFrame();
 
+    // True once the wait has timed out for long enough that the swapchain is not coming back.
+    // The caller must stop the mode: nothing recovers from here, and a loop that keeps turning
+    // presents nothing while holding the capture session against the next run.
+    bool SwapChainStalled() const;
+
     // Queue the drawn back buffer. Does not block: WaitForFrame already made room. vsync
     // selects sync interval 1 so the flip lands on a vblank rather than tearing.
     void Present(bool vsync);
@@ -109,6 +114,14 @@ private:
     bool DrawMarker(const bool cells[FrameMarker::kCells]);
     void SampleStats();
     void SamplePresentationPath();
+
+    // How long one frame-pacing wait may block. Far above any real vblank interval, far below
+    // anything a user would notice, so the loop keeps turning even if the swapchain stops.
+    static const DWORD kWaitTimeoutMs = 250;
+    // Consecutive timeouts that mean the swapchain is gone rather than briefly busy. Five
+    // seconds: healthy captures record zero timeouts end to end, so this cannot false-fire on
+    // a mode change or an alt-tab, and it bounds how long a dead run can sit unnoticed.
+    static const int kStallTimeouts = 5000 / kWaitTimeoutMs;
 
     // Marker compositor-ID cell: this backend is the blend pipeline.
     static const int kCompositorIdBlend = 1;
@@ -171,5 +184,7 @@ private:
     long long m_presentFailures;
     long long m_drawFailures;
     long long m_waitTimeouts;
+    long long m_consecutiveWaitTimeouts;
+    HRESULT m_lastPresentHr;            // last status, so only CHANGES are logged
     long long m_presents;
 };
