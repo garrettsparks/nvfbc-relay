@@ -29,3 +29,77 @@ kcd_60x2_dejit_event.trace
 # (75 removals, 73 of them single-frame events), and the only one carrying the once-per-
 # second NvFBC delivery hitch that produces half of them.
 gm_60x2_gameplay_hour.trace
+# THE D3D11 FLIP PRESENT, on Avatar. Everything above is the D3D9 vsync path, where a
+# frame-generated source runs the compose clock at the DISPLAYED rate: two presents per source
+# frame, the comb lock structurally unable to engage, half the decisions landing between teeth.
+# These present on the SINK's own clock at 1:1, so the lock holds engaged and the steady state
+# is pure passthrough. A policy change that assumes the old two-presents-per-tooth geometry
+# passes every fixture above and fails here.
+#
+# Each configuration ships TWO fixtures, because one window cannot gate both regimes. The
+# _steady pair is a single benchmark test with no fade at either end, where the field decided
+# passthrough on EVERY present: any spurious blend fails it immediately, and the replay model
+# tracks it almost exactly. The _bench pair is all nine tests across three bench runs with
+# every inter-test fade kept, which is where the source drops to 60 Hz on a fade to black and
+# the relay blends across the hole. The model tracks a fade about half as well as it tracks
+# gameplay, so the _bench bounds are looser by construction and gate what the model can see;
+# that is why the _steady fixtures exist beside them rather than instead of them.
+avatar_60x2_flip_steady.trace
+avatar_60x2_flip_bench.trace
+# The same configuration with generated-frame substitution armed (-subgen, which implies the
+# driver change map). What it pins is a NEGATIVE: substitution fires 38 times in six minutes
+# and changes nothing. The cause was originally read as the tooth guard having already removed
+# the mid-tooth blends; measuring the change map on this log says otherwise. 99.5% of batches
+# report ZERO changed blocks between the real member and the generated member paired with it,
+# so the ring refuses the retracted slot as a duplicate and the policy never sees a candidate.
+# The 59x2 subgen pair further down shows the identical 99.6% at a ratio where the tooth guard
+# is not even armed, which is what separates the two explanations.
+# A change that makes -subgen active again at x2 breaks this pair and nothing else.
+avatar_60x2_subgen_steady.trace
+avatar_60x2_subgen_bench.trace
+# Frame generation OFF: arrivals, presents and source flips all 1:1:1, so keep-real has nothing
+# to collapse and every present has exactly one candidate frame. The FG-off fixture further up
+# covers 1-member batches on the D3D9 path, where the present clock is DWM's; these cover them
+# where the present is the sink's own. The degenerate geometry - no pairing, no collapse, no
+# side to choose - so anything that only works because a batch has two members, or because the
+# target can sit between teeth, has nowhere to hide.
+avatar_60x1_flip_steady.trace
+avatar_60x1_flip_bench.trace
+# The non-integer ratio. 59 fps into a 60 Hz sink: no comb can hold it, so the bracket phase
+# ramps through a full source period once per second and the compositor synthesizes whenever
+# the target sits more than a quarter period from a real frame - about half of every beat, and
+# 44% of all presents. Every other fixture here runs the blend path at 0-9%; these run it at
+# maximum duty, with weights piled in the 0.25-0.75 midrange rather than at the edges. The
+# passthrough threshold, the stickiness band and the tooth guard all decide something on nearly
+# every present, so a change to any of them shows up here first.
+avatar_59x1_flip_steady.trace
+avatar_59x1_flip_bench.trace
+# The SAME 59 fps source and the same content, declared as -src 60. Nobody types -src 59; the
+# flag will always name a nominal target rate, so a source that misses it by a frame is the
+# realistic configuration and this pair is what it costs. Every derived period comes out 1.7%
+# short - lag 95833 vs 96186 us, passthrough threshold 4166 vs 4237, comb 16666 vs 16949 - and
+# the output is indistinguishable: 44.8% synth against 44.3%, blend runs of median 26 against
+# 25. What DOES move is the comb: an exact 1.000 ratio makes M=1 a true match rather than a
+# 1.67%-error one, the gate engages twice as often and holds half as long, and the pull tail
+# halves. Paired with avatar_59x1_flip_* this isolates -src as a single variable.
+avatar_59at60_flip_steady.trace
+avatar_59at60_flip_bench.trace
+# 59 base with frame generation x2, declared -src 60. The pair that proves keep-real erases the
+# frame generator: arrivals come at 115/s in pairs, keep-real collapses each to its real member
+# at 59.04/s, and the policy then walks the identical 59:60 ramp the FG-off pair walks - 45.1%
+# synth against 44.8%, blend runs of the same length, the comb lock never engaging once. Same
+# beat, twice the arrival traffic. It also carries the only VRR source in the corpus: the panel
+# is G-SYNC and the individual flips wander 7.1 to 9.9 ms even while the per-second count holds
+# 118, so a policy that quietly assumes an evenly spaced source grid fails here and nowhere else.
+avatar_59x2_flip_steady.trace
+avatar_59x2_flip_bench.trace
+# The same 59x2 configuration with -subgen armed. What it pins is WHY substitution is inert,
+# which is not what the 60x2 subgen pair above was originally read to say. The blocker is not
+# the tooth guard and not the policy gate: it is the ring's duplicate refusal. The driver's
+# change map reports ZERO changed blocks between the real member and the generated member it
+# was paired with on 99.6% of batches, so the retracted slot is never marked generated, the
+# policy never sees a candidate, and 24 substitutions happen in six minutes against 8300
+# blends. Synth share is 45.1%, identical to the no-subgen pair. If a capture-path change ever
+# makes generated frames genuinely reachable, this fixture moves and nothing else does.
+avatar_59x2_subgen_steady.trace
+avatar_59x2_subgen_bench.trace
