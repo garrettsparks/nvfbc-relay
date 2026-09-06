@@ -7,6 +7,7 @@ description Avatar 59 fps base with frame generation x2, declared -src 60, -subg
 field_worst_run 41
 field_long_runs 0
 field_synth_pct 45.1
+src_hint 60.0
 # Replay 45.1% / runs 0 / worst 41 against field 45.1% / runs 0 / worst 41: an exact match on
 # every field. Read beside avatar_59x2_flip_bench, which is the identical configuration with
 # -subgen absent and lands at the same 45.1%: the pair is the measurement that -subgen changes

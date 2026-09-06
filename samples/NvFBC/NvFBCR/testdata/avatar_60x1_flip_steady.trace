@@ -7,6 +7,7 @@ description Avatar 60 fps with frame generation OFF on the D3D11 flip present (b
 field_worst_run 0
 field_long_runs 0
 field_synth_pct 0.0
+src_hint 60.0
 # Replay 0.0% / worst 0 against field 0.0% / worst 0: EXACT over all 2040 presents, and the
 # fixture is 2040 arrivals to 2040 presents to 2040 head-0 flips, perfectly 1:1:1. THE HAPPY
 # PATH GATE at the degenerate geometry: no pairing, no collapse, no side to choose, and the

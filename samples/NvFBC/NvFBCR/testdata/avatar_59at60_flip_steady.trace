@@ -7,6 +7,7 @@ description Avatar 59 fps source declared as -src 60, no frame generation, b:fli
 field_worst_run 33
 field_long_runs 0
 field_synth_pct 45.6
+src_hint 60.0
 # Replay 45.1% / runs 0 / worst 33 against field 45.6% / runs 0 / worst 33. The worst run
 # matches exactly and the synth share lands half a point LOW, the model's only miss being a
 # handful of decisions at the stickiness band. A mis-declared -src does not degrade the model:

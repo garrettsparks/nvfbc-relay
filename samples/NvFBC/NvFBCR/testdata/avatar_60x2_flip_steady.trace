@@ -7,6 +7,7 @@ description Avatar 60x2 in-game DLSS frame generation on the D3D11 flip present 
 field_worst_run 0
 field_long_runs 0
 field_synth_pct 0.0
+src_hint 60.0
 # Replay 0.0% / worst 0 against field 0.0% / worst 0: EXACT, over all 1560 presents. THE
 # HAPPY PATH GATE. The field decided passthrough on every present of this window, so the bound
 # is not holding a rate steady, it asserts that in the 1:1 sink-locked x2 regime the policy

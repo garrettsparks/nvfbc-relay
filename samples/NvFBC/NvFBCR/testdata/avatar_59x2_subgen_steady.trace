@@ -7,6 +7,7 @@ description Avatar 59 fps base with frame generation x2, declared -src 60, -subg
 field_worst_run 30
 field_long_runs 0
 field_synth_pct 46.5
+src_hint 60.0
 # Replay 44.7% / runs 0 / worst 31 against field 46.5% / runs 0 / worst 30. The widest gap of
 # the four 59-series steady fixtures, and it is the window rather than substitution: one 24 s
 # test at 46.5% sits at the top of the per-test spread (43.0 to 47.6 across the nine), so the

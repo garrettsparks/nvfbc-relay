@@ -1995,6 +1995,16 @@ struct TraceFixture {
     int maxLongRuns = -1;
     double maxSynthPct = -1.0;
     int minReseeds = -1;
+    // The -src the relay ran with, in fps. Sizes the replay's source period, comb modulus
+    // and passthrough threshold by production's rules; absent (0) means a 60 fps source,
+    // which every fixture recorded before the field existed was.
+    double srcHint = 0.0;
+    // An x3 capture on which the rotation vote must REFUSE rather than decide. Smooth
+    // Motion x3 rotates a real member through the batch and the vote has to find it; DLSS
+    // frame generation delivers members the capture cannot tell apart, so there is no
+    // rotation to read and a vote that decided anyway would be retracting on noise. A
+    // fixture that sets this owns the measurement in a comment beside it.
+    bool rotationInert = false;
     // What the relay actually did, and how far the replay may sit from it.
     int fieldWorstRun = -1;
     int fieldLongRuns = -1;
@@ -2045,6 +2055,8 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         else if (std::strcmp(tag, "field_worst_run") == 0) { num(&n); out->fieldWorstRun = (int)n; }
         else if (std::strcmp(tag, "field_long_runs") == 0) { num(&n); out->fieldLongRuns = (int)n; }
         else if (std::strcmp(tag, "field_synth_pct") == 0) { dbl(&out->fieldSynthPct); }
+        else if (std::strcmp(tag, "src_hint") == 0)         { dbl(&out->srcHint); }
+        else if (std::strcmp(tag, "rotation_inert") == 0)   { num(&n); out->rotationInert = n != 0; }
         else if (std::strcmp(tag, "min_placed_pct") == 0)  { num(&n); out->minPlacedPct = (int)n; }
         else if (std::strcmp(tag, "max_ahead_pct") == 0)   { num(&n); out->maxAheadPct = (int)n; }
         else if (std::strcmp(tag, "min_blends_removed") == 0) {
@@ -2155,10 +2167,12 @@ static void ReportRotation(const TraceFixture& fx, int64_t lagFloor, int64_t bat
     size_t nf = 0;
     int64_t ema = 0;
     long long observed = 0, validB = 0, keepReal = 0, dropWhole = 0;
+    std::vector<long long> decidedAt;
     // The regime is the DOMINANT flip rate, not any rate ever glimpsed: every capture opens
     // on the desktop and passes through loading, so a latch on the first x3-looking reading
     // labels an x2 fixture x3 and then demands x3 behaviour of it.
     long long fpsHist[16] = {0};
+    const int64_t srcPeriodUs = fx.srcHint > 0.0 ? (int64_t)(1e6 / fx.srcHint + 0.5) : 16667;
     for (size_t b = 0; b < starts.size(); b++) {
         const int64_t bs = starts[b];
         while (nf < byKnown.size() && byKnown[nf].first <= bs + lagFloor) {
@@ -2175,7 +2189,11 @@ static void ReportRotation(const TraceFixture& fx, int64_t lagFloor, int64_t bat
         if (!newest || ema <= 0) continue;
         const int64_t sp = h.MedianSpacing(newest->displayTs - 200000, newest->displayTs, 0);
         if (sp <= 0) continue;
-        const int fps = (int)((16667 + sp / 2) / sp);
+        // Flips per SOURCE frame, from the declared source period, as production derives it.
+        // Dividing into the present period instead labelled a 90x2 fixture (two flips per
+        // real frame, 180 a second) as x3 because 180 flips fit three to a present, and put
+        // a 90 fps source on a knife edge between x1 and x2 (16667 / 11111 = 1.50003).
+        const int fps = (int)((srcPeriodUs + sp / 2) / sp);
         const int stride = (int)((ema + sp / 2) / sp);
         if (fps >= 0 && fps < 16) fpsHist[fps]++;
         if (stride != rp.stride || fps != rp.flipsPerSource)
@@ -2215,6 +2233,7 @@ static void ReportRotation(const TraceFixture& fx, int64_t lagFloor, int64_t bat
         const int pos = policy::RotationPositionAt(rp, bs, sp);
         if (pos >= 0 && rp.valid) {
             validB++;
+            decidedAt.push_back(observed);
             const int m = policy::RotationRealMember(rp, pos);
             if (m >= 2) dropWhole++;
             else if (m >= 0) keepReal++;
@@ -2227,11 +2246,32 @@ static void ReportRotation(const TraceFixture& fx, int64_t lagFloor, int64_t bat
     std::printf("    rotation: x%d grid, %.0f%% of %lld observed batches decided"
                 " (keeps %lld, drops %lld)\n",
                 dominantFps, validPct, observed, keepReal, dropWhole);
+    if (validB > 0 && validB < observed / 4) {
+        // A sparse decision set is only readable by WHERE it fell: spread through the run it
+        // is the vote reading a regime, clustered it is the vote arming on a transition.
+        int decile[10] = {0};
+        for (long long i : decidedAt) decile[(int)((i - 1) * 10 / observed)]++;
+        std::printf("    rotation decisions by tenth of the window:");
+        for (int d = 0; d < 10; d++) std::printf(" %d", decile[d]);
+        std::printf("\n    rotation decisions at log seconds:");
+        for (long long i : decidedAt) std::printf(" %.1f", starts[(size_t)(i - 1)] / 1e6);
+        std::printf("\n");
+    }
 
-    if (dominantFps == 3) {
-        // x3 rotates, so the vote must find it. Every x3 capture measured decides on
-        // 45-80% of batches; well under a third means the signal was lost, which is what
-        // the two shipped faults looked like (0%).
+    if (dominantFps == 3 && fx.rotationInert) {
+        // An x3 grid with nothing rotating on it. Under DLSS frame generation the members
+        // of a batch are the same pixels, so the phase the vote looks for does not exist,
+        // and keep-real's last-member rule is already right whichever member it keeps. The
+        // vote refusing is the designed outcome for a uniform population, and a decision
+        // here would be the x2 fault in a new costume: retracting a member on noise.
+        CHECK(validB == 0,
+              "[%s] the rotation vote decided on %lld batches of an x3 capture whose members "
+              "do not differ: it must refuse a uniform population",
+              fx.description.c_str(), validB);
+    } else if (dominantFps == 3) {
+        // x3 rotates, so the vote must find it. Every Smooth Motion x3 capture measured
+        // decides on 45-80% of batches; well under a third means the signal was lost, which
+        // is what the two shipped faults looked like (0%).
         CHECK(validPct > 30.0,
               "[%s] x3 rotation vote decided only %.0f%% of batches: the rotation is "
               "readable on every x3 capture measured, so this is the vote losing it",
@@ -2358,26 +2398,36 @@ static void test_replay_capture_corpus() {
                   "grid", path.c_str(), gaps.size(), fx.flipDisplay.size());
             std::sort(gaps.begin(), gaps.end());
             const int64_t medGap = gaps[gaps.size() / 2];
-            CHECK(medGap > 2000 && medGap < 20000,
+            // 500 Hz down to 30 Hz. The low end admits a 30 fps game on a variable-refresh
+            // panel, whose scanout follows the game and flips every 33 ms; the plausibility
+            // cut above already drops anything slower as a stall rather than a grid.
+            CHECK(medGap > 2000 && medGap < 36000,
                   "%s: median flip spacing %lld us is outside any sane refresh rate",
                   path.c_str(), (long long)medGap);
             if (!fx.flipKnown.empty()) {
                 CHECK(fx.flipKnown.size() == fx.flipDisplay.size(),
                       "%s: %zu knowability stamps for %zu flips", path.c_str(),
                       fx.flipKnown.size(), fx.flipDisplay.size());
-                // The driver stamps the event as it assigns the flip time and delivery only
-                // adds delay, so learning of a flip BEFORE it happened means the two streams
-                // were joined wrong.
+                // A mis-joined pair of streams sits seconds apart, and that is what this
+                // catches. It cannot demand a positive median: under frame generation the
+                // driver submits a real frame and its generated successor together and
+                // schedules the second flip for the next vblank, so its event lands about
+                // 11 ms BEFORE the scanout it names, on every other head-0 flip (measured on
+                // the 30x2 Avatar capture: E L E L on 96.7% of adjacent flips, early by a
+                // median 11.6 ms, late by 5.0 ms). The median then falls between the two
+                // clusters and can be a few ms negative. One display period of slack keeps
+                // the join check; a one-frame join error would still read as a bimodal
+                // distribution and not move the median past it.
                 std::vector<int64_t> delay;
                 for (size_t i = 0; i < fx.flipKnown.size(); i++)
                     delay.push_back(fx.flipKnown[i] - fx.flipDisplay[i]);
                 std::sort(delay.begin(), delay.end());
                 const int64_t medDelay = delay[delay.size() / 2];
-                CHECK(medDelay > 0 && medDelay < 100000,
+                CHECK(medDelay > -20000 && medDelay < 100000,
                       "%s: median knowability delay %lld us is not a delivery latency",
                       path.c_str(), (long long)medDelay);
                 std::printf("  flips [%s]: %zu head-0, spacing %lld us (%.1f Hz), "
-                            "known +%lld us median\n",
+                            "known %+lld us median\n",
                             fx.description.c_str(), fx.flipDisplay.size(),
                             (long long)medGap, 1e6 / (double)medGap, (long long)medDelay);
             }
@@ -2397,6 +2447,33 @@ static void test_replay_capture_corpus() {
         p.phaseOffset = 0;
         p.passthroughQpc = 4166;
         p.lagOverride = 0;
+        if (fx.srcHint > 0.0) {
+            // Size the declared-rate periods the way TemporalCaptureMode does at startup,
+            // so a fixture recorded at -src 30 replays a relay that was told 30. Kept in
+            // step by hand: the comb scan (M = 1..8, a match inside 2% of an integer) and
+            // the threshold floor (a quarter of the source period, never less than a
+            // quarter of the present period) are the production rules verbatim, and the
+            // stall span follows from srcPeriod inside Simulate. The stall span is what
+            // made this necessary: at a 60-declared replay it sits exactly on a 30 fps
+            // bracket, so half the brackets read as stalls and the model re-seeded five
+            // times a second through a window where the field never broke alternation.
+            p.srcPeriod = (int64_t)(1e6 / fx.srcHint + 0.5);
+            int combM = 1;
+            const double ratio = fx.srcHint / 60.0;
+            for (int m = 1; m <= 8; m++) {
+                const double nm = ratio * (double)m;
+                const long long nn = (long long)(nm + 0.5);
+                const double frac = nm - (double)nn;
+                if (nn >= 1 && frac > -0.02 && frac < 0.02) { combM = m; break; }
+            }
+            p.combQpc = p.srcPeriod / combM;
+            const int64_t thresholdBase =
+                p.srcPeriod > p.presentPeriod ? p.srcPeriod : p.presentPeriod;
+            p.passthroughQpc = thresholdBase / 4;
+            std::printf("    declared -src %.1f: period %lld us, comb %lld us (M=%d), "
+                        "threshold %lld us\n", fx.srcHint, (long long)p.srcPeriod,
+                        (long long)p.combQpc, combM, (long long)p.passthroughQpc);
+        }
         // Guard deliberately ARMED (production's rule) even though every fixture predates
         // it: at a present clock matching the source rate the target advances a full
         // period every present, so the guard must not change one decision here, and the

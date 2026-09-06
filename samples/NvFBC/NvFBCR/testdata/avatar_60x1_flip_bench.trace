@@ -7,6 +7,7 @@ description Avatar 60 fps with frame generation OFF on the D3D11 flip present (b
 field_worst_run 82
 field_long_runs 4
 field_synth_pct 2.8
+src_hint 60.0
 # Replay 3.8% / runs 5 / worst 143 against field 2.8% / runs 4 / worst 82. The model
 # OVER-predicts here, which is the safe direction: it is not inventing stability the capture
 # does not have, it is finding a longer synth run through the fades than the relay did. That

@@ -38,6 +38,11 @@ PRE  = re.compile(r"temporal dl=(-?\d+)us")
 # lag= is optional: logs recorded before it existed still carry usable scanout times, they
 # just cannot say when the relay could first have known them.
 FLIP = re.compile(r"flip disp=(-?\d+)us evt=(-?\d+)us(?: lag=(-?\d+)us)? head=(\d+)")
+# The declared source rate. Every period the policy derives (lag, passthrough threshold,
+# comb modulus, stall span) is sized from it, so the replay has to run the same declaration
+# or it models a different relay: at 30 fps the stall span of a 60-declared replay sits
+# exactly on the source period and re-seeds on half the brackets the field never blinked at.
+SRC  = re.compile(r"Resolved options: src rate hint ([\d.]+) fps")
 WARMUP = 200          # must match the test: skips the lock's cold-start acquisition
 
 def main():
@@ -65,11 +70,16 @@ def main():
     # when each flip became knowable, and sorting would erase that.
     flips, delays = [], []
     have_lag = True
+    src_hint = 0.0
     for line in open(src, errors="replace"):
         m = CAP.search(line)
         if m:
             v = int(m.group(1))
             if keep(v): arr.append(v)
+            continue
+        m = SRC.search(line)
+        if m:
+            src_hint = float(m.group(1))
             continue
         m = PRE.search(line)
         if m:
@@ -118,6 +128,8 @@ def main():
         f.write(f"field_worst_run {worst}\n")
         f.write(f"field_long_runs {longRuns}\n")
         f.write(f"field_synth_pct {pct:.1f}\n")
+        if src_hint > 0:
+            f.write(f"src_hint {src_hint:.1f}\n")
         f.write(f"arrivals {len(arr)}\n{enc(arr)}\n")
         f.write(f"presents {len(pres)}\n{enc(pres)}\n")
         if flips:

@@ -7,6 +7,7 @@ description Avatar 60x2 in-game DLSS frame generation WITH generated-frame subst
 field_worst_run 0
 field_long_runs 0
 field_synth_pct 0.0
+src_hint 60.0
 # Replay 0.5% / worst 1 against field 0.0% / worst 0: 8 presents of 1680 differ. THE NEGATIVE
 # GATE. Substitution is armed and the driver change map screened every candidate it was
 # offered, and the field still decided passthrough on every present of this window. The bound

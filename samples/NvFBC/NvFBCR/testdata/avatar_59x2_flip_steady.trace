@@ -7,6 +7,7 @@ description Avatar 59 fps base with frame generation x2 (118 fps displayed on a 
 field_worst_run 29
 field_long_runs 0
 field_synth_pct 45.2
+src_hint 60.0
 # Replay 44.7% / runs 0 / worst 29 against field 45.2% / runs 0 / worst 29: the worst run
 # matches exactly and the synth share is half a point low, the same signature the FG-off 59
 # fixtures show. The model reproduces the pair collapse and then the ramp, which is the whole

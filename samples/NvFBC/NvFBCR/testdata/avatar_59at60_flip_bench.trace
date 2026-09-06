@@ -7,6 +7,7 @@ description Avatar 59 fps source declared as -src 60, no frame generation, b:fli
 field_worst_run 42
 field_long_runs 0
 field_synth_pct 44.8
+src_hint 60.0
 # Replay 44.8% / runs 0 / worst 39 against field 44.8% / runs 0 / worst 42: an exact match on
 # the synth share over five minutes, the closest agreement in the corpus. Read it beside
 # avatar_59x1_flip_bench, which is the same source and content one flag apart and lands at
