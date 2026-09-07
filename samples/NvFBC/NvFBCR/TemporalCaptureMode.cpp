@@ -257,16 +257,15 @@ bool TemporalCaptureMode::Setup() {
     // COMPOSITOR: nearest keeps the validated selection path; the synthesizing
     // compositors (blend, interp) pass a real frame through sharp whenever one sits
     // within the passthrough threshold of the target and synthesize at the bracket
-    // weight otherwise. The threshold floors at the present period so an oversampling
-    // source (whose frames are always within half a source period of any target)
-    // passes through free; at-rate and slower sources get a quarter source period,
-    // far above the locked operating point and far below the mid-gap distance of a
-    // hole, so the gate cannot chatter.
+    // weight otherwise. A source at twice the present rate or faster (whose frames are
+    // always within half a source period of any target) takes a quarter of the present
+    // period and passes through free; every other source takes a quarter of its own
+    // period, far above the locked operating point and far below the mid-gap distance
+    // of a hole, so the gate cannot chatter. The rule is policy's so the replay sizes
+    // the same gate; see PassthroughThreshold for the regime that told the two apart.
     if (m_compositorKind != kCompositorNearest) {
-        const LONGLONG thresholdBase =
-            (m_assumedSrcPeriodQpc > m_scheduler.PeriodQpc()) ? m_assumedSrcPeriodQpc
-                                                              : m_scheduler.PeriodQpc();
-        m_policyCfg.passthroughQpc = thresholdBase / 4;
+        m_policyCfg.passthroughQpc =
+            policy::PassthroughThreshold(m_assumedSrcPeriodQpc, m_scheduler.PeriodQpc());
         if (m_d3d11Present) {
             // The backend IS the blend pipeline: it owns the composite decision, the lerp
             // and the marker, and no D3D9 compositor exists. It initializes in Run, once the

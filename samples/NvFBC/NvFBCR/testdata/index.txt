@@ -171,6 +171,11 @@ avatar_60x3_subgen_bench.trace
 # content step where a blend would have been two of 16.7. The quarter-period rule was written
 # for sources at or below the sink and the present-period floor for sources at two times it or
 # more; 1.5x is the gap between them, and this pair is where a rule that closes it shows.
+# The rule that closed it sizes any source between one and two times the present rate at a
+# quarter of its own period (policy::PassthroughThreshold, shared by production and this
+# replay); the pair went from 29.1 and 26.7 to 49.4 and 48.4 percent synth with lock
+# engagement unchanged. The field lines still carry the old relay until a capture on the new
+# one replaces them.
 avatar_90x1_flip_steady.trace
 avatar_90x1_flip_bench.trace
 # 90 base with frame generation x2, 180 displayed. The first fixture whose source cannot hold its
@@ -183,6 +188,9 @@ avatar_90x1_flip_bench.trace
 # compound here, the 1.5x threshold gap and a source the comb cannot follow, and this pair is
 # what separates a fix for the first from a fix for the second: a threshold rule alone should
 # raise the blend share and the smooth-step share without moving the lock engagement.
+# Under the shared threshold rule the replay went from 9.9 and 14.3 to 43.5 and 45.2 percent
+# synth with engagement exactly where it was, so the first effect is closed and what remains
+# is the second.
 avatar_90x2_flip_steady.trace
 avatar_90x2_flip_bench.trace
 # 90x2 with -subgen armed, and the pair that measured what the driver change map COSTS. The
@@ -195,6 +203,8 @@ avatar_90x2_flip_bench.trace
 # because the slower grab (868 us between members against 275 without the map) lands after the
 # next 5.5 ms flip more often. It did not move the smooth-step share (31% against 30% without),
 # on a source too different to compare. Read as a record of the observer effect, not as a
-# substitution result.
+# substitution result. Declared 90, the pair takes the shared threshold rule like every other
+# -src 90 row: the replay went from 26.6 and 24.6 to 52.7 and 51.1 percent synth with the comb
+# and the re-seed counts unchanged.
 avatar_90x2_subgen_steady.trace
 avatar_90x2_subgen_bench.trace

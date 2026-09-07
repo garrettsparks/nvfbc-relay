@@ -1995,6 +1995,11 @@ struct TraceFixture {
     int maxLongRuns = -1;
     double maxSynthPct = -1.0;
     int minReseeds = -1;
+    // Optional floor on the synth share, for fixtures whose regime the relay is meant to
+    // blend: a source between one and two times the sink rate alternates real frames with
+    // midpoint targets, and the ceiling above cannot notice those midpoints quietly passing
+    // through sharp again. Absent (-1) leaves the share bounded from above only.
+    double minSynthPct = -1.0;
     // The -src the relay ran with, in fps. Sizes the replay's source period, comb modulus
     // and passthrough threshold by production's rules; absent (0) means a 60 fps source,
     // which every fixture recorded before the field existed was.
@@ -2052,6 +2057,7 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         else if (std::strcmp(tag, "max_long_runs") == 0){ num(&n); out->maxLongRuns = (int)n; }
         else if (std::strcmp(tag, "min_reseeds") == 0)  { num(&n); out->minReseeds = (int)n; }
         else if (std::strcmp(tag, "max_synth_pct") == 0){ dbl(&out->maxSynthPct); }
+        else if (std::strcmp(tag, "min_synth_pct") == 0){ dbl(&out->minSynthPct); }
         else if (std::strcmp(tag, "field_worst_run") == 0) { num(&n); out->fieldWorstRun = (int)n; }
         else if (std::strcmp(tag, "field_long_runs") == 0) { num(&n); out->fieldLongRuns = (int)n; }
         else if (std::strcmp(tag, "field_synth_pct") == 0) { dbl(&out->fieldSynthPct); }
@@ -2449,14 +2455,14 @@ static void test_replay_capture_corpus() {
         p.lagOverride = 0;
         if (fx.srcHint > 0.0) {
             // Size the declared-rate periods the way TemporalCaptureMode does at startup,
-            // so a fixture recorded at -src 30 replays a relay that was told 30. Kept in
-            // step by hand: the comb scan (M = 1..8, a match inside 2% of an integer) and
-            // the threshold floor (a quarter of the source period, never less than a
-            // quarter of the present period) are the production rules verbatim, and the
-            // stall span follows from srcPeriod inside Simulate. The stall span is what
-            // made this necessary: at a 60-declared replay it sits exactly on a 30 fps
-            // bracket, so half the brackets read as stalls and the model re-seeded five
-            // times a second through a window where the field never broke alternation.
+            // so a fixture recorded at -src 30 replays a relay that was told 30. The comb
+            // scan (M = 1..8, a match inside 2% of an integer) is the production rule kept
+            // in step by hand; the passthrough threshold is production's own function, so
+            // the corpus cannot describe a gate the relay does not run. The stall span
+            // follows from srcPeriod inside Simulate and is what made this necessary: at
+            // a 60-declared replay it sits exactly on a 30 fps bracket, so half the
+            // brackets read as stalls and the model re-seeded five times a second through
+            // a window where the field never broke alternation.
             p.srcPeriod = (int64_t)(1e6 / fx.srcHint + 0.5);
             int combM = 1;
             const double ratio = fx.srcHint / 60.0;
@@ -2467,9 +2473,7 @@ static void test_replay_capture_corpus() {
                 if (nn >= 1 && frac > -0.02 && frac < 0.02) { combM = m; break; }
             }
             p.combQpc = p.srcPeriod / combM;
-            const int64_t thresholdBase =
-                p.srcPeriod > p.presentPeriod ? p.srcPeriod : p.presentPeriod;
-            p.passthroughQpc = thresholdBase / 4;
+            p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
             std::printf("    declared -src %.1f: period %lld us, comb %lld us (M=%d), "
                         "threshold %lld us\n", fx.srcHint, (long long)p.srcPeriod,
                         (long long)p.combQpc, combM, (long long)p.passthroughQpc);
@@ -2551,6 +2555,12 @@ static void test_replay_capture_corpus() {
         CHECK(synthPct <= fx.maxSynthPct,
               "[%s] synth share grew to %.1f%% (bound %.1f%%)",
               fx.description.c_str(), synthPct, fx.maxSynthPct);
+        if (fx.minSynthPct >= 0.0) {
+            CHECK(synthPct >= fx.minSynthPct,
+                  "[%s] synth share fell to %.1f%% (floor %.1f%%): a regime the relay is "
+                  "meant to blend is passing through instead",
+                  fx.description.c_str(), synthPct, fx.minSynthPct);
+        }
         CHECK(reseeds >= fx.minReseeds,
               "[%s] re-seeds fell to %d (bound %d): a suppressed re-seed means a stall "
               "recovers by slew instead of snapping",
@@ -2638,17 +2648,11 @@ static void test_replay_capture_corpus() {
 // LCG (see kRngSeed), so a suite's timeline depends only on its own parameters and the
 // census pins below are constants of the POLICY alone. New suites may go anywhere.
 //
-// The threshold convention mirrors the production Setup rule
-// T = max(assumed srcP, presentP) / 4. The presentP floor covers the oversampling
-// regime: when the source outpaces the present, a real frame is always within
-// srcP/2 of the target, so the threshold must exceed srcP/2 for passthrough to
-// dominate; at-rate and sub-rate sources get srcP/4.
+// Each suite sizes its passthrough threshold with production's own
+// policy::PassthroughThreshold from its source and present periods, so a census pin
+// here pins the gate the relay runs and not a copy of it; the sizing rule itself is
+// pinned in test_passthrough_threshold_rule.
 // ---------------------------------------------------------------------------------
-
-static int64_t ThresholdUs(int64_t srcPeriod, int64_t presentPeriod) {
-    const int64_t base = srcPeriod > presentPeriod ? srcPeriod : presentPeriod;
-    return base / 4;
-}
 
 // Exact op census pin. The LCG is seeded and every suite timeline deterministic, so
 // these counts are constants of the policy; any behavioral drift anywhere in a
@@ -2682,7 +2686,7 @@ static void test_composite_passthrough_at_lock() {
     p.arrivalJitter = 300;
     p.combQpc = 16672;
     p.presents = 12000;
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     SimResult r = Simulate(p);
     const size_t warmup = 3000;   // covers worst-case lock acquisition (~40 s)
     CHECK(r.ops.size() == (size_t)p.presents,
@@ -2715,7 +2719,7 @@ static void test_composite_gate_placement() {
     p.arrivalJitter = 300;
     p.combQpc = 16672;
     p.presents = 12000;
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     SimResult r = Simulate(p);
     const size_t warmup = 3000;
     const int64_t T = p.passthroughQpc;
@@ -2749,7 +2753,7 @@ static void test_composite_hole_classification() {
     p.arrivalJitter = 300;
     p.combQpc = 16672;
     p.presents = 12000;
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     const int kHoles = 25;
     for (int i = 0; i < kHoles; i++) p.drops.push_back(3000 + 100 * (int64_t)i);
     SimResult r = Simulate(p);
@@ -2785,7 +2789,7 @@ static void test_composite_two_frame_hole() {
     p.arrivalJitter = 300;
     p.combQpc = 16672;
     p.presents = 12000;
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     p.drops.push_back(6000);
     p.drops.push_back(6001);
     SimResult r = Simulate(p);
@@ -2823,7 +2827,7 @@ static void test_composite_oversampling() {
     p.arrivalJitter = 150;
     p.combQpc = 0;
     p.presents = 7200;
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     SimResult r = Simulate(p);
     const size_t warmup = 100;
     int pass = 0, total = 0;
@@ -2865,7 +2869,7 @@ static void test_composite_refusal_regime() {
     p.arrivalJitter = 600;
     p.combQpc = 6944 / 5;
     p.presents = 6000;
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     SimResult r = Simulate(p);
     const size_t warmup = 100;
     int pass = 0, hold = 0, total = 0;
@@ -2891,7 +2895,7 @@ static void test_composite_unlocked_sweep() {
     p.arrivalJitter = 300;
     p.combQpc = 0;
     p.presents = 12000;
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     SimResult r = Simulate(p);
     const size_t warmup = 100;
     int pass = 0, blend = 0, transitions = 0, total = 0;
@@ -2933,7 +2937,7 @@ static void test_composite_gate_hysteresis() {
         p.combQpc = 0;
         p.presents = 6000;
         p.phaseOffset = c.offset;
-        p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+        p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
         SimResult r = Simulate(p);
         const size_t warmup = 100;
         int transitions = 0, pass = 0, total = 0;
@@ -2966,7 +2970,7 @@ static void test_composite_v16_differential() {
     // then purely the composite config.
     p.passthroughQpc = 0;
     SimResult off = Simulate(p);
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     SimResult on = Simulate(p);
     CHECK(off.picks.size() == on.picks.size(), "differential run sizes diverged");
     for (size_t i = 0; i < off.picks.size() && i < on.picks.size(); i++) {
@@ -2991,7 +2995,8 @@ static void test_ring_underrun_graceful() {
     p.combQpc = 0;
     p.presents = 3000;
     p.lagOverride = 50000;       // the lag a -src 25 declaration would size
-    p.passthroughQpc = 10000;    // max(assumed srcP, presentP)/4 for that declaration
+    // Sized from the DECLARED period as production does, not from the 240 fps arrivals.
+    p.passthroughQpc = policy::PassthroughThreshold(40000, p.presentPeriod);
     SimResult r = Simulate(p);
     const size_t warmup = 100;
     int noBefore = 0, holds = 0, afterAdv = 0, total = 0;
@@ -3397,7 +3402,7 @@ static void test_composite_monotone_output() {
     p.arrivalJitter = 300;
     p.combQpc = 16672;
     p.presents = 24000;
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     SimResult r = Simulate(p);
     CHECK(r.wraps >= 1, "no pull wrap in %lld presents; guard unexercised", (long long)p.presents);
     for (size_t i = 1; i < r.outTs.size(); i++) {
@@ -3426,7 +3431,7 @@ static void test_composite_lock_acquisition() {
     p.combQpc = 16667;
     p.presents = 6000;
     p.phaseOffset = 2000;   // unpulled target starts ~6.2 ms from the nearest frame
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     SimResult r = Simulate(p);
     const size_t warmup = 10;   // ring fill only: the traverse itself is under test
     int transitions = 0;
@@ -3460,7 +3465,7 @@ static void test_composite_quantized_arrivals() {
     p.combQpc = 11111 / 2;   // the M=2 comb the production ratio scan derives for 90:60
     p.presents = 6000;
     p.periodPattern = {8333, 12500, 12500};
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     SimResult r = Simulate(p);
     const size_t warmup = 100;
     int engagedN = 0, total = 0;
@@ -3494,7 +3499,7 @@ static void test_composite_tooth_guard_double_rate() {
     p.arrivalJitter = 300;
     p.combQpc = 16672;
     p.presents = 12000;
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     // Off the gate's knife edge: the default lag parks the two parities at exactly a
     // quarter period from the teeth, where the Schmitt band latches BOTH into passing.
     // The field runs nowhere near that edge; the offset puts one parity well inside the
@@ -3542,7 +3547,7 @@ static void test_composite_tooth_guard_hole_cover() {
     p.arrivalJitter = 300;
     p.combQpc = 16672;
     p.presents = 12000;
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     p.phaseOffset = 3500;   // off the knife edge; see the double-rate test
     const int kHoles = 25;
     for (int i = 0; i < kHoles; i++) p.drops.push_back(3000 + 100 * (int64_t)i);
@@ -3575,7 +3580,7 @@ static void test_composite_tooth_guard_quad_rate() {
     p.arrivalJitter = 0;
     p.combQpc = 16672;
     p.presents = 12000;
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     p.phaseOffset = 3500;   // off the knife edge; see the double-rate test
     SimResult r = Simulate(p);
     const size_t warmup = 3000;
@@ -3606,6 +3611,42 @@ static void test_composite_tooth_guard_quad_rate() {
     CHECK(stepLo > 16672 - 200 && stepHi < 16672 + 200,
           "content steps [%lld, %lld] not one source period",
           (long long)stepLo, (long long)stepHi);
+}
+
+// The passthrough threshold's SIZING rule, a function of the two declared constants.
+// Pinned at every declared rate the corpus carries and on both sides of the boundary at
+// twice the present rate: a source just under it takes a quarter of its own period, one
+// at it or past it takes the present-period floor. The one regime the rule moves is
+// between one and two times the present rate, where the floor was more than a third of
+// the source period and the midpoint targets of a three-halves source passed through the
+// widened gate two times in five instead of blending.
+static void test_passthrough_threshold_rule() {
+    const int64_t present60 = 16667, present120 = 8333;
+    struct Case { int64_t src; int64_t present; int64_t want; const char* what; };
+    const Case cases[] = {
+        {33333, present60, 8333, "30 fps into a 60 Hz present clock"},
+        {16949, present60, 4237, "59 fps into a 60 Hz present clock"},
+        {16667, present60, 4166, "60 fps into a 60 Hz present clock"},
+        {11111, present60, 2777, "90 fps into a 60 Hz present clock, the regime that moves"},
+        {8403,  present60, 2100, "119 fps into a 60 Hz present clock, just under the floor"},
+        {8333,  present60, 4166, "120 fps into a 60 Hz present clock, on the floor"},
+        {4166,  present60, 4166, "240 fps into a 60 Hz present clock"},
+        {16667, present120, 4166, "60 fps into a 120 Hz present clock"},
+        {4166,  present120, 2083, "240 fps into a 120 Hz present clock"},
+    };
+    for (const Case& c : cases) {
+        const int64_t got = policy::PassthroughThreshold(c.src, c.present);
+        CHECK(got == c.want, "%s: threshold %lld us, want %lld", c.what,
+              (long long)got, (long long)c.want);
+    }
+    // The property the rule exists for: at three halves, the gate a midpoint target faces
+    // after a pass (threshold plus the stickiness band) sits below half a source period,
+    // so every midpoint target blends and the output alternates sharp and half-blend.
+    const int64_t t90 = policy::PassthroughThreshold(11111, present60);
+    const int64_t band90 = (kStickinessUs < t90 / 4) ? kStickinessUs : t90 / 4;
+    CHECK(t90 + band90 < 11111 / 2,
+          "the widened gate at 90 fps (%lld us) admits a midpoint target at %lld us",
+          (long long)(t90 + band90), (long long)(11111 / 2));
 }
 
 // The ARMING rule, which decides whether a whole regime blends or re-presents. Pinned
@@ -3729,7 +3770,7 @@ static void test_composite_tooth_guard_differential() {
     p.arrivalJitter = 300;
     p.combQpc = 16672;
     p.presents = 12000;
-    p.passthroughQpc = ThresholdUs(p.srcPeriod, p.presentPeriod);
+    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
     p.phaseOffset = 3500;   // off the knife edge; see the double-rate test
     p.noToothGuard = true;
     SimResult r = Simulate(p);
@@ -3994,6 +4035,7 @@ int main(int argc, char** argv) {
     test_generated_frame_placement();
     test_composite_lock_acquisition();
     test_composite_quantized_arrivals();
+    test_passthrough_threshold_rule();
     test_tooth_guard_arming();
     test_composite_tooth_guard_double_rate();
     test_composite_tooth_guard_hole_cover();

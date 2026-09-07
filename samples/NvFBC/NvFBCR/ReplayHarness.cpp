@@ -1991,9 +1991,9 @@ int main(int argc, char** argv) {
     cfg.sinkPeriod = (int64_t)(freq / 60.0);
     cfg.passthrough = cap.passthroughUs * kTicksPerUs;
     // A capture recorded in t: mode carries no passthrough threshold, so a forced blend
-    // replay needs production's: a quarter of the source period, which is the 4166 us the
-    // 60 fps runs print.
-    if (cfg.blend && cfg.passthrough <= 0) cfg.passthrough = cfg.assumedSrcPeriod / 4;
+    // replay sizes production's from the declared source and the sink it presents to.
+    if (cfg.blend && cfg.passthrough <= 0)
+        cfg.passthrough = policy::PassthroughThreshold(cfg.assumedSrcPeriod, cfg.sinkPeriod);
     if (fromS >= 0.0) cfg.fromTs = (int64_t)(fromS * 1e6) * kTicksPerUs;
     if (toS >= 0.0) cfg.toTs = (int64_t)(toS * 1e6) * kTicksPerUs;
     cfg.phasePullSlew = (int64_t)(freq / 40000.0);        // 25 us per present

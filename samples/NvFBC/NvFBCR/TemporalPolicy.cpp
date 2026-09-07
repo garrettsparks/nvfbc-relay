@@ -894,6 +894,11 @@ int64_t ToothGuardPeriod(int64_t srcPeriodQpc, int64_t sinkPeriodQpc, bool combO
     return srcPeriodQpc;
 }
 
+int64_t PassthroughThreshold(int64_t srcPeriodQpc, int64_t presentPeriodQpc) {
+    if (srcPeriodQpc / 2 <= presentPeriodQpc / 4) return presentPeriodQpc / 4;
+    return srcPeriodQpc / 4;
+}
+
 bool GeneratedCandidateOnTarget(const BracketInfo& b, const CompositeState& s,
                                 const PolicyConfig& cfg) {
     if (!b.hasGen || !b.hasBefore || !b.hasAfter) return false;

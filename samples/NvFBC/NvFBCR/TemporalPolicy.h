@@ -678,6 +678,23 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
 // source below it is genuine rate conversion and stays unguarded.
 int64_t ToothGuardPeriod(int64_t srcPeriodQpc, int64_t sinkPeriodQpc, bool combOn);
 
+// The blend-mode passthrough threshold: how close a real frame must sit to the target to
+// be shown sharp instead of synthesized. The value to put in PolicyConfig::passthroughQpc.
+// Lives beside the arming rule for the same reason: it decides how a whole regime looks,
+// production and the replay must size it identically, and inlined at the call sites it
+// drifted into three copies of one expression.
+//
+// A source at twice the present rate or faster always has a real frame within half a
+// source period of any target, so it takes a quarter of the PRESENT period and passes
+// through free. Everything else takes a quarter of the SOURCE period. Applying the
+// present-period floor to every source faster than the present clock was wrong in exactly
+// one regime, between one and two times the present rate: there the floor is more than a
+// third of the source period, and a midpoint target (half a source period from either
+// neighbour, which at three halves is every other target) falls inside the hysteresis
+// widened gate often enough to pass when the even output is a blend. Each such pass is a
+// full-period step followed by a half-period step where two even steps were available.
+int64_t PassthroughThreshold(int64_t srcPeriodQpc, int64_t presentPeriodQpc);
+
 // Whether a generated frame could stand in for the blend this bracket would otherwise
 // produce, judged on PLACEMENT alone: this present would synthesize, a generated frame is
 // reachable, it sits inside the passthrough gate of the target, its content is strictly
