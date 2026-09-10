@@ -163,34 +163,30 @@ avatar_60x3_subgen_bench.trace
 # corpus faster than the sink without being an integer multiple of it. The target alternates
 # between a real frame (w about 0.03) and the midpoint between the next two (w about 0.55), so
 # the ideal output is a strict real / half-blend alternation with every content step 1.5 source
-# periods. The relay does that on 59% of midpoint presents and PASSES the other 41%: the
-# passthrough threshold floors at a quarter of the present period (4166 us, 37.5% of this
-# source period) and the hysteresis band widens it to 5166 us, while a midpoint present sits
-# 5555 us from each neighbour and the lock parks it a few hundred microseconds past the middle,
-# so it lands inside the widened gate about two times in five. Each pass is a 22 ms then 11 ms
-# content step where a blend would have been two of 16.7. The quarter-period rule was written
-# for sources at or below the sink and the present-period floor for sources at two times it or
-# more; 1.5x is the gap between them, and this pair is where a rule that closes it shows.
-# The rule that closed it sizes any source between one and two times the present rate at a
-# quarter of its own period (policy::PassthroughThreshold, shared by production and this
-# replay); the pair went from 29.1 and 26.7 to 49.4 and 48.4 percent synth with lock
-# engagement unchanged. The field lines still carry the old relay until a capture on the new
-# one replaces them.
+# periods. Captured on the relay that sizes the passthrough threshold at a quarter of the
+# source period (2777 us; policy::PassthroughThreshold, shared by production and this replay):
+# 99.8% of midpoint presents blend, content steps are 1.5 periods on 96% of presents, and the
+# per-test step deviation from the ideal is 0.8 to 1.8 ms rms. The capture this pair replaced
+# ran the present-period floor (4166 us, widened to 5166 by the hysteresis band against a
+# midpoint 5555 us from either neighbour) and passed 41% of midpoints through it, each pass a
+# 22 ms then 11 ms content step; it replayed at 29.1 and 26.7 percent synth against 49.0 and
+# 48.4 here, with lock engagement at 88% on both, so the difference is the gate alone. A
+# min_synth_pct floor on each fixture fails if midpoints start passing again.
 avatar_90x1_flip_steady.trace
 avatar_90x1_flip_bench.trace
 # 90 base with frame generation x2, 180 displayed. The first fixture whose source cannot hold its
-# declared rate: keep-real collapses the pairs to 87 to 90 real frames a second with the batch
-# period spread from 9.2 to 12.0 ms (p5 to p95) around the 11.1 ms it should be. The M=2 comb
-# engages on 15 to 61 percent of presents against 80 to 98 on the steady 90x1 source, the phase
-# wanders instead of alternating (37% of presents near a real frame, 37% near a midpoint, 26%
-# in between), and 61% of the midpoint presents pass through the widened gate. Content steps
-# are 1.5 periods on only 30% of presents against 56% at 90x1 and the ideal 100%. Two effects
-# compound here, the 1.5x threshold gap and a source the comb cannot follow, and this pair is
-# what separates a fix for the first from a fix for the second: a threshold rule alone should
-# raise the blend share and the smooth-step share without moving the lock engagement.
-# Under the shared threshold rule the replay went from 9.9 and 14.3 to 43.5 and 45.2 percent
-# synth with engagement exactly where it was, so the first effect is closed and what remains
-# is the second.
+# declared rate: keep-real collapses the pairs to about 88 real frames a second with the batch
+# period wandering around the 11.1 ms it should be. The M=2 comb engages on 23 to 51 percent of
+# presents against 76 to 99 on the steady 90x1 source, and the phase wanders instead of
+# alternating. Captured on the quarter-source-period threshold: 98.8% of midpoint presents
+# blend anyway, because the blend band spans w in [0.31, 0.69] and a wandering phase still
+# lands in it; content steps are 1.5 periods on 82% of presents, the rest spread by the
+# source's own wobble rather than quantized to 1.0 / 2.0 pairs, step deviation 1.9 to 2.7 ms
+# rms per test. The capture this pair replaced, on the present-period floor, blended 39% of
+# midpoints and stepped 1.5 on 29%, at 42% lock engagement against 35% here (the source, not
+# the relay: 88.7 against 88.3 real frames a second). Two effects compounded on that capture,
+# the 1.5x threshold gap and a source the comb cannot follow; the first is closed and what
+# remains is the second.
 avatar_90x2_flip_steady.trace
 avatar_90x2_flip_bench.trace
 # 90x2 with -subgen armed, and the pair that measured what the driver change map COSTS. The
