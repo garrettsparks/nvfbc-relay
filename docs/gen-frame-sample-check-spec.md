@@ -146,17 +146,62 @@ per slot) and comparing them directly is simpler and exact.
 
 ### Logging
 
-Per second member, on the existing capture line or beside it:
+One line per wake, beside the capture line and keyed to it by the arrival it describes,
+emitted when the deferred readback lands one wake later:
 
-    gencheck: blocks=<driver count> same=<0|1> ndiff=<samples that differ> rb=<us>
+    gencheck: arr=<us> m=<member> blocks=<driver count> same=<-1|0|1> ndiff=<n>
+              same_prev=<-1|0|1> ndiff_prev=<n> rb=<us>
 
-where `rb` is the time the deferred readback took, and in the shutdown summary:
+`same`/`ndiff` compare member m with member m-1 of the same batch (the pair the driver's map
+for this grab describes) and are -1 on a first member; `same_prev`/`ndiff_prev` compare a
+first member with the previous batch's first member and are -1 otherwise; `rb` is the time
+the readback took. The shutdown summary:
 
-    gencheck summary: <n> pairs, agree <n> (<pct>), driver-dupe/samples-differ <n>,
-    driver-change/samples-same <n>, readback median <us> p95 <us> worst <us>
+    gencheck summary: <n> pairs, agree <n> (<pct> of <n> with a map),
+    driver-dupe/samples-differ <n>, driver-change/samples-same <n>, no-map <n>;
+    batch-to-batch repeats <n> of <n> first members (<rate>/min),
+    batch-to-batch ndiff median <n> of 256;
+    readback median <us> p95 <us> worst <us> over <n> readbacks;
+    controls: self-test <n>/3 passed, degenerate gathers <n>
+
+### Controls
+
+An instrument broken in the boring way, sampling nothing or reading a stale target, would
+print "same" everywhere and hand over the "map is true" verdict for free. Three controls
+make that failure loud:
+
+- **Self-test.** On the first three wakes the same slot is gathered a second time into a
+  spare target and the two rows are compared word for word. A difference means the gather
+  is not deterministic and the instrument disables itself with an error.
+- **Degenerate gathers.** A row whose 256 words are all one value on a frame of gameplay
+  read one texel or none. Counted, not fatal (a black fade is legitimately uniform); a count
+  comparable to the wake count means the instrument is blind.
+- **Positive control.** Consecutive first members in motion differ on most samples, so the
+  batch-to-batch `ndiff_prev` median over a capture must be large. A median near zero in
+  gameplay means the instrument is not reading the frame, whatever the agreement matrix says.
+  Its independent cross-check is the marked recording: `picturerepeats.py` counts the same
+  batch-to-batch repeats from pixels.
 
 `ndiff` is what makes the disagreement cases readable: 3 of 256 differing is a partial or
 torn grab; 200 of 256 is a different frame.
+
+### Across batches, not only within them
+
+The same 256 words, kept per slot, also answer a question the log has never been able to:
+whether the FIRST member of this batch carries the same picture as the first member of the
+previous one. That is a source-side repeat, a frame the game delivered twice under two
+timestamps, and the relay passes both through as real frames because its timestamps
+advanced. It was found from the marked recording on the Avatar 90x2 captures (47 such pairs
+in five minutes on the current build, one every six seconds of gameplay, against one in five
+minutes without frame generation) and no log field counted it. One more 256-word compare per
+batch, against words already read, puts it on the capture line:
+
+    gencheck: ... same_prev=<0|1> ndiff_prev=<n>
+
+and in the summary as a count and a rate per minute. Measurement only, like the rest of the
+instrument. Its cross-check is the recording: `picturerepeats.py` in the analysis repository
+counts the same events from pixels, and the two counts should agree inside the sampling
+blind spot.
 
 ### Flag
 
@@ -164,6 +209,11 @@ torn grab; 200 of 256 is a different frame.
 (the two are the point of the comparison) and does not alter `-subgen`'s use of the map.
 
 ## The runs
+
+Both on the shipping present path with the shipping flags, `b:flip -src 60 -lock -lag 75
+-mark -etw -dejit`, plus the flags in the table. The instrument is capture-thread only, so
+the present path does not change its verdict; it is named so the cost runs below and the
+marked recording are the same relay the corpus describes.
 
 | capture | generator | expected driver dupe rate | what it settles |
 |---|---|---|---|
@@ -182,6 +232,24 @@ Whichever way it lands, the `rb` column and the intra-batch `dt` census with the
 decide whether the instrument is shippable as-is as a production content check on the D3D11
 path. The expectation is that it is: a 1 KB copy of finished data has no reason to cost
 anything.
+
+## The cost runs
+
+The change map cost the source 9% (the table above). The instrument has to be measured on
+the same axis, with the same benchmark, or its claim to be free is an assumption. Avatar
+90x2 is the benchmark that measured the map, so its numbers compare directly; each set of
+three runs sat within six score points of itself, which is the resolution of the method.
+
+| set | relay | flags | what it measures |
+|---|---|---|---|
+| A | on | shipping flags, `-gencheck`; no `-subgen`, which turns the map on at startup | the instrument's own cost on the source |
+| B | on | shipping flags only | the relay's baseline cost on the source |
+| C | off | game alone, same benchmark | what the relay costs at all (deferred item, rides along) |
+
+Three runs per set, scores and GPU time per frame from the benchmark CSV (CPU time
+reciprocal for the real rate, never the Fps column). A minus B is the instrument; B minus C
+is the relay. The referee captures above run with both `-diffmap` and `-gencheck`, because
+the comparison is the point there; the cost runs separate them.
 
 ## Risks and how they are watched
 
@@ -217,3 +285,10 @@ anything.
 Replacing `GeneratedContentUsable`'s graded verdict. If the map turns out partly right and
 partial grabs matter, the graded check still has a job on the D3D9 path; this instrument
 answers the equality question only, which is the one the driver map claims to answer.
+
+Putting the verdict into the frame. The marked recording is the primary record, and the
+decision fields the log has and the marker lacks (the op, the lock flag, an identity for the
+source frame shown) belong in a marker extension schema, which `docs/frame-marker-spec.md`
+provides for. That is a marker change, not part of this instrument; the two meet only in
+that a source-frame identity in the marker would let the recording count source-side repeats
+without pixels, the same event `same_prev` counts from the capture thread.

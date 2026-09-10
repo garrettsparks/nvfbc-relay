@@ -25,7 +25,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
                                          bool tint, bool etw, bool noJoin, bool dejitter,
                                          bool fgPhase, bool phaseKeep, bool subGen,
-                                         bool diffMap, unsigned int extraLagMs,
+                                         bool diffMap, bool genCheck, unsigned int extraLagMs,
                                          bool d3d11Present)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
@@ -45,6 +45,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_phaseKeepRequested(phaseKeep)
     , m_subGen(subGen)
     , m_diffMap(diffMap)
+    , m_genCheck(genCheck)
     , m_d3d11Present(d3d11Present)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
@@ -129,6 +130,9 @@ bool TemporalCaptureMode::Setup() {
     }
     if (m_diffMap) {
         m_ring.EnableDiffMap();
+    }
+    if (m_genCheck) {
+        m_ring.EnableGenCheck();
     }
     if (m_phaseKeep) {
         m_ring.EnablePhaseKeep(this);
@@ -854,6 +858,8 @@ void TemporalCaptureMode::Run(
             g.checkUsMax, g.offered ? g.checkUsTotal / g.offered : 0);
     }
     m_ring.Stop();
+    // After the join: the instrument's counters are capture-thread-owned until then.
+    m_ring.LogGenCheckSummary();
 }
 
 const char* TemporalCaptureMode::GetModeName() const {

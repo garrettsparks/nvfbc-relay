@@ -98,6 +98,8 @@ private:
     bool m_subGen;
     // -diffmap: the NvFBC difference-map instrument, forwarded to the ring at Setup.
     bool m_diffMap;
+    // -gencheck: the sample-check referee for the difference map, forwarded to the ring.
+    bool m_genCheck;
     // The synth compositor when one is in use, for the substitution counters. Aliases
     // m_compositor and is never deleted through this pointer.
     SynthCompositorBase* m_synth = NULL;
@@ -137,7 +139,7 @@ public:
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
                         bool etw = false, bool noJoin = false, bool dejitter = false,
                         bool fgPhase = false, bool phaseKeep = false,
-                        bool subGen = false, bool diffMap = false,
+                        bool subGen = false, bool diffMap = false, bool genCheck = false,
                         unsigned int extraLagMs = 0, bool d3d11Present = false);
     virtual ~TemporalCaptureMode();
 

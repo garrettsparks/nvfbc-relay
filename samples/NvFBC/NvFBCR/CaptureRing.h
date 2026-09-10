@@ -221,6 +221,27 @@ public:
     // reference runs: the readback stalls the capture thread on the GPU once per wake.
     void EnableFgPhase() { m_fgPhaseRequested = true; }
 
+    // Request the generated-frame sample check (-gencheck) before Start. A referee for the
+    // driver's change map, on the capture thread, deciding nothing.
+    //
+    // The change map says whether a grab returned the same content as the previous grab,
+    // and under DLSS frame generation it says so on nearly every second member of a batch.
+    // Whether that is true (the generated frame never reaches NvFBC) or an artefact of
+    // repeat grabs inside a burst is a question the recording cannot answer, because
+    // retracted members never reach it. This reads 256 texels of every published slot on
+    // the GPU into a one-row target, queued behind the copy that just filled the slot and
+    // covered by the same flush, and reads the 1 KB back one wake later, when it is long
+    // finished. Two frames sampled at the same 256 positions read as identical only when
+    // every sample misses the region that differs; at 256 stratified samples a difference
+    // over 6% of the frame is missed once in ten million. The same words also compare each
+    // batch's first member with the previous batch's, which is a picture the source
+    // delivered twice under two timestamps and nothing in the timestamps can see.
+    void EnableGenCheck() { m_genCheckRequested = true; }
+
+    // Exit summary for -gencheck: agreement with the change map, batch-to-batch repeats,
+    // and readback cost. Call after Stop.
+    void LogGenCheckSummary() const;
+
 private:
     struct Slot {
         IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
@@ -327,6 +348,68 @@ private:
     int m_fgPrevMember = -1;
     bool m_fgKeptValid = false;
     bool m_fgPrevWakeValid = false;
+
+    // -gencheck instrument. Everything here is capture-thread-owned; the summary reads it
+    // after the thread has joined.
+    static const int kGenCheckGrid = 16;
+    static const int kGenCheckSamples = kGenCheckGrid * kGenCheckGrid;
+    static const int kGenCheckRbBins = 2001;   // readback time histogram, 1 us bins, last is overflow
+    struct GenCheckVertex { float x, y, z, rhw, u, v; };
+    struct GenCheckSlot {
+        IDirect3DSurface9* rt;       // capture device, kGenCheckSamples x 1 render target
+        IDirect3DSurface9* sys;      // sysmem twin for the deferred readback
+        int member;                  // what the pending gather describes
+        LONGLONG arrUs;
+        LONGLONG batchStartUs;
+        long long changed;           // the driver's change map for the same grab (-1: off)
+    };
+    bool m_genCheckRequested = false;
+    bool m_genCheckActive = false;
+    GenCheckSlot m_genCheck[RING_SIZE] = {};
+    IDirect3DVertexBuffer9* m_genCheckVb = NULL;   // one quad per sample, pretransformed, static
+    int m_genCheckPending = -1;               // slot gathered on the previous wake, not yet read
+    // Controls, because an instrument broken in the boring way (sampling nothing, reading a
+    // stale target) would print "same" everywhere and hand over the wrong verdict for free.
+    // Self-test: on the first wakes the same slot is gathered a second time into a spare
+    // target; the two rows must be identical or the gather is not deterministic and the
+    // instrument disables itself. Degenerate: a gather whose 256 words are all one value on
+    // a frame of gameplay read one texel or none, counted and reported. Positive control:
+    // consecutive first members in motion must differ on most samples; the summary reports
+    // that median and it must be large.
+    static const int kGenCheckSelfTestWakes = 3;
+    IDirect3DSurface9* m_gcSelfRt = NULL;
+    IDirect3DSurface9* m_gcSelfSys = NULL;
+    int m_gcSelfTestsLeft = kGenCheckSelfTestWakes;
+    bool m_gcSelfPending = false;             // the spare target holds a second gather of m_genCheckPending
+    long long m_gcSelfPassed = 0;
+    long long m_gcDegenerate = 0;
+    unsigned int m_gcNdiffPrevHist[kGenCheckSamples + 1] = {};
+    // Words of the previous wake (for member m against member m-1, the pair the change map
+    // describes) and of the previous batch's first member (for the batch-to-batch repeat).
+    DWORD m_gcLast[kGenCheckSamples] = {};
+    bool m_gcLastValid = false;
+    LONGLONG m_gcLastBatchStartUs = 0;
+    DWORD m_gcPrevFirst[kGenCheckSamples] = {};
+    bool m_gcPrevFirstValid = false;
+    long long m_gcPairs = 0;                  // second-and-later members compared
+    long long m_gcPairsNoMap = 0;             // of those, without a change map to agree with
+    long long m_gcAgree = 0;
+    long long m_gcDriverDupeSamplesDiffer = 0;
+    long long m_gcDriverChangeSamplesSame = 0;
+    long long m_gcPrevCompared = 0;           // first members with a previous first member
+    long long m_gcPrevRepeats = 0;            // of those, identical to it
+    LONGLONG m_gcFirstArrUs = -1;             // span of first members, for the per-minute rate
+    LONGLONG m_gcLastArrUs = -1;
+    unsigned int m_gcRbHist[kGenCheckRbBins] = {};
+    long long m_gcRbCount = 0;
+    LONGLONG m_gcRbWorstUs = 0;
+    void GenCheckSetup();
+    void GenCheckRelease();
+    void GenCheckIssue(int slot);
+    bool GenCheckDraw(IDirect3DSurface9* target, IDirect3DTexture9* source);
+    bool GenCheckRead(IDirect3DSurface9* rt, IDirect3DSurface9* sys, DWORD* words);
+    void GenCheckOnWake(int slot, int member, LONGLONG arrUs, LONGLONG batchStartUs,
+                        long long changed);
 
     Slot m_ring[RING_SIZE];
     int m_ringSlots = kDefaultRingSlots;

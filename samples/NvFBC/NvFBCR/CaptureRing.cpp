@@ -69,6 +69,7 @@ CaptureRing::~CaptureRing() {
     delete[] m_fgLumWake[0]; m_fgLumWake[0] = NULL;
     delete[] m_fgLumWake[1]; m_fgLumWake[1] = NULL;
     delete[] m_fgLumKept;    m_fgLumKept = NULL;
+    GenCheckRelease();
     if (m_capSync) {
         m_capSync->Release();
         m_capSync = NULL;
@@ -198,6 +199,12 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
         } else {
             LOGERR("fgphase instrument DISABLED: small-surface setup failed (0x%08x)", hr);
         }
+    }
+
+    // ---- Sample-check instrument resources (-gencheck). Same rule: a failed setup
+    // disables the instrument, never the relay. ----
+    if (m_genCheckRequested) {
+        GenCheckSetup();
     }
 
     // ---- Rebind NvFBC to the capture device. ----
@@ -453,6 +460,11 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         int slot = (int)(count % m_ringSlots);
         m_capDevice->StretchRect(m_captureTarget, &srcRect, m_ring[slot].capSurface, &srcRect, D3DTEXF_NONE);
 
+        // The sample gather is queued here, behind the copy that just filled the slot, so
+        // the flush below covers it and no second sync is introduced. Its readback happens
+        // one wake later (GenCheckOnWake), by which time it is long finished.
+        if (m_genCheckActive) GenCheckIssue(slot);
+
         // Force the StretchRect to complete on the capture GPU before publishing, so the
         // present device never reads a not-yet-coherent shared slot. D3DGETDATA_FLUSH kicks
         // the command buffer; GetData returns S_FALSE until the GPU signals the event.
@@ -688,7 +700,335 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
                           (LONGLONG)((batch.stampTs - m_baseQpc.QuadPart) * usPerTick),
                           keep.keepThis);
         }
+        if (m_genCheckActive) {
+            GenCheckOnWake(slot, batch.member,
+                           (LONGLONG)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
+                           (LONGLONG)((batch.stampTs - m_baseQpc.QuadPart) * usPerTick),
+                           changed);
+        }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// -gencheck: the sample check. See EnableGenCheck for what it decides and why it is a
+// gather rather than a read.
+// ---------------------------------------------------------------------------------------
+
+// Stratified sample positions: one jittered point per cell of the grid, from a fixed seed,
+// so every run samples the same texels and two runs are comparable. The jitter stays inside
+// the middle 90% of the cell so no sample sits on a cell boundary. An equality test cannot
+// be gamed by a static pattern; a sample either lands in the region that differs or not.
+static void GenCheckPositions(float* u, float* v, int n, int grid) {
+    unsigned int s = 0x9E3779B9u;
+    for (int i = 0; i < n; i++) {
+        const int cx = i % grid, cy = i / grid;
+        s = s * 1664525u + 1013904223u;
+        const float ju = (float)(s >> 8) / 16777216.0f;
+        s = s * 1664525u + 1013904223u;
+        const float jv = (float)(s >> 8) / 16777216.0f;
+        u[i] = ((float)cx + 0.05f + 0.9f * ju) / (float)grid;
+        v[i] = ((float)cy + 0.05f + 0.9f * jv) / (float)grid;
+    }
+}
+
+void CaptureRing::GenCheckSetup() {
+    HRESULT hr = S_OK;
+    for (int i = 0; i < m_ringSlots && SUCCEEDED(hr); i++) {
+        hr = m_capDevice->CreateRenderTarget(kGenCheckSamples, 1, D3DFMT_A2B10G10R10,
+                                             D3DMULTISAMPLE_NONE, 0, FALSE,
+                                             &m_genCheck[i].rt, NULL);
+        if (SUCCEEDED(hr)) {
+            hr = m_capDevice->CreateOffscreenPlainSurface(kGenCheckSamples, 1,
+                                                          D3DFMT_A2B10G10R10,
+                                                          D3DPOOL_SYSTEMMEM,
+                                                          &m_genCheck[i].sys, NULL);
+        }
+    }
+    if (SUCCEEDED(hr)) {
+        hr = m_capDevice->CreateRenderTarget(kGenCheckSamples, 1, D3DFMT_A2B10G10R10,
+                                             D3DMULTISAMPLE_NONE, 0, FALSE, &m_gcSelfRt, NULL);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = m_capDevice->CreateOffscreenPlainSurface(kGenCheckSamples, 1, D3DFMT_A2B10G10R10,
+                                                      D3DPOOL_SYSTEMMEM, &m_gcSelfSys, NULL);
+    }
+    // One quad per sample, covering exactly output pixel i of the one-row target, with a
+    // constant texture coordinate at the sample position so the fixed-function stage reads
+    // one point-sampled texel of the slot. No shader on the capture device, the whole gather
+    // is one draw call, and the vertices are written once: nothing is uploaded per wake.
+    if (SUCCEEDED(hr)) {
+        hr = m_capDevice->CreateVertexBuffer(kGenCheckSamples * 6 * sizeof(GenCheckVertex),
+                                             D3DUSAGE_WRITEONLY, D3DFVF_XYZRHW | D3DFVF_TEX1,
+                                             D3DPOOL_DEFAULT, &m_genCheckVb, NULL);
+    }
+    void* vbMem = NULL;
+    if (SUCCEEDED(hr)) hr = m_genCheckVb->Lock(0, 0, &vbMem, 0);
+    if (FAILED(hr)) {
+        LOGERR("gencheck instrument DISABLED: one-row target setup failed (0x%08x)", hr);
+        GenCheckRelease();
+        return;
+    }
+    float u[kGenCheckSamples], v[kGenCheckSamples];
+    GenCheckPositions(u, v, kGenCheckSamples, kGenCheckGrid);
+    GenCheckVertex* verts = (GenCheckVertex*)vbMem;
+    for (int i = 0; i < kGenCheckSamples; i++) {
+        const float x0 = (float)i, x1 = (float)(i + 1);
+        GenCheckVertex* q = verts + i * 6;
+        const float xs[6] = { x0, x1, x0, x1, x1, x0 };
+        const float ys[6] = { 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f };
+        for (int k = 0; k < 6; k++) {
+            q[k].x = xs[k];
+            q[k].y = ys[k];
+            q[k].z = 0.5f;
+            q[k].rhw = 1.0f;
+            q[k].u = u[i];
+            q[k].v = v[i];
+        }
+    }
+    m_genCheckVb->Unlock();
+    m_genCheckActive = true;
+    LOG("gencheck instrument ACTIVE: %d samples on a %dx%d stratified grid, gathered on the "
+        "capture device behind each slot copy, read back one wake later; gencheck: lines "
+        "carry the sample verdict beside the driver's diff= for every second member, and "
+        "same_prev= compares each batch's first member with the previous batch's",
+        kGenCheckSamples, kGenCheckGrid, kGenCheckGrid);
+}
+
+void CaptureRing::GenCheckRelease() {
+    for (int i = 0; i < RING_SIZE; i++) {
+        if (m_genCheck[i].rt)  { m_genCheck[i].rt->Release();  m_genCheck[i].rt = NULL; }
+        if (m_genCheck[i].sys) { m_genCheck[i].sys->Release(); m_genCheck[i].sys = NULL; }
+    }
+    if (m_gcSelfRt)     { m_gcSelfRt->Release();     m_gcSelfRt = NULL; }
+    if (m_gcSelfSys)    { m_gcSelfSys->Release();    m_gcSelfSys = NULL; }
+    if (m_genCheckVb)   { m_genCheckVb->Release();   m_genCheckVb = NULL; }
+    m_genCheckActive = false;
+    m_genCheckPending = -1;
+    m_gcSelfPending = false;
+}
+
+void CaptureRing::GenCheckIssue(int slot) {
+    bool ok = GenCheckDraw(m_genCheck[slot].rt, m_ring[slot].capTexture);
+    // Self-test on the first wakes: the same slot gathered again into the spare target.
+    // Read back with the slot on the next wake and compared word for word.
+    if (ok && m_gcSelfTestsLeft > 0) {
+        ok = GenCheckDraw(m_gcSelfRt, m_ring[slot].capTexture);
+        m_gcSelfPending = ok;
+    }
+    if (!ok) {
+        LOGERR("gencheck: gather draw failed, instrument disabled");
+        m_genCheckActive = false;
+        m_genCheckPending = -1;
+        m_gcSelfPending = false;
+    }
+}
+
+bool CaptureRing::GenCheckRead(IDirect3DSurface9* rt, IDirect3DSurface9* sys, DWORD* words) {
+    if (FAILED(m_capDevice->GetRenderTargetData(rt, sys))) return false;
+    D3DLOCKED_RECT lr;
+    if (FAILED(sys->LockRect(&lr, NULL, D3DLOCK_READONLY))) return false;
+    memcpy(words, lr.pBits, sizeof(DWORD) * kGenCheckSamples);
+    sys->UnlockRect();
+    return true;
+}
+
+bool CaptureRing::GenCheckDraw(IDirect3DSurface9* target, IDirect3DTexture9* source) {
+    IDirect3DSurface9* oldRt = NULL;
+    m_capDevice->GetRenderTarget(0, &oldRt);
+    HRESULT hr = m_capDevice->SetRenderTarget(0, target);
+    if (SUCCEEDED(hr)) {
+        // Full state every time: nothing else draws on this device, but NvFBC owns it
+        // between wakes and nothing here may depend on what it left behind.
+        m_capDevice->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+        m_capDevice->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        m_capDevice->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+        m_capDevice->SetRenderState(D3DRS_LIGHTING, FALSE);
+        m_capDevice->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        m_capDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        m_capDevice->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        m_capDevice->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        m_capDevice->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+        m_capDevice->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+        m_capDevice->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+        m_capDevice->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        m_capDevice->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        m_capDevice->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        m_capDevice->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        m_capDevice->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+        m_capDevice->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        m_capDevice->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+        m_capDevice->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        m_capDevice->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        m_capDevice->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        m_capDevice->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        m_capDevice->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        m_capDevice->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, 0);
+        m_capDevice->SetPixelShader(NULL);
+        m_capDevice->SetVertexShader(NULL);
+        m_capDevice->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+        m_capDevice->SetStreamSource(0, m_genCheckVb, 0, sizeof(GenCheckVertex));
+        m_capDevice->SetTexture(0, source);
+        hr = m_capDevice->BeginScene();
+        if (SUCCEEDED(hr)) {
+            hr = m_capDevice->DrawPrimitive(D3DPT_TRIANGLELIST, 0, kGenCheckSamples * 2);
+            m_capDevice->EndScene();
+        }
+        m_capDevice->SetTexture(0, NULL);
+        if (oldRt) m_capDevice->SetRenderTarget(0, oldRt);
+    }
+    if (oldRt) oldRt->Release();
+    if (FAILED(hr)) LOGERR("gencheck: gather draw failed (0x%08x)", hr);
+    return SUCCEEDED(hr);
+}
+
+void CaptureRing::GenCheckOnWake(int slot, int member, LONGLONG arrUs, LONGLONG batchStartUs,
+                                 long long changed) {
+    // The gather issued on the PREVIOUS wake is finished: the flush this wake waited on
+    // covered everything queued before it. Copy the one row and compare.
+    if (m_genCheckPending >= 0) {
+        GenCheckSlot& g = m_genCheck[m_genCheckPending];
+        DWORD words[kGenCheckSamples];
+        LARGE_INTEGER t0, t1;
+        QueryPerformanceCounter(&t0);
+        const bool ok = GenCheckRead(g.rt, g.sys, words);
+        QueryPerformanceCounter(&t1);
+        if (!ok) {
+            LOGERR("gencheck: readback failed, instrument disabled");
+            m_genCheckActive = false;
+            m_genCheckPending = -1;
+            m_gcSelfPending = false;
+            return;
+        }
+        const LONGLONG rbUs = (t1.QuadPart - t0.QuadPart) * 1000000 / m_freqQuad;
+        m_gcRbHist[rbUs < 0 ? 0 : (rbUs >= kGenCheckRbBins ? kGenCheckRbBins - 1 : (int)rbUs)]++;
+        m_gcRbCount++;
+        if (rbUs > m_gcRbWorstUs) m_gcRbWorstUs = rbUs;
+
+        // Self-test: the spare target holds a second gather of the same slot.
+        if (m_gcSelfPending) {
+            DWORD self[kGenCheckSamples];
+            m_gcSelfPending = false;
+            if (GenCheckRead(m_gcSelfRt, m_gcSelfSys, self)) {
+                int d = 0;
+                for (int i = 0; i < kGenCheckSamples; i++) if (self[i] != words[i]) d++;
+                if (d != 0) {
+                    LOGERR("gencheck self-test FAILED: two gathers of one slot differ on %d of %d "
+                           "samples; the gather is not deterministic, instrument disabled",
+                           d, kGenCheckSamples);
+                    m_genCheckActive = false;
+                    m_genCheckPending = -1;
+                    return;
+                }
+                m_gcSelfPassed++;
+                m_gcSelfTestsLeft--;
+                if (m_gcSelfTestsLeft == 0) {
+                    LOG("gencheck self-test passed: %lld same-slot gathers read identical",
+                        m_gcSelfPassed);
+                }
+            }
+        }
+        // A gather whose words are all one value on gameplay read one texel or nothing.
+        // Legitimate on a black fade, so counted rather than fatal; the summary reports it
+        // and a count comparable to the frame count means the instrument is blind.
+        {
+            int sameAsFirst = 0;
+            for (int i = 0; i < kGenCheckSamples; i++) if (words[i] == words[0]) sameAsFirst++;
+            if (sameAsFirst == kGenCheckSamples) m_gcDegenerate++;
+        }
+
+        int same = -1, ndiff = -1, samePrev = -1, ndiffPrev = -1;
+        if (g.member == 0) {
+            // Batch to batch: the picture the source delivered under a new timestamp
+            // against the picture it delivered under the previous one. On moving content
+            // this differs on most samples, which is the positive control: a median near
+            // zero in gameplay means the instrument is not reading the frame.
+            if (m_gcPrevFirstValid) {
+                ndiffPrev = 0;
+                for (int i = 0; i < kGenCheckSamples; i++)
+                    if (words[i] != m_gcPrevFirst[i]) ndiffPrev++;
+                samePrev = ndiffPrev == 0 ? 1 : 0;
+                m_gcPrevCompared++;
+                if (samePrev) m_gcPrevRepeats++;
+                m_gcNdiffPrevHist[ndiffPrev]++;
+            }
+            memcpy(m_gcPrevFirst, words, sizeof(words));
+            m_gcPrevFirstValid = true;
+            if (m_gcFirstArrUs < 0) m_gcFirstArrUs = g.arrUs;
+            m_gcLastArrUs = g.arrUs;
+        } else if (m_gcLastValid && m_gcLastBatchStartUs == g.batchStartUs) {
+            // Within the batch: member m against member m-1, which is the pair the driver's
+            // change map for this grab describes.
+            ndiff = 0;
+            for (int i = 0; i < kGenCheckSamples; i++)
+                if (words[i] != m_gcLast[i]) ndiff++;
+            same = ndiff == 0 ? 1 : 0;
+            m_gcPairs++;
+            if (g.changed < 0) m_gcPairsNoMap++;
+            else if (g.changed == 0 && same) m_gcAgree++;
+            else if (g.changed > 0 && !same) m_gcAgree++;
+            else if (g.changed == 0) m_gcDriverDupeSamplesDiffer++;
+            else m_gcDriverChangeSamplesSame++;
+        }
+        memcpy(m_gcLast, words, sizeof(words));
+        m_gcLastValid = true;
+        m_gcLastBatchStartUs = g.batchStartUs;
+
+        // Keyed by the arrival it describes, so the line joins to its capture line offline.
+        LOG("gencheck: arr=%lldus m=%d blocks=%lld same=%d ndiff=%d same_prev=%d "
+            "ndiff_prev=%d rb=%lldus",
+            (long long)g.arrUs, g.member, g.changed, same, ndiff, samePrev, ndiffPrev,
+            (long long)rbUs);
+        m_genCheckPending = -1;
+    }
+
+    // This wake's gather becomes the pending one.
+    GenCheckSlot& n = m_genCheck[slot];
+    n.member = member;
+    n.arrUs = arrUs;
+    n.batchStartUs = batchStartUs;
+    n.changed = changed;
+    m_genCheckPending = slot;
+}
+
+void CaptureRing::LogGenCheckSummary() const {
+    if (!m_genCheckRequested) return;
+    if (m_gcRbCount == 0) {
+        LOG("gencheck summary: no readbacks (instrument %s)",
+            m_genCheckActive ? "active but never woke" : "inactive");
+        return;
+    }
+    LONGLONG median = 0, p95 = 0;
+    long long acc = 0;
+    bool haveMedian = false;
+    for (int b = 0; b < kGenCheckRbBins; b++) {
+        acc += m_gcRbHist[b];
+        if (!haveMedian && acc * 2 >= m_gcRbCount) { median = b; haveMedian = true; }
+        if (acc * 20 >= m_gcRbCount * 19) { p95 = b; break; }
+    }
+    const long long withMap = m_gcPairs - m_gcPairsNoMap;
+    const double minutes = (m_gcLastArrUs > m_gcFirstArrUs)
+                               ? (double)(m_gcLastArrUs - m_gcFirstArrUs) / 60000000.0 : 0.0;
+    // Median of the batch-to-batch difference, the positive control.
+    int ndiffPrevMedian = 0;
+    long long nacc = 0;
+    for (int b = 0; b <= kGenCheckSamples; b++) {
+        nacc += m_gcNdiffPrevHist[b];
+        if (nacc * 2 >= m_gcPrevCompared) { ndiffPrevMedian = b; break; }
+    }
+    LOG("gencheck summary: %lld pairs, agree %lld (%.1f%% of %lld with a map), "
+        "driver-dupe/samples-differ %lld, driver-change/samples-same %lld, no-map %lld; "
+        "batch-to-batch repeats %lld of %lld first members (%.2f/min), "
+        "batch-to-batch ndiff median %d of %d; "
+        "readback median %lld us p95 %lld us worst %lld us over %lld readbacks; "
+        "controls: self-test %lld/%d passed, degenerate gathers %lld%s",
+        m_gcPairs, m_gcAgree, withMap > 0 ? 100.0 * (double)m_gcAgree / (double)withMap : 0.0,
+        withMap, m_gcDriverDupeSamplesDiffer, m_gcDriverChangeSamplesSame, m_gcPairsNoMap,
+        m_gcPrevRepeats, m_gcPrevCompared,
+        minutes > 0.0 ? (double)m_gcPrevRepeats / minutes : 0.0,
+        ndiffPrevMedian, kGenCheckSamples,
+        (long long)median, (long long)p95, (long long)m_gcRbWorstUs, m_gcRbCount,
+        m_gcSelfPassed, kGenCheckSelfTestWakes, m_gcDegenerate,
+        m_genCheckActive ? "" : " (instrument disabled itself before exit)");
 }
 
 // Downscale a ring surface on the GPU, read it back, convert to blurred luma. The blur
