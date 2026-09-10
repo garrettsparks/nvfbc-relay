@@ -201,10 +201,11 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
         }
     }
 
-    // ---- Sample-check instrument resources (-gencheck). Same rule: a failed setup
-    // disables the instrument, never the relay. ----
-    if (m_genCheckRequested) {
-        GenCheckSetup();
+    // ---- Sample-check instrument resources (-gencheck). The opposite rule from fgphase:
+    // the instrument is under test and does not fall back. A failed setup refuses to start
+    // the relay, so no capture is ever taken believing the instrument ran. ----
+    if (m_genCheckRequested && !GenCheckSetup()) {
+        return false;
     }
 
     // ---- Rebind NvFBC to the capture device. ----
@@ -731,7 +732,7 @@ static void GenCheckPositions(float* u, float* v, int n, int grid) {
     }
 }
 
-void CaptureRing::GenCheckSetup() {
+bool CaptureRing::GenCheckSetup() {
     HRESULT hr = S_OK;
     for (int i = 0; i < m_ringSlots && SUCCEEDED(hr); i++) {
         hr = m_capDevice->CreateRenderTarget(kGenCheckSamples, 1, D3DFMT_A2B10G10R10,
@@ -764,9 +765,10 @@ void CaptureRing::GenCheckSetup() {
     void* vbMem = NULL;
     if (SUCCEEDED(hr)) hr = m_genCheckVb->Lock(0, 0, &vbMem, 0);
     if (FAILED(hr)) {
-        LOGERR("gencheck instrument DISABLED: one-row target setup failed (0x%08x)", hr);
+        LOGERR("gencheck instrument setup failed (0x%08x): refusing to start. The instrument "
+               "does not fall back while it is under test", hr);
         GenCheckRelease();
-        return;
+        return false;
     }
     float u[kGenCheckSamples], v[kGenCheckSamples];
     GenCheckPositions(u, v, kGenCheckSamples, kGenCheckGrid);
@@ -792,6 +794,21 @@ void CaptureRing::GenCheckSetup() {
         "carry the sample verdict beside the driver's diff= for every second member, and "
         "same_prev= compares each batch's first member with the previous batch's",
         kGenCheckSamples, kGenCheckGrid, kGenCheckGrid);
+    return true;
+}
+
+// The instrument is under test. A failure that fell back to "instrument off" would let a
+// capture run to completion believing it measured something, which costs the same minutes
+// as a stop and teaches less. So any failure past setup stops the relay, attributably, the
+// way an invalidated NvFBC session does: the present loop sees the ring stop and ends the
+// run, the session is released, and the log ends on the line that says why.
+void CaptureRing::GenCheckFatal(const char* what) {
+    LOGERR("gencheck FATAL: %s. Stopping the relay: the instrument does not fall back while "
+           "it is under test", what);
+    m_genCheckActive = false;
+    m_genCheckPending = -1;
+    m_gcSelfPending = false;
+    m_stop.store(true);
 }
 
 void CaptureRing::GenCheckRelease() {
@@ -809,18 +826,19 @@ void CaptureRing::GenCheckRelease() {
 
 void CaptureRing::GenCheckIssue(int slot) {
     bool ok = GenCheckDraw(m_genCheck[slot].rt, m_ring[slot].capTexture);
-    // Self-test on the first wakes: the same slot gathered again into the spare target.
-    // Read back with the slot on the next wake and compared word for word.
-    if (ok && m_gcSelfTestsLeft > 0) {
+    // Self-test on the first wakes: the same slot gathered again into the spare target,
+    // read back with the slot's own row on the next wake and compared word for word. There
+    // is ONE spare target, and it is read at the end of the following wake, after this
+    // point in that wake; drawing into it here while it still holds an unread gather would
+    // compare two different frames, so the test runs on alternate wakes.
+    if (ok && m_gcSelfTestsLeft > 0 && !m_gcSelfPending) {
         ok = GenCheckDraw(m_gcSelfRt, m_ring[slot].capTexture);
-        m_gcSelfPending = ok;
+        if (ok) {
+            m_gcSelfPending = true;
+            m_gcSelfSlot = slot;
+        }
     }
-    if (!ok) {
-        LOGERR("gencheck: gather draw failed, instrument disabled");
-        m_genCheckActive = false;
-        m_genCheckPending = -1;
-        m_gcSelfPending = false;
-    }
+    if (!ok) GenCheckFatal("gather draw failed");
 }
 
 bool CaptureRing::GenCheckRead(IDirect3DSurface9* rt, IDirect3DSurface9* sys, DWORD* words) {
@@ -893,10 +911,7 @@ void CaptureRing::GenCheckOnWake(int slot, int member, LONGLONG arrUs, LONGLONG 
         const bool ok = GenCheckRead(g.rt, g.sys, words);
         QueryPerformanceCounter(&t1);
         if (!ok) {
-            LOGERR("gencheck: readback failed, instrument disabled");
-            m_genCheckActive = false;
-            m_genCheckPending = -1;
-            m_gcSelfPending = false;
+            GenCheckFatal("readback failed");
             return;
         }
         const LONGLONG rbUs = (t1.QuadPart - t0.QuadPart) * 1000000 / m_freqQuad;
@@ -904,19 +919,18 @@ void CaptureRing::GenCheckOnWake(int slot, int member, LONGLONG arrUs, LONGLONG 
         m_gcRbCount++;
         if (rbUs > m_gcRbWorstUs) m_gcRbWorstUs = rbUs;
 
-        // Self-test: the spare target holds a second gather of the same slot.
+        // Self-test: the spare target holds a second gather of this same slot.
         if (m_gcSelfPending) {
             DWORD self[kGenCheckSamples];
+            const bool sameSlot = (m_gcSelfSlot == m_genCheckPending);
             m_gcSelfPending = false;
-            if (GenCheckRead(m_gcSelfRt, m_gcSelfSys, self)) {
+            if (sameSlot && GenCheckRead(m_gcSelfRt, m_gcSelfSys, self)) {
                 int d = 0;
                 for (int i = 0; i < kGenCheckSamples; i++) if (self[i] != words[i]) d++;
                 if (d != 0) {
                     LOGERR("gencheck self-test FAILED: two gathers of one slot differ on %d of %d "
-                           "samples; the gather is not deterministic, instrument disabled",
-                           d, kGenCheckSamples);
-                    m_genCheckActive = false;
-                    m_genCheckPending = -1;
+                           "samples; the gather is not deterministic", d, kGenCheckSamples);
+                    GenCheckFatal("self-test failed");
                     return;
                 }
                 m_gcSelfPassed++;
@@ -993,8 +1007,8 @@ void CaptureRing::GenCheckOnWake(int slot, int member, LONGLONG arrUs, LONGLONG 
 void CaptureRing::LogGenCheckSummary() const {
     if (!m_genCheckRequested) return;
     if (m_gcRbCount == 0) {
-        LOG("gencheck summary: no readbacks (instrument %s)",
-            m_genCheckActive ? "active but never woke" : "inactive");
+        LOG("gencheck summary: no readbacks (%s)",
+            m_genCheckActive ? "active but never woke" : "stopped on a fatal error first");
         return;
     }
     LONGLONG median = 0, p95 = 0;
@@ -1028,7 +1042,7 @@ void CaptureRing::LogGenCheckSummary() const {
         ndiffPrevMedian, kGenCheckSamples,
         (long long)median, (long long)p95, (long long)m_gcRbWorstUs, m_gcRbCount,
         m_gcSelfPassed, kGenCheckSelfTestWakes, m_gcDegenerate,
-        m_genCheckActive ? "" : " (instrument disabled itself before exit)");
+        m_genCheckActive ? "" : " (the instrument stopped the relay on a fatal error)");
 }
 
 // Downscale a ring surface on the GPU, read it back, convert to blurred luma. The blur

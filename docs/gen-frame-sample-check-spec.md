@@ -168,11 +168,21 @@ the readback took. The shutdown summary:
 
 An instrument broken in the boring way, sampling nothing or reading a stale target, would
 print "same" everywhere and hand over the "map is true" verdict for free. Three controls
-make that failure loud:
+make that failure loud, and the failure policy makes it final: while the instrument is under
+test it does not fall back. A setup failure refuses to start the relay; a draw, readback or
+self-test failure stops the relay the way an invalidated capture session does, so a run can
+never complete believing it measured something. (The older instruments, fgphase and the
+change map, still degrade to off; that is deliberate for them and wrong for this one until
+it has earned trust.)
 
-- **Self-test.** On the first three wakes the same slot is gathered a second time into a
-  spare target and the two rows are compared word for word. A difference means the gather
-  is not deterministic and the instrument disables itself with an error.
+- **Self-test.** On early wakes the same slot is gathered a second time into a spare target
+  and the two rows are compared word for word when that slot's own row is read back; three
+  passes retire the test. There is one spare target and it is read a wake after it is
+  drawn, so the test runs on alternate wakes; the first field run drew into it on
+  consecutive wakes, compared two different frames, and disabled the instrument on the
+  second wake, which is the control doing its job on the control. A difference between two
+  gathers of one slot means the gather is not deterministic, and the relay stops with an
+  error.
 - **Degenerate gathers.** A row whose 256 words are all one value on a frame of gameplay
   read one texel or none. Counted, not fatal (a black fade is legitimately uniform); a count
   comparable to the wake count means the instrument is blind.

@@ -380,7 +380,8 @@ private:
     IDirect3DSurface9* m_gcSelfRt = NULL;
     IDirect3DSurface9* m_gcSelfSys = NULL;
     int m_gcSelfTestsLeft = kGenCheckSelfTestWakes;
-    bool m_gcSelfPending = false;             // the spare target holds a second gather of m_genCheckPending
+    bool m_gcSelfPending = false;             // the spare target holds an unread second gather
+    int m_gcSelfSlot = -1;                    // of this slot; compared only against that slot's own row
     long long m_gcSelfPassed = 0;
     long long m_gcDegenerate = 0;
     unsigned int m_gcNdiffPrevHist[kGenCheckSamples + 1] = {};
@@ -403,8 +404,9 @@ private:
     unsigned int m_gcRbHist[kGenCheckRbBins] = {};
     long long m_gcRbCount = 0;
     LONGLONG m_gcRbWorstUs = 0;
-    void GenCheckSetup();
+    bool GenCheckSetup();
     void GenCheckRelease();
+    void GenCheckFatal(const char* what);
     void GenCheckIssue(int slot);
     bool GenCheckDraw(IDirect3DSurface9* target, IDirect3DTexture9* source);
     bool GenCheckRead(IDirect3DSurface9* rt, IDirect3DSurface9* sys, DWORD* words);
