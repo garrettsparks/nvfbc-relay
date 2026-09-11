@@ -290,6 +290,30 @@ the comparison is the point there; the cost runs separate them.
 | answers | graded ratio | identical or not |
 | blind to | nothing above noise | < ~5% of the frame |
 
+## The late-grab experiment
+
+The referee run showed the generated frame is in the capture buffer a millisecond or two after
+the real frame's present under in-game frame generation, unannounced: the two notifications
+both arrive at the real frame's present, and the rare second grab that landed late enough
+(1.7 to 2.7 ms after the flip event) returned the generated frame every time, while the next
+real frame's change map against it ran to thousands of blocks. `-lategrab N` goes and looks on
+purpose: after a batch's second member, the capture thread sleeps N microseconds on the
+driver's high-precision sleep and issues one grab without waiting for a notification. The
+picture lands in a texture outside the ring, so nothing on screen can change; the sample check
+gathers it and reports it as member 2, and its change map against the member before it is
+logged on a line of its own:
+
+    lategrab arr=<us> after=<us> flush=<us> diff=<blocks>
+
+Reading it: `diff=0` means the late grab found the real frame again (too early); a large `diff`
+followed by a capture line whose own `diff` is in the thousands means it found the generated
+frame; a large `diff` followed by a capture line with `diff=0` means it found the next real
+frame early (too late). `gencheck.py` tabulates the three, the landing time, and the flush
+cost. Setup failure refuses to start; a failed no-wait grab is counted, not fatal. The
+consumer, if the supply is real, is substitution at every mismatched ratio, with 90x2 into 60
+Hz the clearest: the 180 per second displayed stream lands on the sink grid every third frame,
+alternating real and generated, and the generated frame would replace the half-blend.
+
 ## Not in scope
 
 Replacing `GeneratedContentUsable`'s graded verdict. If the map turns out partly right and

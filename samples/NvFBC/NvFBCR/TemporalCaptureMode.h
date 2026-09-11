@@ -100,6 +100,8 @@ private:
     bool m_diffMap;
     // -gencheck: the sample-check referee for the difference map, forwarded to the ring.
     bool m_genCheck;
+    // -lategrab N: one extra no-wait grab per batch, N us after the second member.
+    unsigned int m_lateGrabUs;
     // The synth compositor when one is in use, for the substitution counters. Aliases
     // m_compositor and is never deleted through this pointer.
     SynthCompositorBase* m_synth = NULL;
@@ -140,6 +142,7 @@ public:
                         bool etw = false, bool noJoin = false, bool dejitter = false,
                         bool fgPhase = false, bool phaseKeep = false,
                         bool subGen = false, bool diffMap = false, bool genCheck = false,
+                        unsigned int lateGrabUs = 0,
                         unsigned int extraLagMs = 0, bool d3d11Present = false);
     virtual ~TemporalCaptureMode();
 

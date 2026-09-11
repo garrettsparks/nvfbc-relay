@@ -242,6 +242,18 @@ public:
     // and readback cost. Call after Stop.
     void LogGenCheckSummary() const;
 
+    // Request one extra grab per batch (-lategrab), issued a fixed delay after the batch's
+    // second member WITHOUT waiting for a notification. Before Start.
+    //
+    // Under in-game frame generation the capture engine wakes twice at the real frame's
+    // present and never again; the generated frame is in the buffer a millisecond or two
+    // later, unannounced, and the rare second grab that arrived late enough returned it.
+    // This goes and looks on purpose. Measurement only: the grab lands in a slot of its own
+    // outside the ring, nothing on screen changes, and the change map plus the sample check
+    // classify what came back. The delay is in microseconds after the second member.
+    void EnableLateGrab(unsigned int delayUs) { m_lateGrabUs = delayUs; }
+    void LogLateGrabSummary() const;
+
 private:
     struct Slot {
         IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
@@ -363,9 +375,11 @@ private:
         LONGLONG batchStartUs;
         long long changed;           // the driver's change map for the same grab (-1: off)
     };
+    // One entry per ring slot plus one for the late-grab slot, which lives outside the ring.
+    static const int kGenCheckLateSlot = RING_SIZE;
     bool m_genCheckRequested = false;
     bool m_genCheckActive = false;
-    GenCheckSlot m_genCheck[RING_SIZE] = {};
+    GenCheckSlot m_genCheck[RING_SIZE + 1] = {};
     IDirect3DVertexBuffer9* m_genCheckVb = NULL;   // one quad per sample, pretransformed, static
     int m_genCheckPending = -1;               // slot gathered on the previous wake, not yet read
     // Controls, because an instrument broken in the boring way (sampling nothing, reading a
@@ -412,6 +426,19 @@ private:
     bool GenCheckRead(IDirect3DSurface9* rt, IDirect3DSurface9* sys, DWORD* words);
     void GenCheckOnWake(int slot, int member, LONGLONG arrUs, LONGLONG batchStartUs,
                         long long changed);
+
+    // -lategrab experiment. Capture-thread-owned.
+    unsigned int m_lateGrabUs = 0;
+    bool m_lateGrabDoneThisBatch = false;
+    IDirect3DTexture9* m_lateTexture = NULL;   // capture device only, never shared or shown
+    IDirect3DSurface9* m_lateSurface = NULL;
+    long long m_lateGrabIssued = 0;
+    long long m_lateGrabFailed = 0;
+    long long m_lateGrabSameByMap = 0;         // change map says identical to the grab before it
+    long long m_lateGrabDistinctByMap = 0;     // change map says a different picture
+    long long m_lateGrabNoMap = 0;
+    void LateGrab(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams, LONGLONG batchStartQpc,
+                  LONGLONG lastArrivalQpc, double usPerTick);
 
     Slot m_ring[RING_SIZE];
     int m_ringSlots = kDefaultRingSlots;

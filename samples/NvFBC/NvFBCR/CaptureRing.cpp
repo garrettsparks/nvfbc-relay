@@ -70,6 +70,8 @@ CaptureRing::~CaptureRing() {
     delete[] m_fgLumWake[1]; m_fgLumWake[1] = NULL;
     delete[] m_fgLumKept;    m_fgLumKept = NULL;
     GenCheckRelease();
+    if (m_lateSurface) { m_lateSurface->Release(); m_lateSurface = NULL; }
+    if (m_lateTexture) { m_lateTexture->Release(); m_lateTexture = NULL; }
     if (m_capSync) {
         m_capSync->Release();
         m_capSync = NULL;
@@ -199,6 +201,21 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
         } else {
             LOGERR("fgphase instrument DISABLED: small-surface setup failed (0x%08x)", hr);
         }
+    }
+
+    // ---- Late-grab slot (-lategrab): a capture-side texture outside the ring, so the extra
+    // grab can be examined without ever being bracketable. Same no-fallback rule. ----
+    if (m_lateGrabUs > 0) {
+        hr = m_capDevice->CreateTexture(m_width, m_height, 1, D3DUSAGE_RENDERTARGET,
+                                        D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT, &m_lateTexture, NULL);
+        if (SUCCEEDED(hr)) hr = m_lateTexture->GetSurfaceLevel(0, &m_lateSurface);
+        if (FAILED(hr)) {
+            LOGERR("lategrab: slot setup failed (0x%08x): refusing to start", hr);
+            return false;
+        }
+        LOG("lategrab ACTIVE: one no-wait grab per batch, %u us after the second member, into a "
+            "slot outside the ring; lategrab: lines carry the change map against the member "
+            "before it, and the sample check reports it as m=2", m_lateGrabUs);
     }
 
     // ---- Sample-check instrument resources (-gencheck). The opposite rule from fgphase:
@@ -484,6 +501,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         // The intra-batch (real) member is stamped with the BATCH-START time so the ring
         // timeline stays at base cadence; everything else is stamped at its own arrival.
         m_ring[slot].member = batch.member;
+        if (batch.member == 0) m_lateGrabDoneThisBatch = false;
         // Publish the batch start for the stage-6 walk. At batch OPEN only: every member
         // shares the start stamp, so one entry names the whole batch, and the release
         // store is what lets the present thread read the entry without touching slots.
@@ -707,7 +725,89 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
                            (LONGLONG)((batch.stampTs - m_baseQpc.QuadPart) * usPerTick),
                            changed);
         }
+        // One extra grab per batch, after its second member, where the generated frame
+        // should be by now and nothing will announce it.
+        if (m_lateGrabUs > 0 && batch.member >= 1 && !m_lateGrabDoneThisBatch) {
+            m_lateGrabDoneThisBatch = true;
+            LateGrab(grabParams, batch.stampTs, now.QuadPart, usPerTick);
+        }
     }
+}
+
+// The extra grab. Sleeps the requested delay on the capture thread (the source is between
+// frames; a natural wake in this window would only be a third member of the same batch,
+// which the x2 regime this targets does not produce), then grabs whatever the buffer holds
+// without waiting for a notification. The picture goes to the late slot, the sample check
+// gathers it, and the change map for this grab (against the second member, the grab before
+// it) says whether it is the same picture; the NEXT real frame's change map, on the next
+// capture line, then says whether a different picture was the generated frame (thousands of
+// blocks) or the next real frame arriving early (zero).
+void CaptureRing::LateGrab(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams, LONGLONG batchStartQpc,
+                           LONGLONG lastArrivalQpc, double usPerTick) {
+    // The driver's high-precision sleep, with a clock spin for whatever it leaves short:
+    // the delay IS the experiment, and a sleep that returned early would make the grab read
+    // "real frame again" for the wrong reason. The logged after= is measured, not requested.
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    m_nvfbc->NvFBCToDx9VidGPUBasedCPUSleep((__int64)m_lateGrabUs);
+    const LONGLONG wantTicks = ((LONGLONG)m_lateGrabUs * m_freqQuad) / 1000000;
+    do {
+        QueryPerformanceCounter(&t1);
+    } while (t1.QuadPart - t0.QuadPart < wantTicks && !m_stop.load());
+    NVFBC_TODX9VID_GRAB_FRAME_PARAMS p = *grabParams;
+    p.dwFlags = NVFBC_TODX9VID_NOWAIT;
+    p.dwWaitTime = 0;
+    const NVFBCRESULT res = m_nvfbc->NvFBCToDx9VidGrabFrame(&p);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (res != NVFBC_SUCCESS) {
+        if (m_lateGrabFailed == 0) {
+            LOGERR("lategrab: no-wait grab returned %d; counted, not fatal", (int)res);
+        }
+        m_lateGrabFailed++;
+        return;
+    }
+    RECT srcRect = { 0, 0, (LONG)m_width, (LONG)m_height };
+    m_capDevice->StretchRect(m_captureTarget, &srcRect, m_lateSurface, &srcRect, D3DTEXF_NONE);
+    if (m_genCheckActive) GenCheckIssue(kGenCheckLateSlot);
+    m_capSync->Issue(D3DISSUE_END);
+    while (m_capSync->GetData(NULL, 0, D3DGETDATA_FLUSH) == S_FALSE) {
+        if (m_stop.load()) break;
+    }
+    LARGE_INTEGER afterFlush;
+    QueryPerformanceCounter(&afterFlush);
+    const LONGLONG flushUs = (afterFlush.QuadPart - now.QuadPart) * 1000000 / m_freqQuad;
+
+    long long changed = -1;
+    if (m_diffMapActive) {
+        const unsigned char* dm = (const unsigned char*)m_diffMapBuf;
+        changed = 0;
+        for (unsigned int b = 0; b < m_diffMapBlocks; b++) {
+            if (dm[b] != 0) changed++;
+        }
+    }
+    m_lateGrabIssued++;
+    if (changed < 0) m_lateGrabNoMap++;
+    else if (changed == 0) m_lateGrabSameByMap++;
+    else m_lateGrabDistinctByMap++;
+
+    const LONGLONG arrUs = (LONGLONG)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick);
+    const LONGLONG batchStartUs = (LONGLONG)((batchStartQpc - m_baseQpc.QuadPart) * usPerTick);
+    // A line of its own, so nothing that reads capture lines counts this as an arrival.
+    LOG("lategrab arr=%lldus after=%lldus flush=%lldus diff=%lld",
+        (long long)arrUs, (long long)((now.QuadPart - lastArrivalQpc) * usPerTick),
+        (long long)flushUs, changed);
+    if (m_genCheckActive) GenCheckOnWake(kGenCheckLateSlot, 2, arrUs, batchStartUs, changed);
+}
+
+void CaptureRing::LogLateGrabSummary() const {
+    if (m_lateGrabUs == 0) return;
+    LOG("lategrab summary: %lld issued %u us after the second member, %lld failed; by the change "
+        "map: %lld same picture as the member before, %lld a different picture, %lld without a "
+        "map. The next capture line's diff= after each distinct one says whether it was the "
+        "generated frame (thousands of blocks) or the next real frame (zero).",
+        m_lateGrabIssued, m_lateGrabUs, m_lateGrabFailed, m_lateGrabSameByMap,
+        m_lateGrabDistinctByMap, m_lateGrabNoMap);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -734,7 +834,9 @@ static void GenCheckPositions(float* u, float* v, int n, int grid) {
 
 bool CaptureRing::GenCheckSetup() {
     HRESULT hr = S_OK;
-    for (int i = 0; i < m_ringSlots && SUCCEEDED(hr); i++) {
+    for (int i = 0; i <= RING_SIZE && SUCCEEDED(hr); i++) {
+        // Ring slots in use, plus the late-grab slot when that experiment is armed.
+        if (i >= m_ringSlots && !(i == kGenCheckLateSlot && m_lateGrabUs > 0)) continue;
         hr = m_capDevice->CreateRenderTarget(kGenCheckSamples, 1, D3DFMT_A2B10G10R10,
                                              D3DMULTISAMPLE_NONE, 0, FALSE,
                                              &m_genCheck[i].rt, NULL);
@@ -812,7 +914,7 @@ void CaptureRing::GenCheckFatal(const char* what) {
 }
 
 void CaptureRing::GenCheckRelease() {
-    for (int i = 0; i < RING_SIZE; i++) {
+    for (int i = 0; i <= RING_SIZE; i++) {
         if (m_genCheck[i].rt)  { m_genCheck[i].rt->Release();  m_genCheck[i].rt = NULL; }
         if (m_genCheck[i].sys) { m_genCheck[i].sys->Release(); m_genCheck[i].sys = NULL; }
     }
@@ -825,7 +927,9 @@ void CaptureRing::GenCheckRelease() {
 }
 
 void CaptureRing::GenCheckIssue(int slot) {
-    bool ok = GenCheckDraw(m_genCheck[slot].rt, m_ring[slot].capTexture);
+    IDirect3DTexture9* source = (slot == kGenCheckLateSlot) ? m_lateTexture
+                                                            : m_ring[slot].capTexture;
+    bool ok = GenCheckDraw(m_genCheck[slot].rt, source);
     // Self-test on the first wakes: the same slot gathered again into the spare target,
     // read back with the slot's own row on the next wake and compared word for word. There
     // is ONE spare target, and it is read at the end of the following wake, after this
@@ -919,12 +1023,15 @@ void CaptureRing::GenCheckOnWake(int slot, int member, LONGLONG arrUs, LONGLONG 
         m_gcRbCount++;
         if (rbUs > m_gcRbWorstUs) m_gcRbWorstUs = rbUs;
 
-        // Self-test: the spare target holds a second gather of this same slot.
-        if (m_gcSelfPending) {
+        // Self-test: the spare target holds a second gather of some slot. Compare only when
+        // THIS readback is that slot's; a spare drawn earlier this same wake belongs to the
+        // slot read on the next wake and must be left pending until then. (Clearing it on
+        // the mismatch retired every test after the first, which the first field run
+        // reported as 1 of 3 passed.)
+        if (m_gcSelfPending && m_gcSelfSlot == m_genCheckPending) {
             DWORD self[kGenCheckSamples];
-            const bool sameSlot = (m_gcSelfSlot == m_genCheckPending);
             m_gcSelfPending = false;
-            if (sameSlot && GenCheckRead(m_gcSelfRt, m_gcSelfSys, self)) {
+            if (GenCheckRead(m_gcSelfRt, m_gcSelfSys, self)) {
                 int d = 0;
                 for (int i = 0; i < kGenCheckSamples; i++) if (self[i] != words[i]) d++;
                 if (d != 0) {
