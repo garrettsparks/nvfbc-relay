@@ -228,7 +228,7 @@ marked recording are the same relay the corpus describes.
 | capture | generator | expected driver dupe rate | what it settles |
 |---|---|---|---|
 | Avatar 60x2, `-subgen -gencheck` | DLSS-G | ~99.3% | whether the map is true under DLSS-G |
-| KCD 60x2, `-subgen -gencheck` | Smooth Motion | ~7.5% | that the instrument agrees where the map is already trusted |
+| KCD 60x2, `-subgen -gencheck` | Smooth Motion | ~7.5% | that the instrument agrees where the map is already trusted (measured: 7524 of 7524 pairs agree inside the recording, 87% of them real generated frames) |
 
 ## Reading the result
 
@@ -328,10 +328,19 @@ the pending second notification is answered late; `-grabdelay sweep` cycles 0, 6
 1500, 1800, 2100 and 2400 us batch by batch. The first member is held as the keeper and the
 delayed member discarded, so the output is unchanged. The exit summary prints, per delay, the
 batches, the second members, their mean executed dt and the fraction whose change map against
-the first member ran to 4000 blocks or more, which is a generated frame. The consumer, if the
-window is usable, is substitution at every mismatched ratio, with 90x2 into 60 Hz the clearest:
-the 180 per second displayed stream lands on the sink grid every third frame, alternating real
-and generated, and the generated frame would replace the half-blend.
+the first member ran to 4000 blocks or more, which is a generated frame. The sweep's top entry
+must leave the executed dt under the 3 ms batch threshold, or the delayed member opens a batch
+of its own and the following step inherits a first member with no second; the first sweep ran
+to 2400 and lost its control step that way, and the table now tops out at 1800.
+
+Result at 60x2: no window. From 1.2 to 3.0 ms after the first member the delayed copy was the
+real frame again on 92 to 94% of batches and a generated frame on 0.4 to 0.8%, the natural
+rate. The picture a grab returns is fixed when the notification is issued, not when the grab
+executes; the natural late catches were late notifications. Neither polling nor a delayed
+answer reaches the generated frame at x2, and the supply through this path is whatever the
+driver's notification timing yields. The consumer that would have used it, substitution at
+mismatched ratios with 90x2 into 60 Hz the clearest case, stays dormant under DLSS frame
+generation for that reason.
 
 ## Not in scope
 

@@ -764,7 +764,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
                 m_grabDelayNext = true;
             } else if (batch.member == 1 && m_grabDelayStep >= 0) {
                 m_gdSecond[m_grabDelayStep]++;
-                m_gdDtSum[m_grabDelayStep] += dt;
+                m_gdDtSum[m_grabDelayStep] += (LONGLONG)(dt * usPerTick);   // dt is in ticks here
                 if (changed < 0) m_gdNoMap[m_grabDelayStep]++;
                 else if (changed >= 4000) m_gdGenerated[m_grabDelayStep]++;
             }
@@ -787,11 +787,13 @@ void CaptureRing::PreciseSleep(unsigned int us) {
 void CaptureRing::EnableGrabDelay(int delayUs) {
     m_grabDelayArmed = true;
     if (delayUs < 0) {
-        // The sweep. Zero is the control; the top stays under the 3 ms batch threshold once
-        // the loop's own processing is added, so a delayed second member is still a second
-        // member and not a batch of its own.
+        // The sweep. Zero is the control. The top must stay under the 3 ms batch threshold
+        // AFTER the loop's own ~700 us of processing is added, or the delayed second member
+        // opens a batch of its own and the step after it inherits a first member that has no
+        // second: the first sweep ran to 2400 and its 2400 step landed at 3.0 ms, leaving 3
+        // second members of 1803 and a corrupted control. Executed dt tops out near 2.5 ms.
         static const unsigned int kSweep[kGrabDelayMaxSteps] =
-            { 0, 600, 900, 1200, 1500, 1800, 2100, 2400 };
+            { 0, 400, 700, 1000, 1200, 1400, 1600, 1800 };
         m_grabDelaySteps = kGrabDelayMaxSteps;
         for (int i = 0; i < kGrabDelayMaxSteps; i++) m_grabDelayTable[i] = kSweep[i];
     } else {
