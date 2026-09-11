@@ -27,6 +27,10 @@ this program.
 
 HDCP also needs to be disabled. Thanks, DRM.
 
+The exe asks for administrator rights when it starts. Enabling NvFBC on a
+machine where it is off needs them, and so does reading the display driver's
+flip events (`-etw`).
+
 ---
 
 # Use
@@ -73,16 +77,8 @@ The blend mode has two ways to reach the screen, and the name says which clock
 the present rides. `b:vsync` presents through a D3D11 flip-model swapchain on
 the output window; Windows promotes it to independent flip, so the present
 blocks on the capture card's own vblank. `b:dwm` presents through the D3D9
-swapchain, blocked on DWM's compose clock, which is the path `t` and `o` run
-on. Under in-game frame generation that clock runs at the displayed rate, two
+swapchain, blocked on DWM's compose clock, which is the path `t` runs on. Under in-game frame generation that clock runs at the displayed rate, two
 presents per source frame into a 60Hz sink, and the recording shows it.
-
-Naming note: everything written before 2026-09-11 (fixture descriptions,
-capture file names, the analysis documents under `docs/`) used `b:vsync` for
-the D3D9 path and `b:flip` for the D3D11 one. The names were swapped when the
-present path got its seam. `b:flip` is accepted as an alias for `b:vsync` on
-this branch only and is gone at the release. The old documents were not
-rewritten.
 
 Measured in one session, Avatar 60x2 with in-game frame generation,
 `-src 60 -lock -lag 75 -mark -etw -dejit`, inside the benchmark tests:

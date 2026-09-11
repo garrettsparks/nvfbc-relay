@@ -1,7 +1,7 @@
 # nvfbc-relay policy replay fixture
-# Avatar 59 fps source declared as -src 60, no frame generation, b:flip present, -lock -lag 75 -dejit. One benchmark test, no fade at either end. The realistic mis-declaration: the flag names a nominal 60 while the source delivers 59, so every period the policy derives is 1.7 percent short of the truth.
+# Avatar 59 fps source declared as -src 60, no frame generation, b:vsync present, -lock -lag 75 -dejit. One benchmark test, no fade at either end. The realistic mis-declaration: the flag names a nominal 60 while the source delivers 59, so every period the policy derives is 1.7 percent short of the truth.
 # units: microseconds. first value absolute, rest are deltas.
-description Avatar 59 fps source declared as -src 60, no frame generation, b:flip present, -lock -lag 75 -dejit. One benchmark test, no fade at either end. The realistic mis-declaration: the flag names a nominal 60 while the source delivers 59, so every period the policy derives is 1.7 percent short of the truth.
+description Avatar 59 fps source declared as -src 60, no frame generation, b:vsync present, -lock -lag 75 -dejit. One benchmark test, no fade at either end. The realistic mis-declaration: the flag names a nominal 60 while the source delivers 59, so every period the policy derives is 1.7 percent short of the truth.
 # What the RELAY did on this capture. The replay model is only trustworthy
 # for a configuration where it reproduces these; the test checks that.
 field_worst_run 33

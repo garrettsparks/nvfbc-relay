@@ -1,8 +1,6 @@
 #include "FrameCompositors.h"
 #include <SimpleLogger.h>
 
-extern int g_interpBackend;   // NvFBCR.cpp: -interp flow|fruc
-
 const char* SynthExecLabel(int code) {
     switch (code) {
         case 1:  return "blend";
@@ -232,13 +230,11 @@ bool BlendCompositor::RenderSynthesis(const FrameBracket& bracket, double weight
 
 InterpCompositor::InterpCompositor(const policy::PolicyConfig* cfg)
     : SynthCompositorBase(cfg)
-    , m_backend(g_interpBackend)
 {
 }
 
 int InterpCompositor::Id() const {
-    if (m_backend == kInterpBackendFlow) return 3;   // flow-warp marker compositor ID
-    return 2;                                        // fruc
+    return 3;   // flow-warp marker compositor ID
 }
 
 bool InterpCompositor::SetupResources() {
@@ -247,20 +243,19 @@ bool InterpCompositor::SetupResources() {
     return m_blender.Setup(m_device);
 }
 
-bool InterpCompositor::OnCaptureStarted(CaptureRing* ring, LARGE_INTEGER baseQpc,
+bool InterpCompositor::OnCaptureStarted(CaptureRing* ring, LARGE_INTEGER /*baseQpc*/,
                                         LONGLONG freqQpc) {
-    return m_sidecar.Setup(m_device, ring, m_rect.right, m_rect.bottom, baseQpc, freqQpc);
+    return m_sidecar.Setup(m_device, ring, m_rect.right, m_rect.bottom, freqQpc);
 }
 
 bool InterpCompositor::RenderSynthesis(const FrameBracket& bracket, double weight,
                                        IDirect3DSurface9* backbuffer) {
     if (m_sidecar.Enabled()) {
-        const LONGLONG target = bracket.info.beforeTs + bracket.info.beforeDiff;
-        if (m_sidecar.Interpolate(bracket, target)) {
+        if (m_sidecar.Interpolate(bracket)) {
             m_device->StretchRect(m_sidecar.OutputSurface9(), &m_rect, backbuffer, &m_rect,
                                   D3DTEXF_NONE);
             m_lastSynthUs = m_sidecar.LastProcessUs();
-            m_lastSynthExecCode = (m_backend == kInterpBackendFlow) ? 3 : 2;
+            m_lastSynthExecCode = 3;   // flow-warp
             return true;
         }
     }

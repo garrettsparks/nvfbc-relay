@@ -1,7 +1,7 @@
 # nvfbc-relay policy replay fixture
-# Avatar 60x2 with generated-frame substitution (-subgen) on the D3D11 flip present: all nine benchmark tests across three bench runs, desktop trimmed off both ends, every inter-test fade kept. Carries a real 106 ms source stall in the last test, which the relay covers with blends rather than repeats.
+# Avatar 60x2 with generated-frame substitution (-subgen) on the D3D11 flip-model present (b:vsync): all nine benchmark tests across three bench runs, desktop trimmed off both ends, every inter-test fade kept. Carries a real 106 ms source stall in the last test, which the relay covers with blends rather than repeats.
 # units: microseconds. first value absolute, rest are deltas.
-description Avatar 60x2 with generated-frame substitution (-subgen) on the D3D11 flip present: all nine benchmark tests across three bench runs, desktop trimmed off both ends, every inter-test fade kept. Carries a real 106 ms source stall in the last test, which the relay covers with blends rather than repeats.
+description Avatar 60x2 with generated-frame substitution (-subgen) on the D3D11 flip-model present (b:vsync): all nine benchmark tests across three bench runs, desktop trimmed off both ends, every inter-test fade kept. Carries a real 106 ms source stall in the last test, which the relay covers with blends rather than repeats.
 # What the RELAY did on this capture. The replay model is only trustworthy
 # for a configuration where it reproduces these; the test checks that.
 field_worst_run 24

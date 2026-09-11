@@ -200,7 +200,7 @@ this document counts. The tool is `picturerepeats.py` in the analysis repository
 
 ## The replay agrees with the field, and the corpus now describes the shipping relay
 
-The four fixtures `avatar_90x1_flip_{steady,bench}` and `avatar_90x2_flip_{steady,bench}`
+The four fixtures `avatar_90x1_vsync_{steady,bench}` and `avatar_90x2_vsync_{steady,bench}`
 were rebuilt from the new captures at the test windows above (steady = the first benchmark
 test with no fade at either end; bench = first test start to last test end, fades kept). The
 replay lands on the field on every one:

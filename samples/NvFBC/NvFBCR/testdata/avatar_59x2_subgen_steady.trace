@@ -1,7 +1,7 @@
 # nvfbc-relay policy replay fixture
-# Avatar 59 fps base with frame generation x2, declared -src 60, -subgen armed, b:flip present, -lock -lag 75 -dejit. One benchmark test, no fade at either end. Substitution has nothing to substitute: the change map refuses 99.6 percent of retracted members as duplicates of the real frame they were paired with.
+# Avatar 59 fps base with frame generation x2, declared -src 60, -subgen armed, b:vsync present, -lock -lag 75 -dejit. One benchmark test, no fade at either end. Substitution has nothing to substitute: the change map refuses 99.6 percent of retracted members as duplicates of the real frame they were paired with.
 # units: microseconds. first value absolute, rest are deltas.
-description Avatar 59 fps base with frame generation x2, declared -src 60, -subgen armed, b:flip present, -lock -lag 75 -dejit. One benchmark test, no fade at either end. Substitution has nothing to substitute: the change map refuses 99.6 percent of retracted members as duplicates of the real frame they were paired with.
+description Avatar 59 fps base with frame generation x2, declared -src 60, -subgen armed, b:vsync present, -lock -lag 75 -dejit. One benchmark test, no fade at either end. Substitution has nothing to substitute: the change map refuses 99.6 percent of retracted members as duplicates of the real frame they were paired with.
 # What the RELAY did on this capture. The replay model is only trustworthy
 # for a configuration where it reproduces these; the test checks that.
 field_worst_run 30

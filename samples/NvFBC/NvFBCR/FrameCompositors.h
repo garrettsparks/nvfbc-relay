@@ -81,10 +81,10 @@ private:
 };
 
 // Interpolating composition: the synthesized frame comes from the D3D11 sidecar
-// (raw NVOFA flow + our warp, or NvOFFRUC, per -interp), with the lerp as the
-// per-present fallback when the engine cannot deliver. The sidecar initializes in
-// OnCaptureStarted (it opens ring slot shared handles, which exist only after
-// CaptureRing::Start); a sidecar that cannot initialize refuses the mode.
+// (raw NVOFA flow + our warp), with the lerp as the per-present fallback when the
+// engine cannot deliver. The sidecar initializes in OnCaptureStarted (it opens ring
+// slot shared handles, which exist only after CaptureRing::Start); a sidecar that
+// cannot initialize refuses the mode.
 class InterpCompositor : public SynthCompositorBase {
 public:
     explicit InterpCompositor(const policy::PolicyConfig* cfg);
@@ -100,5 +100,4 @@ protected:
 private:
     InterpSidecar m_sidecar;
     BlendRenderer m_blender;   // lerp fallback; output stays synthesized-at-target
-    int m_backend;             // InterpBackend, latched at construction
 };

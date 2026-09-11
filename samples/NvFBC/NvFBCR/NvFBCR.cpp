@@ -125,11 +125,6 @@ unsigned int g_extraLagMs = 0;
 // bare -mark). The counter keeps advancing past N so mark= stays a continuous present count.
 unsigned int g_markFrames = 0;
 
-// Interp compositor backend for o:* modes (-interp flow|fruc). Flow (raw NVOFA + our
-// warp) is the default: the only runtime dependency is the driver's nvofapi64.dll,
-// while FRUC needs the SDK's NvOFFRUC.dll beside the exe.
-int g_interpBackend = 1;
-
 // Single fps validation policy for every entry point that accepts a rate (mode strings,
 // -src): accept (0, 1000].
 static bool ParseFps(const string& value, float* outFps) {
@@ -173,15 +168,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
                                            kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
                                            g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs);
         }
-        if (_stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0 ||
-            _stricmp(modeStr.c_str(), "b:flip") == 0) {
-            if (_stricmp(modeStr.c_str(), "b:flip") == 0) {
-                // Transitional alias: the flip-model path was b:flip while it was the
-                // experiment and the D3D9 path was b:vsync. Accepted so existing launch
-                // lines keep working through the rename; removed at the release.
-                LOG("b:flip is now b:vsync (the D3D11 flip-model present); the old name is a "
-                    "transitional alias and goes away at the release");
-            }
+        if (_stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
                                            kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
                                            g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs,
@@ -224,20 +211,14 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
     LOGERR("  b, b:vsync     - Temporal blend compositor (sharp passthrough at the target, lerp otherwise) on a D3D11 flip-model swapchain, presented on the SINK's vblank");
     LOGERR("  b:dwm, b:60    - The same blend compositor on the D3D9 swapchain: DWM's compose clock (b:dwm) or a timer at the given fps");
-    LOGERR("  o, o:vsync, o:60 - Temporal interp compositor (NVOFA motion-compensated synthesis)");
-    LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
     LOGERR("Options:");
-    LOGERR("  -src 30        - Declared source fps; sizes the static temporal lag (default: assume >= 60)");
+    LOGERR("  -src 30        - Declared source fps, the BASE render rate (with frame generation at 60x2, pass 60); sizes the static temporal lag (default: assume >= 60)");
     LOGERR("  -lock          - Enable the phase comb lock (needs -src for the rate); off by default");
-    LOGERR("  -interp flow|fruc - o:* synthesis engine (default flow = raw NVOFA + warp)");
-    LOGERR("  -mark [N]      - Burn the frame-counter marker (video-to-log alignment, debug); off by default. N = first N presents only (stream head anchor), else every present");
-    LOGERR("  -tint          - Border-tint synthesized frames red (blend mode, debug); off by default");
-    LOGERR("  -etw           - Log the display driver's true scanout times alongside capture (debug); off by default");
-    LOGERR("  -nojoin        - With -etw: log flips but skip the per-present grid lookup (debug A/B control)");
-    LOGERR("  -dejit         - With -etw: re-stamp late-delivered capture batches onto the flip grid (phantom-blend fix)");
-    LOGERR("  -fgphase       - Content-phase instrument: log per-batch f of generated frames (stage-7 gate; run with -etw for the offline g join)");
-    LOGERR("  -phasekeep     - With -etw: phase-aware keep-real, so x3 keeps the real frame in every batch that has one (inert at x2)");
+    LOGERR("  -lag 75        - Extra bracketing delay in ms (0-200): output latency the player never sees, traded for fewer held frames");
+    LOGERR("  -etw           - Read the display driver's true scanout times alongside capture; needed by -dejit");
+    LOGERR("  -dejit         - With -etw and -lock: re-stamp late-delivered capture batches onto the flip grid (removes phantom blends)");
+    LOGERR("  -mark [N]      - Burn the frame-counter marker for offline analysis; N = first N presents only, else every present");
     return NULL;
 }
 
@@ -674,12 +655,6 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         else LOGERR("-src value '%s' invalid (1-1000) - ignored", tokens[i + 1].c_str());
         return 2;
     }
-    if (tokens[i] == "-interp" && i + 1 < tokens.size()) {
-        if (tokens[i + 1] == "flow")      g_interpBackend = 1;
-        else if (tokens[i + 1] == "fruc") g_interpBackend = 0;
-        else LOGERR("-interp value '%s' invalid (flow|fruc) - keeping default", tokens[i + 1].c_str());
-        return 2;
-    }
     return 0;
 }
 
@@ -763,15 +738,12 @@ void ConsoleUserInput(string* framerateStr) {
     cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
     cout << "  b, b:vsync     - Temporal blend compositor on a D3D11 flip-model swapchain, presented on the SINK's vblank" << endl;
     cout << "  b:dwm, b:60    - The same blend compositor on the D3D9 swapchain: DWM's compose clock (b:dwm) or a timer" << endl;
-    cout << "  o, o:vsync, o:60 - Temporal interp compositor (NVOFA motion-compensated synthesis)" << endl;
-    cout << "  t:60 -src 30   - Mode plus options: -src <fps> declares the source rate (lag sizing)" << endl;
+    cout << "  b -src 60 -lock - Mode plus options: -src <fps> declares the source's BASE render rate (lag sizing)" << endl;
     cout << "  -lock          - Enable the phase comb lock (needs -src; off by default)" << endl;
-    cout << "  -interp flow|fruc - o:* synthesis engine (default flow = raw NVOFA + warp)" << endl;
-    cout << "  -mark [N]      - Burn the frame-counter marker (video-to-log alignment, debug); N = first N presents only" << endl;
-    cout << "  -tint          - Border-tint synthesized frames red (blend mode, debug)" << endl;
-    cout << "  -flipex        - Flip-mode presentation (no DWM copy, present statistics; experimental)" << endl;
-    cout << endl;
-    cout << "  diag, diag:vsync - Clock probes (DWM compose timing + card raster)" << endl;
+    cout << "  -lag 75        - Extra bracketing delay in ms (0-200): output latency traded for fewer held frames" << endl;
+    cout << "  -etw           - Read the display driver's scanout times alongside capture; needed by -dejit" << endl;
+    cout << "  -dejit         - With -etw and -lock: re-stamp late-delivered capture batches onto the flip grid" << endl;
+    cout << "  -mark [N]      - Burn the frame-counter marker for offline analysis; N = first N presents only" << endl;
     cout << endl;
     cout << "  60             - Timer mode (simple timer-driven at specified fps)" << endl;
     cout << endl;

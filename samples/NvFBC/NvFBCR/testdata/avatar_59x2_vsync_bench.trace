@@ -1,7 +1,7 @@
 # nvfbc-relay policy replay fixture
-# Avatar 59 fps base with frame generation x2 (118 fps displayed on a VRR panel), declared -src 60, b:flip present, -lock -lag 75 -dejit. All nine benchmark tests, every inter-test fade kept (frame generation stops on a fade, so the source drops 118 to 59 and the batches go from pairs to singletons), desktop trimmed off both ends.
+# Avatar 59 fps base with frame generation x2 (118 fps displayed on a VRR panel), declared -src 60, b:vsync present, -lock -lag 75 -dejit. All nine benchmark tests, every inter-test fade kept (frame generation stops on a fade, so the source drops 118 to 59 and the batches go from pairs to singletons), desktop trimmed off both ends.
 # units: microseconds. first value absolute, rest are deltas.
-description Avatar 59 fps base with frame generation x2 (118 fps displayed on a VRR panel), declared -src 60, b:flip present, -lock -lag 75 -dejit. All nine benchmark tests, every inter-test fade kept (frame generation stops on a fade, so the source drops 118 to 59 and the batches go from pairs to singletons), desktop trimmed off both ends.
+description Avatar 59 fps base with frame generation x2 (118 fps displayed on a VRR panel), declared -src 60, b:vsync present, -lock -lag 75 -dejit. All nine benchmark tests, every inter-test fade kept (frame generation stops on a fade, so the source drops 118 to 59 and the batches go from pairs to singletons), desktop trimmed off both ends.
 # What the RELAY did on this capture. The replay model is only trustworthy
 # for a configuration where it reproduces these; the test checks that.
 field_worst_run 39

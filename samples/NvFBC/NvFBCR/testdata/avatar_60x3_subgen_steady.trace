@@ -1,14 +1,14 @@
 # nvfbc-relay policy replay fixture
-# Avatar 60 fps base with frame generation x3, -src 60, -subgen armed, b:flip present, -lock -lag 75 -dejit. One benchmark test, no fade at either end. Substitution is inert at x3 by design and by placement: the lock holds at 1:1 so no present would blend, and the ring offers nothing outside the x2 regime.
+# Avatar 60 fps base with frame generation x3, -src 60, -subgen armed, b:vsync present, -lock -lag 75 -dejit. One benchmark test, no fade at either end. Substitution is inert at x3 by design and by placement: the lock holds at 1:1 so no present would blend, and the ring offers nothing outside the x2 regime.
 # units: microseconds. first value absolute, rest are deltas.
-description Avatar 60 fps base with frame generation x3, -src 60, -subgen armed, b:flip present, -lock -lag 75 -dejit. One benchmark test, no fade at either end. Substitution is inert at x3 by design and by placement: the lock holds at 1:1 so no present would blend, and the ring offers nothing outside the x2 regime.
+description Avatar 60 fps base with frame generation x3, -src 60, -subgen armed, b:vsync present, -lock -lag 75 -dejit. One benchmark test, no fade at either end. Substitution is inert at x3 by design and by placement: the lock holds at 1:1 so no present would blend, and the ring offers nothing outside the x2 regime.
 # What the RELAY did on this capture. The replay model is only trustworthy
 # for a configuration where it reproduces these; the test checks that.
 field_worst_run 1
 field_long_runs 0
 field_synth_pct 0.3
 src_hint 60.0
-# rotation_inert: 0 of 1319 batches decided, by design; see avatar_60x3_flip_steady for the
+# rotation_inert: 0 of 1319 batches decided, by design; see avatar_60x3_vsync_steady for the
 # member measurement this rests on. The members here carry the change map (-subgen implies it),
 # and it is where the 84% duplicate / 16% distinct split of the later member was read.
 rotation_inert 1

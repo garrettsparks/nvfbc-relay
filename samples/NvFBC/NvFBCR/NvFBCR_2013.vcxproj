@@ -68,15 +68,15 @@
       </IgnoreSpecificDefaultLibraries>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <SubSystem>Windows</SubSystem>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
       <DataExecutionPrevention>
       </DataExecutionPrevention>
       <TargetMachine>MachineX64</TargetMachine>
     </Link>
     <PreBuildEvent>
-      <Command>lib /nologo /machine:x64 /def:"$(ProjectDir)nvofapi64.def" /out:"$(IntDir)nvofapi64.lib"
-lib /nologo /machine:x64 /def:"$(ProjectDir)NvOFFRUC.def" /out:"$(IntDir)NvOFFRUC.lib"</Command>
-      <Message>Generating NVIDIA import libraries from module definition files</Message>
+      <Command>lib /nologo /machine:x64 /def:"$(ProjectDir)nvofapi64.def" /out:"$(IntDir)nvofapi64.lib"</Command>
+      <Message>Generating the NVIDIA optical flow import library from its module definition file</Message>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -101,6 +101,7 @@ lib /nologo /machine:x64 /def:"$(ProjectDir)NvOFFRUC.def" /out:"$(IntDir)NvOFFRU
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <GenerateMapFile>true</GenerateMapFile>
       <SubSystem>Windows</SubSystem>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
@@ -109,9 +110,8 @@ lib /nologo /machine:x64 /def:"$(ProjectDir)NvOFFRUC.def" /out:"$(IntDir)NvOFFRU
       <TargetMachine>MachineX64</TargetMachine>
     </Link>
     <PreBuildEvent>
-      <Command>lib /nologo /machine:x64 /def:"$(ProjectDir)nvofapi64.def" /out:"$(IntDir)nvofapi64.lib"
-lib /nologo /machine:x64 /def:"$(ProjectDir)NvOFFRUC.def" /out:"$(IntDir)NvOFFRUC.lib"</Command>
-      <Message>Generating NVIDIA import libraries from module definition files</Message>
+      <Command>lib /nologo /machine:x64 /def:"$(ProjectDir)nvofapi64.def" /out:"$(IntDir)nvofapi64.lib"</Command>
+      <Message>Generating the NVIDIA optical flow import library from its module definition file</Message>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -157,7 +157,6 @@ lib /nologo /machine:x64 /def:"$(ProjectDir)NvOFFRUC.def" /out:"$(IntDir)NvOFFRU
   </ItemGroup>
   <ItemGroup>
     <None Include="nvofapi64.def" />
-    <None Include="NvOFFRUC.def" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

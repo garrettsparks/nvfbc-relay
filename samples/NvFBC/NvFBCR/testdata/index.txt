@@ -1,13 +1,6 @@
 # Capture corpus for the policy replay gate. One fixture per line.
 # Build with: uv run mktrace.py <NvFBCR.log> <name>.trace "<description>"
 # (mktrace.py lives in this directory; run the suite afterwards for the bounds)
-#
-# MODE NAMES. Every fixture description, fixture file name and comment below was written
-# before the present-path rename of 2026-09-11, when "b:vsync" meant the D3D9 present (DWM's
-# compose clock) and "b:flip" meant the D3D11 flip-model present (the sink's vblank). From that
-# rename on, b:vsync IS the D3D11 flip-model present and the D3D9 present is b:dwm; b:flip is a
-# transitional alias that goes away at the release. Nothing below was rewritten: a "_flip_"
-# fixture is a b:vsync capture in today's names, and "the D3D9 vsync path" is today's b:dwm.
 kcd_60x2_mapcycles.trace
 kcd_60x2_mapcycles_postfix.trace
 # Steady walking, the regime the map-cycle fixtures do not cover: they are dominated by
@@ -36,12 +29,12 @@ kcd_60x2_dejit_event.trace
 # (75 removals, 73 of them single-frame events), and the only one carrying the once-per-
 # second NvFBC delivery hitch that produces half of them.
 gm_60x2_gameplay_hour.trace
-# THE D3D11 FLIP PRESENT, on Avatar. Everything above is the D3D9 vsync path, where a
-# frame-generated source runs the compose clock at the DISPLAYED rate: two presents per source
-# frame, the comb lock structurally unable to engage, half the decisions landing between teeth.
-# These present on the SINK's own clock at 1:1, so the lock holds engaged and the steady state
-# is pure passthrough. A policy change that assumes the old two-presents-per-tooth geometry
-# passes every fixture above and fails here.
+# THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
+# (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
+# presents per source frame, the comb lock structurally unable to engage, half the decisions
+# landing between teeth. These present on the SINK's own clock at 1:1, so the lock holds
+# engaged and the steady state is pure passthrough. A policy change that assumes the old
+# two-presents-per-tooth geometry passes every fixture above and fails here.
 #
 # Each configuration ships TWO fixtures, because one window cannot gate both regimes. The
 # _steady pair is a single benchmark test with no fade at either end, where the field decided
@@ -51,8 +44,8 @@ gm_60x2_gameplay_hour.trace
 # the relay blends across the hole. The model tracks a fade about half as well as it tracks
 # gameplay, so the _bench bounds are looser by construction and gate what the model can see;
 # that is why the _steady fixtures exist beside them rather than instead of them.
-avatar_60x2_flip_steady.trace
-avatar_60x2_flip_bench.trace
+avatar_60x2_vsync_steady.trace
+avatar_60x2_vsync_bench.trace
 # The same configuration with generated-frame substitution armed (-subgen, which implies the
 # driver change map). What it pins is a NEGATIVE: substitution fires 38 times in six minutes
 # and changes nothing. The cause was originally read as the tooth guard having already removed
@@ -70,8 +63,8 @@ avatar_60x2_subgen_bench.trace
 # where the present is the sink's own. The degenerate geometry - no pairing, no collapse, no
 # side to choose - so anything that only works because a batch has two members, or because the
 # target can sit between teeth, has nowhere to hide.
-avatar_60x1_flip_steady.trace
-avatar_60x1_flip_bench.trace
+avatar_60x1_vsync_steady.trace
+avatar_60x1_vsync_bench.trace
 # The non-integer ratio. 59 fps into a 60 Hz sink: no comb can hold it, so the bracket phase
 # ramps through a full source period once per second and the compositor synthesizes whenever
 # the target sits more than a quarter period from a real frame - about half of every beat, and
@@ -80,8 +73,8 @@ avatar_60x1_flip_bench.trace
 # passthrough threshold, the stickiness band and the tooth guard all decide something on nearly
 # every present, so a change to any of them shows up here first. Captured and replayed at
 # -src 59, the only fixture that is; the 59at60 pair below is the same source declared as 60.
-avatar_59x1_flip_steady.trace
-avatar_59x1_flip_bench.trace
+avatar_59x1_vsync_steady.trace
+avatar_59x1_vsync_bench.trace
 # The SAME 59 fps source and the same content, declared as -src 60. Nobody types -src 59; the
 # flag will always name a nominal target rate, so a source that misses it by a frame is the
 # realistic configuration and this pair is what it costs. Every derived period comes out 1.7%
@@ -89,9 +82,9 @@ avatar_59x1_flip_bench.trace
 # the output is indistinguishable: 44.8% synth against 44.3%, blend runs of median 26 against
 # 25. What DOES move is the comb: an exact 1.000 ratio makes M=1 a true match rather than a
 # 1.67%-error one, the gate engages twice as often and holds half as long, and the pull tail
-# halves. Paired with avatar_59x1_flip_* this isolates -src as a single variable.
-avatar_59at60_flip_steady.trace
-avatar_59at60_flip_bench.trace
+# halves. Paired with avatar_59x1_vsync_* this isolates -src as a single variable.
+avatar_59at60_vsync_steady.trace
+avatar_59at60_vsync_bench.trace
 # 59 base with frame generation x2, declared -src 60. The pair that proves keep-real erases the
 # frame generator: arrivals come at 115/s in pairs, keep-real collapses each to its real member
 # at 59.04/s, and the policy then walks the identical 59:60 ramp the FG-off pair walks - 45.1%
@@ -99,8 +92,8 @@ avatar_59at60_flip_bench.trace
 # beat, twice the arrival traffic. It also carries the only VRR source in the corpus: the panel
 # is G-SYNC and the individual flips wander 7.1 to 9.9 ms even while the per-second count holds
 # 118, so a policy that quietly assumes an evenly spaced source grid fails here and nowhere else.
-avatar_59x2_flip_steady.trace
-avatar_59x2_flip_bench.trace
+avatar_59x2_vsync_steady.trace
+avatar_59x2_vsync_bench.trace
 # The same 59x2 configuration with -subgen armed. What it pins is WHY substitution is inert,
 # which is not what the 60x2 subgen pair above was originally read to say. The blocker is not
 # the tooth guard and not the policy gate: it is the ring's duplicate refusal. The driver's
@@ -125,8 +118,8 @@ avatar_59x2_subgen_bench.trace
 # pull) or refusing (59:60, nothing to hold); this is the only one where it is doing the thing
 # it was built for. The fades in the _bench pair are where it re-seeds: all 46 in-test breaks
 # across nine tests fall inside the first five seconds after a fade, and none after.
-avatar_30x1_flip_steady.trace
-avatar_30x1_flip_bench.trace
+avatar_30x1_vsync_steady.trace
+avatar_30x1_vsync_bench.trace
 # 30 base with frame generation x2, -src 30. The 2:1 alternation again, reached through
 # keep-real: arrivals come at 58/s in pairs 187 us apart, the generated member of each pair is
 # retracted, and the policy sees the same 30 real frames per second the FG-off pair sees. All
@@ -134,8 +127,8 @@ avatar_30x1_flip_bench.trace
 # holds on 100% of in-test presents. What this pair pins beyond the FG-off one is that the pair
 # collapse and the lock compose: a change that let a retracted member leak into the bracket
 # would shift the blend weights off 0.5 here first, because at 2:1 every blend is a midpoint.
-avatar_30x2_flip_steady.trace
-avatar_30x2_flip_bench.trace
+avatar_30x2_vsync_steady.trace
+avatar_30x2_vsync_bench.trace
 # 30x2 with -subgen armed: the sharpest supply test the corpus has. At 2:1 every blend sits at
 # w=0.5, which is exactly where the placement rule puts the generated member, and the 8333 us
 # threshold admits it on every one, so nothing but the ring's duplicate refusal stands between
@@ -146,15 +139,15 @@ avatar_30x2_flip_bench.trace
 avatar_30x2_subgen_steady.trace
 avatar_30x2_subgen_bench.trace
 # Frame generation x3, 180 fps displayed into the 60 Hz sink. The first x3 coverage on the
-# flip present and the first under DLSS frame generation rather than Smooth Motion. The
+# b:vsync present and the first under DLSS frame generation rather than Smooth Motion. The
 # delivery is not three members per batch: the relay sees two on 69% of batches and three on
 # 31%, at 120 to 165 arrivals per second against 181 displayed, with members up to 1.2 ms
 # apart (p95) under the 3 ms collapse threshold. keep-real reduces every shape to one real
 # frame at 60.05 per second, the lock holds at 1:1 and the nine tests pass 11634 of 11639
 # presents through sharp. A change to the batch threshold or to member ordering at x3 has
 # nowhere else in the corpus to be caught.
-avatar_60x3_flip_steady.trace
-avatar_60x3_flip_bench.trace
+avatar_60x3_vsync_steady.trace
+avatar_60x3_vsync_bench.trace
 # 60x3 with -subgen armed, and the row that changed what x3 under DLSS frame generation means.
 # The change map on the members says the later members are NOT all duplicates here: the
 # second of a two-member batch is a full-frame-distinct image on 16% of batches, the middle of
@@ -179,8 +172,8 @@ avatar_60x3_subgen_bench.trace
 # 22 ms then 11 ms content step; it replayed at 29.1 and 26.7 percent synth against 49.0 and
 # 48.4 here, with lock engagement at 88% on both, so the difference is the gate alone. A
 # min_synth_pct floor on each fixture fails if midpoints start passing again.
-avatar_90x1_flip_steady.trace
-avatar_90x1_flip_bench.trace
+avatar_90x1_vsync_steady.trace
+avatar_90x1_vsync_bench.trace
 # 90 base with frame generation x2, 180 displayed. The first fixture whose source cannot hold its
 # declared rate: keep-real collapses the pairs to about 88 real frames a second with the batch
 # period wandering around the 11.1 ms it should be. The M=2 comb engages on 23 to 51 percent of
@@ -194,8 +187,8 @@ avatar_90x1_flip_bench.trace
 # the relay: 88.7 against 88.3 real frames a second). Two effects compounded on that capture,
 # the 1.5x threshold gap and a source the comb cannot follow; the first is closed and what
 # remains is the second.
-avatar_90x2_flip_steady.trace
-avatar_90x2_flip_bench.trace
+avatar_90x2_vsync_steady.trace
+avatar_90x2_vsync_bench.trace
 # 90x2 with -subgen armed, and the pair that measured what the driver change map COSTS. The
 # game's own benchmark ran 9% slower with the flag on (score 5028 to 4576, GPU time 11.27 to
 # 12.38 ms a frame, three runs each within six points of each other), because -subgen implies

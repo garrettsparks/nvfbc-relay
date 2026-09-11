@@ -6,23 +6,13 @@
 #include "CaptureRing.h"
 #include "FlowWarpEngine.h"
 
-// Interp backend selection (-interp flow|fruc). Flow (raw NVOFA + our warp) is the
-// default: we own the blend math (no dimming possible) and the only runtime dependency
-// is the driver's nvofapi64.dll; FRUC needs the SDK's NvOFFRUC.dll beside the exe.
-// Both engines' entry points are implicit imports, so their DLLs must resolve when
-// the process loads, whichever backend a run selects.
-enum InterpBackend {
-    kInterpBackendFruc = 0,
-    kInterpBackendFlow = 1,
-};
-
-// D3D11 interpolation sidecar: reads ring slots via their shared handles, converts the
-// bracket frames to 8-bit BGRA for the ENGINE inputs (alpha forced to 1.0 - NvFBC's
-// desktop alpha is unspecified, and alpha-weighted math inside FRUC dims the output
-// when that byte is garbage), and exposes the interpolated result back to the D3D9
-// present device as a shared surface. The flow backend's warp samples the original
-// 10-bit ring aliases and, driver permitting, renders through a 10-bit share, so its
-// 8-bit hop is confined to flow estimation; FRUC is 8-bit in and out by its API.
+// D3D11 interpolation sidecar for the interp compositor: reads ring slots via their shared
+// handles, converts the bracket frames to 8-bit BGRA for the optical-flow engine's inputs
+// (alpha forced to 1.0 - NvFBC's desktop alpha is unspecified), and exposes the warped
+// result back to the D3D9 present device as a shared surface. The engine is raw NVOFA flow
+// plus our own warp (FlowWarpEngine), whose only NVIDIA runtime dependency is the driver's
+// nvofapi64.dll. The warp samples the original 10-bit ring aliases and, driver permitting,
+// renders through a 10-bit share, so the 8-bit hop is confined to flow estimation.
 //
 // The present stack stays D3D9; this device is a third participant in the existing
 // multi-device design, using the same manual coherency discipline (event query + flush)
@@ -30,7 +20,7 @@ enum InterpBackend {
 // specification.
 //
 // Failure policy: Setup failures are loud and leave the sidecar disabled; runtime
-// Process failures return false per-frame (the caller renders its fallback), and
+// failures return false per-frame (the caller renders its fallback), and
 // kMaxConsecutiveFailures in a row disables the sidecar for the session (LOGERR once).
 class InterpSidecar {
 public:
@@ -40,13 +30,14 @@ public:
     InterpSidecar(const InterpSidecar&) = delete;
     InterpSidecar& operator=(const InterpSidecar&) = delete;
 
-    // Call AFTER CaptureRing::Start (slot shared handles must exist).
+    // Call AFTER CaptureRing::Start (slot shared handles must exist). freqQpc is the QPC
+    // frequency, for the engine-time telemetry.
     bool Setup(IDirect3DDevice9Ex* presentDevice, CaptureRing* ring, int width, int height,
-               LARGE_INTEGER baseQpc, LONGLONG freqQpc);
+               LONGLONG freqQpc);
 
-    // Interpolate the bracket at targetQpc. On success the frame is in OutputSurface9().
-    // false -> caller falls back (blend/nearest). Never throws, never blocks unboundedly.
-    bool Interpolate(const FrameBracket& bracket, LONGLONG targetQpc);
+    // Interpolate the bracket at its own weight. On success the frame is in OutputSurface9().
+    // false -> caller falls back to the lerp. Never throws, never blocks unboundedly.
+    bool Interpolate(const FrameBracket& bracket);
 
     IDirect3DSurface9* OutputSurface9() const { return m_outSurface9; }
     bool Enabled() const { return m_enabled; }
@@ -59,10 +50,8 @@ private:
     bool TryCreateOutputShare(IDirect3DDevice9Ex* presentDevice, DXGI_FORMAT fmt11,
                               D3DFORMAT fmt9);
     void ReleaseOutputShare();
-    bool CreateFruc();
-    bool ConvertSlotToBgra(int ringSlot, int inputIdx);   // ring alias -> m_frucInput[inputIdx]
+    bool ConvertSlotToBgra(int ringSlot, int inputIdx);   // ring alias -> m_flowInput[inputIdx]
     void FlushD3D11();
-    double QpcToSeconds(LONGLONG qpc) const;
 
     // D3D11 infra
     ID3D11Device* m_dev11;
@@ -77,30 +66,21 @@ private:
     ID3D11SamplerState* m_convSampler;
     ID3D11Query* m_flushQuery;
 
-    // FRUC-registered resources: 2 input ping/pong + 1 output (NvOFFRUC_MIN_RESOURCE = 3)
-    ID3D11Texture2D* m_frucInput[2];
-    ID3D11RenderTargetView* m_frucInputRtv[2];
-    ID3D11ShaderResourceView* m_frucInputSrv[2];
-    ID3D11Texture2D* m_frucOutput;
-    ID3D11RenderTargetView* m_sharedOutRtv;   // flow backend renders straight to the share
+    // The flow engine's 8-bit inputs, one per bracket side.
+    ID3D11Texture2D* m_flowInput[2];
+    ID3D11RenderTargetView* m_flowInputRtv[2];
+    ID3D11RenderTargetView* m_sharedOutRtv;   // the warp renders straight to the share
     FlowWarpEngine m_flow;
-    int m_backend;                             // InterpBackend, latched at Setup
 
-    // Cross-API output path: FRUC output -> CopyResource -> shared -> opened on D3D9
+    // Cross-API output path: warp output -> shared texture -> opened on D3D9
     ID3D11Texture2D* m_sharedOut11;
     IDirect3DTexture9* m_outTexture9;
     IDirect3DSurface9* m_outSurface9;
 
-    // FRUC engine (entry points are implicit imports; see NvOFFRUC.def)
-    void* m_frucHandle;             // NvOFFRUCHandle
-
     int m_width;
     int m_height;
-    LARGE_INTEGER m_baseQpc;
     LONGLONG m_freqQpc;
-    int m_inputIdx;                 // ping/pong cursor
-    LONGLONG m_lastFedTs;           // newest ring timestamp already fed to FRUC
     int m_consecutiveFailures;
     bool m_enabled;
-    LONGLONG m_lastProcessUs;       // wall time of the last NvOFFRUCProcess (telemetry)
+    LONGLONG m_lastProcessUs;       // wall time of the last flow + warp (telemetry)
 };
