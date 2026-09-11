@@ -79,9 +79,6 @@ struct WakeRec {
     // Modelling the vote at the arrival instant instead costs one reset on the validation
     // capture, which is the whole reason this field is parsed.
     int64_t flush = 0;
-    // NvFBC's own change map for this grab: blocks that differ from the previous grab.
-    // -1 when the capture ran without the instrument.
-    int64_t changedBlocks = -1;
     long long index = 0;    // capture #N, so a divergence can be named
     long long collapsed = -1;   // col=, cumulative; -1 when the log predates the field
 };
@@ -219,11 +216,6 @@ bool ParseLog(const char* path, Capture* out) {
             w.flush *= kTicksPerUs;
             w.index = idx;
             w.collapsed = Field(p, "col=", &col) ? col : -1;
-            // The driver's change map for this grab, -1 when the instrument was off. Zero
-            // means this grab returned the same content as the previous one, which is how
-            // the ring refuses a capture-race duplicate without touching pixels.
-            int64_t diff = -1;
-            w.changedBlocks = Field(p, "diff=", &diff) ? diff : -1;
             out->wakes.push_back(w);
             continue;
         }
@@ -452,13 +444,6 @@ struct RingModel {
         int64_t batchStart = 0;
         int member = 0;
         bool valid = false;
-        // The third slot state: retracted by keep-real, so NOT a bracket endpoint, but its
-        // pixels are still in the ring and still reachable. stamp is rewritten to the
-        // midpoint of the two real neighbours when the slot enters this state.
-        bool gen = false;
-        // The batch of the older neighbour the placement used; the newer one is batchStart.
-        // Dejitter corrects per batch, and a placement between two of them needs both.
-        int64_t genPrevBatchStart = 0;
     };
     std::vector<Slot> slots;
     long long published = 0;
@@ -475,84 +460,20 @@ struct RingModel {
         s.batchStart = batchStart;
         s.member = member;
         s.valid = valid;
-        s.gen = false;
         published = count + 1;
     }
-    // Keep-real drops the batch's generated member. Production clears the valid bit and the
-    // slot is gone; keeping it REACHABLE is what this models, so the count of
-    // substitutions it would make can be read off an existing log.
-    //
-    // The stamp is the midpoint of the two real neighbours, never the generated frame's own
-    // flip time: the f/g measurement puts content phase at a constant 0.4952 that does not
-    // track the display, and the midpoint rule lands 259 us from it against 587 us sd for
-    // the flip time.
-    // substitutable mirrors CaptureRing::SubstitutableRegime: the caller measures the
-    // delivery structure and says whether a retracted member is a generated frame whose
-    // content is at the midpoint. Passing it in rather than recomputing it here keeps the
-    // ring model a ring model.
-    void Retract(long long count, bool substitutable, int64_t srcPeriod) {
+    // Keep-real drops the batch's generated member: the slot stops being a bracket
+    // endpoint, exactly as production clears the valid bit.
+    void Retract(long long count) {
         if (count < 1) return;
         slots[(size_t)((count - 1) % size)].valid = false;
-        slots[(size_t)((count - 1) % size)].gen = false;
-        if (!substitutable) return;
-
-        const int newMember = slots[(size_t)(count % size)].member;
-        const int members = newMember + 1;
-        if (newMember < 1) return;
-        const int64_t after = slots[(size_t)(count % size)].stamp;
-        long long oldest = count - (size - 1);
-        if (oldest < 0) oldest = 0;
-        int64_t before = 0, beforeBatch = 0;
-        bool haveBefore = false;
-        for (long long i = count - 1 - newMember; i >= oldest; i--) {
-            const Slot& s = slots[(size_t)(i % size)];
-            if (!s.valid) continue;
-            before = s.stamp;
-            beforeBatch = s.batchStart;
-            haveBefore = true;
-            break;
-        }
-        if (!haveBefore || before >= after) return;
-        (void)srcPeriod;
-        // The same placement the relay uses, from the same policy function rather than a
-        // copy of the arithmetic.
-        for (int j = 0; j < newMember; j++) {
-            Slot& g = slots[(size_t)((count - newMember + j) % size)];
-            int64_t placed = 0;
-            if (!policy::PlaceGeneratedFrame(before, after, j, members, &placed)) continue;
-            g.stamp = placed;
-            g.genPrevBatchStart = beforeBatch;
-            g.gen = true;
-        }
     }
     void Revalidate(long long count, int64_t stamp) {
         if (count >= 1) {
             Slot& s = slots[(size_t)((count - 1) % size)];
             s.stamp = stamp;
             s.valid = true;
-            s.gen = false;
         }
-    }
-    // The reachable generated frame nearest a target. The window is FindBracket's window,
-    // not the whole array: a slot that has aged out of the search span is unreachable
-    // whether it is valid or not.
-    bool FindGenerated(int64_t target, int64_t* diffOut, int64_t* stampOut,
-                       int64_t* depthOut) const {
-        long long oldest = published - (size - 1);
-        if (oldest < 0) oldest = 0;
-        int64_t best = INT64_MAX, bestStamp = 0, bestDepth = 0;
-        for (long long i = published - 1; i >= oldest; i--) {
-            const Slot& s = slots[(size_t)(i % size)];
-            if (!s.gen) continue;
-            int64_t d = target - s.stamp;
-            if (d < 0) d = -d;
-            if (d < best) { best = d; bestStamp = s.stamp; bestDepth = published - 1 - i; }
-        }
-        if (best == INT64_MAX) return false;
-        *diffOut = best;
-        *stampOut = bestStamp;
-        *depthOut = bestDepth;
-        return true;
     }
     // CaptureRing::FindBracket, including the dejitter overlay, which the relay reads
     // through at present time. The overlay is the REAL policy::StampOverlay populated from
@@ -560,39 +481,17 @@ struct RingModel {
     // but dejitter itself replayed against the corrections the field actually applied.
     //
     // It was omitted until 2026-08-29 on the grounds that no replayed capture used -dejit.
-    // That stopped being true and nobody noticed, and the cost was not the aggregate (which
-    // stayed inside ~4%) but a blind spot exactly where a bug shipped: generated frames
-    // were placed on the raw timeline while their bracket endpoints were corrected, and a
-    // model that ignores corrections on BOTH cannot see the difference.
+    // That stopped being true and nobody noticed: the aggregate stayed inside ~4% while
+    // the replay was blind to exactly the stamps the field had corrected.
     void FindBracket(int64_t target, const policy::StampOverlay* overlay,
                      policy::BracketInfo* out, int* beforeDepth) const {
         *out = policy::BracketInfo();
         *beforeDepth = -1;
         long long oldest = published - (size - 1);
         if (oldest < 0) oldest = 0;
-        int64_t bestBefore = INT64_MAX, bestAfter = INT64_MAX, bestGen = INT64_MAX;
+        int64_t bestBefore = INT64_MAX, bestAfter = INT64_MAX;
         for (long long i = published - 1; i >= oldest; i--) {
             const Slot& s = slots[(size_t)(i % size)];
-            // A generated frame's stamp is a placement between TWO batches, so it takes the
-            // mean of their corrections; correcting the endpoints and not the frame between
-            // them is the bug this replay could not previously see.
-            if (s.gen) {
-                int64_t ts = s.stamp;
-                if (overlay) {
-                    ts = policy::CorrectGeneratedStamp(
-                        ts, overlay->CorrectionFor(s.batchStart),
-                        overlay->CorrectionFor(s.genPrevBatchStart));
-                }
-                int64_t d = target - ts;
-                if (d < 0) d = -d;
-                if (d < bestGen) {
-                    bestGen = d;
-                    out->hasGen = true;
-                    out->genTs = ts;
-                    out->genDiff = d;
-                }
-                continue;
-            }
             if (!s.valid) continue;
             // Corrections are keyed by BATCH, so a member stamped at its own flip still
             // finds the correction its batch earned.
@@ -637,42 +536,6 @@ struct PresentCensus {
     // The comb lock, PREDICTED here and scored against the log's tgt=/pull=. This is the
     // half that would be untested if the target were taken from the log.
     long long opHold = 0, opHoldComb = 0, opPassBefore = 0, opPassAfter = 0, opSynth = 0;
-    // GENERATED-FRAME SUBSTITUTION: of the synths, how many had a retracted generated frame
-    // reachable and close enough to present sharp instead. The outcomes are kept apart
-    // because they mean different things: no generated frame reachable at all is a source
-    // that never paired (or a bracket so wide the frame aged out), while
-    // reachable-but-outside-the-gate is the substitution the passthrough threshold rejects.
-    long long genSub = 0, genSubNoGen = 0, genSubOutOfGate = 0;
-    std::vector<int64_t> genSubDiff;      // |target - generated stamp| on the accepted ones
-    // The same distance on the REFUSED ones. A refusal a few hundred us past the gate is a
-    // threshold argument; one clustered near half a source period is a different statement
-    // entirely, namely that no generated frame exists near this target at all and the
-    // nearest one belongs to another batch.
-    std::vector<int64_t> outDiff;
-    // Blends the policy's no-reuse rule saved: the same generated frame stays reachable
-    // for many presents, and showing it twice is a duplicate no content check can catch,
-    // because the pixels are perfectly good both times.
-    long long genSubRepeat = 0;
-    // Blends its monotone rule saved. A synth outputs at the target, which advances by
-    // construction; a substituted frame carries its own
-    // content time and can sit behind what was already shown. Counted separately from the
-    // repeat case because a repeat is one slot shown twice while this is a content
-    // REGRESSION, and the composite's monotonic rule does not cover a frame it never saw.
-    long long genSubBackward = 0;
-    // How far back in the ring the substituted frame sat, in wakes. This is the answer to
-    // whether retaining generated frames needs a deeper ring: they already occupy a slot
-    // today (retraction clears the valid bit, it does not free the position), so the depth
-    // reached is the whole cost.
-    std::vector<int64_t> genSubDepth;
-    // Bracket span at the synth, bucketed in QUARTER source periods (bucket 4 = exactly one
-    // period), last bucket open-ended. A single "one period" column hides the thing worth
-    // knowing: the spec's claim is GEOMETRIC - at a span of exactly one period the
-    // generated frame is inside the gate by construction - and that holds only as long as
-    // the span really is one period. A 1.4-period bracket is one late frame, not a dropped
-    // one, and its midpoint is nowhere near the target.
-    static const int kSpanBuckets = 12;
-    long long synthBySpan[kSpanBuckets] = {0}, genSubBySpan[kSpanBuckets] = {0};
-    long long noGenBySpan[kSpanBuckets] = {0}, outOfGateBySpan[kSpanBuckets] = {0};
     long long tgtDiffSum = 0, tgtDiffMax = 0;
     long long pullDiffSum = 0, pullDiffMax = 0;
     // Shown-stamp step census, the same six classes pacing.py prints so replayed and live
@@ -711,10 +574,6 @@ struct CaptureCensus {
     long long samplesShort = 0;   // some reachable residue below kMinSamplesPerResidue
     long long shapeFail = 0;      // every residue full, yet the vote refused the shape
     long long observations = 0;   // RotationObserve calls that landed
-    // Batches whose retracted member was kept reachable.
-    long long substitutableBatches = 0;
-    // Retractions the driver's change map refused as capture-race duplicates.
-    long long genDupRefused = 0;
     // Grid readings actually seen, to name the regime rather than assume it.
     long long fpsHist[16] = {0};
     long long strideHist[16] = {0};
@@ -756,10 +615,6 @@ struct Config {
     int64_t lag = 0;               // the static bracketing delay
     int64_t passthrough = 0;       // blend-mode passthrough gate
     bool blend = false;            // the capture ran b: mode, so DecideComposite governs
-    // Offer the retracted generated frame to the policy. Off by default so a replay
-    // reproduces the build that recorded the log; --sub-gen answers what the change would
-    // have done to that same capture.
-    bool subGen = false;
     // The composite tooth guard, armed by production's own rule (comb on + at-rate
     // source). On by default because replaying an old log then PREDICTS what the guard
     // would have done to that capture; --no-tooth-guard reproduces builds that predate it.
@@ -891,68 +746,13 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
         // passes through sharp. Counting "incomplete bracket" as "hold" overstates holds by
         // that population, so the real decision is run.
         if (cfg.blend) {
-            const int64_t prevOut = compState.lastOutputTs;
-            const int64_t prevGen = compState.lastGenTs;
-            int64_t genDepth = -1;
-            // The generated candidate is offered to the REAL policy rather than scored by
-            // a copy of its rule here. genUsable is forced true because a log carries no
-            // pixels: the content check cannot be replayed, so this counts substitutions
-            // the guard would still be free to refuse, and the census below reports the
-            // refusals the policy itself makes.
-            if (cfg.subGen) {
-                int64_t gd = 0, gstamp = 0, gdepth = 0;
-                if (ring.FindGenerated(target, &gd, &gstamp, &gdepth)) {
-                    b.hasGen = true;
-                    b.genUsable = true;
-                    b.genTs = gstamp;
-                    b.genDiff = gd;
-                    genDepth = gdepth;
-                }
-            }
             const policy::CompositeDecision cd = policy::DecideComposite(b, compState, pcfg);
-
-            // Bracket span in quarter source periods, for both outcomes: the substitution
-            // and the blend it replaced have to be counted in the same bins or the rate
-            // per bin means nothing.
-            const int64_t span = b.beforeDiff + b.afterDiff;
-            const int64_t sp = cfg.assumedSrcPeriod;
-            int w = PresentCensus::kSpanBuckets - 1;
-            if (sp > 0) {
-                const int64_t q = span * 4 / sp;
-                if (q < w && q >= 0) w = (int)q;
-            }
-
             switch (cd.op) {
                 case policy::CompositeOp::Hold: pc->opHold++; break;
                 case policy::CompositeOp::HoldComb: pc->opHoldComb++; break;
                 case policy::CompositeOp::PassthroughBefore: pc->opPassBefore++; break;
                 case policy::CompositeOp::PassthroughAfter: pc->opPassAfter++; break;
-                case policy::CompositeOp::PassthroughGenerated:
-                    pc->genSub++;
-                    pc->genSubBySpan[w]++;
-                    pc->genSubDiff.push_back(b.genDiff);
-                    pc->genSubDepth.push_back(genDepth);
-                    break;
-                case policy::CompositeOp::Synthesize:
-                    pc->opSynth++;
-                    pc->synthBySpan[w]++;
-                    // WHY the policy declined, which is the whole diagnostic value: an
-                    // out-of-gate refusal argues about a threshold, a reuse or a backward
-                    // refusal is a rule doing its job, and no frame at all says the source
-                    // never paired here.
-                    if (!b.hasGen) {
-                        pc->genSubNoGen++;
-                        pc->noGenBySpan[w]++;
-                    } else if (b.genDiff > pcfg.passthroughQpc) {
-                        pc->genSubOutOfGate++;
-                        pc->outOfGateBySpan[w]++;
-                        pc->outDiff.push_back(b.genDiff);
-                    } else if (b.genTs <= prevOut) {
-                        pc->genSubBackward++;
-                    } else if (b.genTs == prevGen) {
-                        pc->genSubRepeat++;
-                    }
-                    break;
+                case policy::CompositeOp::Synthesize: pc->opSynth++; break;
             }
         }
         const policy::Pick pick = policy::SelectFrame(b, selState, pcfg);
@@ -1019,8 +819,6 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
 
     int64_t rotPeriodEma = 0;         // m_rotPeriodEma: CLAMPED, stride-derivation only
     int64_t membersEmaQ8 = 0;         // m_batchMembersEmaQ8: the pairing gate
-    // Whether retracted members are kept reachable, mirroring CaptureRing's arming.
-    bool substitutable = false;
     int rotRealMember = -1;
     int64_t rotSpacing = 0;
     int prevKeeper = -1;
@@ -1088,8 +886,6 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
                 const int64_t members = (int64_t)(prevLastMember + 1) << 8;
                 membersEmaQ8 = membersEmaQ8 ? (membersEmaQ8 * 7 + members) / 8 : members;
             }
-            substitutable = cfg.subGen;
-            if (substitutable) c.substitutableBatches++;
             const bool paired = membersEmaQ8 >= cfg.minPairingQ8;
             if (!paired && cfg.phaseKeep) c.notPaired++;
             if (cfg.phaseKeep && paired) {
@@ -1238,16 +1034,7 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
         if (keep.collapsed) collapsed++;
 
         ring.Write(count, keep.stampTs, batch.stampTs, batch.member, keep.keepThis);
-        // A change map reading zero means the two members are the same frame, so the
-        // retracted one is a duplicate and never becomes reachable. Mirrors
-        // CaptureRing::RetractGenerated; -1 (no instrument) leaves the slot reachable and
-        // the compositor's own content check owns the question.
-        if (keep.retractPrev && cap.wakes[i].changedBlocks != 0) {
-            ring.Retract(count, substitutable, cfg.assumedSrcPeriod);
-        } else if (keep.retractPrev) {
-            ring.Retract(count, false, cfg.assumedSrcPeriod);
-            c.genDupRefused++;
-        }
+        if (keep.retractPrev) ring.Retract(count);
 
         // Per-wake fidelity against the log's own cumulative col=.
         if (cap.wakes[i].collapsed >= 0 && cap.wakes[i].collapsed != collapsed) {
@@ -1593,58 +1380,6 @@ void ReportPresent(const PresentCensus& p, const Config& cfg) {
                     "  pass-after %lld  synth %lld (%.2f/s)\n",
                     p.opHold, p.opHold / s2, p.opHoldComb, p.opHoldComb / s2,
                     p.opPassBefore, p.opPassAfter, p.opSynth, p.opSynth / s2);
-        std::printf("  GENERATED-FRAME SUBSTITUTION (present the retracted frame instead"
-                    " of blending), gate %lld us:\n", cfg.passthrough / kTicksPerUs);
-        const long long blendClass = p.opSynth + p.genSub;
-        std::printf("    substituted %lld of %lld presents that would have blended"
-                    " (%.1f%%, %.3f/s)\n", p.genSub, blendClass,
-                    blendClass ? 100.0 * (double)p.genSub / (double)blendClass : 0.0,
-                    p.genSub / s2);
-        // The denominator is every present that WOULD have blended, which is the synths
-        // left plus the ones the substitution took: once a substitution happens that
-        // present is no longer a synth, so dividing by the survivors alone reads over 100%.
-        std::printf("    by bracket span  %9s %8s %8s %8s %8s\n",
-                    "blend-class", "sub", "rate", "no-gen", "out-gate");
-        for (int w = 0; w < PresentCensus::kSpanBuckets; w++) {
-            const long long pop = p.synthBySpan[w] + p.genSubBySpan[w];
-            if (!pop) continue;
-            char label[24];
-            if (w == PresentCensus::kSpanBuckets - 1)
-                std::snprintf(label, sizeof(label), "%.2f+ periods", w / 4.0);
-            else
-                std::snprintf(label, sizeof(label), "%.2f-%.2f periods", w / 4.0,
-                              (w + 1) / 4.0);
-            std::printf("      %-17s %8lld %8lld %7.1f%% %8lld %8lld\n", label,
-                        pop, p.genSubBySpan[w],
-                        100.0 * (double)p.genSubBySpan[w] / (double)pop,
-                        p.noGenBySpan[w], p.outOfGateBySpan[w]);
-        }
-        const double u = (double)kTicksPerUs;
-        auto pct = [&](std::vector<int64_t> d, const char* what) {
-            if (d.empty()) return;
-            std::sort(d.begin(), d.end());
-            std::printf("    |target - generated stamp| %s: p50 %.0f us  p90 %.0f us"
-                        "  max %.0f us\n", what,
-                        (double)d[d.size() / 2] / u,
-                        (double)d[(size_t)((double)d.size() * 0.9)] / u,
-                        (double)d.back() / u);
-        };
-        pct(p.genSubDiff, "substituted");
-        pct(p.outDiff, "refused   ");
-        std::printf("    refused by the policy: %lld no generated frame reachable,"
-                    " %lld outside the gate, %lld would not advance the output,"
-                    " %lld already shown\n",
-                    p.genSubNoGen, p.genSubOutOfGate, p.genSubBackward, p.genSubRepeat);
-        if (!p.genSubDepth.empty()) {
-            std::vector<int64_t> d = p.genSubDepth;
-            std::sort(d.begin(), d.end());
-            std::printf("    ring depth reached for the substituted frame: p50 %lld"
-                        "  p90 %lld  max %lld wakes (of %d slots)\n",
-                        d[d.size() / 2], d[(size_t)((double)d.size() * 0.9)], d.back(),
-                        cfg.ringSlots);
-        }
-        std::printf("    NOT modelled: the NvFBC race puts real pixels in the generated slot"
-                    " about 12%% of the time, which the guard rejects on gdiff/motion\n");
     }
     if (p.pickCompared) {
         std::printf("  against the log, on the %lld presents it logged: pick %.2f%%,"
@@ -1836,11 +1571,6 @@ void ReportCensus(const Capture& cap, const CaptureCensus& c) {
         std::printf("per-wake col= matches the log on every wake (%lld collapsed)\n",
                     c.collapsed);
     }
-    if (c.substitutableBatches) {
-        std::printf("subgen: %lld of %lld batches offered a retracted frame to the ring;"
-                    " %lld refused as duplicates by the driver's change map\n",
-                    c.substitutableBatches, c.opens, c.genDupRefused);
-    }
 }
 
 void ReportResets(const std::vector<ResetRec>& resets) {
@@ -1886,7 +1616,6 @@ void ReportResets(const std::vector<ResetRec>& resets) {
 int main(int argc, char** argv) {
     const char* path = NULL;
     bool arm = false, oldConstants = false, quiet = false, forceBlend = false;
-    bool subGen = false;
     bool toothGuard = true;
     long long sepUs = 80;
     int ringSlots = 16;
@@ -1901,7 +1630,6 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--ring") == 0 && i + 1 < argc) ringSlots = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--no-pairing-gate") == 0) pairingQ8 = 0;
         else if (std::strcmp(argv[i], "--force-blend") == 0) forceBlend = true;
-        else if (std::strcmp(argv[i], "--sub-gen") == 0) subGen = true;
         else if (std::strcmp(argv[i], "--no-tooth-guard") == 0) toothGuard = false;
         else if (std::strcmp(argv[i], "--from") == 0 && i + 1 < argc) fromS = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--to") == 0 && i + 1 < argc) toS = std::atof(argv[++i]);
@@ -1925,10 +1653,9 @@ int main(int argc, char** argv) {
                      "         reproducing the reset-storm collapse (spec gate 2).\n"
                      "  --quiet  one summary line, for sweeping a directory of logs.\n"
                      "  --force-blend  run DecideComposite on a capture recorded in t:\n"
-                     "         mode. This is what exercises the substitution NULL CONTROL: an\n"
-                     "         FG-off log has no generated frames, and a t: capture never\n"
-                     "         calls DecideComposite, so without this the zero it prints\n"
-                     "         is the mode's zero rather than the absence of the frames.\n"
+                     "         mode, to predict what blend mode would have done with the\n"
+                     "         same arrivals. A t: capture never calls DecideComposite, so\n"
+                     "         without this the blend census is the mode's zero.\n"
                      "  --from <s> --to <s>  restrict the PRESENT census to a window of the\n"
                      "         log's own dl= clock, to trim desktop off the ends. Every\n"
                      "         present is still decided; only the counting is windowed.\n"
@@ -1984,7 +1711,6 @@ int main(int argc, char** argv) {
     // makes the question answerable from a recorded log instead of a new capture.
     cfg.lag = (cap.lagUs + lagAddMs * 1000) * kTicksPerUs;
     cfg.blend = cap.blend || forceBlend;
-    cfg.subGen = subGen;
     cfg.toothGuard = toothGuard;
     // The XR1 is a 60 Hz sink and no capture has used another. Older logs do not record the
     // refresh at all, so this is assumed rather than parsed.

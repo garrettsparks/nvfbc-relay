@@ -43,20 +43,6 @@ struct BracketInfo {
     int64_t afterTs = 0;
     int64_t beforeDiff = 0;
     int64_t afterDiff = 0;
-    // The driver-generated frame keep-real retracted, when one is still reachable. It is
-    // NOT a bracket endpoint: selection never sees it and it can never be chosen as
-    // before/after, because treating it as real is exactly what keep-real exists to
-    // prevent. Its only use is standing in for a blend at a target it already sits on.
-    //
-    // genTs is its CONTENT time (the midpoint of its two real neighbours, not its own
-    // flip), genDiff the unsigned distance from the target. genUsable is the caller's
-    // verdict on the PIXELS: the capture API can race and leave real content in the
-    // generated slot, which only a content comparison can detect. The split is
-    // deliberate - the policy rules on placement, the caller rules on content.
-    bool hasGen = false;
-    bool genUsable = false;
-    int64_t genTs = 0;
-    int64_t genDiff = 0;
 };
 
 // Batch-collapse memory across capture wakes. Under driver-level frame generation the
@@ -512,31 +498,6 @@ struct PolicyConfig {
 int RingSlotsForLag(int64_t bracketingDelayQpc, int64_t srcPeriodQpc, int minSlots,
                     int maxSlots);
 
-// WHERE A GENERATED FRAME SITS between the two real frames it was interpolated between.
-// member is its 0-based position among the batch's members, members the batch's total count
-// (the generated ones plus the real one that ends the batch), so member j of N lands at
-// (j+1)/N of the interval. At N=2 that is the midpoint, which is what the f/g measurement
-// found: content phase is a CONSTANT 0.4952 that does not track the display, so a generated
-// frame is placed between its neighbours and never at its own flip time.
-//
-// Nothing here knows the frame-generation multiplier. A batch divides the interval it spans
-// by the number of frames it carries, so two submissions per source frame and four are the
-// same arithmetic and a fluctuating multiplier needs no detection.
-//
-// Returns false on a degenerate interval (neighbours out of order, or no room), which is the
-// caller's signal to leave the frame unreachable rather than place it outside its own
-// neighbours.
-bool PlaceGeneratedFrame(int64_t beforeTs, int64_t afterTs, int member, int members,
-                         int64_t* outTs);
-
-// Dejitter corrects ring stamps PER BATCH at read time. A generated frame's stamp is a
-// placement derived from TWO batches, so it takes the mean of their corrections: correcting
-// the endpoints while leaving the frame that sits between them alone would slide it relative
-// to the interval the passthrough gate measures. Both corrections are zero with dejitter
-// off, and this returns the raw placement.
-int64_t CorrectGeneratedStamp(int64_t placedTs, int64_t correctionNewer,
-                              int64_t correctionOlder);
-
 // The signed distance to the nearest point on a p-periodic timeline, in [-p/2, p/2).
 int64_t WrapHalf(int64_t d, int64_t p);
 
@@ -594,9 +555,8 @@ enum class CompositeOp : int {
     Synthesize = 3,         // no real frame near the target: make one there from the
                             // bracket pair at the bracket weight (lerp, flow warp - the
                             // executor is the compositor's business, not the policy's)
-    PassthroughGenerated = 4,  // no real frame near the target, but the driver already
-                               // made one that sits on it: present that instead of
-                               // interpolating. Sharp where a blend would double-image.
+                            // 4 was the generated-frame substitution (op=pass-gen),
+                            // retired; recordings carry the label, so never reuse it.
     HoldComb = 5,           // the source comb owes no frame at this target: re-present
                             // last output. Distinct from Hold so a log where the present
                             // clock outruns the source (in-game frame generation runs the
@@ -621,17 +581,11 @@ struct CompositeState {
     int64_t lastOutputTs = INT64_MIN;
     bool lastPassAfter = false;
     bool lastSynth = false;
-    // Target time of the last CONSUMED decision (pass, synthesis, or substitution; holds
-    // leave it). The tooth guard measures target advance against this, never against
-    // lastOutputTs: targets carry present-clock jitter (microseconds) where output stamps
-    // carry delivery lateness (milliseconds), and the guard's cut sits between the two.
+    // Target time of the last CONSUMED decision (pass or synthesis; holds leave it). The
+    // tooth guard measures target advance against this, never against lastOutputTs:
+    // targets carry present-clock jitter (microseconds) where output stamps carry
+    // delivery lateness (milliseconds), and the guard's cut sits between the two.
     int64_t lastTargetTs = INT64_MIN;
-    // Content time of the last generated frame presented. A generated frame stays
-    // reachable for many presents, so without this the same one wins the search again
-    // and again and is shown twice: a duplicate manufactured by the substitution itself,
-    // which no content check can catch because the pixels are perfectly good. Measured on
-    // an FG-off replay, where generated frames are scarce, this is 48% of substitutions.
-    int64_t lastGenTs = INT64_MIN;
 };
 
 // The per-present composite decision for blend mode. A real frame within the
@@ -694,19 +648,5 @@ int64_t ToothGuardPeriod(int64_t srcPeriodQpc, int64_t sinkPeriodQpc, bool combO
 // widened gate often enough to pass when the even output is a blend. Each such pass is a
 // full-period step followed by a half-period step where two even steps were available.
 int64_t PassthroughThreshold(int64_t srcPeriodQpc, int64_t presentPeriodQpc);
-
-// Whether a generated frame could stand in for the blend this bracket would otherwise
-// produce, judged on PLACEMENT alone: this present would synthesize, a generated frame is
-// reachable, it sits inside the passthrough gate of the target, its content is strictly
-// newer than the last output, and it is not the one the previous substitution showed.
-// b.genUsable is deliberately NOT consulted.
-//
-// Exposed so the caller can run its content check ONLY where the answer could change the
-// outcome (measured: about 0.3 presents per second). A check on every capture wake is the
-// thing that must not ship - the diagnostic that does exactly that degrades output by
-// 3.4x in motion-gated duplicates. Call this, run the check, put the verdict in
-// b.genUsable, then call DecideComposite, which applies the identical rule.
-bool GeneratedCandidateOnTarget(const BracketInfo& b, const CompositeState& s,
-                                const PolicyConfig& cfg);
 
 }  // namespace policy

@@ -1,17 +1,15 @@
 #include "TemporalCaptureMode.h"
 #include "FrameCompositors.h"
+#include "D3D9Present.h"
 #include "D3D11Present.h"
 #include <SimpleLogger.h>
 #include <cstdio>
 
 // External global variables
 extern IDirect3DDevice9Ex* g_pD3D9Device;
-extern IDirect3DSurface9* g_backbuffer;
 extern int BUF_WIDTH;
 extern int BUF_HEIGHT;
 extern int g_targetRefreshHz;
-extern bool g_flipEx;
-extern HWND g_d3d9HostWnd;
 
 // Presents between estimator-vs-assumption audits (about 10 s at 60 Hz): rare enough to keep
 // the log quiet, frequent enough that a wrong -src is caught within the first minute.
@@ -24,19 +22,20 @@ static const float kDefaultAssumedSrcFps = 60.0f;
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
                                          bool tint, bool etw, bool noJoin, bool dejitter,
-                                         bool fgPhase, bool phaseKeep, bool subGen,
-                                         bool diffMap, bool genCheck, unsigned int lateGrabUs,
-                                         int grabDelayUs, unsigned int extraLagMs,
+                                         bool fgPhase, bool phaseKeep, unsigned int extraLagMs,
                                          bool d3d11Present)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
-    , m_compositor(NULL)
+    , m_present(NULL)
     , m_telemetryCountdown(0)
     , m_compositorKind(compositor)
     , m_lock(lock)
     , m_mark(mark)
     , m_markFrames(markFrames)
-    , m_tint(tint)
+    , m_vsyncPresent(vsyncPresent)
+    , m_targetFramerate(framerate)
+    , m_srcRateHint(srcRateHint)
+    , m_device(NULL)
     , m_etw(etw)
     , m_noJoin(noJoin)
     , m_dejitter(dejitter && etw && !noJoin)
@@ -44,18 +43,31 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_phaseKeep(phaseKeep && etw && !noJoin)
     , m_extraLagMs(extraLagMs)
     , m_phaseKeepRequested(phaseKeep)
-    , m_subGen(subGen)
-    , m_diffMap(diffMap)
-    , m_genCheck(genCheck)
-    , m_lateGrabUs(lateGrabUs)
-    , m_grabDelayUs(grabDelayUs)
-    , m_d3d11Present(d3d11Present)
-    , m_vsyncPresent(vsyncPresent)
-    , m_targetFramerate(framerate)
-    , m_srcRateHint(srcRateHint)
-    , m_device(NULL)
 {
     m_baseQpc.QuadPart = 0;
+
+    // The one place that knows there are two present paths. The D3D11 backend IS the blend
+    // pipeline and brings its own compositor; the D3D9 path hosts whichever IFrameCompositor
+    // the mode letter selected. Both take &m_policyCfg, which Setup fills in before either
+    // reads it. Nothing touches a device here: the paths create their resources in Setup,
+    // after the ring has started.
+    if (d3d11Present) {
+        m_present = new D3D11PresentBackend(tint);
+    } else {
+        IFrameCompositor* c;
+        if (compositor == kCompositorInterp) {
+            c = new InterpCompositor(&m_policyCfg);
+        } else if (compositor == kCompositorBlend) {
+            c = new BlendCompositor(&m_policyCfg, tint);
+        } else {
+            c = new NearestCompositor(&m_policyCfg);
+        }
+        m_present = new D3D9PresentPath(c);
+    }
+    const char* kindName = "Temporal";
+    if (compositor == kCompositorInterp) kindName = "Temporal interp";
+    else if (compositor == kCompositorBlend) kindName = "Temporal blend";
+    snprintf(m_modeName, sizeof(m_modeName), "%s (%s)", kindName, m_present->Name());
 }
 
 TemporalCaptureMode::~TemporalCaptureMode() {
@@ -65,8 +77,11 @@ TemporalCaptureMode::~TemporalCaptureMode() {
         m_etwConsumer.LogSummary();
         m_etwConsumer.Stop();
     }
-    delete m_compositor;
-    delete m_present11;
+    delete m_present;
+}
+
+bool TemporalCaptureMode::PresentsViaD3D11() const {
+    return m_present->OwnsOutputWindow();
 }
 
 LONGLONG TemporalCaptureMode::LagForSourcePeriod(LONGLONG srcPeriodQpc) const {
@@ -76,11 +91,12 @@ LONGLONG TemporalCaptureMode::LagForSourcePeriod(LONGLONG srcPeriodQpc) const {
 }
 
 UINT TemporalCaptureMode::GetPresentationInterval() const {
-    // vsync present needs the device created with INTERVAL_ONE so PresentEx blocks on vsync.
-    // NOTE: windowed INTERVAL_ONE blocks on DWM's compose clock, whose identity is
-    // regime-dependent: composed desktop → primary/source display; fullscreen game on the
-    // source → DWM composes only the card's display and the present is card-locked 60 Hz
-    // (the production case). See spec Rounds 5-10.
+    // The vsync present needs the D3D9 device created with INTERVAL_ONE so PresentEx blocks
+    // on vsync. NOTE: windowed INTERVAL_ONE blocks on DWM's compose clock, whose identity is
+    // regime-dependent: composed desktop -> primary/source display; fullscreen game on the
+    // source -> DWM composes only the card's display and the present is card-locked 60 Hz
+    // (the production case). On the D3D11 path the D3D9 swapchain never presents and this
+    // is moot.
     return m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
 }
 
@@ -119,29 +135,9 @@ bool TemporalCaptureMode::AnchorAndSteps(long long batchStartTs, long long prevA
 bool TemporalCaptureMode::Setup() {
     m_device = g_pD3D9Device;
 
-    // The D3D11 present backend carries the blend pipeline only. Refused here, before any
-    // device work: on this path the D3D9 swapchain sits on a hidden window, so a compositor
-    // that fell through to the D3D9 present would draw where nothing is shown.
-    if (m_d3d11Present && m_compositorKind != kCompositorBlend) {
-        LOGERR("D3D11 present refused: it carries the blend compositor only (use b:flip)");
-        return false;
-    }
-
     // Before the ring starts: the instrument allocates its readback resources in Start.
     if (m_fgPhase) {
         m_ring.EnableFgPhase();
-    }
-    if (m_diffMap) {
-        m_ring.EnableDiffMap();
-    }
-    if (m_genCheck) {
-        m_ring.EnableGenCheck();
-    }
-    if (m_lateGrabUs > 0) {
-        m_ring.EnableLateGrab(m_lateGrabUs);
-    }
-    if (m_grabDelayUs != 0) {
-        m_ring.EnableGrabDelay(m_grabDelayUs);
     }
     if (m_phaseKeep) {
         m_ring.EnablePhaseKeep(this);
@@ -151,12 +147,6 @@ bool TemporalCaptureMode::Setup() {
     }
     if (!m_scheduler.Setup(m_targetFramerate)) {
         return false;
-    }
-    // Marker resources live on the PRESENT device (the burn is a backbuffer overlay,
-    // never a ring-surface write). A failed Init disables the marker, not the relay. The
-    // D3D11 present backend draws its own marker on its own device.
-    if (m_mark && !m_d3d11Present) {
-        m_marker.Init(m_device, BUF_WIDTH, BUF_HEIGHT, m_markFrames);
     }
     // STATIC BRACKETING LAG: max(present period, 1.25 x assumed source period). The lag
     // exists so that a frame newer than the target has already arrived at pick time; the
@@ -276,26 +266,16 @@ bool TemporalCaptureMode::Setup() {
     // period, far above the locked operating point and far below the mid-gap distance
     // of a hole, so the gate cannot chatter. The rule is policy's so the replay sizes
     // the same gate; see PassthroughThreshold for the regime that told the two apart.
+    // The compositor itself lives behind the present path and initializes there, once
+    // the ring has created the slot shared handles.
     if (m_compositorKind != kCompositorNearest) {
         m_policyCfg.passthroughQpc =
             policy::PassthroughThreshold(m_assumedSrcPeriodQpc, m_scheduler.PeriodQpc());
-        if (m_d3d11Present) {
-            // The backend IS the blend pipeline: it owns the composite decision, the lerp
-            // and the marker, and no D3D9 compositor exists. It initializes in Run, once the
-            // ring has created the slot shared handles it aliases.
-            m_present11 = new D3D11PresentBackend();
-            LOG("Blend compositor ACTIVE on the D3D11 flip present (b:flip): passthrough threshold %lld us; op=/bw= on the temporal line",
-                m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq());
-            if (m_tint) LOG("-tint ignored: the D3D11 present path has no tint pass");
-        } else if (m_compositorKind == kCompositorInterp) {
-            m_synth = new InterpCompositor(&m_policyCfg);
-            LOG("Interp compositor ACTIVE (o mode): passthrough threshold %lld us; op=/bw=/pt= on the temporal line",
-                m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq());
-        } else {
-            m_synth = new BlendCompositor(&m_policyCfg, m_tint);
-            LOG("Blend compositor ACTIVE (b mode): passthrough threshold %lld us; op=/bw= on the temporal line",
-                m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq());
-        }
+        const bool interp = m_compositorKind == kCompositorInterp;
+        LOG("%s compositor ACTIVE on the %s: passthrough threshold %lld us; %s on the temporal line",
+            interp ? "Interp" : "Blend", m_present->Name(),
+            m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq(),
+            interp ? "op=/bw=/pt=" : "op=/bw=");
         if (m_policyCfg.srcPeriodQpc > 0) {
             LOG("Composite tooth guard ACTIVE: synthesis must advance a full source period "
                 "(%lld us teeth); op=hold-comb between teeth",
@@ -308,28 +288,6 @@ bool TemporalCaptureMode::Setup() {
                 m_srcRateHint <= 0.0f ? "needs -src" :
                 "source is slower than the sink, so synthesis is rate conversion");
         }
-        // Armed before Setup, which is where the content check allocates its readback
-        // resources and where it disarms itself if they cannot be created.
-        if (m_subGen) {
-            if (m_synth) m_synth->EnableGeneratedSubstitution(true);
-            // The ring decides WHICH retracted members are substitutable, from the delivery
-            // structure: it needs the declared source period to tell x2 from x3 and from a
-            // source that pairs nothing.
-            m_ring.EnableGeneratedSubstitution();
-            LOG("Generated-frame substitution ACTIVE (-subgen): a retracted generated frame "
-                "within the passthrough threshold replaces the blend, in the x2 regime only; "
-                "op=pass-gen");
-        }
-        m_compositor = m_synth;
-    } else {
-        if (m_subGen) {
-            LOG("-subgen ignored: nearest mode never blends, so there is nothing to replace");
-        }
-        m_compositor = new NearestCompositor(&m_policyCfg);
-    }
-    if (m_compositor && !m_compositor->Setup(m_device, BUF_WIDTH, BUF_HEIGHT)) {
-        LOGERR("Compositor setup failed - refusing the mode");
-        return false;
     }
 
     // RESOLVED-CONFIG VALIDATION, deliberately last: everything above may still be deciding
@@ -391,79 +349,68 @@ void TemporalCaptureMode::Run(
 
     // Note: Start releases nvfbcDx9 (the session bound to the present device) and rebinds
     // NvFBC to the ring's private capture device. nvfbcDx9 must not be used after this call.
-    // The capture device joins the D3D9 present device on the hidden host window when the
-    // output window belongs to the D3D11 swapchain: flip model allows one swapchain per
-    // window and no second API on it.
-    if (!m_ring.Start(nvfbcDx9, grabParams, m_baseQpc, g_d3d9HostWnd ? g_d3d9HostWnd : hwnd)) {
+    // The capture device joins the present device on whatever window main created it on:
+    // the output window when the D3D9 swapchain presents there, a hidden host window when
+    // the output window belongs to another API's swapchain (flip model allows one swapchain
+    // per window and no second API on it).
+    HWND deviceWnd = hwnd;
+    D3DDEVICE_CREATION_PARAMETERS creation;
+    ZeroMemory(&creation, sizeof(creation));
+    if (SUCCEEDED(device->GetCreationParameters(&creation)) && creation.hFocusWindow) {
+        deviceWnd = creation.hFocusWindow;
+    }
+    if (!m_ring.Start(nvfbcDx9, grabParams, m_baseQpc, deviceWnd)) {
         return;
     }
 
-    // Capture-side resources that exist only now (ring slot shared handles): the interp
-    // sidecar's aliases, or the whole D3D11 present backend. Either refuses the mode when it
-    // cannot finish initializing instead of silently running a different one.
-    if (m_present11) {
-        if (!m_present11->Setup(hwnd, &m_ring, BUF_WIDTH, BUF_HEIGHT, &m_policyCfg, m_subGen,
-                                m_mark, m_markFrames)) {
-            LOGERR("D3D11 present backend init failed - refusing the mode");
-            m_ring.Stop();
-            return;
-        }
-    } else if (!m_compositor->OnCaptureStarted(&m_ring, m_baseQpc, m_scheduler.Freq())) {
-        LOGERR("Compositor capture-side init failed - refusing the mode");
+    // The present path finishes initializing now that the ring's slot shared handles exist:
+    // the D3D9 compositor and its capture-side aliases, or the whole D3D11 backend. Either
+    // refuses the mode when it cannot finish instead of silently running a different one,
+    // and it refuses LOUDLY: the console is closed by now, so a logged refusal alone would
+    // read as the relay vanishing.
+    if (!m_present->Setup(device, hwnd, &m_ring, BUF_WIDTH, BUF_HEIGHT, &m_policyCfg, m_mark,
+                          m_markFrames, m_baseQpc, m_scheduler.Freq())) {
+        LOGERR("%s init failed - refusing the mode", m_present->Name());
         m_ring.Stop();
+        const char* advice = m_present->RefusalAdvice();
+        char text[640];
+        snprintf(text, sizeof(text),
+                 "The %s could not be initialized.\n\n"
+                 "The relay will NOT start. It deliberately does not fall back to another "
+                 "present path: a run labelled one way that silently presented another would "
+                 "be worse than no run.\n\nSee NvFBCR.log for the reason.%s%s",
+                 m_present->Name(), advice[0] ? "\n\n" : "", advice);
+        MessageBoxA(NULL, text, "NvFBCR: present path unavailable",
+                    MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
         return;
     }
 
     MSG msg = {};
     LONGLONG lastPresentQpc = 0;
-    long long presentFailures = 0;
-    long long backbufferFailures = 0;
-    // Present statistics live on the swapchain, not the device, and are only meaningful under
-    // flip mode. Acquired once: the swapchain object is stable even though its buffers rotate.
-    IDirect3DSwapChain9Ex* presentStatsSwapChain = NULL;
-    UINT lastSyncRefresh = 0;
-    long long missedRefreshes = 0, statsSamples = 0;
-    if (g_flipEx) {
-        IDirect3DSwapChain9* sc = NULL;
-        if (SUCCEEDED(device->GetSwapChain(0, &sc)) && sc) {
-            if (FAILED(sc->QueryInterface(__uuidof(IDirect3DSwapChain9Ex),
-                                          (void**)&presentStatsSwapChain))) {
-                presentStatsSwapChain = NULL;
-            }
-            sc->Release();
-        }
-        LOG("Flip-mode presentation ACTIVE (-flipex): FLIPEX swap effect, back buffer acquired "
-            "per present; present statistics %s",
-            presentStatsSwapChain ? "available (presentstats: lines follow)" : "UNAVAILABLE");
-    }
     m_scheduler.Seed();
 
     while (TRUE)
     {
         // Present timing. Timer mode waits on the absolute-QPC deadline. Vsync mode lets the
-        // INTERVAL_ONE present (below) be the wait, and anchors the target to "now" (just after
-        // the previous compose tick) so selection runs on DWM's compose clock rather than QPC.
-        // That clock is regime-dependent: composed desktop → primary/source display; fullscreen
-        // game on the source → card-locked 60 Hz (spec Rounds 5-10).
+        // present path's own blocking wait be the pacing, and anchors the target to "now"
+        // (just after the previous frame was consumed) so selection runs on that path's
+        // clock rather than QPC: DWM's compose tick on the D3D9 swapchain (regime-dependent:
+        // the source display's rate on a composed desktop, card-locked 60 Hz under a
+        // fullscreen game on the source), the sink's vblank on the flip-model swapchain.
         LONGLONG deadline;
         // How long this present's pacing wait blocked (blk= on the line). A vsync present
         // that is doing its job spends nearly the whole period waiting; one that returns at
-        // once is not pacing anything, and pdt alone cannot tell those apart.
+        // once is not pacing anything, and pdt alone cannot tell those apart. A path that
+        // paces BEFORE the decision blocks in WaitForFrame and is measured here; one that
+        // paces in the present itself returns at once here and reports the block from
+        // Present, so the sum is the whole wait either way.
         LONGLONG blockTicks = 0;
         if (m_vsyncPresent) {
-            LARGE_INTEGER now;
-            if (m_present11) {
-                // The D3D11 path waits HERE, on the swapchain's own object, before the
-                // decision: the frame is decided against the freshest ring state and queued
-                // the instant there is room. Present itself does not block on this path.
-                LARGE_INTEGER waitStart;
-                QueryPerformanceCounter(&waitStart);
-                m_present11->WaitForFrame();
-                QueryPerformanceCounter(&now);
-                blockTicks = now.QuadPart - waitStart.QuadPart;
-            } else {
-                QueryPerformanceCounter(&now);
-            }
+            LARGE_INTEGER waitStart, now;
+            QueryPerformanceCounter(&waitStart);
+            m_present->WaitForFrame();
+            QueryPerformanceCounter(&now);
+            blockTicks = now.QuadPart - waitStart.QuadPart;
             deadline = now.QuadPart;
         } else {
             m_scheduler.WaitUntilDeadline();
@@ -543,126 +490,17 @@ void TemporalCaptureMode::Run(
         }
 
         // The DECISION is pure policy (selection or composite, in TemporalPolicy.cpp with
-        // the mechanism rationale); an executor draws it onto the back buffer. This loop
-        // owns the timing, the present, and the log. Two executors, never both in one
-        // present: the D3D11 backend decides, draws, marks and presents on its own device;
-        // the D3D9 path does the same through the compositor and PresentEx.
+        // the mechanism rationale); the present path executes it onto its own target,
+        // burns the marker over it (once per present, repeats included: the counter
+        // identifies presented frames, not source frames; before the present stamp so
+        // jit/pdt absorb its cost) and shows it. This loop owns the timing, the bracket,
+        // the lock and the log.
         CompositeOutcome outcome;
-        long long markN = -1;
+        m_present->Compose(bracket, &outcome);
+        const long long markN = m_present->BurnMarker(outcome);
         LARGE_INTEGER beforePresent;
-        if (m_present11) {
-            m_present11->Compose(bracket, &outcome);
-            markN = m_present11->BurnMarker(outcome);
-            QueryPerformanceCounter(&beforePresent);
-            // Queues the frame; the pacing wait already happened at the top of the loop.
-            m_present11->Present(m_vsyncPresent);
-        } else {
-            // The back buffer is acquired PER PRESENT, never cached. Under
-            // D3DSWAPEFFECT_DISCARD back buffer 0 is the same surface every time and this is
-            // a no-op, but under FLIPEX the runtime rotates which handle is the back buffer
-            // at presentation time, so a cached pointer composites into a surface that is no
-            // longer the one being presented - the "every third frame is blank" that made
-            // the earlier FLIPEX attempt fail. Falls back to the cached global if the call
-            // fails, so a failure degrades rather than presenting whatever the flip queue
-            // left behind.
-            IDirect3DSurface9* backbuffer = NULL;
-            if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) ||
-                !backbuffer) {
-                backbuffer = NULL;
-                backbufferFailures++;
-                if (backbufferFailures == 1 || (backbufferFailures % 600) == 0) {
-                    LOGERR("GetBackBuffer failed (%lld so far); falling back to the cached surface",
-                           backbufferFailures);
-                }
-            }
-            IDirect3DSurface9* const presentTarget = backbuffer ? backbuffer : g_backbuffer;
-
-            m_compositor->Compose(bracket, presentTarget, &outcome);
-
-            // Burn the marker over the composed backbuffer, once per present (repeats
-            // included: the counter identifies presented frames, not source frames).
-            // Before the present stamp, so jit/pdt absorb its cost and a -mark on/off
-            // A/B measures it.
-            if (m_mark) {
-                markN = (long long)m_marker.Burn(presentTarget, outcome.pickCode, outcome.weightQ,
-                                                 outcome.synthesized, m_compositor->Id(),
-                                                 outcome.pixelExec);
-            }
-
-            QueryPerformanceCounter(&beforePresent);
-            // Timer: immediate (non-blocking). Vsync: the device was CREATED with
-            // INTERVAL_ONE (GetPresentationInterval), so this present blocks until DWM's next
-            // compose (source clock on a composed desktop; card clock under a fullscreen
-            // game) - that is the frame-pacing wait in vsync mode.
-            //
-            // dwFlags is 0 and must stay 0. It is NOT a presentation interval: the only legal
-            // values are D3DPRESENT_DONOTWAIT and D3DPRESENT_LINEAR_CONTENT, and the interval
-            // is fixed at device creation. This argument used to receive the interval
-            // constants, which meant vsync mode silently requested DONOTWAIT (numerically
-            // identical to INTERVAL_ONE, both 1) and timer mode passed an undefined bit. Under
-            // DONOTWAIT a present that would wait returns D3DERR_WASSTILLDRAWING WITHOUT
-            // PRESENTING, which is invisible in the log (the present was counted) and shows
-            // downstream as the previous frame repeating - the exact judder signature this
-            // relay is measured against.
-            const HRESULT presentHr = device->PresentEx(NULL, NULL, NULL, NULL, 0);
-            // On this path the present IS the pacing wait, so the block is measured here.
-            LARGE_INTEGER afterPresent;
-            QueryPerformanceCounter(&afterPresent);
-            blockTicks = afterPresent.QuadPart - beforePresent.QuadPart;
-            // GetBackBuffer AddRefs; release after the present so the runtime can rotate it.
-            if (backbuffer) backbuffer->Release();
-            if (FAILED(presentHr) || presentHr == S_PRESENT_MODE_CHANGED ||
-                presentHr == S_PRESENT_OCCLUDED) {
-                // Never silent: a present that did not reach the screen must be attributable,
-                // or a video-vs-log disagreement has no explanation in the log.
-                presentFailures++;
-                if (presentFailures == 1 || (presentFailures % 600) == 0) {
-                    // CheckDeviceState separates the two readings of a non-OK present status
-                    // that this relay cannot otherwise tell apart: an ADVISORY one (the
-                    // device is fine, the runtime is just noting a conversion - which is the
-                    // likely reading on a multi-monitor desktop whose displays run different
-                    // modes), versus a device that genuinely wants recreating. S_OK here
-                    // means the status is advisory and no Reset is owed; anything else means
-                    // the swapchain is in a state that a Reset is supposed to clear, and
-                    // ignoring it is a real bug rather than noise.
-                    const HRESULT devState = device->CheckDeviceState(hwnd);
-                    LOGERR("present returned 0x%08lx (%lld so far); CheckDeviceState 0x%08lx "
-                           "(S_OK means advisory, no Reset owed)",
-                           (unsigned long)presentHr, presentFailures, (unsigned long)devState);
-                }
-            }
-        }
-
-        // PRESENT STATISTICS: what the SINK actually did with our frames, from the runtime
-        // rather than inferred from ETW. Only a flip-mode swapchain reports these in windowed
-        // mode - a bitblt one returns zeroes - so this is the half of -flipex that pays off
-        // whether or not DWM ever promotes the window to independent flip.
-        //
-        // PresentRefreshCount equals SyncRefreshCount when every present landed on its own
-        // vsync; when the former runs ahead, a refresh went by showing the previous frame,
-        // which is a DOWNSTREAM DUPE measured in-process. That is the same quantity a marked
-        // video plus a marker decode plus content-step analysis currently produces offline.
-        if (g_flipEx && presentStatsSwapChain) {
-            D3DPRESENTSTATS ps;
-            ZeroMemory(&ps, sizeof(ps));
-            if (SUCCEEDED(presentStatsSwapChain->GetPresentStats(&ps))) {
-                if (lastSyncRefresh != 0 && ps.SyncRefreshCount > lastSyncRefresh) {
-                    const UINT elapsed = ps.SyncRefreshCount - lastSyncRefresh;
-                    // More than one sink refresh since the last present means refreshes that
-                    // showed no new frame of ours.
-                    if (elapsed > 1) missedRefreshes += (elapsed - 1);
-                }
-                lastSyncRefresh = ps.SyncRefreshCount;
-                statsSamples++;
-                if ((statsSamples % 1800) == 0) {
-                    LOG("presentstats: present=%u presentRefresh=%u syncRefresh=%u "
-                        "syncQpc=%lldus missedRefreshes=%lld over %lld presents",
-                        ps.PresentCount, ps.PresentRefreshCount, ps.SyncRefreshCount,
-                        (long long)((ps.SyncQPCTime.QuadPart - m_baseQpc.QuadPart) * usPerTick),
-                        missedRefreshes, statsSamples);
-                }
-            }
-        }
+        QueryPerformanceCounter(&beforePresent);
+        blockTicks += m_present->Present(m_vsyncPresent);
 
         // Inter-present interval (should hold steady at the present period if the scheduler works).
         LONGLONG presentDelta = (lastPresentQpc != 0) ? (beforePresent.QuadPart - lastPresentQpc) : 0;
@@ -808,35 +646,19 @@ void TemporalCaptureMode::Run(
         }
         if (msg.message == WM_QUIT) break;
         if (m_ring.HasStopped()) break;  // capture thread hit a fatal error
-        if (m_present11 && m_present11->SwapChainStalled()) {
+        if (m_present->SwapChainStalled()) {
             // The swapchain stopped retiring frames and does not come back. Stopping is the
             // only correct move: nothing reaches the screen either way, and a loop left
             // turning here holds the NvFBC session against the next run while its output
             // window may not even be somewhere a person can close it.
-            LOGERR("D3D11Present: swapchain stalled - no paced present for seconds. Stopping "
-                   "the capture so the session is released and this run ends attributably.");
+            LOGERR("%s: swapchain stalled - no paced present for seconds. Stopping the "
+                   "capture so the session is released and this run ends attributably.",
+                   m_present->Name());
             break;
         }
     }
 
-    if (presentStatsSwapChain) {
-        // The whole-run figure, so a capture carries its downstream dupe count without a
-        // video: refreshes that showed no new frame of ours, over presents that reported.
-        LOG("presentstats summary: %lld refreshes showed no new frame over %lld presents "
-            "(%.3f/s at 60 Hz sink)", missedRefreshes, statsSamples,
-            statsSamples > 0 ? (double)missedRefreshes * 60.0 / (double)statsSamples : 0.0);
-        presentStatsSwapChain->Release();
-        presentStatsSwapChain = NULL;
-    }
-    if (m_present11) {
-        m_present11->LogSummary();
-    }
-    if (backbufferFailures > 0) {
-        LOGERR("GetBackBuffer failed %lld times over the run", backbufferFailures);
-    }
-    if (presentFailures > 0) {
-        LOGERR("present reported a non-OK status %lld times over the run", presentFailures);
-    }
+    m_present->LogSummary();
 
     if (m_phaseKeep) {
         // Without the flipped count, a live A/B cannot tell "the rotation was read and no
@@ -856,26 +678,9 @@ void TemporalCaptureMode::Run(
             m_dejitMeasured, m_dejitLate, m_dejitCorrected,
             m_dejitFenceBlocked, m_dejitLockDeclined, m_dejitSkipped);
     }
-    if (m_subGen && m_synth) {
-        // The population this feature addresses, measured in the field rather than inferred
-        // from a replay. offered counts the presents where PLACEMENT said yes, so
-        // offered - substituted - rejected is what the policy's own rules refused.
-        const SynthCompositorBase::GenSubStats& g = m_synth->GeneratedSubstitutionStats();
-        LOG("subgen summary: %lld substituted, %lld offered, %lld refused by the change map, "
-            "%lld rejected on content, content check %lld us worst / %lld us mean",
-            g.substituted, g.offered, m_ring.GeneratedDuplicatesRefused(), g.rejectedContent,
-            g.checkUsMax, g.offered ? g.checkUsTotal / g.offered : 0);
-    }
     m_ring.Stop();
-    // After the join: the instruments' counters are capture-thread-owned until then.
-    m_ring.LogGenCheckSummary();
-    m_ring.LogLateGrabSummary();
-    m_ring.LogGrabDelaySummary();
 }
 
 const char* TemporalCaptureMode::GetModeName() const {
-    if (m_d3d11Present) return "Temporal blend (D3D11 flip present)";
-    if (m_compositorKind == kCompositorInterp) return "Temporal interp";
-    if (m_compositorKind == kCompositorBlend) return "Temporal blend";
-    return "Temporal";
+    return m_modeName;
 }

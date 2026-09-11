@@ -44,8 +44,11 @@ takes a mode:
 | Mode | Behavior |
 | ---- | -------- |
 | `vsync` | Default. Capture and present on the vsync interval. The original relay behavior. |
-| `t` or `t:vsync` | Temporal selection, present blocked on DWM's compose clock. The production mode. |
+| `t` or `t:vsync` | Temporal selection, present blocked on DWM's compose clock. |
 | `t:<fps>` | Temporal selection, present driven by a QPC timer at the given rate. |
+| `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the bracket pair otherwise), presented through a D3D11 flip-model swapchain on the capture card's own vblank. The production mode. |
+| `b:dwm` | The same blend on the D3D9 swapchain, present blocked on DWM's compose clock. The path `t` runs on. |
+| `b:<fps>` | The same blend, present driven by a QPC timer at the given rate. |
 | `<fps>` | Plain timer capture at the given rate. No temporal selection. |
 | `diag` | Diagnostic clock probe: QPC 60Hz, immediate present. Logs DWM compose timing and card raster per tick. |
 | `diag:vsync` | Diagnostic probe on `INTERVAL_ONE`. Present block time measures DWM's delivery cadence. |
@@ -63,6 +66,36 @@ Under a fullscreen game on the source, the card locks the compose clock to
 desktop there's no such lock and a 240Hz source gives you 240Hz presents.
 That's the DWM compose clock showing through, and it confuses people reading
 present rates out of a desktop capture.
+
+## Present paths
+
+The blend mode has two ways to reach the screen, and the name says which clock
+the present rides. `b:vsync` presents through a D3D11 flip-model swapchain on
+the output window; Windows promotes it to independent flip, so the present
+blocks on the capture card's own vblank. `b:dwm` presents through the D3D9
+swapchain, blocked on DWM's compose clock, which is the path `t` and `o` run
+on. Under in-game frame generation that clock runs at the displayed rate, two
+presents per source frame into a 60Hz sink, and the recording shows it.
+
+Naming note: everything written before 2026-09-11 (fixture descriptions,
+capture file names, the analysis documents under `docs/`) used `b:vsync` for
+the D3D9 path and `b:flip` for the D3D11 one. The names were swapped when the
+present path got its seam. `b:flip` is accepted as an alias for `b:vsync` on
+this branch only and is gone at the release. The old documents were not
+rewritten.
+
+Measured in one session, Avatar 60x2 with in-game frame generation,
+`-src 60 -lock -lag 75 -mark -etw -dejit`, inside the benchmark tests:
+
+| | `b:dwm` (D3D9, DWM compose clock) | `b:vsync` (D3D11 flip model, sink vblank) |
+| --- | --- | --- |
+| presents/s on the 60Hz sink | 117 to 120 | 60.00 |
+| present spacing stdev | 575 to 2076 us | 20 to 97 us |
+| comb lock engaged | 0.0% | 100% |
+| hold-comb/s | 53 to 60 | 0 |
+| content repeats/s in the recording (mean) | 3.55 (worst test 14.27) | 0 |
+| PresentMon presentation mode | Composed | Hardware: Independent Flip (99.2%) |
+| KCD2 anomalies/min (real gameplay) | 0.30 | 0.10, all inside a map close |
 
 ---
 

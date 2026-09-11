@@ -1,6 +1,13 @@
 # Capture corpus for the policy replay gate. One fixture per line.
 # Build with: uv run mktrace.py <NvFBCR.log> <name>.trace "<description>"
 # (mktrace.py lives in this directory; run the suite afterwards for the bounds)
+#
+# MODE NAMES. Every fixture description, fixture file name and comment below was written
+# before the present-path rename of 2026-09-11, when "b:vsync" meant the D3D9 present (DWM's
+# compose clock) and "b:flip" meant the D3D11 flip-model present (the sink's vblank). From that
+# rename on, b:vsync IS the D3D11 flip-model present and the D3D9 present is b:dwm; b:flip is a
+# transitional alias that goes away at the release. Nothing below was rewritten: a "_flip_"
+# fixture is a b:vsync capture in today's names, and "the D3D9 vsync path" is today's b:dwm.
 kcd_60x2_mapcycles.trace
 kcd_60x2_mapcycles_postfix.trace
 # Steady walking, the regime the map-cycle fixtures do not cover: they are dominated by

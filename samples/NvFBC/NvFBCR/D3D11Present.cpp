@@ -120,10 +120,10 @@ UINT OutputBitsPerColor(IDXGIAdapter* adapter, HWND hwnd) {
 
 }  // namespace
 
-D3D11PresentBackend::D3D11PresentBackend()
+D3D11PresentBackend::D3D11PresentBackend(bool tint)
     : m_enabled(false)
     , m_width(0), m_height(0), m_ringSlots(0)
-    , m_cfg(NULL), m_subGen(false)
+    , m_cfg(NULL), m_tintRequested(tint)
     , m_dev(NULL), m_ctx(NULL), m_swapChain(NULL), m_swapChainMedia(NULL), m_frameWait(NULL)
     , m_rtv(NULL)
     , m_vs(NULL), m_ps(NULL), m_markerPs(NULL), m_cb(NULL), m_sampler(NULL)
@@ -159,13 +159,14 @@ D3D11PresentBackend::~D3D11PresentBackend() {
     if (m_dev) m_dev->Release();
 }
 
-bool D3D11PresentBackend::Setup(HWND hwnd, CaptureRing* ring, int width, int height,
-                                const policy::PolicyConfig* cfg, bool subGen, bool mark,
-                                unsigned int markFrames) {
+bool D3D11PresentBackend::Setup(IDirect3DDevice9Ex* /*device*/, HWND hwnd, CaptureRing* ring,
+                                int width, int height, const policy::PolicyConfig* cfg,
+                                bool mark, unsigned int markFrames,
+                                LARGE_INTEGER /*baseQpc*/, LONGLONG /*freqQpc*/) {
     m_width = width;
     m_height = height;
     m_cfg = cfg;
-    m_subGen = subGen;
+    if (m_tintRequested) LOG("-tint ignored: the D3D11 present path has no tint pass");
     if (!CreateDeviceAndSwapChain(hwnd, width, height)) return false;
     if (!OpenRingAliases(ring)) return false;
     if (!CreatePipeline()) return false;
@@ -537,22 +538,8 @@ void D3D11PresentBackend::SampleStats() {
 }
 
 void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome* out) {
-    // The generated frame is offered to the policy only after PLACEMENT says a substitution
-    // is on the table, and only when the ring already screened it against the driver's
-    // change map. There is no content check on this device: the D3D9 compositor's GPU
-    // readback is the expensive path the change map exists to replace, and an unscreened
-    // candidate is skipped rather than trusted.
-    policy::BracketInfo info = bracket.info;
-    if (m_subGen && info.hasGen) {
-        if (policy::GeneratedCandidateOnTarget(info, m_compState, *m_cfg)) {
-            m_genSub.offered++;
-            info.genUsable = bracket.genScreened;
-            if (!bracket.genScreened) m_genSub.skippedUnscreened++;
-        }
-    } else {
-        info.hasGen = false;   // disarmed: the policy must not see a candidate at all
-    }
-    const policy::CompositeDecision d = policy::DecideComposite(info, m_compState, *m_cfg);
+    const policy::CompositeDecision d =
+        policy::DecideComposite(bracket.info, m_compState, *m_cfg);
 
     out->pickLabel = policy::PickLabel(policy::Pick::None);
     out->opLabel = policy::CompositeLabel(d.op);
@@ -575,13 +562,6 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome*
             slotA = slotB = bracket.afterSlot;
             out->weightQ = 15;
             out->opWeight = 1.0;
-            break;
-        case policy::CompositeOp::PassthroughGenerated:
-            // A frame the driver rendered at this instant, presented sharp. Its pixels are
-            // one real frame, so synthesized/pixelExec stay at the passthrough values and
-            // op=pass-gen carries the provenance.
-            slotA = slotB = bracket.genSlot;
-            m_genSub.substituted++;
             break;
         case policy::CompositeOp::Synthesize:
             slotA = bracket.beforeSlot;
@@ -685,11 +665,11 @@ bool D3D11PresentBackend::SwapChainStalled() const {
     return m_consecutiveWaitTimeouts >= kStallTimeouts;
 }
 
-void D3D11PresentBackend::Present(bool vsync) {
-    if (!m_enabled) return;
-    // Queues the frame; WaitForFrame already made the room, so this returns promptly. Sync
-    // interval 1 puts the flip on a vblank. Under independent flip that vblank is the sink's,
-    // which is the entire point of this backend.
+LONGLONG D3D11PresentBackend::Present(bool vsync) {
+    if (!m_enabled) return 0;
+    // Queues the frame; WaitForFrame already made the room, so this returns promptly and
+    // reports no pacing block. Sync interval 1 puts the flip on a vblank. Under independent
+    // flip that vblank is the sink's, which is the entire point of this backend.
     const HRESULT hr = m_swapChain->Present(vsync ? 1 : 0, 0);
     m_presents++;
     const bool bad = FAILED(hr) || hr == DXGI_STATUS_OCCLUDED;
@@ -705,6 +685,7 @@ void D3D11PresentBackend::Present(bool vsync) {
     }
     m_lastPresentHr = hr;
     SampleStats();
+    return 0;
 }
 
 void D3D11PresentBackend::LogSummary() const {
@@ -722,10 +703,5 @@ void D3D11PresentBackend::LogSummary() const {
             m_samplesOverlay, m_samplesComposed,
             pathed > 0 ? 100.0 * (double)m_samplesOverlay / (double)pathed : 0.0,
             m_compModeChanges, PresentationPathName(m_compMode));
-    }
-    if (m_subGen) {
-        LOG("subgen summary: %lld substituted, %lld offered, %lld skipped unscreened "
-            "(no content check on the D3D11 present path)",
-            m_genSub.substituted, m_genSub.offered, m_genSub.skippedUnscreened);
     }
 }

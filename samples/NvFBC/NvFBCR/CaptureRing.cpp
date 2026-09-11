@@ -37,8 +37,6 @@ CaptureRing::CaptureRing()
         m_ring[i].mainSurface = NULL;
         m_ring[i].sharedHandle = NULL;
         m_ring[i].valid = false;
-        m_ring[i].generated = false;
-        m_ring[i].genPrevBatchStart.QuadPart = 0;
         m_ring[i].timestamp.QuadPart = 0;
         m_ring[i].batchStart.QuadPart = 0;
         m_ring[i].member = 0;
@@ -59,19 +57,11 @@ CaptureRing::~CaptureRing() {
         m_captureTarget->Release();
         m_captureTarget = NULL;
     }
-    if (m_diffMapBuf) {
-        VirtualFree(m_diffMapBuf, 0, MEM_RELEASE);
-        m_diffMapBuf = NULL;
-        m_diffMapPtrs[0] = NULL;
-    }
     if (m_fgSmallRT)  { m_fgSmallRT->Release();  m_fgSmallRT = NULL; }
     if (m_fgSmallSys) { m_fgSmallSys->Release(); m_fgSmallSys = NULL; }
     delete[] m_fgLumWake[0]; m_fgLumWake[0] = NULL;
     delete[] m_fgLumWake[1]; m_fgLumWake[1] = NULL;
     delete[] m_fgLumKept;    m_fgLumKept = NULL;
-    GenCheckRelease();
-    if (m_lateSurface) { m_lateSurface->Release(); m_lateSurface = NULL; }
-    if (m_lateTexture) { m_lateTexture->Release(); m_lateTexture = NULL; }
     if (m_capSync) {
         m_capSync->Release();
         m_capSync = NULL;
@@ -203,40 +193,6 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
         }
     }
 
-    // ---- Late-grab slot (-lategrab): a capture-side texture outside the ring, so the extra
-    // grab can be examined without ever being bracketable. Same no-fallback rule. ----
-    if (m_lateGrabUs > 0) {
-        hr = m_capDevice->CreateTexture(m_width, m_height, 1, D3DUSAGE_RENDERTARGET,
-                                        D3DFMT_A2B10G10R10, D3DPOOL_DEFAULT, &m_lateTexture, NULL);
-        if (SUCCEEDED(hr)) hr = m_lateTexture->GetSurfaceLevel(0, &m_lateSurface);
-        if (FAILED(hr)) {
-            LOGERR("lategrab: slot setup failed (0x%08x): refusing to start", hr);
-            return false;
-        }
-        LOG("lategrab ACTIVE: one no-wait grab per batch, %u us after the second member, into a "
-            "slot outside the ring; lategrab: lines carry the change map against the member "
-            "before it, and the sample check reports it as m=2", m_lateGrabUs);
-    }
-    if (m_grabDelayArmed) {
-        if (m_grabDelaySteps > 1) {
-            LOG("grabdelay ACTIVE: the second grab of every batch is delayed by a sweep of "
-                "%u..%u us (%d steps, one per batch); the first member stays the keeper, and "
-                "the second member's diff= against it scores what the delayed copy returned",
-                m_grabDelayTable[0], m_grabDelayTable[m_grabDelaySteps - 1], m_grabDelaySteps);
-        } else {
-            LOG("grabdelay ACTIVE: the second grab of every batch is delayed by %u us; the "
-                "first member stays the keeper, and the second member's diff= against it "
-                "scores what the delayed copy returned", m_grabDelayTable[0]);
-        }
-    }
-
-    // ---- Sample-check instrument resources (-gencheck). The opposite rule from fgphase:
-    // the instrument is under test and does not fall back. A failed setup refuses to start
-    // the relay, so no capture is ever taken believing the instrument ran. ----
-    if (m_genCheckRequested && !GenCheckSetup()) {
-        return false;
-    }
-
     // ---- Rebind NvFBC to the capture device. ----
     // Release the session WinMain created against the present device, create a new one bound
     // to the capture device, and update the global so Cleanup releases the right session.
@@ -268,50 +224,9 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     setupParams.dwNumBuffers = 1;
     setupParams.bHDRRequest = TRUE;
 
-    // -diffmap: ask the driver for its per-block change map alongside each grab. Requested
-    // here and CONFIRMED by SetUp succeeding with it on; a driver that refuses the feature
-    // must not take the relay with it, so a failure retries without and the instrument
-    // reports itself inactive.
-    if (m_diffMapRequested) {
-        m_diffMapBuf = VirtualAlloc(NULL, NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE,
-                                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (m_diffMapBuf) {
-            m_diffMapPtrs[0] = m_diffMapBuf;
-            setupParams.bDiffMap = 1;
-            setupParams.eDiffMapBlockSize = NVFBC_TODX9VID_DIFFMAP_BLOCKSIZE_16X16;
-            setupParams.dwDiffMapBuffSize = NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE;
-            setupParams.ppDiffMap = m_diffMapPtrs;
-            const unsigned int bx = (m_width + 15) / 16, by = (m_height + 15) / 16;
-            m_diffMapBlocks = bx * by;
-            if (m_diffMapBlocks > NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE)
-                m_diffMapBlocks = NVFBC_TODX9VID_MAX_DIFF_MAP_SIZE;
-        } else {
-            LOGERR("CaptureRing: diffmap buffer allocation failed - instrument off");
-        }
-    }
-
     if (NVFBC_SUCCESS != m_nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
-        if (setupParams.bDiffMap) {
-            LOGERR("CaptureRing: SetUp refused the diffmap - retrying without it");
-            setupParams.bDiffMap = 0;
-            setupParams.ppDiffMap = NULL;
-            setupParams.dwDiffMapBuffSize = 0;
-            if (NVFBC_SUCCESS != m_nvfbc->NvFBCToDx9VidSetUp(&setupParams)) {
-                LOGERR("CaptureRing: NvFBCToDx9VidSetUp on capture device failed");
-                return false;
-            }
-        } else {
-            LOGERR("CaptureRing: NvFBCToDx9VidSetUp on capture device failed");
-            return false;
-        }
-    }
-    m_diffMapActive = setupParams.bDiffMap != 0;
-    if (m_diffMapActive) {
-        LOG("diffmap instrument ACTIVE: 16x16 blocks, %u blocks for %dx%d; diff= on the "
-            "capture line counts blocks the driver says changed since the previous grab",
-            m_diffMapBlocks, m_width, m_height);
-    } else if (m_diffMapRequested) {
-        LOG("diffmap instrument OFF: the driver did not accept it");
+        LOGERR("CaptureRing: NvFBCToDx9VidSetUp on capture device failed");
+        return false;
     }
 
     // Fully event-driven blocking grab — safe now that the lock it holds is private.
@@ -325,102 +240,6 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     m_stop.store(false);
     m_captureThread = std::thread(&CaptureRing::CaptureLoop, this, grabParams);
     return true;
-}
-
-// Keep-real has just published the batch's real member at `count` and is dropping the
-// generated member that preceded it. The slot stops being bracketable, but its pixels stay
-// where they are and stay reachable, because a frame the driver already rendered at an
-// instant beats interpolating one there.
-//
-// The stamp becomes a placement between the two real neighbours, never the generated
-// frame's own arrival or flip: the f/g measurement puts generated content at a CONSTANT
-// phase between its neighbours that does not track the display, and at x2 that placement
-// lands 259 us from the measured phase (the estimator's own floor) against 587 us sd for
-// the flip time.
-//
-// NOTHING HERE KNOWS THE MULTIPLIER, deliberately. There is no x2 path and no x3 path: a
-// batch divides the interval it spans by the number of frames it carries, so a source that
-// submits two frames per source frame and one that submits four are the same arithmetic,
-// and a multiplier that fluctuates needs no detection. What bounds the damage when the
-// placement is wrong - a capture that missed one of the driver's submissions, so the
-// interval is divided into the wrong number of parts - is not a regime test but the
-// passthrough gate downstream: a frame placed further from the target than the gate allows
-// is refused for being too far away, whatever the reason it landed there.
-//
-// Called on the capture thread only, and it writes a slot the present thread may be
-// reading. That is safe for the same reason plain retraction is: the pixels are never
-// touched, and a present that reads the old stamp gets a value that was true a moment ago
-// rather than a torn one - the write is a single aligned 64-bit store.
-void CaptureRing::RetractGenerated(long long count, long long changedBlocks) {
-    if (count < 1) return;
-    const int genSlot = (int)((count - 1) % m_ringSlots);
-    m_ring[genSlot].valid = false;
-    m_ring[genSlot].generated = false;
-    if (!m_subGenArmed) return;
-
-    // THE CONTENT CHECK, when the driver will do it for us. changedBlocks is how many
-    // blocks NvFBC says differ between THIS grab and the previous one - that is, between
-    // the real member just published and the generated member about to be retracted. Zero
-    // means the capture race handed us the same frame twice, so the slot holds a duplicate
-    // and must not be reachable.
-    //
-    // Measured against the pixel instrument over 65619 batches: this catches 98.80% of
-    // duplicates with ZERO false positives (0 of 60711 genuine frames). The separation is
-    // total rather than tuned - duplicates sit at exactly 0 blocks and genuine frames at
-    // p10 6135 of 8160 - so there is no threshold here, and widening it to 20 blocks
-    // changes nothing. It costs a comparison on a value already computed for the log,
-    // against the GPU pipeline sync the present-thread check needs.
-    //
-    // -1 means the instrument is off (the driver refused it, or -diffmap was not asked
-    // for); the compositor's pixel check then covers this and the slot stays reachable.
-    if (changedBlocks == 0) {
-        m_genDupRefused++;
-        return;
-    }
-
-    // Members submitted in this batch so far, counting the one just published. Frame
-    // generation submits its generated frames alongside the real one they precede, so a
-    // batch of N members carries N-1 generated frames covering the interval between the
-    // previous real frame and this one.
-    const int newMember = m_ring[(int)(count % m_ringSlots)].member;
-    const int members = newMember + 1;
-    if (newMember < 1) return;
-
-    const LONGLONG after = m_ring[(int)(count % m_ringSlots)].timestamp.QuadPart;
-    long long oldest = count - (m_ringSlots - 1);
-    if (oldest < 0) oldest = 0;
-    LONGLONG before = 0, beforeBatch = 0;
-    bool haveBefore = false;
-    for (long long i = count - 1 - newMember; i >= oldest; i--) {
-        const Slot& s = m_ring[(int)(i % m_ringSlots)];
-        if (!s.valid) continue;
-        before = s.timestamp.QuadPart;
-        beforeBatch = s.batchStart.QuadPart;
-        haveBefore = true;
-        break;
-    }
-    // A pathological ordering (a stamp no older than the frame that followed it) would put
-    // the placement outside its own neighbours. Leave the slots unreachable instead.
-    if (!haveBefore || before >= after) return;
-
-    // PLACEMENT: generated member j of N sits at (j+1)/N of the way from the previous real
-    // frame to this one. At x2 that is the midpoint, which is what the f/g measurement
-    // found (content phase a constant 0.4952, against 587 us sd for using the flip time).
-    // The general form is written out rather than the x2 special case because the rule is
-    // the same physical statement at any multiplier - the driver divides the interval it
-    // is interpolating across - and only the N=2 value has been measured.
-    //
-    // Every generated member of the batch is re-placed on each arrival, because N is not
-    // known until the batch ends: the first retraction in a 3-member batch legitimately
-    // believes N is 2, and the third member is what corrects it.
-    for (int j = 0; j < newMember; j++) {
-        Slot& g = m_ring[(int)((count - newMember + j) % m_ringSlots)];
-        LONGLONG placed = 0;
-        if (!policy::PlaceGeneratedFrame(before, after, j, members, &placed)) continue;
-        g.timestamp.QuadPart = placed;
-        g.genPrevBatchStart.QuadPart = beforeBatch;
-        g.generated = true;
-    }
 }
 
 void CaptureRing::SetSlotsInUse(int n) {
@@ -457,14 +276,6 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     LOG("CaptureRing: batch-collapse keep-real (intra-batch wake <3ms = real member; previous slot retracted)");
 
     while (!m_stop.load()) {
-        // -grabdelay: the previous wake opened a batch, so the second notification is on its
-        // way or already pending. Answering it later is the whole experiment.
-        if (m_grabDelayNext) {
-            m_grabDelayNext = false;
-            if (m_grabDelayStep >= 0 && m_grabDelayTable[m_grabDelayStep] > 0) {
-                PreciseSleep(m_grabDelayTable[m_grabDelayStep]);
-            }
-        }
         NVFBCRESULT res = m_nvfbc->NvFBCToDx9VidGrabFrame(grabParams);
 
         if (res == NVFBC_ERROR_INVALIDATED_SESSION) {
@@ -498,11 +309,6 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         int slot = (int)(count % m_ringSlots);
         m_capDevice->StretchRect(m_captureTarget, &srcRect, m_ring[slot].capSurface, &srcRect, D3DTEXF_NONE);
 
-        // The sample gather is queued here, behind the copy that just filled the slot, so
-        // the flush below covers it and no second sync is introduced. Its readback happens
-        // one wake later (GenCheckOnWake), by which time it is long finished.
-        if (m_genCheckActive) GenCheckIssue(slot);
-
         // Force the StretchRect to complete on the capture GPU before publishing, so the
         // present device never reads a not-yet-coherent shared slot. D3DGETDATA_FLUSH kicks
         // the command buffer; GetData returns S_FALSE until the GPU signals the event.
@@ -521,7 +327,6 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         // The intra-batch (real) member is stamped with the BATCH-START time so the ring
         // timeline stays at base cadence; everything else is stamped at its own arrival.
         m_ring[slot].member = batch.member;
-        if (batch.member == 0) m_lateGrabDoneThisBatch = false;
         // Publish the batch start for the stage-6 walk. At batch OPEN only: every member
         // shares the start stamp, so one entry names the whole batch, and the release
         // store is what lets the present thread read the entry without touching slots.
@@ -669,37 +474,14 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
                 const int prevSlot = (int)((count - 1) % m_ringSlots);
                 m_ring[prevSlot].timestamp.QuadPart = m_prevBatchStart + m_prevSpacing;
                 m_ring[prevSlot].valid = true;
-                m_ring[prevSlot].generated = false;   // a reclaimed single is real again
                 m_phaseKeepReclaimed++;
             }
-            // -grabdelay: the first member is the real frame and stays the keeper whatever the
-            // delayed second grab returns, so the output is unchanged by the experiment.
-            if (m_grabDelayArmed) m_rotRealMember = 0;
             m_prevKeeper = m_rotRealMember;
             m_prevBatchStart = batch.stampTs;
             m_prevSpacing = m_rotSpacing;
         }
         if (batch.member > 0) m_prevLastMember = batch.member;
         else m_prevLastMember = 0;
-
-        // THE DRIVER'S OWN ANSWER to "did this grab return different content from the last
-        // one", read before the ring decisions because the retraction below needs it.
-        //
-        // -1 when the instrument is off, so the field is always present and unambiguous.
-        //
-        // This once carried a second count over four times the extent, because the map's
-        // layout could not be verified without a capture: if the driver laid it out over
-        // the SOURCE resolution rather than the scaled one, the narrow count would have
-        // been reading half a map. The two agreed exactly on every wake of two captures,
-        // so the geometry is settled and the wide scan is gone.
-        long long changed = -1;
-        if (m_diffMapActive) {
-            const unsigned char* dm = (const unsigned char*)m_diffMapBuf;
-            changed = 0;
-            for (unsigned int b = 0; b < m_diffMapBlocks; b++) {
-                if (dm[b] != 0) changed++;
-            }
-        }
 
         // What this wake does to the ring, decided in the policy layer so it is testable at
         // all: with no rotation guidance (m_rotRealMember < 0 - x2, frame generation off, an
@@ -714,515 +496,33 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         m_ring[slot].timestamp.QuadPart = keep.stampTs;
         m_ring[slot].batchStart.QuadPart = batch.stampTs;
         m_ring[slot].valid = keep.keepThis;
-        m_ring[slot].generated = false;       // a recycled slot never inherits the flag
         m_writeCount = count + 1;
         m_published.store(count + 1);  // publish only after the slot write is GPU-complete
 
-        if (keep.retractPrev) {
+        if (keep.retractPrev && count >= 1) {
             // Retract the previous member (the generated frame): hide it from future brackets.
             // Content is never overwritten, so a present read already in flight stays coherent.
-            RetractGenerated(count, changed);
+            m_ring[(int)((count - 1) % m_ringSlots)].valid = false;
         }
         if (keep.collapsed) collapsed++;
 
         // Verbose: source arrival timeline (dt = inter-arrival gap ≈ source frame period);
         // flush = GPU-completion wait added by the cross-device coherency fix; col = cumulative
-        // batch-collapsed wakes (skipped or retracted frame-gen members); diff = the
-        // driver's change map, see above.
+        // batch-collapsed wakes (skipped or retracted frame-gen members).
         LONGLONG dt = (prevArrival != 0) ? (now.QuadPart - prevArrival) : 0;
-        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld diff=%lld",
+        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld",
             count,
             (long long)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
             (long long)(dt * usPerTick),
             (long long)flushUs,
-            collapsed, changed);
+            collapsed);
 
         if (m_fgPhaseActive) {
             FgPhaseOnWake(batch.member, slot,
                           (LONGLONG)((batch.stampTs - m_baseQpc.QuadPart) * usPerTick),
                           keep.keepThis);
         }
-        if (m_genCheckActive) {
-            GenCheckOnWake(slot, batch.member,
-                           (LONGLONG)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
-                           (LONGLONG)((batch.stampTs - m_baseQpc.QuadPart) * usPerTick),
-                           changed);
-        }
-        // One extra grab per batch, after its second member, where the generated frame
-        // should be by now and nothing will announce it.
-        if (m_lateGrabUs > 0 && batch.member >= 1 && !m_lateGrabDoneThisBatch) {
-            m_lateGrabDoneThisBatch = true;
-            LateGrab(grabParams, batch.stampTs, now.QuadPart, usPerTick);
-        }
-        // -grabdelay bookkeeping: a first member picks the delay for the grab that answers
-        // this batch's second notification; the second member, when it comes, is scored by
-        // the change map against the first (thousands of blocks = a different picture).
-        if (m_grabDelayArmed) {
-            if (batch.member == 0) {
-                m_grabDelayStep = m_grabDelaySteps > 1 ? (m_grabDelayIdx++ % m_grabDelaySteps) : 0;
-                m_gdBatches[m_grabDelayStep]++;
-                m_grabDelayNext = true;
-            } else if (batch.member == 1 && m_grabDelayStep >= 0) {
-                m_gdSecond[m_grabDelayStep]++;
-                m_gdDtSum[m_grabDelayStep] += (LONGLONG)(dt * usPerTick);   // dt is in ticks here
-                if (changed < 0) m_gdNoMap[m_grabDelayStep]++;
-                else if (changed >= 4000) m_gdGenerated[m_grabDelayStep]++;
-            }
-        }
     }
-}
-
-void CaptureRing::PreciseSleep(unsigned int us) {
-    // The driver's high-precision sleep, with a clock spin for whatever it leaves short: the
-    // delay is the experiment, and a sleep that returned early would be read as a result.
-    LARGE_INTEGER t0, t1;
-    QueryPerformanceCounter(&t0);
-    m_nvfbc->NvFBCToDx9VidGPUBasedCPUSleep((__int64)us);
-    const LONGLONG wantTicks = ((LONGLONG)us * m_freqQuad) / 1000000;
-    do {
-        QueryPerformanceCounter(&t1);
-    } while (t1.QuadPart - t0.QuadPart < wantTicks && !m_stop.load());
-}
-
-void CaptureRing::EnableGrabDelay(int delayUs) {
-    m_grabDelayArmed = true;
-    if (delayUs < 0) {
-        // The sweep. Zero is the control. The top must stay under the 3 ms batch threshold
-        // AFTER the loop's own ~700 us of processing is added, or the delayed second member
-        // opens a batch of its own and the step after it inherits a first member that has no
-        // second: the first sweep ran to 2400 and its 2400 step landed at 3.0 ms, leaving 3
-        // second members of 1803 and a corrupted control. Executed dt tops out near 2.5 ms.
-        static const unsigned int kSweep[kGrabDelayMaxSteps] =
-            { 0, 400, 700, 1000, 1200, 1400, 1600, 1800 };
-        m_grabDelaySteps = kGrabDelayMaxSteps;
-        for (int i = 0; i < kGrabDelayMaxSteps; i++) m_grabDelayTable[i] = kSweep[i];
-    } else {
-        m_grabDelaySteps = 1;
-        m_grabDelayTable[0] = (unsigned int)delayUs;
-    }
-}
-
-void CaptureRing::LogGrabDelaySummary() const {
-    if (!m_grabDelayArmed) return;
-    for (int i = 0; i < m_grabDelaySteps; i++) {
-        const long long withMap = m_gdSecond[i] - m_gdNoMap[i];
-        LOG("grabdelay summary: +%u us before the second grab: %lld batches, %lld with a second "
-            "member (executed dt mean %lld us), of which a different picture %lld (%.1f%%)%s",
-            m_grabDelayTable[i], m_gdBatches[i], m_gdSecond[i],
-            m_gdSecond[i] ? (long long)(m_gdDtSum[i] / m_gdSecond[i]) : 0LL,
-            m_gdGenerated[i],
-            withMap > 0 ? 100.0 * (double)m_gdGenerated[i] / (double)withMap : 0.0,
-            m_gdNoMap[i] ? " (some without a change map)" : "");
-    }
-}
-
-// The extra grab. Sleeps the requested delay on the capture thread (the source is between
-// frames; a natural wake in this window would only be a third member of the same batch,
-// which the x2 regime this targets does not produce), then grabs whatever the buffer holds
-// without waiting for a notification. The picture goes to the late slot, the sample check
-// gathers it, and the change map for this grab (against the second member, the grab before
-// it) says whether it is the same picture; the NEXT real frame's change map, on the next
-// capture line, then says whether a different picture was the generated frame (thousands of
-// blocks) or the next real frame arriving early (zero).
-void CaptureRing::LateGrab(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams, LONGLONG batchStartQpc,
-                           LONGLONG lastArrivalQpc, double usPerTick) {
-    PreciseSleep(m_lateGrabUs);
-    NVFBC_TODX9VID_GRAB_FRAME_PARAMS p = *grabParams;
-    p.dwFlags = NVFBC_TODX9VID_NOWAIT;
-    p.dwWaitTime = 0;
-    const NVFBCRESULT res = m_nvfbc->NvFBCToDx9VidGrabFrame(&p);
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (res != NVFBC_SUCCESS) {
-        if (m_lateGrabFailed == 0) {
-            LOGERR("lategrab: no-wait grab returned %d; counted, not fatal", (int)res);
-        }
-        m_lateGrabFailed++;
-        return;
-    }
-    RECT srcRect = { 0, 0, (LONG)m_width, (LONG)m_height };
-    m_capDevice->StretchRect(m_captureTarget, &srcRect, m_lateSurface, &srcRect, D3DTEXF_NONE);
-    if (m_genCheckActive) GenCheckIssue(kGenCheckLateSlot);
-    m_capSync->Issue(D3DISSUE_END);
-    while (m_capSync->GetData(NULL, 0, D3DGETDATA_FLUSH) == S_FALSE) {
-        if (m_stop.load()) break;
-    }
-    LARGE_INTEGER afterFlush;
-    QueryPerformanceCounter(&afterFlush);
-    const LONGLONG flushUs = (afterFlush.QuadPart - now.QuadPart) * 1000000 / m_freqQuad;
-
-    long long changed = -1;
-    if (m_diffMapActive) {
-        const unsigned char* dm = (const unsigned char*)m_diffMapBuf;
-        changed = 0;
-        for (unsigned int b = 0; b < m_diffMapBlocks; b++) {
-            if (dm[b] != 0) changed++;
-        }
-    }
-    m_lateGrabIssued++;
-    if (changed < 0) m_lateGrabNoMap++;
-    else if (changed == 0) m_lateGrabSameByMap++;
-    else m_lateGrabDistinctByMap++;
-
-    const LONGLONG arrUs = (LONGLONG)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick);
-    const LONGLONG batchStartUs = (LONGLONG)((batchStartQpc - m_baseQpc.QuadPart) * usPerTick);
-    // A line of its own, so nothing that reads capture lines counts this as an arrival.
-    LOG("lategrab arr=%lldus after=%lldus flush=%lldus diff=%lld",
-        (long long)arrUs, (long long)((now.QuadPart - lastArrivalQpc) * usPerTick),
-        (long long)flushUs, changed);
-    if (m_genCheckActive) GenCheckOnWake(kGenCheckLateSlot, 2, arrUs, batchStartUs, changed);
-}
-
-void CaptureRing::LogLateGrabSummary() const {
-    if (m_lateGrabUs == 0) return;
-    LOG("lategrab summary: %lld issued %u us after the second member, %lld failed; by the change "
-        "map: %lld same picture as the member before, %lld a different picture, %lld without a "
-        "map. The next capture line's diff= after each distinct one says whether it was the "
-        "generated frame (thousands of blocks) or the next real frame (zero).",
-        m_lateGrabIssued, m_lateGrabUs, m_lateGrabFailed, m_lateGrabSameByMap,
-        m_lateGrabDistinctByMap, m_lateGrabNoMap);
-}
-
-// ---------------------------------------------------------------------------------------
-// -gencheck: the sample check. See EnableGenCheck for what it decides and why it is a
-// gather rather than a read.
-// ---------------------------------------------------------------------------------------
-
-// Stratified sample positions: one jittered point per cell of the grid, from a fixed seed,
-// so every run samples the same texels and two runs are comparable. The jitter stays inside
-// the middle 90% of the cell so no sample sits on a cell boundary. An equality test cannot
-// be gamed by a static pattern; a sample either lands in the region that differs or not.
-static void GenCheckPositions(float* u, float* v, int n, int grid) {
-    unsigned int s = 0x9E3779B9u;
-    for (int i = 0; i < n; i++) {
-        const int cx = i % grid, cy = i / grid;
-        s = s * 1664525u + 1013904223u;
-        const float ju = (float)(s >> 8) / 16777216.0f;
-        s = s * 1664525u + 1013904223u;
-        const float jv = (float)(s >> 8) / 16777216.0f;
-        u[i] = ((float)cx + 0.05f + 0.9f * ju) / (float)grid;
-        v[i] = ((float)cy + 0.05f + 0.9f * jv) / (float)grid;
-    }
-}
-
-bool CaptureRing::GenCheckSetup() {
-    HRESULT hr = S_OK;
-    for (int i = 0; i <= RING_SIZE && SUCCEEDED(hr); i++) {
-        // Ring slots in use, plus the late-grab slot when that experiment is armed.
-        if (i >= m_ringSlots && !(i == kGenCheckLateSlot && m_lateGrabUs > 0)) continue;
-        hr = m_capDevice->CreateRenderTarget(kGenCheckSamples, 1, D3DFMT_A2B10G10R10,
-                                             D3DMULTISAMPLE_NONE, 0, FALSE,
-                                             &m_genCheck[i].rt, NULL);
-        if (SUCCEEDED(hr)) {
-            hr = m_capDevice->CreateOffscreenPlainSurface(kGenCheckSamples, 1,
-                                                          D3DFMT_A2B10G10R10,
-                                                          D3DPOOL_SYSTEMMEM,
-                                                          &m_genCheck[i].sys, NULL);
-        }
-    }
-    if (SUCCEEDED(hr)) {
-        hr = m_capDevice->CreateRenderTarget(kGenCheckSamples, 1, D3DFMT_A2B10G10R10,
-                                             D3DMULTISAMPLE_NONE, 0, FALSE, &m_gcSelfRt, NULL);
-    }
-    if (SUCCEEDED(hr)) {
-        hr = m_capDevice->CreateOffscreenPlainSurface(kGenCheckSamples, 1, D3DFMT_A2B10G10R10,
-                                                      D3DPOOL_SYSTEMMEM, &m_gcSelfSys, NULL);
-    }
-    // One quad per sample, covering exactly output pixel i of the one-row target, with a
-    // constant texture coordinate at the sample position so the fixed-function stage reads
-    // one point-sampled texel of the slot. No shader on the capture device, the whole gather
-    // is one draw call, and the vertices are written once: nothing is uploaded per wake.
-    if (SUCCEEDED(hr)) {
-        hr = m_capDevice->CreateVertexBuffer(kGenCheckSamples * 6 * sizeof(GenCheckVertex),
-                                             D3DUSAGE_WRITEONLY, D3DFVF_XYZRHW | D3DFVF_TEX1,
-                                             D3DPOOL_DEFAULT, &m_genCheckVb, NULL);
-    }
-    void* vbMem = NULL;
-    if (SUCCEEDED(hr)) hr = m_genCheckVb->Lock(0, 0, &vbMem, 0);
-    if (FAILED(hr)) {
-        LOGERR("gencheck instrument setup failed (0x%08x): refusing to start. The instrument "
-               "does not fall back while it is under test", hr);
-        GenCheckRelease();
-        return false;
-    }
-    float u[kGenCheckSamples], v[kGenCheckSamples];
-    GenCheckPositions(u, v, kGenCheckSamples, kGenCheckGrid);
-    GenCheckVertex* verts = (GenCheckVertex*)vbMem;
-    for (int i = 0; i < kGenCheckSamples; i++) {
-        const float x0 = (float)i, x1 = (float)(i + 1);
-        GenCheckVertex* q = verts + i * 6;
-        const float xs[6] = { x0, x1, x0, x1, x1, x0 };
-        const float ys[6] = { 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f };
-        for (int k = 0; k < 6; k++) {
-            q[k].x = xs[k];
-            q[k].y = ys[k];
-            q[k].z = 0.5f;
-            q[k].rhw = 1.0f;
-            q[k].u = u[i];
-            q[k].v = v[i];
-        }
-    }
-    m_genCheckVb->Unlock();
-    m_genCheckActive = true;
-    LOG("gencheck instrument ACTIVE: %d samples on a %dx%d stratified grid, gathered on the "
-        "capture device behind each slot copy, read back one wake later; gencheck: lines "
-        "carry the sample verdict beside the driver's diff= for every second member, and "
-        "same_prev= compares each batch's first member with the previous batch's",
-        kGenCheckSamples, kGenCheckGrid, kGenCheckGrid);
-    return true;
-}
-
-// The instrument is under test. A failure that fell back to "instrument off" would let a
-// capture run to completion believing it measured something, which costs the same minutes
-// as a stop and teaches less. So any failure past setup stops the relay, attributably, the
-// way an invalidated NvFBC session does: the present loop sees the ring stop and ends the
-// run, the session is released, and the log ends on the line that says why.
-void CaptureRing::GenCheckFatal(const char* what) {
-    LOGERR("gencheck FATAL: %s. Stopping the relay: the instrument does not fall back while "
-           "it is under test", what);
-    m_genCheckActive = false;
-    m_genCheckPending = -1;
-    m_gcSelfPending = false;
-    m_stop.store(true);
-}
-
-void CaptureRing::GenCheckRelease() {
-    for (int i = 0; i <= RING_SIZE; i++) {
-        if (m_genCheck[i].rt)  { m_genCheck[i].rt->Release();  m_genCheck[i].rt = NULL; }
-        if (m_genCheck[i].sys) { m_genCheck[i].sys->Release(); m_genCheck[i].sys = NULL; }
-    }
-    if (m_gcSelfRt)     { m_gcSelfRt->Release();     m_gcSelfRt = NULL; }
-    if (m_gcSelfSys)    { m_gcSelfSys->Release();    m_gcSelfSys = NULL; }
-    if (m_genCheckVb)   { m_genCheckVb->Release();   m_genCheckVb = NULL; }
-    m_genCheckActive = false;
-    m_genCheckPending = -1;
-    m_gcSelfPending = false;
-}
-
-void CaptureRing::GenCheckIssue(int slot) {
-    IDirect3DTexture9* source = (slot == kGenCheckLateSlot) ? m_lateTexture
-                                                            : m_ring[slot].capTexture;
-    bool ok = GenCheckDraw(m_genCheck[slot].rt, source);
-    // Self-test on the first wakes: the same slot gathered again into the spare target,
-    // read back with the slot's own row on the next wake and compared word for word. There
-    // is ONE spare target, and it is read at the end of the following wake, after this
-    // point in that wake; drawing into it here while it still holds an unread gather would
-    // compare two different frames, so the test runs on alternate wakes.
-    if (ok && m_gcSelfTestsLeft > 0 && !m_gcSelfPending) {
-        ok = GenCheckDraw(m_gcSelfRt, m_ring[slot].capTexture);
-        if (ok) {
-            m_gcSelfPending = true;
-            m_gcSelfSlot = slot;
-        }
-    }
-    if (!ok) GenCheckFatal("gather draw failed");
-}
-
-bool CaptureRing::GenCheckRead(IDirect3DSurface9* rt, IDirect3DSurface9* sys, DWORD* words) {
-    if (FAILED(m_capDevice->GetRenderTargetData(rt, sys))) return false;
-    D3DLOCKED_RECT lr;
-    if (FAILED(sys->LockRect(&lr, NULL, D3DLOCK_READONLY))) return false;
-    memcpy(words, lr.pBits, sizeof(DWORD) * kGenCheckSamples);
-    sys->UnlockRect();
-    return true;
-}
-
-bool CaptureRing::GenCheckDraw(IDirect3DSurface9* target, IDirect3DTexture9* source) {
-    IDirect3DSurface9* oldRt = NULL;
-    m_capDevice->GetRenderTarget(0, &oldRt);
-    HRESULT hr = m_capDevice->SetRenderTarget(0, target);
-    if (SUCCEEDED(hr)) {
-        // Full state every time: nothing else draws on this device, but NvFBC owns it
-        // between wakes and nothing here may depend on what it left behind.
-        m_capDevice->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
-        m_capDevice->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-        m_capDevice->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-        m_capDevice->SetRenderState(D3DRS_LIGHTING, FALSE);
-        m_capDevice->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-        m_capDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-        m_capDevice->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-        m_capDevice->SetRenderState(D3DRS_FOGENABLE, FALSE);
-        m_capDevice->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
-        m_capDevice->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
-        m_capDevice->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
-        m_capDevice->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-        m_capDevice->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-        m_capDevice->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-        m_capDevice->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-        m_capDevice->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
-        m_capDevice->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-        m_capDevice->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-        m_capDevice->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-        m_capDevice->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-        m_capDevice->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-        m_capDevice->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-        m_capDevice->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-        m_capDevice->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, 0);
-        m_capDevice->SetPixelShader(NULL);
-        m_capDevice->SetVertexShader(NULL);
-        m_capDevice->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-        m_capDevice->SetStreamSource(0, m_genCheckVb, 0, sizeof(GenCheckVertex));
-        m_capDevice->SetTexture(0, source);
-        hr = m_capDevice->BeginScene();
-        if (SUCCEEDED(hr)) {
-            hr = m_capDevice->DrawPrimitive(D3DPT_TRIANGLELIST, 0, kGenCheckSamples * 2);
-            m_capDevice->EndScene();
-        }
-        m_capDevice->SetTexture(0, NULL);
-        if (oldRt) m_capDevice->SetRenderTarget(0, oldRt);
-    }
-    if (oldRt) oldRt->Release();
-    if (FAILED(hr)) LOGERR("gencheck: gather draw failed (0x%08x)", hr);
-    return SUCCEEDED(hr);
-}
-
-void CaptureRing::GenCheckOnWake(int slot, int member, LONGLONG arrUs, LONGLONG batchStartUs,
-                                 long long changed) {
-    // The gather issued on the PREVIOUS wake is finished: the flush this wake waited on
-    // covered everything queued before it. Copy the one row and compare.
-    if (m_genCheckPending >= 0) {
-        GenCheckSlot& g = m_genCheck[m_genCheckPending];
-        DWORD words[kGenCheckSamples];
-        LARGE_INTEGER t0, t1;
-        QueryPerformanceCounter(&t0);
-        const bool ok = GenCheckRead(g.rt, g.sys, words);
-        QueryPerformanceCounter(&t1);
-        if (!ok) {
-            GenCheckFatal("readback failed");
-            return;
-        }
-        const LONGLONG rbUs = (t1.QuadPart - t0.QuadPart) * 1000000 / m_freqQuad;
-        m_gcRbHist[rbUs < 0 ? 0 : (rbUs >= kGenCheckRbBins ? kGenCheckRbBins - 1 : (int)rbUs)]++;
-        m_gcRbCount++;
-        if (rbUs > m_gcRbWorstUs) m_gcRbWorstUs = rbUs;
-
-        // Self-test: the spare target holds a second gather of some slot. Compare only when
-        // THIS readback is that slot's; a spare drawn earlier this same wake belongs to the
-        // slot read on the next wake and must be left pending until then. (Clearing it on
-        // the mismatch retired every test after the first, which the first field run
-        // reported as 1 of 3 passed.)
-        if (m_gcSelfPending && m_gcSelfSlot == m_genCheckPending) {
-            DWORD self[kGenCheckSamples];
-            m_gcSelfPending = false;
-            if (GenCheckRead(m_gcSelfRt, m_gcSelfSys, self)) {
-                int d = 0;
-                for (int i = 0; i < kGenCheckSamples; i++) if (self[i] != words[i]) d++;
-                if (d != 0) {
-                    LOGERR("gencheck self-test FAILED: two gathers of one slot differ on %d of %d "
-                           "samples; the gather is not deterministic", d, kGenCheckSamples);
-                    GenCheckFatal("self-test failed");
-                    return;
-                }
-                m_gcSelfPassed++;
-                m_gcSelfTestsLeft--;
-                if (m_gcSelfTestsLeft == 0) {
-                    LOG("gencheck self-test passed: %lld same-slot gathers read identical",
-                        m_gcSelfPassed);
-                }
-            }
-        }
-        // A gather whose words are all one value on gameplay read one texel or nothing.
-        // Legitimate on a black fade, so counted rather than fatal; the summary reports it
-        // and a count comparable to the frame count means the instrument is blind.
-        {
-            int sameAsFirst = 0;
-            for (int i = 0; i < kGenCheckSamples; i++) if (words[i] == words[0]) sameAsFirst++;
-            if (sameAsFirst == kGenCheckSamples) m_gcDegenerate++;
-        }
-
-        int same = -1, ndiff = -1, samePrev = -1, ndiffPrev = -1;
-        if (g.member == 0) {
-            // Batch to batch: the picture the source delivered under a new timestamp
-            // against the picture it delivered under the previous one. On moving content
-            // this differs on most samples, which is the positive control: a median near
-            // zero in gameplay means the instrument is not reading the frame.
-            if (m_gcPrevFirstValid) {
-                ndiffPrev = 0;
-                for (int i = 0; i < kGenCheckSamples; i++)
-                    if (words[i] != m_gcPrevFirst[i]) ndiffPrev++;
-                samePrev = ndiffPrev == 0 ? 1 : 0;
-                m_gcPrevCompared++;
-                if (samePrev) m_gcPrevRepeats++;
-                m_gcNdiffPrevHist[ndiffPrev]++;
-            }
-            memcpy(m_gcPrevFirst, words, sizeof(words));
-            m_gcPrevFirstValid = true;
-            if (m_gcFirstArrUs < 0) m_gcFirstArrUs = g.arrUs;
-            m_gcLastArrUs = g.arrUs;
-        } else if (m_gcLastValid && m_gcLastBatchStartUs == g.batchStartUs) {
-            // Within the batch: member m against member m-1, which is the pair the driver's
-            // change map for this grab describes.
-            ndiff = 0;
-            for (int i = 0; i < kGenCheckSamples; i++)
-                if (words[i] != m_gcLast[i]) ndiff++;
-            same = ndiff == 0 ? 1 : 0;
-            m_gcPairs++;
-            if (g.changed < 0) m_gcPairsNoMap++;
-            else if (g.changed == 0 && same) m_gcAgree++;
-            else if (g.changed > 0 && !same) m_gcAgree++;
-            else if (g.changed == 0) m_gcDriverDupeSamplesDiffer++;
-            else m_gcDriverChangeSamplesSame++;
-        }
-        memcpy(m_gcLast, words, sizeof(words));
-        m_gcLastValid = true;
-        m_gcLastBatchStartUs = g.batchStartUs;
-
-        // Keyed by the arrival it describes, so the line joins to its capture line offline.
-        LOG("gencheck: arr=%lldus m=%d blocks=%lld same=%d ndiff=%d same_prev=%d "
-            "ndiff_prev=%d rb=%lldus",
-            (long long)g.arrUs, g.member, g.changed, same, ndiff, samePrev, ndiffPrev,
-            (long long)rbUs);
-        m_genCheckPending = -1;
-    }
-
-    // This wake's gather becomes the pending one.
-    GenCheckSlot& n = m_genCheck[slot];
-    n.member = member;
-    n.arrUs = arrUs;
-    n.batchStartUs = batchStartUs;
-    n.changed = changed;
-    m_genCheckPending = slot;
-}
-
-void CaptureRing::LogGenCheckSummary() const {
-    if (!m_genCheckRequested) return;
-    if (m_gcRbCount == 0) {
-        LOG("gencheck summary: no readbacks (%s)",
-            m_genCheckActive ? "active but never woke" : "stopped on a fatal error first");
-        return;
-    }
-    LONGLONG median = 0, p95 = 0;
-    long long acc = 0;
-    bool haveMedian = false;
-    for (int b = 0; b < kGenCheckRbBins; b++) {
-        acc += m_gcRbHist[b];
-        if (!haveMedian && acc * 2 >= m_gcRbCount) { median = b; haveMedian = true; }
-        if (acc * 20 >= m_gcRbCount * 19) { p95 = b; break; }
-    }
-    const long long withMap = m_gcPairs - m_gcPairsNoMap;
-    const double minutes = (m_gcLastArrUs > m_gcFirstArrUs)
-                               ? (double)(m_gcLastArrUs - m_gcFirstArrUs) / 60000000.0 : 0.0;
-    // Median of the batch-to-batch difference, the positive control.
-    int ndiffPrevMedian = 0;
-    long long nacc = 0;
-    for (int b = 0; b <= kGenCheckSamples; b++) {
-        nacc += m_gcNdiffPrevHist[b];
-        if (nacc * 2 >= m_gcPrevCompared) { ndiffPrevMedian = b; break; }
-    }
-    LOG("gencheck summary: %lld pairs, agree %lld (%.1f%% of %lld with a map), "
-        "driver-dupe/samples-differ %lld, driver-change/samples-same %lld, no-map %lld; "
-        "batch-to-batch repeats %lld of %lld first members (%.2f/min), "
-        "batch-to-batch ndiff median %d of %d; "
-        "readback median %lld us p95 %lld us worst %lld us over %lld readbacks; "
-        "controls: self-test %lld/%d passed, degenerate gathers %lld%s",
-        m_gcPairs, m_gcAgree, withMap > 0 ? 100.0 * (double)m_gcAgree / (double)withMap : 0.0,
-        withMap, m_gcDriverDupeSamplesDiffer, m_gcDriverChangeSamplesSame, m_gcPairsNoMap,
-        m_gcPrevRepeats, m_gcPrevCompared,
-        minutes > 0.0 ? (double)m_gcPrevRepeats / minutes : 0.0,
-        ndiffPrevMedian, kGenCheckSamples,
-        (long long)median, (long long)p95, (long long)m_gcRbWorstUs, m_gcRbCount,
-        m_gcSelfPassed, kGenCheckSelfTestWakes, m_gcDegenerate,
-        m_genCheckActive ? "" : " (the instrument stopped the relay on a fatal error)");
 }
 
 // Downscale a ring surface on the GPU, read it back, convert to blurred luma. The blur
@@ -1369,41 +669,8 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, const policy::StampOverlay* ov
     if (oldest < 0) oldest = 0;
 
     LONGLONG bestBeforeDiff = LLONG_MAX, bestAfterDiff = LLONG_MAX;
-    LONGLONG bestGenDiff = LLONG_MAX;
     for (long long i = p - 1; i >= oldest; i--) {
         int slot = (int)(i % m_ringSlots);
-        // Retracted generated frames are reachable but never endpoints, so they are
-        // collected on a separate side channel and cannot reach any caller that only reads
-        // hasBefore/hasAfter.
-        //
-        // The correction is the MEAN of its two neighbours' corrections, because the stamp
-        // is a placement between them: correcting the endpoints while leaving the frame
-        // that sits between them alone would slide it relative to the very interval the
-        // passthrough gate measures. With dejitter off both terms are zero and this is the
-        // raw placement.
-        if (m_ring[slot].generated) {
-            LONGLONG ts = m_ring[slot].timestamp.QuadPart;
-            if (overlay) {
-                ts = policy::CorrectGeneratedStamp(
-                    ts, overlay->CorrectionFor(m_ring[slot].batchStart.QuadPart),
-                    overlay->CorrectionFor(m_ring[slot].genPrevBatchStart.QuadPart));
-            }
-            LONGLONG d = targetQpc - ts;
-            if (d < 0) d = -d;
-            if (d < bestGenDiff) {
-                bestGenDiff = d;
-                out->genScreened = m_diffMapActive;
-                out->info.hasGen = true;
-                // The CORRECTED placement, on the same timeline as the endpoints above:
-                // the policy compares this against the last output and against the gate.
-                out->info.genTs = ts;
-                out->info.genDiff = d;
-                out->genSurface = m_ring[slot].mainSurface;
-                out->genTexture = m_ring[slot].mainTexture;
-                out->genSlot = slot;
-            }
-            continue;
-        }
         if (!m_ring[slot].valid) continue;
         LONGLONG ts = m_ring[slot].timestamp.QuadPart;
         // Corrections are measured PER BATCH, so they are looked up by the slot's batch

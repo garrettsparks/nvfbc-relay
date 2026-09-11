@@ -1,37 +1,35 @@
 #pragma once
 
 #include "IFrameCaptureMode.h"
-#include "IFrameCompositor.h"
 #include "PresentScheduler.h"
 #include "CaptureRing.h"
-#include "FrameMarker.h"
 #include "TemporalPolicy.h"
 #include "EtwConsumer.h"
 
-// Defined in FrameCompositors.h and D3D11Present.h, which this header deliberately does not
-// pull in: only the implementation needs the concrete types.
-class SynthCompositorBase;
-class D3D11PresentBackend;
+// Defined in IPresentPath.h, which this header deliberately does not pull in: only the
+// implementation needs the concrete present paths.
+class IPresentPath;
 
-// Temporal capture mode — nearest-frame selection for smooth fixed-rate capture of a
-// (possibly variable-rate) source.
+// Temporal capture mode: frame selection and composition for smooth fixed-rate capture of
+// a (possibly variable-rate) source.
 //
 // Composition of the shared pieces plus a trivial selection step:
-//   CaptureRing      — capture thread fills a ring with source frames stamped at arrival.
-//   Present timing   — two options (the <selection>:<present> framework's present axis):
-//                      timer  (t:60)    — PresentScheduler's absolute-QPC deadline drives it.
-//                      vsync  (t:vsync) — the INTERVAL_ONE present blocks on DWM's compose clock
-//                                         (windowed flips always ride DWM). That clock is
-//                                         regime-dependent: on a composed desktop it is the
-//                                         PRIMARY/source display ("wrong display", known and
-//                                         accepted); under a fullscreen game on the source, DWM
-//                                         composes only the card's display and the present
-//                                         becomes card-locked 60 Hz — the production use case
-//                                         (spec Rounds 5-10).
-//   This mode        — each present: aim a content target lagged a fixed bracketing delay
-//                      behind, bracket it in the ring, hand the bracket to the compositor
-//                      (nearest copies one real frame; blend lerps the pair; interp
-//                      motion-compensates the pair), present.
+//   CaptureRing      - capture thread fills a ring with source frames stamped at arrival.
+//   Present timing   - two options (the <selection>:<present> framework's present axis):
+//                      timer  (t:60)    - PresentScheduler's absolute-QPC deadline drives it.
+//                      vsync  (t:vsync) - the present path's own blocking wait drives it, and
+//                                         which clock that is belongs to the path: DWM's
+//                                         compose clock on the D3D9 swapchain (regime-
+//                                         dependent: the source display's rate on a composed
+//                                         desktop, card-locked 60 Hz under a fullscreen game),
+//                                         the SINK's vblank on the D3D11 flip-model swapchain.
+//   Present path     - everything from the bracket to the screen: the compositor (nearest
+//                      copies one real frame; blend lerps the pair; interp motion-compensates
+//                      the pair), the marker, the swapchain and its statistics. This loop
+//                      never asks which path it is driving.
+//   This mode        - each present: aim a content target lagged a fixed bracketing delay
+//                      behind, bracket it in the ring, hand the bracket to the present path,
+//                      log the line.
 
 // Which compositor the mode letter selected (t nearest, b blend, o interp).
 enum CompositorKind {
@@ -56,19 +54,21 @@ private:
     LONGLONG m_assumedSrcPeriodQpc; // declared/default source period the lag was sized for
     policy::PolicyConfig m_policyCfg;    // stickiness band, comb spacing (0 = lock off), pull slew, passthrough gate
     policy::PhaseLockState m_lockState;  // comb-lock pull/EMAs/gate (pure policy state)
-    IFrameCompositor* m_compositor; // owned; picked at Setup from m_compositorKind
+    // THE PRESENT PATH. Owned. Constructed with the mode, before any device exists, so main
+    // can ask whether the output window belongs to it before creating the D3D9 device; its
+    // device work happens in Setup, after the ring has started. The compositor lives behind
+    // it, so this class holds no compositor of its own.
+    IPresentPath* m_present;
     int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
     CompositorKind m_compositorKind;
     bool m_lock;                    // -lock: opt in to the comb lock (needs -src); default off
     bool m_mark;                    // -mark: burn the frame-counter marker (debug); default off
     unsigned int m_markFrames;      // -mark N: burn only the first N presents; 0 = all (unset)
-    bool m_tint;                    // -tint: border-tint synthesized frames (blend mode, debug)
-    bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: vblank present (t:vsync)
+    bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: the path's blocking present (t:vsync)
     LARGE_INTEGER m_baseQpc;        // logging time origin
     float m_targetFramerate;
     float m_srcRateHint;            // declared source fps (-src); 0 = unset, assume >= 60
     IDirect3DDevice9Ex* m_device;
-    FrameMarker m_marker;           // per-present provenance burn-in (inert unless -mark)
     bool m_etw;                     // -etw: read the driver's scanout times while capturing
     // -nojoin: keep the ETW session and its flip lines, skip the per-present grid lookup.
     // The A/B control for the join itself: -etw off logs no flips, so it cannot answer
@@ -94,26 +94,7 @@ private:
     // later than the target. The cost is that they become blends, not passthroughs.
     unsigned int m_extraLagMs;
     bool m_phaseKeepRequested;      // asked for, so an unmet prerequisite can say so once
-    // -subgen: present the driver's retracted generated frame where a blend would go.
-    bool m_subGen;
-    // -diffmap: the NvFBC difference-map instrument, forwarded to the ring at Setup.
-    bool m_diffMap;
-    // -gencheck: the sample-check referee for the difference map, forwarded to the ring.
-    bool m_genCheck;
-    // -lategrab N: one extra no-wait grab per batch, N us after the second member.
-    unsigned int m_lateGrabUs;
-    // -grabdelay: delay the second grab of every batch by N us (negative = sweep a table).
-    int m_grabDelayUs;
-    // The synth compositor when one is in use, for the substitution counters. Aliases
-    // m_compositor and is never deleted through this pointer.
-    SynthCompositorBase* m_synth = NULL;
-    // b:flip: decide, composite and present through a D3D11 flip-model swapchain on the
-    // output window, so that Windows can promote the present to independent flip and the
-    // present blocks on the SINK's vblank instead of DWM's compose clock. Owned. When set,
-    // m_compositor is NULL: the backend owns the composite decision and the marker, and
-    // the D3D9 swapchain never presents.
-    bool m_d3d11Present;
-    D3D11PresentBackend* m_present11 = NULL;
+    char m_modeName[64];            // GetModeName: the compositor kind and the present path
     policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
     policy::StampOverlay m_overlay;      // present-thread-owned; FindBracket reads through it
     long long m_nextBatch = 0;           // cursor into the ring's batch-start history
@@ -138,13 +119,13 @@ private:
     LONGLONG LagForSourcePeriod(LONGLONG srcPeriodQpc) const;
 
 public:
+    // d3d11Present selects the D3D11 flip-model present path, which carries the blend
+    // compositor only; the parser pairs it with kCompositorBlend and nothing else.
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
                         bool lock = false, CompositorKind compositor = kCompositorNearest,
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
                         bool etw = false, bool noJoin = false, bool dejitter = false,
                         bool fgPhase = false, bool phaseKeep = false,
-                        bool subGen = false, bool diffMap = false, bool genCheck = false,
-                        unsigned int lateGrabUs = 0, int grabDelayUs = 0,
                         unsigned int extraLagMs = 0, bool d3d11Present = false);
     virtual ~TemporalCaptureMode();
 
@@ -153,7 +134,8 @@ public:
     // The temporal modes rebind NvFBC to CaptureRing's private capture device, so the present
     // device is free to live on the adapter that actually owns the output window.
     virtual bool PresentsOnTargetAdapter() const override { return true; }
-    virtual bool PresentsViaD3D11() const override { return m_d3d11Present; }
+    // A property of the chosen present path, not of the mode.
+    virtual bool PresentsViaD3D11() const override;
     virtual bool Setup() override;
     virtual void Run(
         NvFBCToDx9Vid* nvfbcDx9,

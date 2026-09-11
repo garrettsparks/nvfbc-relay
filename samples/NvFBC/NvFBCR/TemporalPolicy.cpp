@@ -13,21 +13,6 @@ const char* PickLabel(Pick p) {
     }
 }
 
-// Map a tick offset into [-p/2, p/2): the signed distance to the nearest point on a
-// p-periodic timeline. C++ % truncates toward zero, so negative remainders need folding up.
-bool PlaceGeneratedFrame(int64_t beforeTs, int64_t afterTs, int member, int members,
-                         int64_t* outTs) {
-    if (members < 2 || member < 0 || member >= members - 1) return false;
-    if (beforeTs >= afterTs) return false;
-    *outTs = beforeTs + (afterTs - beforeTs) * (member + 1) / members;
-    return true;
-}
-
-int64_t CorrectGeneratedStamp(int64_t placedTs, int64_t correctionNewer,
-                              int64_t correctionOlder) {
-    return placedTs - (correctionNewer + correctionOlder) / 2;
-}
-
 int RingSlotsForLag(int64_t bracketingDelayQpc, int64_t srcPeriodQpc, int minSlots,
                     int maxSlots) {
     const int64_t wakePeriod = srcPeriodQpc / 2;   // x2 delivers ~2 wakes per source frame
@@ -37,6 +22,8 @@ int RingSlotsForLag(int64_t bracketingDelayQpc, int64_t srcPeriodQpc, int minSlo
     return (int)want;
 }
 
+// Map a tick offset into [-p/2, p/2): the signed distance to the nearest point on a
+// p-periodic timeline. C++ % truncates toward zero, so negative remainders need folding up.
 int64_t WrapHalf(int64_t d, int64_t p) {
     int64_t m = (d + p / 2) % p;
     if (m < 0) m += p;
@@ -837,16 +824,13 @@ const char* CompositeLabel(CompositeOp op) {
         case CompositeOp::PassthroughBefore:   return "pass-before";
         case CompositeOp::PassthroughAfter:    return "pass-after";
         case CompositeOp::Synthesize:          return "synth";
-        case CompositeOp::PassthroughGenerated: return "pass-gen";
         case CompositeOp::HoldComb:            return "hold-comb";
         default:                               return "hold";
     }
 }
 
 // The passthrough gate as this present sees it: a one-sided Schmitt band that widens only
-// the exit from passing. Factored out so the substitution rule and the composite decision
-// cannot drift apart - the caller runs the first to decide whether to pay for a content
-// check, and the second must reach the same conclusion from the same bracket.
+// the exit from passing.
 static int64_t PassthroughGate(const CompositeState& s, const PolicyConfig& cfg) {
     const int64_t band = (cfg.stickinessQpc < cfg.passthroughQpc / 4)
                              ? cfg.stickinessQpc : cfg.passthroughQpc / 4;
@@ -874,10 +858,6 @@ static int64_t PassthroughGate(const CompositeState& s, const PolicyConfig& cfg)
 // the largest sub-tooth advance a faster compose clock produces is 3/4 of a period (the
 // 4x case), the smallest legitimate cover is a full period. Compose clocks beyond 4x the
 // source would need a finer cut; none exists in this pipeline.
-//
-// Factored out for the same reason as PassthroughGate: the substitution rule and the
-// composite decision must reach the same verdict from the same bracket, or the
-// substitution re-opens the manufactured tooth the guard closed.
 static bool SynthWouldManufactureTooth(const BracketInfo& b, const CompositeState& s,
                                        const PolicyConfig& cfg) {
     if (cfg.srcPeriodQpc <= 0) return false;
@@ -897,39 +877,6 @@ int64_t ToothGuardPeriod(int64_t srcPeriodQpc, int64_t sinkPeriodQpc, bool combO
 int64_t PassthroughThreshold(int64_t srcPeriodQpc, int64_t presentPeriodQpc) {
     if (srcPeriodQpc / 2 <= presentPeriodQpc / 4) return presentPeriodQpc / 4;
     return srcPeriodQpc / 4;
-}
-
-bool GeneratedCandidateOnTarget(const BracketInfo& b, const CompositeState& s,
-                                const PolicyConfig& cfg) {
-    if (!b.hasGen || !b.hasBefore || !b.hasAfter) return false;
-
-    // Only where a blend would otherwise happen. A present with a real frame on target is
-    // already showing real pixels at the right instant and has nothing to gain.
-    const int64_t gate = PassthroughGate(s, cfg);
-    if (b.beforeDiff < gate || b.afterDiff < gate) return false;
-
-    // Where the tooth guard re-presents rather than blends, there is no blend to stand in
-    // for. A generated frame sits mid-tooth by construction, so without this mirror every
-    // guarded present would substitute instead, showing generated content at the compose
-    // rate - the same parity lottery the guard exists to close.
-    if (SynthWouldManufactureTooth(b, s, cfg)) return false;
-
-    // The gate is the BARE threshold, deliberately not the widened band: the band exists
-    // to stop a parked phase chattering between passing and synthesizing on the same
-    // endpoint, and a generated frame is a different frame each time, so there is no loop
-    // to damp. Reusing the threshold rather than adding a tunable is what makes this free:
-    // it is already the relay's definition of close enough to show sharp.
-    if (b.genDiff > cfg.passthroughQpc) return false;
-
-    // Strictly newer than the last output, not merely non-regressing. The composite's own
-    // monotone guard permits equality because a pull wrap legitimately re-presents one
-    // instant per beat; here equality means showing the same content twice on purpose.
-    if (b.genTs <= s.lastOutputTs) return false;
-
-    // Never the frame the previous substitution showed.
-    if (b.genTs == s.lastGenTs) return false;
-
-    return true;
 }
 
 CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
@@ -956,7 +903,6 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
     int64_t outputTs = 0;
     bool passAfter = s.lastPassAfter;
     bool synth = false;
-    bool showedGen = false;
     if (eligibleBefore && eligibleAfter) {
         // Both real frames are on target (the normal case when the source oversamples
         // the present: the bracket spans less than two thresholds). Side choice holds
@@ -982,19 +928,6 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
         d.op = CompositeOp::PassthroughAfter;
         outputTs = b.afterTs;
         passAfter = true;
-    } else if (b.genUsable && GeneratedCandidateOnTarget(b, s, cfg)) {
-        // The driver already rendered a frame at this instant and keep-real retracted it.
-        // Presenting it beats interpolating: it is sharp where a blend doubles edges, and
-        // it is the source's own content rather than an estimate of it.
-        //
-        // synth stays TRUE on purpose. That flag is the pass/synth Schmitt state, and this
-        // present did not pass a bracket endpoint through - both were outside the gate.
-        // Leaving it true keeps the endpoint hysteresis behaving exactly as it does today,
-        // so the substitution cannot perturb any passthrough decision.
-        d.op = CompositeOp::PassthroughGenerated;
-        synth = true;
-        outputTs = b.genTs;
-        showedGen = true;
     } else if (b.hasBefore && b.hasAfter) {
         // No real frame near the target but both endpoints exist. If the target has not
         // advanced a tooth past the last output, the comb owes it nothing: re-present
@@ -1039,9 +972,6 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
     s.lastPassAfter = passAfter;
     s.lastSynth = synth;
     s.lastTargetTs = b.beforeTs + b.beforeDiff;
-    // After the monotone guard, so a demoted present cannot record a frame it never
-    // showed and lock the no-reuse rule against a substitution that never happened.
-    if (showedGen) s.lastGenTs = outputTs;
     return d;
 }
 

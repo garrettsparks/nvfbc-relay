@@ -116,35 +116,6 @@ bool g_fgPhase = false;
 // votes the rotation phase from arrival timing and keeps member 0 through the [real,gen]
 // class, lifting real content from 2 of every 6 outputs to 4 of 6. Inert at x2 and FG off.
 bool g_phaseKeep = false;
-// -subgen: where blend mode would interpolate, present the driver-generated frame keep-real
-// retracted instead, when one sits on the target and its pixels are not a capture-race copy
-// of a real frame. Sharp where a blend doubles edges. Inert wherever nothing is retracted
-// (frame generation off, a source that pairs nothing), and inert outside blend modes.
-bool g_subGen = false;
-// -diffmap: DIAGNOSTIC. Ask NvFBC for its own per-block difference map with each grab and
-// log how many blocks it reports changed (diff= on the capture line). Decides nothing. It
-// exists to test whether the driver already knows what the generated-frame content check
-// re-derives with a GPU readback: a capture-race duplicate is a grab that returned the same
-// content as the previous one, which is an all-zero map. Run with -fgphase, whose per-batch
-// gdiff is the ground truth to join against.
-bool g_diffMap = false;
-// -gencheck: DIAGNOSTIC. A referee for the change map: 256 texels of every published slot,
-// gathered on the capture device and read back one wake later, say whether two grabs really
-// returned the same picture. Logged beside diff= as gencheck: lines, and as a batch-to-batch
-// compare that counts pictures the source delivered twice under two timestamps. Decides
-// nothing. Runs with or without -diffmap; the comparison needs both.
-bool g_genCheck = false;
-// -lategrab N: EXPERIMENT. One extra no-wait grab per capture batch, N microseconds after the
-// batch's second member, into a slot outside the ring. Under in-game frame generation the
-// generated frame is in the capture buffer shortly after the real frame's present but nothing
-// announces it; this goes and looks. Decides nothing; read with -gencheck and the change map.
-unsigned int g_lateGrabUs = 0;
-// -grabdelay N|sweep: EXPERIMENT. Delay the SECOND grab of every capture batch by N
-// microseconds (sweep cycles a table batch by batch), so the copy that answers the generated
-// frame's present notification executes after the generation pass has landed. The first
-// member stays the keeper, so the output is unchanged; the change map scores the delayed copy.
-// 0 = off, positive = fixed, negative = sweep.
-int g_grabDelayUs = 0;
 // -lag N: extra bracketing delay in ms. Trades output latency, which the player never sees
 // (the source display is direct) and which only shifts an already-delayed stream, for holds.
 unsigned int g_extraLagMs = 0;
@@ -178,11 +149,17 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     }
 
     // Temporal modes (t = nearest selection, b = blend compositor, o = optical-flow
-    // interp compositor), vsync present (t:vsync / b:vsync / o:vsync or the bare
-    // letter): CaptureRing-based temporal mode, present blocked on DWM's compose clock
-    // (windowed INTERVAL_ONE; card-locked 60 Hz under a fullscreen game on the source —
-    // the production case). Nominal 60 fps drives the bracketing lag; the actual
-    // present rate is DWM's delivery.
+    // interp compositor). The bare letter and X:vsync present on vsync, X:<fps> on a QPC
+    // timer. Nominal 60 fps drives the bracketing lag on the vsync present; the actual
+    // present rate is whatever clock the present path blocks on.
+    //
+    // Two present paths carry the vsync present. t and o run on the D3D9 swapchain, whose
+    // windowed INTERVAL_ONE present blocks on DWM's compose clock (card-locked 60 Hz under
+    // a fullscreen game on the source; the DISPLAYED rate under in-game frame generation).
+    // The blend mode has both: b and b:vsync present through a D3D11 flip-model swapchain
+    // on the output window, which Windows promotes to independent flip so the present
+    // blocks on the SINK's own vblank, and b:dwm is the same blend on the D3D9 swapchain.
+    // The D3D11 path carries the blend compositor only: nearest and interp are not ported.
     {
         char c0 = modeStr[0];
         if (c0 >= 'A' && c0 <= 'Z') c0 = (char)(c0 - 'A' + 'a');
@@ -190,42 +167,34 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
         if (c0 == 'b') kind = kCompositorBlend;
         else if (c0 == 'o') kind = kCompositorInterp;
         if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0 ||
-            _stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0 ||
-            _stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0) {
+            _stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0 ||
+            _stricmp(modeStr.c_str(), "b:dwm") == 0) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
                                            kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
-                                           g_dejitter, g_fgPhase, g_phaseKeep, g_subGen,
-                                           g_diffMap, g_genCheck, g_lateGrabUs, g_grabDelayUs,
-                                           g_extraLagMs);
+                                           g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs);
         }
-
-        // D3D11 flip-model present (b:flip): the blend compositor decided and drawn on a D3D11
-        // device onto a DXGI flip-model swapchain, paced by that swapchain's vsync present so
-        // that a promotion to independent flip puts the present on the TARGET display's own
-        // vblank rather than DWM's compose clock. Blend only: nearest and interp are not ported.
-        if (modeStr.length() > 2 && modeStr[1] == ':' &&
-            _stricmp(modeStr.c_str() + 2, "flip") == 0) {
-            if (c0 != 'b') {
-                LOGERR("Invalid capture mode: '%s' (the D3D11 flip present carries the blend "
-                       "compositor only; use b:flip)", modeStr.c_str());
-                return NULL;
+        if (_stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0 ||
+            _stricmp(modeStr.c_str(), "b:flip") == 0) {
+            if (_stricmp(modeStr.c_str(), "b:flip") == 0) {
+                // Transitional alias: the flip-model path was b:flip while it was the
+                // experiment and the D3D9 path was b:vsync. Accepted so existing launch
+                // lines keep working through the rename; removed at the release.
+                LOG("b:flip is now b:vsync (the D3D11 flip-model present); the old name is a "
+                    "transitional alias and goes away at the release");
             }
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
                                            kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
-                                           g_dejitter, g_fgPhase, g_phaseKeep, g_subGen,
-                                           g_diffMap, g_genCheck, g_lateGrabUs, g_grabDelayUs,
-                                           g_extraLagMs, /*d3d11Present=*/true);
+                                           g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs,
+                                           /*d3d11Present=*/true);
         }
 
-        // QPC-timer present (t:60 / b:60 / o:60 format).
+        // QPC-timer present (t:60 / b:60 / o:60 format), on the D3D9 swapchain.
         if (modeStr.length() > 2 && (c0 == 't' || c0 == 'b' || c0 == 'o') && modeStr[1] == ':') {
             float framerate;
             if (ParseFps(modeStr.substr(2), &framerate)) {
                 return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
                                                kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
-                                               g_dejitter, g_fgPhase, g_phaseKeep, g_subGen,
-                                           g_diffMap, g_genCheck, g_lateGrabUs, g_grabDelayUs,
-                                           g_extraLagMs);
+                                               g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs);
             }
         }
     }
@@ -253,8 +222,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  vsync          - VSync-driven presentation");
     LOGERR("  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)");
     LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
-    LOGERR("  b, b:vsync, b:60 - Temporal blend compositor (sharp passthrough at the target, lerp otherwise)");
-    LOGERR("  b:flip         - Temporal blend compositor presented through a D3D11 flip-model swapchain (independent-flip candidate)");
+    LOGERR("  b, b:vsync     - Temporal blend compositor (sharp passthrough at the target, lerp otherwise) on a D3D11 flip-model swapchain, presented on the SINK's vblank");
+    LOGERR("  b:dwm, b:60    - The same blend compositor on the D3D9 swapchain: DWM's compose clock (b:dwm) or a timer at the given fps");
     LOGERR("  o, o:vsync, o:60 - Temporal interp compositor (NVOFA motion-compensated synthesis)");
     LOGERR("  diag, diag:vsync - Clock probes (DWM compose timing + card raster; vsync variant measures DWM delivery)");
     LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
@@ -269,9 +238,6 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  -dejit         - With -etw: re-stamp late-delivered capture batches onto the flip grid (phantom-blend fix)");
     LOGERR("  -fgphase       - Content-phase instrument: log per-batch f of generated frames (stage-7 gate; run with -etw for the offline g join)");
     LOGERR("  -phasekeep     - With -etw: phase-aware keep-real, so x3 keeps the real frame in every batch that has one (inert at x2)");
-    LOGERR("  -gencheck      - Sample-check instrument: 256-texel equality verdict per grab beside the driver's diff= (referee for -diffmap); decides nothing");
-    LOGERR("  -lategrab N    - Experiment: one extra no-wait grab per batch, N us (100-20000) after the second member, into a slot outside the ring; read with -gencheck");
-    LOGERR("  -grabdelay N|sweep - Experiment: delay the second grab of every batch by N us (100-2400) or sweep a table; first member stays the keeper; read the grabdelay summary");
     return NULL;
 }
 
@@ -308,7 +274,7 @@ int g_sourceAdapterIndex = 0;
 bool g_flipEx = false;
 
 // Hidden window hosting the D3D9 devices when the output window belongs to a D3D11 flip-model
-// swapchain (b:flip). Flip model allows one swapchain per window and no second API on it, and a
+// swapchain (b:vsync). Flip model allows one swapchain per window and no second API on it, and a
 // D3D9 device cannot exist without a device window, so the present and capture devices move
 // here and the D3D9 swapchain never presents. NULL on every other path, where the D3D9 present
 // device owns the output window as it always has.
@@ -681,35 +647,6 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         g_phaseKeep = true;
         return 1;
     }
-    if (tokens[i] == "-subgen") {
-        g_subGen = true;
-        return 1;
-    }
-    if (tokens[i] == "-diffmap") {
-        g_diffMap = true;
-        return 1;
-    }
-    if (tokens[i] == "-gencheck") {
-        g_genCheck = true;
-        return 1;
-    }
-    if (tokens[i] == "-lategrab" && i + 1 < tokens.size()) {
-        const long v = strtol(tokens[i + 1].c_str(), NULL, 10);
-        if (v >= 100 && v <= 20000) g_lateGrabUs = (unsigned int)v;
-        else LOGERR("-lategrab value '%s' invalid (100-20000 us) - ignored", tokens[i + 1].c_str());
-        return 2;
-    }
-    if (tokens[i] == "-grabdelay" && i + 1 < tokens.size()) {
-        if (tokens[i + 1] == "sweep") {
-            g_grabDelayUs = -1;
-        } else {
-            const long v = strtol(tokens[i + 1].c_str(), NULL, 10);
-            if (v >= 100 && v <= 2400) g_grabDelayUs = (int)v;
-            else LOGERR("-grabdelay value '%s' invalid (100-2400 us, or sweep) - ignored",
-                        tokens[i + 1].c_str());
-        }
-        return 2;
-    }
     if (tokens[i] == "-flipex") {
         g_flipEx = true;
         return 1;
@@ -824,8 +761,8 @@ void ConsoleUserInput(string* framerateStr) {
     cout << endl;
     cout << "  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)" << endl;
     cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
-    cout << "  b, b:vsync, b:60 - Temporal blend compositor (sharp passthrough at the target, lerp otherwise)" << endl;
-    cout << "  b:flip         - Temporal blend compositor on a D3D11 flip-model swapchain (independent-flip candidate)" << endl;
+    cout << "  b, b:vsync     - Temporal blend compositor on a D3D11 flip-model swapchain, presented on the SINK's vblank" << endl;
+    cout << "  b:dwm, b:60    - The same blend compositor on the D3D9 swapchain: DWM's compose clock (b:dwm) or a timer" << endl;
     cout << "  o, o:vsync, o:60 - Temporal interp compositor (NVOFA motion-compensated synthesis)" << endl;
     cout << "  t:60 -src 30   - Mode plus options: -src <fps> declares the source rate (lag sizing)" << endl;
     cout << "  -lock          - Enable the phase comb lock (needs -src; off by default)" << endl;
@@ -937,21 +874,6 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         ConsoleUserInput(&framerateStr);
     }
 
-    // The substitution wants the driver's change map: it is what tells a generated frame
-    // from a capture-race duplicate of the frame beside it. Measured against the pixel
-    // instrument over 65619 batches it caught 98.80% of duplicates with zero false
-    // positives, and it costs a comparison on a value the capture loop already has rather
-    // than a GPU pipeline sync on the present thread. Implied rather than a second flag to
-    // remember, and harmless where the driver refuses it: the compositor's own content
-    // check still covers that case.
-    //
-    // MUST be resolved before ParseCaptureMode, which passes these flags to the mode's
-    // constructor - setting it afterwards would log the intent and change nothing.
-    if (g_subGen && !g_diffMap) {
-        g_diffMap = true;
-        LOG("-subgen implies -diffmap: the change map is the content check");
-    }
-
     // Create capture mode instance
     IFrameCaptureMode* captureMode = ParseCaptureMode(framerateStr);
     if (!captureMode) {
@@ -962,7 +884,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     // The D3D9 swapchain never presents on the D3D11 path, so its swap effect is moot, and a
     // FLIPEX device on the hidden host window would only add a way for creation to fail.
     if (captureMode->PresentsViaD3D11() && g_flipEx) {
-        LOG("-flipex ignored: b:flip presents through its own D3D11 swapchain");
+        LOG("-flipex ignored: b:vsync presents through its own D3D11 swapchain");
         g_flipEx = false;
     }
 
@@ -993,7 +915,6 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
     LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s, "
         "etw flip capture %s, flip join %s, dejitter %s, fgphase %s, phasekeep %s, "
-        "generated-frame substitution %s, diffmap %s, gencheck %s, lategrab %u us, grabdelay %s, "
         "flip mode %s, extra lag %u ms, present path %s",
         g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
         g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off",
@@ -1005,14 +926,9 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         !g_phaseKeep ? "off"
                      : (g_etw && !g_noJoin ? "ON (-phasekeep)"
                                            : "REFUSED (-phasekeep needs -etw with the join on)"),
-        g_subGen ? "ON (-subgen)" : "off",
-        g_diffMap ? "requested (-diffmap; ACTIVE only when the instrument line follows)" : "off",
-        g_genCheck ? "requested (-gencheck; ACTIVE only when the instrument line follows)" : "off",
-        g_lateGrabUs,
-        g_grabDelayUs == 0 ? "off" : (g_grabDelayUs < 0 ? "sweep" : "fixed (see the ACTIVE line)"),
         g_flipEx ? "FLIPEX (-flipex)" : "bitblt (DISCARD)",
         g_extraLagMs,
-        captureMode->PresentsViaD3D11() ? "D3D11 flip-model swapchain (b:flip)" : "D3D9 swapchain");
+        captureMode->PresentsViaD3D11() ? "D3D11 flip-model swapchain (b:vsync)" : "D3D9 swapchain");
 
     BUF_WIDTH = target.position.right - target.position.left;
     BUF_HEIGHT = target.position.bottom - target.position.top;

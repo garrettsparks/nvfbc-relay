@@ -4,13 +4,11 @@
 #include <d3d11.h>
 #include <dxgi1_3.h>
 
-#include "CaptureRing.h"
-#include "IFrameCompositor.h"
+#include "IPresentPath.h"
 #include "FrameMarker.h"
-#include "TemporalPolicy.h"
 
 // D3D11 PRESENT BACKEND: decides, composites and presents straight onto a DXGI flip-model
-// swapchain, replacing the D3D9 compose-and-PresentEx path for one present.
+// swapchain, the present path that replaces the D3D9 compose-and-PresentEx one.
 //
 // WHY THIS EXISTS. The D3D9 present is a windowed INTERVAL_ONE, which does not wait on any
 // monitor's vblank: it throttles on DWM's compose clock, whose rate follows whatever the
@@ -41,64 +39,72 @@
 //
 // FEEDS OFF THE EXISTING RING. Ring slots are already shared render targets whose handles
 // CaptureRing hands out for opening the same texture on another API's device, and
-// FrameBracket already carries beforeSlot/afterSlot/genSlot so a cross-API consumer can pick
-// its own per-device aliases. Nothing about capture changes. The capture device drains an
+// FrameBracket already carries beforeSlot/afterSlot so a cross-API consumer can pick its
+// own per-device aliases. Nothing about capture changes. The capture device drains an
 // event query before publishing a slot, so a published slot is GPU-complete for this device
 // exactly as it is for the D3D9 present device.
 //
 // OWNS ITS OWN COMPOSITE STATE. DecideComposite mutates the state it is handed (both Schmitt
-// bands, the last output, target and generated stamps), so the D3D9 compositor and this
-// backend must never both decide the same present; a mode runs exactly one of them.
-class D3D11PresentBackend {
+// bands, the last output and target stamps), so the D3D9 compositor and this backend must
+// never both decide the same present; a mode runs exactly one present path.
+//
+// BLEND ONLY. This backend is the blend pipeline: the lerp shader is the compositor, and
+// nearest and interp are not ported. The parser only pairs it with the blend mode.
+class D3D11PresentBackend : public IPresentPath {
 public:
-    D3D11PresentBackend();
+    // tint is accepted so the mode string's options parse the same on either path; this
+    // path has no tint pass and says so at Setup.
+    explicit D3D11PresentBackend(bool tint);
     ~D3D11PresentBackend();
 
     D3D11PresentBackend(const D3D11PresentBackend&) = delete;
     D3D11PresentBackend& operator=(const D3D11PresentBackend&) = delete;
 
-    // Call AFTER CaptureRing::Start (slot shared handles must exist). cfg is borrowed from
-    // the owning mode and must outlive the backend. subGen arms generated-frame substitution;
-    // mark/markFrames arm the frame marker as FrameMarker::Init does. Failure is loud and
-    // leaves the backend disabled so the caller can refuse the mode rather than run degraded.
-    bool Setup(HWND hwnd, CaptureRing* ring, int width, int height,
-               const policy::PolicyConfig* cfg, bool subGen, bool mark, unsigned int markFrames);
+    // Call AFTER CaptureRing::Start (slot shared handles must exist). The D3D9 device is
+    // unused: this path brings its own. cfg is borrowed from the owning mode and must
+    // outlive the backend; mark/markFrames arm the frame marker as FrameMarker::Init does.
+    // Failure is loud and leaves the backend disabled so the caller can refuse the mode
+    // rather than run degraded.
+    bool Setup(IDirect3DDevice9Ex* device, HWND hwnd, CaptureRing* ring, int width,
+               int height, const policy::PolicyConfig* cfg, bool mark,
+               unsigned int markFrames, LARGE_INTEGER baseQpc, LONGLONG freqQpc) override;
 
     // Decide this present and draw it onto the current back buffer. Fills out exactly as
     // the D3D9 synthesizing compositor would, so the temporal log line reads the same.
-    void Compose(const FrameBracket& bracket, CompositeOutcome* out);
+    void Compose(const FrameBracket& bracket, CompositeOutcome* out) override;
 
     // Burn the frame marker over the composed back buffer. Returns the counter burned
     // (mark= on the temporal line), or -1 when the marker is off.
-    long long BurnMarker(const CompositeOutcome& out);
+    long long BurnMarker(const CompositeOutcome& out) override;
 
     // THE FRAME-PACING WAIT. Blocks until the swapchain has room for the next frame, which
     // with a latency of one is the moment the previous frame was consumed: the sink's vblank
     // under independent flip, DWM's compose otherwise. Call at the top of every present,
     // before the decision. Returns false on the bounded timeout, which the caller treats as
     // a wait that did not pace anything.
-    bool WaitForFrame();
+    bool WaitForFrame() override;
 
     // True once the wait has timed out for long enough that the swapchain is not coming back.
     // The caller must stop the mode: nothing recovers from here, and a loop that keeps turning
     // presents nothing while holding the capture session against the next run.
-    bool SwapChainStalled() const;
+    bool SwapChainStalled() const override;
 
-    // Queue the drawn back buffer. Does not block: WaitForFrame already made room. vsync
-    // selects sync interval 1 so the flip lands on a vblank rather than tearing.
-    void Present(bool vsync);
+    // Queue the drawn back buffer. Does not block: WaitForFrame already made room, so the
+    // pacing block reported here is 0. vsync selects sync interval 1 so the flip lands on a
+    // vblank rather than tearing.
+    LONGLONG Present(bool vsync) override;
 
-    // Whole-run present and substitution statistics; safe to call when disabled.
-    void LogSummary() const;
+    // Whole-run present statistics; safe to call when disabled.
+    void LogSummary() const override;
+
+    const char* Name() const override { return "D3D11 flip-model present"; }
+    const char* RefusalAdvice() const override {
+        return "To run on the old present path instead (the D3D9 swapchain on DWM's compose "
+               "clock), use b:dwm.";
+    }
+    bool OwnsOutputWindow() const override { return true; }
 
     bool Enabled() const { return m_enabled; }
-
-    struct GenSubStats {
-        long long substituted = 0;
-        long long offered = 0;            // placement said yes
-        long long skippedUnscreened = 0;  // offered, but the ring had no change map to screen it
-    };
-    const GenSubStats& GeneratedSubstitutionStats() const { return m_genSub; }
 
 private:
     bool CreateDeviceAndSwapChain(HWND hwnd, int width, int height);
@@ -134,8 +140,7 @@ private:
 
     const policy::PolicyConfig* m_cfg;
     policy::CompositeState m_compState;
-    bool m_subGen;
-    GenSubStats m_genSub;
+    bool m_tintRequested;
 
     ID3D11Device* m_dev;
     ID3D11DeviceContext* m_ctx;

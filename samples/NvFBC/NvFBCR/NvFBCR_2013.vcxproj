@@ -118,6 +118,7 @@ lib /nologo /machine:x64 /def:"$(ProjectDir)NvOFFRUC.def" /out:"$(IntDir)NvOFFRU
     <ClCompile Include="BlendRenderer.cpp" />
     <ClCompile Include="DiagCaptureMode.cpp" />
     <ClCompile Include="D3D11Present.cpp" />
+    <ClCompile Include="D3D9Present.cpp" />
     <ClCompile Include="FlowWarpEngine.cpp" />
     <ClCompile Include="FrameCompositors.cpp" />
     <ClCompile Include="InterpSidecar.cpp" />
@@ -137,12 +138,14 @@ lib /nologo /machine:x64 /def:"$(ProjectDir)NvOFFRUC.def" /out:"$(IntDir)NvOFFRU
     <ClInclude Include="BlendRenderer.h" />
     <ClInclude Include="CaptureRing.h" />
     <ClInclude Include="D3D11Present.h" />
+    <ClInclude Include="D3D9Present.h" />
     <ClInclude Include="FlowWarpEngine.h" />
     <ClInclude Include="FrameCompositors.h" />
     <ClInclude Include="EtwConsumer.h" />
     <ClInclude Include="FlipDecode.h" />
     <ClInclude Include="FrameMarker.h" />
     <ClInclude Include="IFrameCompositor.h" />
+    <ClInclude Include="IPresentPath.h" />
     <ClInclude Include="InterpSidecar.h" />
     <ClInclude Include="DiagCaptureMode.h" />
     <ClInclude Include="TemporalCaptureMode.h" />

@@ -29,16 +29,6 @@ struct FrameBracket {
     // flips along it scanned out.
     int beforeMember = 0;
     int afterMember = 0;
-    // The retracted generated frame nearest the target, when one is still reachable.
-    // info.hasGen says whether these are set. It is deliberately not one of the endpoints
-    // above: nothing may select it as a bracket side.
-    IDirect3DSurface9* genSurface = NULL;
-    IDirect3DTexture9* genTexture = NULL;
-    int genSlot = -1;
-    // The ring already screened this frame against the driver's change map, so a consumer
-    // must NOT pay for its own content check. False means no change map was available and
-    // the consumer owns the question.
-    bool genScreened = false;
 };
 
 // Source-paced capture ring on its OWN D3D9Ex device (branch B: two devices).
@@ -175,26 +165,6 @@ public:
     // plain keep-real, so the failure mode is exactly today's behaviour.
     void EnablePhaseKeep(IRotationOracle* oracle) { m_rotationOracle = oracle; }
 
-    // Keep retracted generated frames reachable instead of dropping them. Before Start.
-    void EnableGeneratedSubstitution() { m_subGenArmed = true; }
-
-    // DIAGNOSTIC (-diffmap). Ask NvFBC for its own difference map alongside each grab and
-    // log how many blocks it says changed. Decides nothing.
-    //
-    // The question it exists to answer: the content check currently re-derives, with a GPU
-    // readback on the present thread, something the capture driver may already know. A
-    // capture-race duplicate is by definition "this grab returned the same content as the
-    // previous grab", which is exactly an all-zero difference map. If the driver's map
-    // agrees with the pixel measurement, the check moves to the capture thread and costs a
-    // CPU buffer read instead of a pipeline drain. Run alongside -fgphase, whose per-batch
-    // gdiff is the ground truth to join against.
-    void EnableDiffMap() { m_diffMapRequested = true; }
-
-    // True once SetUp has confirmed the driver gives us a change map. Only meaningful
-    // after Start. Consumers use it to skip their own content check.
-    bool DiffMapActive() const { return m_diffMapActive; }
-    long long GeneratedDuplicatesRefused() const { return m_genDupRefused; }
-
     // Session telemetry for the phase vote, logged at exit by the owner.
     long long PhaseKeepBatches() const { return m_phaseKeepBatches; }
     long long PhaseKeepFlipped() const { return m_phaseKeepFlipped; }
@@ -221,56 +191,6 @@ public:
     // reference runs: the readback stalls the capture thread on the GPU once per wake.
     void EnableFgPhase() { m_fgPhaseRequested = true; }
 
-    // Request the generated-frame sample check (-gencheck) before Start. A referee for the
-    // driver's change map, on the capture thread, deciding nothing.
-    //
-    // The change map says whether a grab returned the same content as the previous grab,
-    // and under DLSS frame generation it says so on nearly every second member of a batch.
-    // Whether that is true (the generated frame never reaches NvFBC) or an artefact of
-    // repeat grabs inside a burst is a question the recording cannot answer, because
-    // retracted members never reach it. This reads 256 texels of every published slot on
-    // the GPU into a one-row target, queued behind the copy that just filled the slot and
-    // covered by the same flush, and reads the 1 KB back one wake later, when it is long
-    // finished. Two frames sampled at the same 256 positions read as identical only when
-    // every sample misses the region that differs; at 256 stratified samples a difference
-    // over 6% of the frame is missed once in ten million. The same words also compare each
-    // batch's first member with the previous batch's, which is a picture the source
-    // delivered twice under two timestamps and nothing in the timestamps can see.
-    void EnableGenCheck() { m_genCheckRequested = true; }
-
-    // Exit summary for -gencheck: agreement with the change map, batch-to-batch repeats,
-    // and readback cost. Call after Stop.
-    void LogGenCheckSummary() const;
-
-    // Request one extra grab per batch (-lategrab), issued a fixed delay after the batch's
-    // second member WITHOUT waiting for a notification. Before Start.
-    //
-    // Under in-game frame generation the capture engine wakes twice at the real frame's
-    // present and never again; the generated frame is in the buffer a millisecond or two
-    // later, unannounced, and the rare second grab that arrived late enough returned it.
-    // This goes and looks on purpose. Measurement only: the grab lands in a slot of its own
-    // outside the ring, nothing on screen changes, and the change map plus the sample check
-    // classify what came back. The delay is in microseconds after the second member.
-    void EnableLateGrab(unsigned int delayUs) { m_lateGrabUs = delayUs; }
-    void LogLateGrabSummary() const;
-
-    // Request a delay of the SECOND grab of every batch (-grabdelay). Before Start.
-    //
-    // Under in-game frame generation the second notification of a batch is the generated
-    // frame's present, and the copy NvFBC takes when the grab answers it holds the real
-    // frame again unless the grab executes about a millisecond later, after the generation
-    // pass has landed: measured on natural late grabs, the second member is a generated
-    // frame on 3% of batches when it executed under 0.8 ms after the first and on 97 to 100%
-    // when it executed after 1.2 ms. A no-wait poll cannot reach it (it returns the last
-    // notified frame), so this delays the answering grab itself: after a batch's first member
-    // is processed the capture thread sleeps before calling the next grab, and the pending
-    // second notification is then answered late. Measurement only: the batch's first member
-    // is kept and the delayed member is discarded, so the screen shows exactly what it shows
-    // today, while the change map and the sample check classify the delayed copy. delayUs
-    // negative sweeps a table of delays batch by batch, so one capture maps the window.
-    void EnableGrabDelay(int delayUs);
-    void LogGrabDelaySummary() const;
-
 private:
     struct Slot {
         IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
@@ -288,27 +208,9 @@ private:
         LARGE_INTEGER batchStart;
         int member;                       // position inside its capture batch; 0 opens one
         bool valid;
-        // Retracted by keep-real: not a bracket endpoint, but still reachable. A slot in
-        // this state holds the driver's own generated frame, and its timestamp has been
-        // rewritten to that frame's CONTENT time (a placement between its two real
-        // neighbours), which is not the arrival stamp it was published with.
-        bool generated;
-        // The batch of the OTHER neighbour that placement used (the older, real one; the
-        // newer is this slot's own batchStart). Only meaningful while generated is set.
-        // Dejitter corrects stamps per batch at read time, and a placement derived from two
-        // batches needs both corrections or it drifts away from the endpoints it sits
-        // between - which is exactly the interval the passthrough gate measures.
-        LARGE_INTEGER genPrevBatchStart;
     };
 
     void CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
-
-    // Retract the generated member keep-real dropped, leaving it reachable but not
-    // bracketable and stamped at its content time. count is the wake that published the
-    // REAL member; the generated one is the wake before it. changedBlocks is the driver's
-    // change map for THIS grab (-1 when unavailable): zero means the two members are the
-    // same frame, so the retracted one is a capture-race duplicate and stays unreachable.
-    void RetractGenerated(long long count, long long changedBlocks);
 
     // Content-phase instrument (-fgphase). Working geometry is a 320x180 GPU downscale:
     // small enough that the sync readback costs ~230 KB a wake, large enough that the
@@ -351,18 +253,6 @@ private:
     // Members per batch, Q8 fixed point: the pairing gate that keeps the vote from arming on
     // a grid reading the declared source rate does not describe. See the wake loop.
     LONGLONG m_batchMembersEmaQ8 = 0;
-    // Generated-frame substitution: keep retracted members reachable and placed.
-    bool m_subGenArmed = false;
-
-    // -diffmap instrument. The buffer is VirtualAlloc'd because NvFBC requires it, and the
-    // pointer array is a member because SetUp keeps the array the client passes.
-    bool m_diffMapRequested = false;
-    bool m_diffMapActive = false;
-    // Retractions refused because the change map said the two members were the same frame.
-    long long m_genDupRefused = 0;
-    void* m_diffMapBuf = NULL;
-    void* m_diffMapPtrs[1] = {NULL};
-    unsigned int m_diffMapBlocks = 0;   // blocks the map is expected to carry
 
     bool m_fgPhaseRequested = false;
     bool m_fgPhaseActive = false;
@@ -377,101 +267,6 @@ private:
     int m_fgPrevMember = -1;
     bool m_fgKeptValid = false;
     bool m_fgPrevWakeValid = false;
-
-    // -gencheck instrument. Everything here is capture-thread-owned; the summary reads it
-    // after the thread has joined.
-    static const int kGenCheckGrid = 16;
-    static const int kGenCheckSamples = kGenCheckGrid * kGenCheckGrid;
-    static const int kGenCheckRbBins = 2001;   // readback time histogram, 1 us bins, last is overflow
-    struct GenCheckVertex { float x, y, z, rhw, u, v; };
-    struct GenCheckSlot {
-        IDirect3DSurface9* rt;       // capture device, kGenCheckSamples x 1 render target
-        IDirect3DSurface9* sys;      // sysmem twin for the deferred readback
-        int member;                  // what the pending gather describes
-        LONGLONG arrUs;
-        LONGLONG batchStartUs;
-        long long changed;           // the driver's change map for the same grab (-1: off)
-    };
-    // One entry per ring slot plus one for the late-grab slot, which lives outside the ring.
-    static const int kGenCheckLateSlot = RING_SIZE;
-    bool m_genCheckRequested = false;
-    bool m_genCheckActive = false;
-    GenCheckSlot m_genCheck[RING_SIZE + 1] = {};
-    IDirect3DVertexBuffer9* m_genCheckVb = NULL;   // one quad per sample, pretransformed, static
-    int m_genCheckPending = -1;               // slot gathered on the previous wake, not yet read
-    // Controls, because an instrument broken in the boring way (sampling nothing, reading a
-    // stale target) would print "same" everywhere and hand over the wrong verdict for free.
-    // Self-test: on the first wakes the same slot is gathered a second time into a spare
-    // target; the two rows must be identical or the gather is not deterministic and the
-    // instrument disables itself. Degenerate: a gather whose 256 words are all one value on
-    // a frame of gameplay read one texel or none, counted and reported. Positive control:
-    // consecutive first members in motion must differ on most samples; the summary reports
-    // that median and it must be large.
-    static const int kGenCheckSelfTestWakes = 3;
-    IDirect3DSurface9* m_gcSelfRt = NULL;
-    IDirect3DSurface9* m_gcSelfSys = NULL;
-    int m_gcSelfTestsLeft = kGenCheckSelfTestWakes;
-    bool m_gcSelfPending = false;             // the spare target holds an unread second gather
-    int m_gcSelfSlot = -1;                    // of this slot; compared only against that slot's own row
-    long long m_gcSelfPassed = 0;
-    long long m_gcDegenerate = 0;
-    unsigned int m_gcNdiffPrevHist[kGenCheckSamples + 1] = {};
-    // Words of the previous wake (for member m against member m-1, the pair the change map
-    // describes) and of the previous batch's first member (for the batch-to-batch repeat).
-    DWORD m_gcLast[kGenCheckSamples] = {};
-    bool m_gcLastValid = false;
-    LONGLONG m_gcLastBatchStartUs = 0;
-    DWORD m_gcPrevFirst[kGenCheckSamples] = {};
-    bool m_gcPrevFirstValid = false;
-    long long m_gcPairs = 0;                  // second-and-later members compared
-    long long m_gcPairsNoMap = 0;             // of those, without a change map to agree with
-    long long m_gcAgree = 0;
-    long long m_gcDriverDupeSamplesDiffer = 0;
-    long long m_gcDriverChangeSamplesSame = 0;
-    long long m_gcPrevCompared = 0;           // first members with a previous first member
-    long long m_gcPrevRepeats = 0;            // of those, identical to it
-    LONGLONG m_gcFirstArrUs = -1;             // span of first members, for the per-minute rate
-    LONGLONG m_gcLastArrUs = -1;
-    unsigned int m_gcRbHist[kGenCheckRbBins] = {};
-    long long m_gcRbCount = 0;
-    LONGLONG m_gcRbWorstUs = 0;
-    bool GenCheckSetup();
-    void GenCheckRelease();
-    void GenCheckFatal(const char* what);
-    void GenCheckIssue(int slot);
-    bool GenCheckDraw(IDirect3DSurface9* target, IDirect3DTexture9* source);
-    bool GenCheckRead(IDirect3DSurface9* rt, IDirect3DSurface9* sys, DWORD* words);
-    void GenCheckOnWake(int slot, int member, LONGLONG arrUs, LONGLONG batchStartUs,
-                        long long changed);
-
-    // -lategrab experiment. Capture-thread-owned.
-    unsigned int m_lateGrabUs = 0;
-    bool m_lateGrabDoneThisBatch = false;
-    IDirect3DTexture9* m_lateTexture = NULL;   // capture device only, never shared or shown
-    IDirect3DSurface9* m_lateSurface = NULL;
-    long long m_lateGrabIssued = 0;
-    long long m_lateGrabFailed = 0;
-    long long m_lateGrabSameByMap = 0;         // change map says identical to the grab before it
-    long long m_lateGrabDistinctByMap = 0;     // change map says a different picture
-    long long m_lateGrabNoMap = 0;
-    void LateGrab(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams, LONGLONG batchStartQpc,
-                  LONGLONG lastArrivalQpc, double usPerTick);
-    void PreciseSleep(unsigned int us);
-
-    // -grabdelay experiment. Capture-thread-owned. The table is the sweep; a fixed delay is
-    // a one-entry table. Executed delay is measured as the second member's dt.
-    static const int kGrabDelayMaxSteps = 8;
-    bool m_grabDelayArmed = false;
-    int m_grabDelaySteps = 0;
-    unsigned int m_grabDelayTable[kGrabDelayMaxSteps] = {};
-    int m_grabDelayIdx = 0;                    // next table entry for a sweep
-    int m_grabDelayStep = -1;                  // entry used for the batch in flight
-    bool m_grabDelayNext = false;              // sleep before the next grab call
-    long long m_gdBatches[kGrabDelayMaxSteps] = {};     // first members seen per entry
-    long long m_gdSecond[kGrabDelayMaxSteps] = {};      // of those, batches with a second member
-    long long m_gdGenerated[kGrabDelayMaxSteps] = {};   // second members that were a different picture
-    long long m_gdNoMap[kGrabDelayMaxSteps] = {};
-    LONGLONG m_gdDtSum[kGrabDelayMaxSteps] = {};        // executed dt of those second members
 
     Slot m_ring[RING_SIZE];
     int m_ringSlots = kDefaultRingSlots;
