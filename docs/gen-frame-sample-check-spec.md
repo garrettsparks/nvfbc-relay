@@ -309,10 +309,29 @@ Reading it: `diff=0` means the late grab found the real frame again (too early);
 followed by a capture line whose own `diff` is in the thousands means it found the generated
 frame; a large `diff` followed by a capture line with `diff=0` means it found the next real
 frame early (too late). `gencheck.py` tabulates the three, the landing time, and the flush
-cost. Setup failure refuses to start; a failed no-wait grab is counted, not fatal. The
-consumer, if the supply is real, is substitution at every mismatched ratio, with 90x2 into 60
-Hz the clearest: the 180 per second displayed stream lands on the sink grid every third frame,
-alternating real and generated, and the generated frame would replace the half-blend.
+cost. Setup failure refuses to start; a failed no-wait grab is counted, not fatal.
+
+Result: at 1000 us the late grab returned the second member's picture on 5200 of 5209 batches
+and a generated frame on none. A no-wait grab returns the last notified frame, not a fresh copy
+of the display, so polling cannot reach the generated frame. The instrument stays as the record
+of that.
+
+### The grab-delay experiment
+
+The natural second grabs said where the frame is. Binned by how late the second grab executed
+after the first member, the fraction that returned a generated frame at 60x3 goes from 3% under
+0.8 ms to 97% at 1.2 ms and 99.7% beyond 1.4 ms; at 60x2 it rises more slowly and the samples
+past 1.2 ms are few. The second notification is the generated frame's present, and the copy
+taken on answering it is complete only once the generation pass has landed. `-grabdelay N`
+sleeps N microseconds after a batch's first member is processed, before the next grab call, so
+the pending second notification is answered late; `-grabdelay sweep` cycles 0, 600, 900, 1200,
+1500, 1800, 2100 and 2400 us batch by batch. The first member is held as the keeper and the
+delayed member discarded, so the output is unchanged. The exit summary prints, per delay, the
+batches, the second members, their mean executed dt and the fraction whose change map against
+the first member ran to 4000 blocks or more, which is a generated frame. The consumer, if the
+window is usable, is substitution at every mismatched ratio, with 90x2 into 60 Hz the clearest:
+the 180 per second displayed stream lands on the sink grid every third frame, alternating real
+and generated, and the generated frame would replace the half-blend.
 
 ## Not in scope
 

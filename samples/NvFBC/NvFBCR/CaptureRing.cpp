@@ -217,6 +217,18 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
             "slot outside the ring; lategrab: lines carry the change map against the member "
             "before it, and the sample check reports it as m=2", m_lateGrabUs);
     }
+    if (m_grabDelayArmed) {
+        if (m_grabDelaySteps > 1) {
+            LOG("grabdelay ACTIVE: the second grab of every batch is delayed by a sweep of "
+                "%u..%u us (%d steps, one per batch); the first member stays the keeper, and "
+                "the second member's diff= against it scores what the delayed copy returned",
+                m_grabDelayTable[0], m_grabDelayTable[m_grabDelaySteps - 1], m_grabDelaySteps);
+        } else {
+            LOG("grabdelay ACTIVE: the second grab of every batch is delayed by %u us; the "
+                "first member stays the keeper, and the second member's diff= against it "
+                "scores what the delayed copy returned", m_grabDelayTable[0]);
+        }
+    }
 
     // ---- Sample-check instrument resources (-gencheck). The opposite rule from fgphase:
     // the instrument is under test and does not fall back. A failed setup refuses to start
@@ -445,6 +457,14 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     LOG("CaptureRing: batch-collapse keep-real (intra-batch wake <3ms = real member; previous slot retracted)");
 
     while (!m_stop.load()) {
+        // -grabdelay: the previous wake opened a batch, so the second notification is on its
+        // way or already pending. Answering it later is the whole experiment.
+        if (m_grabDelayNext) {
+            m_grabDelayNext = false;
+            if (m_grabDelayStep >= 0 && m_grabDelayTable[m_grabDelayStep] > 0) {
+                PreciseSleep(m_grabDelayTable[m_grabDelayStep]);
+            }
+        }
         NVFBCRESULT res = m_nvfbc->NvFBCToDx9VidGrabFrame(grabParams);
 
         if (res == NVFBC_ERROR_INVALIDATED_SESSION) {
@@ -652,6 +672,9 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
                 m_ring[prevSlot].generated = false;   // a reclaimed single is real again
                 m_phaseKeepReclaimed++;
             }
+            // -grabdelay: the first member is the real frame and stays the keeper whatever the
+            // delayed second grab returns, so the output is unchanged by the experiment.
+            if (m_grabDelayArmed) m_rotRealMember = 0;
             m_prevKeeper = m_rotRealMember;
             m_prevBatchStart = batch.stampTs;
             m_prevSpacing = m_rotSpacing;
@@ -731,6 +754,63 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             m_lateGrabDoneThisBatch = true;
             LateGrab(grabParams, batch.stampTs, now.QuadPart, usPerTick);
         }
+        // -grabdelay bookkeeping: a first member picks the delay for the grab that answers
+        // this batch's second notification; the second member, when it comes, is scored by
+        // the change map against the first (thousands of blocks = a different picture).
+        if (m_grabDelayArmed) {
+            if (batch.member == 0) {
+                m_grabDelayStep = m_grabDelaySteps > 1 ? (m_grabDelayIdx++ % m_grabDelaySteps) : 0;
+                m_gdBatches[m_grabDelayStep]++;
+                m_grabDelayNext = true;
+            } else if (batch.member == 1 && m_grabDelayStep >= 0) {
+                m_gdSecond[m_grabDelayStep]++;
+                m_gdDtSum[m_grabDelayStep] += dt;
+                if (changed < 0) m_gdNoMap[m_grabDelayStep]++;
+                else if (changed >= 4000) m_gdGenerated[m_grabDelayStep]++;
+            }
+        }
+    }
+}
+
+void CaptureRing::PreciseSleep(unsigned int us) {
+    // The driver's high-precision sleep, with a clock spin for whatever it leaves short: the
+    // delay is the experiment, and a sleep that returned early would be read as a result.
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    m_nvfbc->NvFBCToDx9VidGPUBasedCPUSleep((__int64)us);
+    const LONGLONG wantTicks = ((LONGLONG)us * m_freqQuad) / 1000000;
+    do {
+        QueryPerformanceCounter(&t1);
+    } while (t1.QuadPart - t0.QuadPart < wantTicks && !m_stop.load());
+}
+
+void CaptureRing::EnableGrabDelay(int delayUs) {
+    m_grabDelayArmed = true;
+    if (delayUs < 0) {
+        // The sweep. Zero is the control; the top stays under the 3 ms batch threshold once
+        // the loop's own processing is added, so a delayed second member is still a second
+        // member and not a batch of its own.
+        static const unsigned int kSweep[kGrabDelayMaxSteps] =
+            { 0, 600, 900, 1200, 1500, 1800, 2100, 2400 };
+        m_grabDelaySteps = kGrabDelayMaxSteps;
+        for (int i = 0; i < kGrabDelayMaxSteps; i++) m_grabDelayTable[i] = kSweep[i];
+    } else {
+        m_grabDelaySteps = 1;
+        m_grabDelayTable[0] = (unsigned int)delayUs;
+    }
+}
+
+void CaptureRing::LogGrabDelaySummary() const {
+    if (!m_grabDelayArmed) return;
+    for (int i = 0; i < m_grabDelaySteps; i++) {
+        const long long withMap = m_gdSecond[i] - m_gdNoMap[i];
+        LOG("grabdelay summary: +%u us before the second grab: %lld batches, %lld with a second "
+            "member (executed dt mean %lld us), of which a different picture %lld (%.1f%%)%s",
+            m_grabDelayTable[i], m_gdBatches[i], m_gdSecond[i],
+            m_gdSecond[i] ? (long long)(m_gdDtSum[i] / m_gdSecond[i]) : 0LL,
+            m_gdGenerated[i],
+            withMap > 0 ? 100.0 * (double)m_gdGenerated[i] / (double)withMap : 0.0,
+            m_gdNoMap[i] ? " (some without a change map)" : "");
     }
 }
 
@@ -744,16 +824,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
 // blocks) or the next real frame arriving early (zero).
 void CaptureRing::LateGrab(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams, LONGLONG batchStartQpc,
                            LONGLONG lastArrivalQpc, double usPerTick) {
-    // The driver's high-precision sleep, with a clock spin for whatever it leaves short:
-    // the delay IS the experiment, and a sleep that returned early would make the grab read
-    // "real frame again" for the wrong reason. The logged after= is measured, not requested.
-    LARGE_INTEGER t0, t1;
-    QueryPerformanceCounter(&t0);
-    m_nvfbc->NvFBCToDx9VidGPUBasedCPUSleep((__int64)m_lateGrabUs);
-    const LONGLONG wantTicks = ((LONGLONG)m_lateGrabUs * m_freqQuad) / 1000000;
-    do {
-        QueryPerformanceCounter(&t1);
-    } while (t1.QuadPart - t0.QuadPart < wantTicks && !m_stop.load());
+    PreciseSleep(m_lateGrabUs);
     NVFBC_TODX9VID_GRAB_FRAME_PARAMS p = *grabParams;
     p.dwFlags = NVFBC_TODX9VID_NOWAIT;
     p.dwWaitTime = 0;

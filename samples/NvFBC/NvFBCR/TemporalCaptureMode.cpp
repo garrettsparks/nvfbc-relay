@@ -26,7 +26,8 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
                                          bool tint, bool etw, bool noJoin, bool dejitter,
                                          bool fgPhase, bool phaseKeep, bool subGen,
                                          bool diffMap, bool genCheck, unsigned int lateGrabUs,
-                                         unsigned int extraLagMs, bool d3d11Present)
+                                         int grabDelayUs, unsigned int extraLagMs,
+                                         bool d3d11Present)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_compositor(NULL)
@@ -47,6 +48,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_diffMap(diffMap)
     , m_genCheck(genCheck)
     , m_lateGrabUs(lateGrabUs)
+    , m_grabDelayUs(grabDelayUs)
     , m_d3d11Present(d3d11Present)
     , m_vsyncPresent(vsyncPresent)
     , m_targetFramerate(framerate)
@@ -137,6 +139,9 @@ bool TemporalCaptureMode::Setup() {
     }
     if (m_lateGrabUs > 0) {
         m_ring.EnableLateGrab(m_lateGrabUs);
+    }
+    if (m_grabDelayUs != 0) {
+        m_ring.EnableGrabDelay(m_grabDelayUs);
     }
     if (m_phaseKeep) {
         m_ring.EnablePhaseKeep(this);
@@ -865,6 +870,7 @@ void TemporalCaptureMode::Run(
     // After the join: the instruments' counters are capture-thread-owned until then.
     m_ring.LogGenCheckSummary();
     m_ring.LogLateGrabSummary();
+    m_ring.LogGrabDelaySummary();
 }
 
 const char* TemporalCaptureMode::GetModeName() const {

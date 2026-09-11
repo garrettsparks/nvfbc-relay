@@ -254,6 +254,23 @@ public:
     void EnableLateGrab(unsigned int delayUs) { m_lateGrabUs = delayUs; }
     void LogLateGrabSummary() const;
 
+    // Request a delay of the SECOND grab of every batch (-grabdelay). Before Start.
+    //
+    // Under in-game frame generation the second notification of a batch is the generated
+    // frame's present, and the copy NvFBC takes when the grab answers it holds the real
+    // frame again unless the grab executes about a millisecond later, after the generation
+    // pass has landed: measured on natural late grabs, the second member is a generated
+    // frame on 3% of batches when it executed under 0.8 ms after the first and on 97 to 100%
+    // when it executed after 1.2 ms. A no-wait poll cannot reach it (it returns the last
+    // notified frame), so this delays the answering grab itself: after a batch's first member
+    // is processed the capture thread sleeps before calling the next grab, and the pending
+    // second notification is then answered late. Measurement only: the batch's first member
+    // is kept and the delayed member is discarded, so the screen shows exactly what it shows
+    // today, while the change map and the sample check classify the delayed copy. delayUs
+    // negative sweeps a table of delays batch by batch, so one capture maps the window.
+    void EnableGrabDelay(int delayUs);
+    void LogGrabDelaySummary() const;
+
 private:
     struct Slot {
         IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
@@ -439,6 +456,22 @@ private:
     long long m_lateGrabNoMap = 0;
     void LateGrab(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams, LONGLONG batchStartQpc,
                   LONGLONG lastArrivalQpc, double usPerTick);
+    void PreciseSleep(unsigned int us);
+
+    // -grabdelay experiment. Capture-thread-owned. The table is the sweep; a fixed delay is
+    // a one-entry table. Executed delay is measured as the second member's dt.
+    static const int kGrabDelayMaxSteps = 8;
+    bool m_grabDelayArmed = false;
+    int m_grabDelaySteps = 0;
+    unsigned int m_grabDelayTable[kGrabDelayMaxSteps] = {};
+    int m_grabDelayIdx = 0;                    // next table entry for a sweep
+    int m_grabDelayStep = -1;                  // entry used for the batch in flight
+    bool m_grabDelayNext = false;              // sleep before the next grab call
+    long long m_gdBatches[kGrabDelayMaxSteps] = {};     // first members seen per entry
+    long long m_gdSecond[kGrabDelayMaxSteps] = {};      // of those, batches with a second member
+    long long m_gdGenerated[kGrabDelayMaxSteps] = {};   // second members that were a different picture
+    long long m_gdNoMap[kGrabDelayMaxSteps] = {};
+    LONGLONG m_gdDtSum[kGrabDelayMaxSteps] = {};        // executed dt of those second members
 
     Slot m_ring[RING_SIZE];
     int m_ringSlots = kDefaultRingSlots;

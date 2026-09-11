@@ -139,6 +139,12 @@ bool g_genCheck = false;
 // generated frame is in the capture buffer shortly after the real frame's present but nothing
 // announces it; this goes and looks. Decides nothing; read with -gencheck and the change map.
 unsigned int g_lateGrabUs = 0;
+// -grabdelay N|sweep: EXPERIMENT. Delay the SECOND grab of every capture batch by N
+// microseconds (sweep cycles a table batch by batch), so the copy that answers the generated
+// frame's present notification executes after the generation pass has landed. The first
+// member stays the keeper, so the output is unchanged; the change map scores the delayed copy.
+// 0 = off, positive = fixed, negative = sweep.
+int g_grabDelayUs = 0;
 // -lag N: extra bracketing delay in ms. Trades output latency, which the player never sees
 // (the source display is direct) and which only shifts an already-delayed stream, for holds.
 unsigned int g_extraLagMs = 0;
@@ -189,7 +195,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
                                            kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
                                            g_dejitter, g_fgPhase, g_phaseKeep, g_subGen,
-                                           g_diffMap, g_genCheck, g_lateGrabUs, g_extraLagMs);
+                                           g_diffMap, g_genCheck, g_lateGrabUs, g_grabDelayUs,
+                                           g_extraLagMs);
         }
 
         // D3D11 flip-model present (b:flip): the blend compositor decided and drawn on a D3D11
@@ -206,8 +213,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
             return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
                                            kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
                                            g_dejitter, g_fgPhase, g_phaseKeep, g_subGen,
-                                           g_diffMap, g_genCheck, g_lateGrabUs, g_extraLagMs,
-                                           /*d3d11Present=*/true);
+                                           g_diffMap, g_genCheck, g_lateGrabUs, g_grabDelayUs,
+                                           g_extraLagMs, /*d3d11Present=*/true);
         }
 
         // QPC-timer present (t:60 / b:60 / o:60 format).
@@ -217,7 +224,8 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
                 return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
                                                kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
                                                g_dejitter, g_fgPhase, g_phaseKeep, g_subGen,
-                                           g_diffMap, g_genCheck, g_lateGrabUs, g_extraLagMs);
+                                           g_diffMap, g_genCheck, g_lateGrabUs, g_grabDelayUs,
+                                           g_extraLagMs);
             }
         }
     }
@@ -263,6 +271,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     LOGERR("  -phasekeep     - With -etw: phase-aware keep-real, so x3 keeps the real frame in every batch that has one (inert at x2)");
     LOGERR("  -gencheck      - Sample-check instrument: 256-texel equality verdict per grab beside the driver's diff= (referee for -diffmap); decides nothing");
     LOGERR("  -lategrab N    - Experiment: one extra no-wait grab per batch, N us (100-20000) after the second member, into a slot outside the ring; read with -gencheck");
+    LOGERR("  -grabdelay N|sweep - Experiment: delay the second grab of every batch by N us (100-2400) or sweep a table; first member stays the keeper; read the grabdelay summary");
     return NULL;
 }
 
@@ -690,6 +699,17 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
         else LOGERR("-lategrab value '%s' invalid (100-20000 us) - ignored", tokens[i + 1].c_str());
         return 2;
     }
+    if (tokens[i] == "-grabdelay" && i + 1 < tokens.size()) {
+        if (tokens[i + 1] == "sweep") {
+            g_grabDelayUs = -1;
+        } else {
+            const long v = strtol(tokens[i + 1].c_str(), NULL, 10);
+            if (v >= 100 && v <= 2400) g_grabDelayUs = (int)v;
+            else LOGERR("-grabdelay value '%s' invalid (100-2400 us, or sweep) - ignored",
+                        tokens[i + 1].c_str());
+        }
+        return 2;
+    }
     if (tokens[i] == "-flipex") {
         g_flipEx = true;
         return 1;
@@ -973,8 +993,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
     LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s, "
         "etw flip capture %s, flip join %s, dejitter %s, fgphase %s, phasekeep %s, "
-        "generated-frame substitution %s, diffmap %s, gencheck %s, lategrab %u us, flip mode %s, "
-        "extra lag %u ms, present path %s",
+        "generated-frame substitution %s, diffmap %s, gencheck %s, lategrab %u us, grabdelay %s, "
+        "flip mode %s, extra lag %u ms, present path %s",
         g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
         g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off",
         !g_etw ? "off (no -etw)" : (g_noJoin ? "OFF (-nojoin)" : "on"),
@@ -989,6 +1009,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         g_diffMap ? "requested (-diffmap; ACTIVE only when the instrument line follows)" : "off",
         g_genCheck ? "requested (-gencheck; ACTIVE only when the instrument line follows)" : "off",
         g_lateGrabUs,
+        g_grabDelayUs == 0 ? "off" : (g_grabDelayUs < 0 ? "sweep" : "fixed (see the ACTIVE line)"),
         g_flipEx ? "FLIPEX (-flipex)" : "bitblt (DISCARD)",
         g_extraLagMs,
         captureMode->PresentsViaD3D11() ? "D3D11 flip-model swapchain (b:flip)" : "D3D9 swapchain");
