@@ -15,23 +15,22 @@ regrab_copies 1
 # 7 -> 2 while every declared bound stayed green, because only the additions were gated.
 # This fixture's removals live at hitch/stall neighborhoods, so it is the first to starve
 # when a gate declines ragged-but-real content.
-# The copy-free timeline (regrab_copies) moved three bounds, two of them through ONE event,
-# and the copies only decided which way it fell. A 1.6 s static screen ends at t=7.38s into a
-# burst of 8 ms deliveries, where the 16.7 ms comb's phase is ambiguous, and the two timelines'
-# resumes settle 7.4 ms apart. The copy-free lock then disengages with its pull near 15.6 ms,
-# and a disengaged pull returns to 0 in a straight line rather than the 1 ms the short way
-# round the comb: after a hitch's recovery window takes it to 6.1 ms at t=9.2s it crawls at
-# 25 us/present for four more seconds, and the last 2.5 ms of that crawl sweeps the target
-# across the passthrough gate, 132 presents of blend from t=11.6s. With the copies in, the
-# pull was 5.6 ms when the lock disengaged and the same recovery window cleared it by t=9.1s.
-# Five of the seven blends dejit removed with the copies in sat in an unlocked blend run at
-# t=11.9s that the crawl replaces; the isolated late-delivery removals at t=155.8s and
-# t=184.4s are unchanged and a third appears at t=26.6s, so the floor of 3 still fails the
-# 7 -> 2 anchoring regression it exists for. At -lag 75 on a 60 Hz present grid the same
-# capture's worst run is 54. Re-seeds 17 -> 14, none without one within 0.5 s.
-max_blends_added 0
+# The copy-free timeline (regrab_copies) moved re-seeds 17 -> 14 (none without one within
+# 0.5 s) and the removal floor 7 -> 3. Five of the seven blends dejit removed with the copies
+# in sat in one unlocked blend run near t=11.9s that the copy-free timeline replays
+# differently; the isolated late-delivery removals at t=155.8s and t=184.4s are unchanged and a
+# third appears at t=26.6s, so the floor of 3 still fails the 7 -> 2 anchoring regression it
+# exists for.
+# Worst run 50 relies on the re-engage convergence window. Without it this timeline ran 132:
+# the game ran near 59 fps after a 1.6 s static screen at t=7.38s, the lock disengaged, and
+# once the game settled the target sat past the passthrough threshold while the pull closed
+# the gap at the steady 25 us a present. The window converges it once the lock re-engages.
+# The one addition allowed is lock path, not correction: at t=12.461s, as the lock re-engages,
+# the plain and dejitted replays' pulls sit 495 us apart, so the two runs are not comparing the
+# same target there.
+max_blends_added 1
 min_blends_removed 3
-max_worst_run 132
+max_worst_run 50
 max_long_runs 1
 max_synth_pct 8.8
 min_reseeds 13

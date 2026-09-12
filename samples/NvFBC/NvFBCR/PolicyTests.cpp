@@ -607,12 +607,13 @@ static void test_no_excursion_while_locked() {
 }
 
 // Re-seed vs slew after a source stall. A stall freezes the pull; if the phase parked mid-gap
-// on resume, the steady-state slew crawls the pull back over ~a hundred presents (the "couple
-// seconds of blend" seen after a map open/close), while the stall-resume re-seed snaps it in
-// one. This reproduces the slow recovery with the flag off, then confirms the fix with it on -
-// no game-specific tuning: any coherent source (source period == present period, so the phase
-// parks) whose big drop leaves the phase mid-gap. Oversampled sources recover instantly either
-// way, so this is the regime where the recovery cost actually shows.
+// on resume, the steady-state slew alone would crawl the pull back over ~two hundred presents
+// (the "couple seconds of blend" seen after a map open/close), while the stall-resume re-seed
+// snaps it in one. Without the resume flag the half-comb error disengages the lock, and its
+// re-engage then converges through the confirmed convergence window, so even that path
+// recovers in well under a second; the re-seed must still be far faster. Any coherent source
+// (source period == present period, so the phase parks) whose big drop leaves the phase
+// mid-gap shows this; oversampled sources recover instantly either way.
 static void test_lock_reseed_recovery() {
     PolicyConfig cfg;
     cfg.stickinessQpc = kStickinessUs;
@@ -645,12 +646,81 @@ static void test_lock_reseed_recovery() {
     for (PhaseLockState s = settledLock(); !passing(s.pullQpc) && snapPresents < 10000; snapPresents++)
         policy::UpdatePhaseLock(s, cfg, beforeDiffAt(s.pullQpc), /*resumedFromStall=*/snapPresents == 0);
 
-    std::printf("  reseed recovery: slew=%d presents (~%.2fs of blend) vs snap=%d present\n",
+    std::printf("  reseed recovery: without a resume=%d presents (~%.2fs of blend) vs snap=%d present\n",
                 slewPresents, slewPresents * 16667.0 / 1e6, snapPresents);
-    CHECK(slewPresents > 100, "un-fixed slew recovered in %d presents (expected the slow >100)", slewPresents);
+    // The steady slew alone needs ~200 presents here, so losing the re-engage window shows up
+    // as this bound failing.
+    CHECK(slewPresents <= 80,
+          "recovery without a resume took %d presents (expected <= 80 through the re-engage window)",
+          slewPresents);
     CHECK(snapPresents <= 3, "re-seed recovered in %d presents (expected <= 3)", snapPresents);
     CHECK((int64_t)snapPresents * 20 < slewPresents,
-          "re-seed (%d) not >=20x faster than slew (%d)", snapPresents, slewPresents);
+          "re-seed (%d) not >=20x faster than recovery without a resume (%d)", snapPresents,
+          slewPresents);
+}
+
+// The re-engage convergence window, with its controls. A lock that disengaged while the phase
+// swept and re-engages with the target far from its phase must converge through the window
+// once its deviation settles. The same re-lock with the target already inside the passthrough
+// threshold must not open it, and a lock flapping at the stability gate, whose deviation never
+// settles, must never open it however often it re-engages.
+static void test_lock_engage_window() {
+    PolicyConfig cfg;
+    cfg.stickinessQpc = kStickinessUs;
+    cfg.combQpc = 16667;
+    cfg.phasePullSlewQpc = kSlewUs;
+    cfg.passthroughQpc = 4166;
+    const int64_t comb = cfg.combQpc;
+    struct Outcome { int windows; int reengages; int converged; };
+    // Starts disengaged with the error EMA already holding the phase offset; jitterAt(k) is
+    // added to each measured phase. converged is the first present whose target sits inside
+    // the passthrough threshold, or -1.
+    auto drive = [&](int64_t offset, int64_t (*jitterAt)(int), int presents) {
+        PhaseLockState s;
+        s.seeded = true;
+        s.engaged = false;
+        s.errEmaQpc = offset;
+        s.devEmaQpc = 3000;
+        Outcome o{0, 0, -1};
+        for (int k = 0; k < presents; k++) {
+            const int64_t bd = ((offset - s.pullQpc + jitterAt(k)) % comb + comb) % comb;
+            const bool wasEngaged = s.engaged;
+            const int prevRecover = s.recoverRun;
+            policy::UpdatePhaseLock(s, cfg, bd, /*resumedFromStall=*/false);
+            if (!wasEngaged && s.engaged) o.reengages++;
+            if (prevRecover == 0 && s.recoverRun > 0) o.windows++;
+            int64_t phase = policy::WrapHalf(offset - s.pullQpc, comb);
+            if (phase < 0) phase = -phase;
+            if (o.converged < 0 && phase < cfg.passthroughQpc) o.converged = k;
+        }
+        return o;
+    };
+    const Outcome farLock = drive(6000, [](int) -> int64_t { return 0; }, 300);
+    const Outcome nearLock = drive(2000, [](int) -> int64_t { return 0; }, 300);
+    // Jitter alternating just under and just over the gate's deviation, so the lock keeps
+    // disengaging and re-engaging without its deviation ever settling.
+    const Outcome flapLock = drive(6000, [](int k) -> int64_t {
+        const int64_t amplitude = ((k / 40) % 2) ? 2400 : 1900;
+        return (k % 2) ? amplitude : -amplitude;
+    }, 400);
+    std::printf("  engage window: far re-lock %d window(s), inside the threshold at present %d; "
+                "near re-lock %d window(s); flapping %d re-engages, %d window(s)\n",
+                farLock.windows, farLock.converged, nearLock.windows, flapLock.reengages,
+                flapLock.windows);
+    CHECK(farLock.reengages >= 1 && farLock.windows == 1,
+          "far re-lock: %d re-engages, %d windows (expected one window)", farLock.reengages,
+          farLock.windows);
+    CHECK(farLock.converged >= 0 && farLock.converged <= 30,
+          "far re-lock reached the threshold at present %d (expected <= 30; the steady slew needs ~80)",
+          farLock.converged);
+    CHECK(nearLock.windows == 0,
+          "near re-lock opened %d windows (expected none: its target already passes)",
+          nearLock.windows);
+    CHECK(flapLock.reengages >= 2,
+          "flapping control re-engaged only %d times: the control is not flapping",
+          flapLock.reengages);
+    CHECK(flapLock.windows == 0, "flapping lock opened %d windows (expected none)",
+          flapLock.windows);
 }
 
 // A real source stall, in both shapes the ring sees. A FREEZE delivers nothing until the game
@@ -3842,6 +3912,7 @@ int main(int argc, char** argv) {
     test_dejit_removes_late_blends();
     test_batch_collapse_keep_real();
     test_lock_reseed_wide_bracket_stall();
+    test_lock_engage_window();
     test_lock_reseed_stall_paired_cadence();
     test_replay_capture_corpus();
 

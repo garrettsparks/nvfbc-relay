@@ -463,6 +463,7 @@ struct PhaseLockState {
     bool seeded = false;
     int stallRun = 0;      // consecutive presents whose bracket carried no phase information
     int recoverRun = 0;    // presents left in the post-resume convergence window
+    int reengageRun = -1;  // presents since a re-engage awaiting confirmation; -1 = none
 };
 
 // Fixed at Setup. combQpc == 0 disables the lock entirely (selection then equals the
@@ -511,6 +512,9 @@ int64_t WrapHalf(int64_t d, int64_t p);
 // snap the correction in one present (re-seed the error EMA, apply the full delta unclamped)
 // instead of crawling back at the steady-state slew. Perceptually free: the snap lands on the
 // stall's own content discontinuity.
+// A re-engage after a disengaged stretch opens the same convergence window once confirmed: the
+// deviation EMA has settled well under the stability gate while the target is still beyond the
+// passthrough threshold (see kEngageStableDiv).
 void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeDiff,
                      bool resumedFromStall = false);
 

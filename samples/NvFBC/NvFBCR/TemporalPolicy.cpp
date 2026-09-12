@@ -51,6 +51,26 @@ static const int kRecoverPresents = 16;   // about 0.27 s at 60 Hz
 static const int kRecoverAlpha    = 2;    // error-EMA divisor while recovering (16 otherwise)
 static const int kRecoverSlewDiv  = 32;   // slew cap of comb/32 while recovering
 
+// Re-engage convergence. The lock disengages while the phase sweeps (a source running off the
+// declared rate) and re-engages once the deviation EMA settles, which can leave the target a
+// large fraction of a comb from its phase. Closing that at the steady-state slew walks the
+// target through the gap between real frames at 25 us a present: a blend run of a hundred or
+// more presents with the source already steady. So a re-engage opens the convergence window
+// above, but only once confirmed: the deviation EMA must settle below comb/kEngageStableDiv,
+// well under the stability gate at comb/8, with the target still beyond the passthrough
+// threshold. A lock flapping at the gate never settles that far and keeps the steady slew, and
+// a target already inside the threshold slews while passing sharp.
+//
+// Confirming by elapsed time cannot separate a real re-lock from flapping: every wait long
+// enough to stop the flapping gave back most of the gain. comb/12 let the flapping through.
+// Steady engaged deviation sits near comb/100 on every x2 capture measured, so comb/16 is far
+// from ordinary jitter. Only a source near the sink rate can use the window: where half a comb
+// does not exceed the passthrough threshold the error can never qualify.
+static const int kEngageStableDiv = 16;
+// A re-engage that has not settled within this many presents is ordinary tracking, not a
+// re-lock, and stops waiting.
+static const int kEngageConfirmPresents = 120;
+
 // How far past a search boundary the backward flip walks keep looking before giving up.
 // Both walks rely on flips on ONE head arriving in display order - measured 0 inversions over
 // 400k flips, and counted at runtime by FlipHistory::OutOfOrder() rather than assumed - and
@@ -698,6 +718,31 @@ bool UpdateStallRun(PhaseLockState& s, const PolicyConfig& cfg, const BracketInf
     return resumed;
 }
 
+// Tracks a re-engage through its confirmation and opens the convergence window once it
+// qualifies (see kEngageStableDiv). Runs after the stability gate for the present is decided.
+static void ConfirmReengage(PhaseLockState& s, const PolicyConfig& cfg, bool wasSeeded,
+                            bool wasEngaged) {
+    if (!s.engaged) {
+        s.reengageRun = -1;
+        return;
+    }
+    // A stall resume already opened the window; cold acquisition has its own pinned behaviour.
+    if (wasSeeded && !wasEngaged && s.recoverRun == 0) s.reengageRun = 0;
+    if (s.reengageRun < 0) return;
+    if (s.devEmaQpc < cfg.combQpc / kEngageStableDiv) {
+        int64_t errMag = s.errEmaQpc;
+        if (errMag < 0) errMag = -errMag;
+        if (s.recoverRun == 0 && cfg.passthroughQpc > 0 && errMag >= cfg.passthroughQpc) {
+            s.recoverRun = kRecoverPresents;
+        }
+        s.reengageRun = -1;
+    } else if (s.reengageRun >= kEngageConfirmPresents) {
+        s.reengageRun = -1;
+    } else {
+        s.reengageRun++;
+    }
+}
+
 void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeDiff,
                      bool resumedFromStall) {
     // Closed loop: the pull is already inside the target this error was measured at, so
@@ -705,13 +750,14 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     // circular comb domain; a linear controller here saturates against clock skew and
     // drains through a disengaged sweep every beat (measured - see the comb-lock spec).
     const int64_t err = WrapHalf(beforeDiff, cfg.combQpc);
+    const bool wasSeeded = s.seeded;
     // Re-seed on stall-resume treats the resumed phase like a fresh acquisition: the fresh
     // err (not the /16-lagged EMA) both drives dev to zero (so the lock stays engaged
     // through the resume instead of flapping) and lets want reflect the true new phase.
     if (!s.seeded || resumedFromStall) {
         s.errEmaQpc = err;
         s.seeded = true;
-        // Only a stall resume opens the window. Cold acquisition converges from a clean
+        // Only a stall resume opens the window here. Cold acquisition converges from a clean
         // timeline and has its own pinned behaviour.
         if (resumedFromStall) s.recoverRun = kRecoverPresents;
     } else {
@@ -730,7 +776,9 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     // off the true rate (steady-state dev parks at the threshold). If in-regime lk flapping
     // ever shows up in real logs, give this the selection-stickiness Schmitt treatment
     // (engage below comb/8, release above comb/6) rather than tightening the -src tolerance.
+    const bool wasEngaged = s.engaged;
     s.engaged = s.devEmaQpc < cfg.combQpc / 8;
+    ConfirmReengage(s, cfg, wasSeeded, wasEngaged);
     const int64_t want = s.engaged ? s.pullQpc + s.errEmaQpc : 0;
     int64_t delta = want - s.pullQpc;
     // Snap the full correction on an engaged stall-resume; otherwise slew-limit it so
