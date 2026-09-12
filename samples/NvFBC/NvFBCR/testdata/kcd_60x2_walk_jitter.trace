@@ -7,6 +7,9 @@ description KCD 60x2 steady walking, gameplay only (video anchor mark 3925 = t+4
 field_worst_run 7
 field_long_runs 0
 field_synth_pct 1.1
+# Recorded by a capture loop that stored the grab timeout's re-delivered picture as a new
+# frame; the loader removes those wakes so the replay runs the loop that skips them.
+regrab_copies 1
 # Replay and field agree exactly here (1.1% / worst 7 on both), so these bounds gate the
 # model rather than excuse it. The reason this capture is in the corpus is the GRID, not the
 # output: same content and 119.5 vs 120.0 flips/s, but a scanout step jittering 5.5x wider

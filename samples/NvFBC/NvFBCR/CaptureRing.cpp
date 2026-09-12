@@ -16,6 +16,16 @@ extern NvFBCToDx9Vid* NvFBCDX9;
 // capture thread notices a stop request.
 static const NvU32 kGrabWaitMs = 100;
 
+// A grab that waits out that timeout still returns SUCCESS, carrying the picture NvFBC already
+// delivered: on the diff-map captures, all 290 wakes that landed at the timeout period changed
+// no block. Stored, it would put an old picture on the timeline at a new time, and a stall
+// would reach the policy as a chain of copies 100 ms apart instead of as the gap it is. So a
+// grab that blocked this long stores nothing and the loop waits again. Timeout returns land
+// 99-101 ms after the previous capture while real frames arrive at every shorter wait, so the
+// margin below the timeout only drops the rare real frame that lands in the last few
+// milliseconds of a wait, which the bracket then covers like any other missing frame.
+static const NvU32 kGrabTimeoutFloorMs = kGrabWaitMs - 5;
+
 CaptureRing::CaptureRing()
     : m_captureTarget(NULL)
     , m_presentDevice(NULL)
@@ -232,6 +242,8 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     // Fully event-driven blocking grab — safe now that the lock it holds is private.
     grabParams->dwFlags = NVFBC_TODX9VID_WAIT_WITH_TIMEOUT;
     grabParams->dwWaitTime = kGrabWaitMs;
+    LOG("CaptureRing: a grab that waits out its %u ms timeout stores nothing (NvFBC re-delivers the previous picture); blocked %u ms or more counts as one",
+        kGrabWaitMs, kGrabTimeoutFloorMs);
 
     LOG("CaptureRing initialized - %dx%d, %d shared slots, private capture device", m_width, m_height, m_ringSlots);
 
@@ -274,8 +286,11 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     const LONGLONG batchThresholdQpc = (m_freqQuad * 3) / 1000;
     policy::BatchState batchState;
     LOG("CaptureRing: batch-collapse keep-real (intra-batch wake <3ms = real member; previous slot retracted)");
+    const LONGLONG timeoutFloorQpc = (m_freqQuad * kGrabTimeoutFloorMs) / 1000;
 
     while (!m_stop.load()) {
+        LARGE_INTEGER grabStart;
+        QueryPerformanceCounter(&grabStart);
         NVFBCRESULT res = m_nvfbc->NvFBCToDx9VidGrabFrame(grabParams);
 
         if (res == NVFBC_ERROR_INVALIDATED_SESSION) {
@@ -284,20 +299,27 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             break;
         }
         if (res != NVFBC_SUCCESS) {
-            // Timed out with no new frame (e.g. static source) — loop and re-check stop.
+            // Nothing was grabbed: loop and re-check stop.
             continue;
         }
 
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
 
+        // The timeout's re-delivery of the picture already in the ring (see
+        // kGrabTimeoutFloorMs). It enters nothing: no slot, no batch, no period estimate, no
+        // vote, so the next real frame arrives against the last one that was actually new.
+        if (now.QuadPart - grabStart.QuadPart >= timeoutFloorQpc) {
+            m_grabTimeoutsSkipped++;
+            continue;
+        }
+
         const LONGLONG prevArrival = batchState.lastArrivalTs;
         const policy::BatchDecision batch =
             policy::UpdateBatch(batchState, now.QuadPart, batchThresholdQpc);
-        // Source-period estimate (gaps over 125 ms are stalls, not cadence). Grab-timeout
-        // re-grabs of a static source return SUCCESS at the timeout period and DO enter:
-        // that is the source's effective cadence while nothing new is drawn. EMA alpha
-        // 1/8: stable within ~8 source frames of a regime change, jitter-immune in
+        // Source-period estimate (gaps over 125 ms are stalls, not cadence). A static source
+        // adds nothing, so the estimate holds its last value while nothing new is drawn. EMA
+        // alpha 1/8: stable within ~8 source frames of a regime change, jitter-immune in
         // steady state.
         if (batch.batchGap > 0 && batch.batchGap < m_freqQuad / 8) {
             long long ema = m_srcPeriodEmaQpc.load(std::memory_order_relaxed);
@@ -381,7 +403,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             if (m_rotationOracle && paired) {
                 // The batch period the STRIDE derives from is a separate, CLAMPED estimate,
                 // not m_srcPeriodEmaQpc. The shared EMA admits any gap under 125 ms, so a
-                // single ~100 ms grab-timeout stall inflates it enough to flip the derived
+                // single stall gap near 100 ms inflates it enough to flip the derived
                 // stride 2 -> 3, which reads as a grid change, resets the vote, and the
                 // excursion takes ~46 batches to decay before flipping back - a second
                 // reset. Measured on the 2026-08-20 fix_reverse capture: 154 such gaps

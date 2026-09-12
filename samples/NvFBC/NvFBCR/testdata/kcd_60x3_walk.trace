@@ -7,6 +7,9 @@ description KCD 60fps, Smooth Motion x3, steady walking, -lock -mark -etw, 2026-
 field_worst_run 46
 field_long_runs 0
 field_synth_pct 18.0
+# Recorded by a capture loop that stored the grab timeout's re-delivered picture as a new
+# frame; the loader removes those wakes so the replay runs the loop that skips them.
+regrab_copies 1
 # Replay tracks the field closely here (19.0% vs 18.0%, worst run identical at 46). The 18%
 # synth IS the known x3 defect - keep-real retains batch member 1, which holds the real
 # frame only in [gen,real] batches of the rotating x3 composition - recorded as a bound so
@@ -14,7 +17,11 @@ field_synth_pct 18.0
 max_worst_run 46
 max_long_runs 0
 max_synth_pct 19.4
-min_reseeds 17
+# Re-seeds counted on the copy-free timeline (regrab_copies). With the copies in, one that
+# landed just ahead of the next real frame closed a narrow bracket inside the stall and fired
+# an extra re-seed there: removing them took the replay from 18 re-seeds to 15, and only 1
+# of the 18 has no re-seed within 0.5 s on the copy-free run.
+min_reseeds 14
 # Stage-6 gates. The 3 additions are threshold boundary tips on a healthy 180/s grid
 # (corrections move minDiff 1-2 ms across the passthrough hysteresis), not mis-anchors;
 # pinned so they can only grow deliberately.

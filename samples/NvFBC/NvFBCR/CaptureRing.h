@@ -99,8 +99,8 @@ public:
     // ONLY: consumers may audit their configured source-rate assumption against it, but it
     // must never drive the bracketing lag; the lag is a static launch-time constant so that
     // output latency stays compensable downstream. Intra-batch frame-gen gaps and stall gaps
-    // over 125 ms are excluded; grab-timeout re-grabs of a static source DO enter (they are
-    // the source's effective cadence while nothing new is drawn).
+    // over 125 ms are excluded, and a static source adds nothing, so the estimate holds its
+    // last value while nothing new is drawn.
     LONGLONG EstimatedSourcePeriodQpc() const { return m_srcPeriodEmaQpc.load(); }
 
     // Find the published frames bracketing targetQpc (present-device aliases). overlay,
@@ -172,6 +172,10 @@ public:
     long long PhaseKeepReclaimed() const { return m_phaseKeepReclaimed; }
     long long PhaseKeepUndecided() const { return m_phaseKeepUndecided; }
     long long PhaseKeepResets() const { return m_phaseKeepResets; }
+
+    // Grabs that waited out NvFBC's timeout and stored nothing. Written by the capture thread
+    // only, so read it after Stop(), which joins that thread.
+    long long GrabTimeoutsSkipped() const { return m_grabTimeoutsSkipped; }
 
     // Request the content-phase instrument (-fgphase) before Start.
     //
@@ -285,6 +289,7 @@ private:
     std::atomic<long long> m_srcPeriodEmaQpc;  // capture-thread-written source period estimate
     std::atomic<bool> m_stop;
     long long m_writeCount;               // capture-thread-local
+    long long m_grabTimeoutsSkipped = 0;  // capture-thread-local; see GrabTimeoutsSkipped
     LONGLONG m_batchStarts[kBatchHistory] = {};   // written by capture thread at batch open
     std::atomic<long long> m_batchOpens{0};
 };

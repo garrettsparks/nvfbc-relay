@@ -116,10 +116,12 @@ struct SimParams {
     int64_t passthroughQpc;  // 0 = composite decision off
     int64_t lagOverride;     // 0 = size from srcPeriod as production does; else this lag
     std::vector<int64_t> drops;  // sorted arrival indices to drop (hole injection)
-    // A source stall, as the ring actually sees one: from arrival index stallAtArrival,
-    // stallArrivals arrivals come stallGap apart instead of srcPeriod. This is the shape a
-    // frozen game produces, because NvFBC's grab times out and re-delivers STALE content
-    // rather than starving the ring: the bracket stays COMPLETE and merely grows WIDE.
+    // A source stall: from arrival index stallAtArrival, stallArrivals arrivals come
+    // stallGap apart instead of srcPeriod. One arrival and a long gap is a FREEZE: the
+    // capture loop stores nothing while the game draws nothing, so the bracket is one-sided
+    // until the first frame after the freeze closes it WIDE. Several arrivals a shorter gap
+    // apart is a HITCH, a game still drawing the odd frame, where the bracket stays COMPLETE
+    // and merely grows WIDE.
     // Note a stall alone is often phase-neutral: 200 ms of frozen 60 fps source is exactly
     // 12 frame periods, so the comb phase comes back where it left. What actually strands
     // the pull is the source resuming on a NEW phase, because the game restarts its frame
@@ -209,11 +211,11 @@ static SimResult Simulate(const SimParams& p) {
         if (p.periodPattern.empty()) {
             t = p.phaseOffset + (i + 1) * p.srcPeriod + stallShift;
         } else {
-            // The stall overrides the cadence rather than riding on top of it: NvFBC's
-            // grab times out and re-delivers stale content at the timeout period no
-            // matter what pattern the source was producing before the freeze. Without
-            // this the pattern branch silently ignores the stall entirely, so a stall
-            // and a non-uniform cadence cannot be simulated together.
+            // The stall overrides the cadence rather than riding on top of it: a frozen
+            // or hitching game delivers at the stall's spacing whatever pattern it was
+            // producing before. Without this the pattern branch silently ignores the
+            // stall entirely, so a stall and a non-uniform cadence cannot be simulated
+            // together.
             int64_t step = p.periodPattern[(size_t)(i % (int64_t)p.periodPattern.size())];
             if (inStall) step = p.stallGap;
             if (p.stallAtArrival >= 0 && i == p.stallAtArrival + p.stallArrivals - 1) {
@@ -651,67 +653,77 @@ static void test_lock_reseed_recovery() {
           "re-seed (%d) not >=20x faster than slew (%d)", snapPresents, slewPresents);
 }
 
-// A real source stall, as the ring sees it. A frozen game does NOT starve the ring:
-// NvFBC's grab times out and returns the SAME frame, so arrivals keep landing at the
-// timeout period and the bracket stays COMPLETE, just wide. The re-seed trigger counts
-// consecutive INCOMPLETE brackets, so it never arms here and the pull crawls back at
-// the steady-state slew, blending the whole way. Measured in the field at ~8% of
-// stalls, up to 175 presents (~2.9 s) of continuous synth.
+// A real source stall, in both shapes the ring sees. A FREEZE delivers nothing until the game
+// resumes, so the bracket is one-sided and then closes wide over the gap; a HITCH still
+// delivers the odd frame, so the bracket stays complete and merely grows wide. The re-seed
+// trigger has to count both as stalled: counting only incomplete brackets never armed on the
+// wide ones, and the pull crawled back at the steady-state slew, blending the whole way
+// (measured in the field at ~8% of stalls, up to 175 presents, ~2.9 s, of continuous synth).
 static void test_lock_reseed_wide_bracket_stall() {
-    SimParams p;
-    p.srcPeriod = 16667;
-    p.presentPeriod = 16667;
-    p.arrivalJitter = 0;
-    p.combQpc = 16667;
-    p.presents = 700;
-    p.phaseOffset = 0;
-    p.passthroughQpc = 4166;
-    p.lagOverride = 0;
-    p.stallAtArrival = 300;      // let the lock settle first
-    p.stallArrivals = 2;         // 2 timeout re-grabs = ~200 ms frozen
-    p.stallGap = 100000;         // NvFBC's grab timeout
-    p.postStallPhase = 8333;     // the game resumes half a comb away
-    const SimResult r = Simulate(p);
+    struct StallShape { const char* name; int64_t arrivals; int64_t gap; };
+    const StallShape kShapes[] = {
+        {"freeze", 1, 200000},   // ~200 ms with nothing delivered
+        {"hitch", 2, 100000},    // ~200 ms with one frame drawn in the middle
+    };
+    for (const StallShape& shape : kShapes) {
+        SimParams p;
+        p.srcPeriod = 16667;
+        p.presentPeriod = 16667;
+        p.arrivalJitter = 0;
+        p.combQpc = 16667;
+        p.presents = 700;
+        p.phaseOffset = 0;
+        p.passthroughQpc = 4166;
+        p.lagOverride = 0;
+        p.stallAtArrival = 300;      // let the lock settle first
+        p.stallArrivals = shape.arrivals;
+        p.stallGap = shape.gap;
+        p.postStallPhase = 8333;     // the game resumes half a comb away
+        const SimResult r = Simulate(p);
 
-    // The stall region is everything abnormal: a wide bracket or a one-sided one.
-    size_t stallEnd = 0;
-    int wide = 0, oneSided = 0;
-    for (size_t i = 0; i < r.span.size(); i++) {
-        const bool abnormal = r.span[i] < 0 || r.span[i] > p.srcPeriod * 2;
-        if (abnormal) { stallEnd = i; }
-        if (r.span[i] > p.srcPeriod * 2) wide++;
-        if (r.span[i] < 0) oneSided++;
-    }
-    CHECK(wide > 0, "no wide bracket produced: the stall was not simulated");
+        // The stall region is everything abnormal: a wide bracket or a one-sided one.
+        size_t stallEnd = 0;
+        int wide = 0, oneSided = 0;
+        for (size_t i = 0; i < r.span.size(); i++) {
+            const bool abnormal = r.span[i] < 0 || r.span[i] > p.srcPeriod * 2;
+            if (abnormal) { stallEnd = i; }
+            if (r.span[i] > p.srcPeriod * 2) wide++;
+            if (r.span[i] < 0) oneSided++;
+        }
+        CHECK(wide > 0, "%s: no wide bracket produced: the stall was not simulated", shape.name);
 
-    int snaps = 0, snapApplied = 0;
-    for (size_t i = 0; i < r.snapped.size(); i++) {
-        if (!r.snapped[i]) continue;
-        snaps++;
-        // A snap that actually moved the pull shows up as a step past the slew clamp.
-        if (i > 0 && (r.pull[i] > r.pull[i-1] ? r.pull[i]-r.pull[i-1] : r.pull[i-1]-r.pull[i]) > kSlewUs) snapApplied++;
-    }
-    int synthAfter = 0;
-    for (size_t i = stallEnd + 1; i < r.ops.size() && i <= stallEnd + 200; i++) {
-        if (r.ops[i] == policy::CompositeOp::Synthesize) synthAfter++;
-    }
-    std::printf("  wide-bracket stall: %d wide, %d one-sided, re-seed armed %d / applied %d, "
-                "%d synth in the 200 presents after\n",
-                wide, oneSided, snaps, snapApplied, synthAfter);
-    for (size_t i = 0; i < r.snapped.size(); i++) {
-        if (!r.snapped[i]) continue;
-        std::printf("    armed at present %zu: span=%" PRId64 " beforeDiff=%" PRId64
-                    " pull %" PRId64 " -> %" PRId64 " engaged=%d\n",
-                    i, r.span[i], r.beforeDiff[i], i ? r.pull[i - 1] : 0, r.pull[i],
-                    (int)r.engaged[i]);
-    }
+        int snaps = 0, snapApplied = 0;
+        for (size_t i = 0; i < r.snapped.size(); i++) {
+            if (!r.snapped[i]) continue;
+            snaps++;
+            // A snap that actually moved the pull shows up as a step past the slew clamp.
+            if (i > 0 && (r.pull[i] > r.pull[i-1] ? r.pull[i]-r.pull[i-1] : r.pull[i-1]-r.pull[i]) > kSlewUs) snapApplied++;
+        }
+        int synthAfter = 0;
+        for (size_t i = stallEnd + 1; i < r.ops.size() && i <= stallEnd + 200; i++) {
+            if (r.ops[i] == policy::CompositeOp::Synthesize) synthAfter++;
+        }
+        std::printf("  %s stall: %d wide, %d one-sided, re-seed armed %d / applied %d, "
+                    "%d synth in the 200 presents after\n",
+                    shape.name, wide, oneSided, snaps, snapApplied, synthAfter);
+        for (size_t i = 0; i < r.snapped.size(); i++) {
+            if (!r.snapped[i]) continue;
+            std::printf("    armed at present %zu: span=%" PRId64 " beforeDiff=%" PRId64
+                        " pull %" PRId64 " -> %" PRId64 " engaged=%d\n",
+                        i, r.span[i], r.beforeDiff[i], i ? r.pull[i - 1] : 0, r.pull[i],
+                        (int)r.engaged[i]);
+        }
 
-    // Arming the re-seed is not enough: the snap is gated on the lock being engaged at
-    // that instant, and devEma only decays 15/16 per present after a stall drives it up.
-    CHECK(snaps > 0, "lock never detected the stall resume (no re-seed armed)");
-    CHECK(snapApplied > 0, "re-seed armed but the pull never moved past the slew clamp");
-    CHECK(synthAfter <= 10,
-          "slow recovery: %d synth presents after the stall (expected <= 10)", synthAfter);
+        // Arming the re-seed is not enough: the snap is gated on the lock being engaged at
+        // that instant, and devEma only decays 15/16 per present after a stall drives it up.
+        CHECK(snaps > 0, "%s: lock never detected the stall resume (no re-seed armed)",
+              shape.name);
+        CHECK(snapApplied > 0, "%s: re-seed armed but the pull never moved past the slew clamp",
+              shape.name);
+        CHECK(synthAfter <= 10,
+              "%s: slow recovery: %d synth presents after the stall (expected <= 10)",
+              shape.name, synthAfter);
+    }
 }
 
 // The flip history the platform layer will feed from the display driver's scanout events.
@@ -1908,55 +1920,63 @@ static void test_batch_collapse_keep_real() {
 // Both the resume phase and the parity matter: a freeze can begin on the real frame or on
 // its generated twin, and only the paired cadence has that second degree of freedom.
 static void test_lock_reseed_stall_paired_cadence() {
-    int worstRun = 0, badPhases = 0, totalPhases = 0;
-    int64_t worstPhase = 0;
-    int worstParity = 0;
-    for (int parity = 0; parity < 2; parity++) {
-        for (int k = 0; k < 21; k++) {
-            SimParams p;
-            p.srcPeriod = 16667;
-            p.presentPeriod = 16667;
-            p.arrivalJitter = 0;
-            p.combQpc = 16667;
-            p.presents = 700;
-            p.phaseOffset = 0;
-            p.passthroughQpc = 4166;
-            p.lagOverride = 0;
-            p.stallAtArrival = 300 + parity;
-            p.stallArrivals = 2;         // 2 timeout re-grabs = ~200 ms frozen
-            p.stallGap = 100000;         // NvFBC's grab timeout
-            p.postStallPhase = (int64_t)k * 16667 / 21;
-            p.periodPattern = { 16250, 400 };   // the real/generated pair
-            const SimResult r = Simulate(p);
+    struct StallShape { const char* name; int64_t arrivals; int64_t gap; };
+    const StallShape kShapes[] = {
+        {"freeze", 1, 200000},   // ~200 ms with nothing delivered
+        {"hitch", 2, 100000},    // ~200 ms with one frame drawn in the middle
+    };
+    for (const StallShape& shape : kShapes) {
+        int worstRun = 0, badPhases = 0, totalPhases = 0;
+        int64_t worstPhase = 0;
+        int worstParity = 0;
+        for (int parity = 0; parity < 2; parity++) {
+            for (int k = 0; k < 21; k++) {
+                SimParams p;
+                p.srcPeriod = 16667;
+                p.presentPeriod = 16667;
+                p.arrivalJitter = 0;
+                p.combQpc = 16667;
+                p.presents = 700;
+                p.phaseOffset = 0;
+                p.passthroughQpc = 4166;
+                p.lagOverride = 0;
+                p.stallAtArrival = 300 + parity;
+                p.stallArrivals = shape.arrivals;
+                p.stallGap = shape.gap;
+                p.postStallPhase = (int64_t)k * 16667 / 21;
+                p.periodPattern = { 16250, 400 };   // the real/generated pair
+                const SimResult r = Simulate(p);
 
-            size_t stallEnd = 0;
-            int wide = 0;
-            for (size_t i = 0; i < r.span.size(); i++) {
-                if (r.span[i] < 0 || r.span[i] > p.srcPeriod * 2) stallEnd = i;
-                if (r.span[i] > p.srcPeriod * 2) wide++;
-            }
-            CHECK(wide > 0, "paired cadence: the stall was not simulated (phase %d)", k);
-
-            int run = 0, best = 0;
-            for (size_t i = stallEnd + 1; i < r.ops.size() && i <= stallEnd + 250; i++) {
-                if (r.ops[i] == policy::CompositeOp::Synthesize) {
-                    run++;
-                    if (run > best) best = run;
-                } else {
-                    run = 0;
+                size_t stallEnd = 0;
+                int wide = 0;
+                for (size_t i = 0; i < r.span.size(); i++) {
+                    if (r.span[i] < 0 || r.span[i] > p.srcPeriod * 2) stallEnd = i;
+                    if (r.span[i] > p.srcPeriod * 2) wide++;
                 }
+                CHECK(wide > 0, "paired cadence %s: the stall was not simulated (phase %d)",
+                      shape.name, k);
+
+                int run = 0, best = 0;
+                for (size_t i = stallEnd + 1; i < r.ops.size() && i <= stallEnd + 250; i++) {
+                    if (r.ops[i] == policy::CompositeOp::Synthesize) {
+                        run++;
+                        if (run > best) best = run;
+                    } else {
+                        run = 0;
+                    }
+                }
+                totalPhases++;
+                if (best >= 50) badPhases++;
+                if (best > worstRun) { worstRun = best; worstPhase = p.postStallPhase; worstParity = parity; }
             }
-            totalPhases++;
-            if (best >= 50) badPhases++;
-            if (best > worstRun) { worstRun = best; worstPhase = p.postStallPhase; worstParity = parity; }
         }
+        std::printf("  paired-cadence %s: worst synth run %d (resume phase %" PRId64
+                    "us, parity %d), %d of %d phases over 50\n",
+                    shape.name, worstRun, worstPhase, worstParity, badPhases, totalPhases);
+        CHECK(badPhases == 0,
+              "slow recovery on a paired cadence (%s): %d of %d resume phases blended 50+ presents",
+              shape.name, badPhases, totalPhases);
     }
-    std::printf("  paired-cadence stall: worst synth run %d (resume phase %" PRId64
-                "us, parity %d), %d of %d phases over 50\n",
-                worstRun, worstPhase, worstParity, badPhases, totalPhases);
-    CHECK(badPhases == 0,
-          "slow recovery on a paired cadence: %d of %d resume phases blended 50+ presents",
-          badPhases, totalPhases);
 }
 
 // Replay real captures through the real policy. Every .trace in testdata/ is a corpus
@@ -1975,6 +1995,14 @@ static void test_lock_reseed_stall_paired_cadence() {
 // policy directly rather than reproducing every ring effect), so the per-fixture
 // tolerance is explicit: a configuration where the model cannot track the hardware must
 // widen it deliberately, in the fixture, where the next reader can see it.
+
+// Where a stored grab-timeout copy sits: this long after the previous wake, in microseconds.
+// On a two-hour gameplay capture 355 wakes landed at 100.0-101.0 ms against real gaps spread
+// thinly, near one per half millisecond, on either side, so the few real frames inside the
+// window are negligible. Used only on fixtures marked regrab_copies.
+static const int64_t kRegrabCopyMinUs = 99000;
+static const int64_t kRegrabCopyMaxUs = 102000;
+
 struct TraceFixture {
     std::string path;
     std::string name;
@@ -2030,6 +2058,13 @@ struct TraceFixture {
     // higher where it is measured to churn (see the x3 and FG-off fixtures, which record
     // real numbers rather than pretending to a cleanliness they do not have). -1 disables.
     int maxBlendsAdded = -1;
+    // Set on a capture whose capture loop STORED the grab timeout's re-delivered picture as a
+    // new frame (mktrace.py sets it for a log without the loop's startup line announcing the
+    // skip). The loader removes those wakes, so the replay runs the loop that stores nothing
+    // on a timeout. Never set it on a capture from a loop that already skips them: there a
+    // real frame arriving after a long stall can land inside the same window.
+    bool regrabCopies = false;
+    int regrabCopiesDropped = 0;   // wakes the loader removed, for the report line
 };
 
 static bool ParseFixture(const std::string& path, TraceFixture* out) {
@@ -2063,6 +2098,7 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         else if (std::strcmp(tag, "field_synth_pct") == 0) { dbl(&out->fieldSynthPct); }
         else if (std::strcmp(tag, "src_hint") == 0)         { dbl(&out->srcHint); }
         else if (std::strcmp(tag, "rotation_inert") == 0)   { num(&n); out->rotationInert = n != 0; }
+        else if (std::strcmp(tag, "regrab_copies") == 0)    { num(&n); out->regrabCopies = n != 0; }
         else if (std::strcmp(tag, "min_placed_pct") == 0)  { num(&n); out->minPlacedPct = (int)n; }
         else if (std::strcmp(tag, "max_ahead_pct") == 0)   { num(&n); out->maxAheadPct = (int)n; }
         else if (std::strcmp(tag, "min_blends_removed") == 0) {
@@ -2109,6 +2145,21 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         if (!ok) break;
     }
     std::fclose(f);
+    if (ok && out->regrabCopies) {
+        // Each gap is measured from the previous WAKE, kept or not: consecutive copies each
+        // land one timeout after the one before, whatever was kept.
+        std::vector<int64_t> kept;
+        kept.reserve(out->arrivals.size());
+        for (size_t i = 0; i < out->arrivals.size(); i++) {
+            const int64_t gap = (i > 0) ? out->arrivals[i] - out->arrivals[i - 1] : 0;
+            if (i > 0 && gap >= kRegrabCopyMinUs && gap <= kRegrabCopyMaxUs) {
+                out->regrabCopiesDropped++;
+                continue;
+            }
+            kept.push_back(out->arrivals[i]);
+        }
+        out->arrivals.swap(kept);
+    }
     return ok && !out->arrivals.empty() && !out->presents.empty();
 }
 
@@ -2522,6 +2573,10 @@ static void test_replay_capture_corpus() {
                     fx.description.empty() ? path.c_str() : fx.description.c_str(),
                     spanStart, spanEnd, (spanEnd - spanStart) / 60.0, fx.presents.size(),
                     synthPct, longRuns, worst, reseeds);
+        if (fx.regrabCopies) {
+            std::printf("    grab-timeout copies removed before replay: %d\n",
+                        fx.regrabCopiesDropped);
+        }
         if (fx.fieldWorstRun >= 0) {
             std::printf("    field : synth %.1f%%, runs>=50 %d, worst %d\n",
                         fx.fieldSynthPct, fx.fieldLongRuns, fx.fieldWorstRun);

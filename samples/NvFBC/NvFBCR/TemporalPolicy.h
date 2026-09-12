@@ -515,9 +515,10 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
                      bool resumedFromStall = false);
 
 // True when a bracket carries no usable phase information: one-sided, or spanning far
-// more than a source period. The wide case is what a frozen source produces, because the
-// capture API keeps re-delivering STALE frames at its grab timeout instead of starving
-// the ring, so the bracket stays complete while its endpoints straddle the freeze.
+// more than a source period. A frozen source produces both in turn: the capture loop stores
+// nothing while the game draws nothing, so the bracket is one-sided until the first frame
+// after the freeze closes it, and then wide while its endpoints straddle the freeze. A
+// hitching source that still draws the odd frame produces the wide case alone.
 bool BracketIsStalled(const BracketInfo& b, const PolicyConfig& cfg);
 
 // Advances the stall run and reports whether THIS present is the resume: the first

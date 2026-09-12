@@ -17,6 +17,10 @@ can measure. Run the suite once and it prints the lines to paste.
              [--skip-us N] [--until-us N]
   then add <name>.trace to index.txt and run the suite: it prints the bounds.
 
+A log from a capture loop that stored the grab timeout's re-delivered picture (no startup
+line saying a timed-out grab stores nothing) gets regrab_copies 1, and the test removes
+those wakes before replaying.
+
 --skip-us drops everything before an absolute log time, and --until-us everything at or
 after one, for a fixture that must isolate one regime. A capture whose early minutes carry
 source hitches reports the hitch recovery as its headline synth share, which buries a
@@ -43,6 +47,10 @@ FLIP = re.compile(r"flip disp=(-?\d+)us evt=(-?\d+)us(?: lag=(-?\d+)us)? head=(\
 # or it models a different relay: at 30 fps the stall span of a 60-declared replay sits
 # exactly on the source period and re-seeds on half the brackets the field never blinked at.
 SRC  = re.compile(r"Resolved options: src rate hint ([\d.]+) fps")
+# The capture loop's startup line announcing that a grab which waits out NvFBC's timeout
+# stores nothing. A log without it came from a loop that stored the timeout's re-delivered
+# picture as a new frame, and the fixture says so, so the replay can remove those wakes.
+SKIPS_COPIES = "timeout stores nothing"
 WARMUP = 200          # must match the test: skips the lock's cold-start acquisition
 
 def main():
@@ -71,7 +79,11 @@ def main():
     flips, delays = [], []
     have_lag = True
     src_hint = 0.0
+    skips_copies = False
     for line in open(src, errors="replace"):
+        if not skips_copies and SKIPS_COPIES in line:
+            skips_copies = True
+            continue
         m = CAP.search(line)
         if m:
             v = int(m.group(1))
@@ -130,6 +142,10 @@ def main():
         f.write(f"field_synth_pct {pct:.1f}\n")
         if src_hint > 0:
             f.write(f"src_hint {src_hint:.1f}\n")
+        if not skips_copies:
+            f.write("# Recorded by a capture loop that stored the grab timeout's re-delivered picture as a new\n")
+            f.write("# frame; the loader removes those wakes so the replay runs the loop that skips them.\n")
+            f.write("regrab_copies 1\n")
         f.write(f"arrivals {len(arr)}\n{enc(arr)}\n")
         f.write(f"presents {len(pres)}\n{enc(pres)}\n")
         if flips:
@@ -144,6 +160,8 @@ def main():
           f"{os.path.getsize(out)/1e6:.2f} MB")
     print(f"  field behaviour past warmup {WARMUP}: synth {pct:.1f}%, "
           f"runs>=50 {longRuns}, worst {worst}")
+    if not skips_copies:
+        print("  capture loop stored grab-timeout copies: wrote regrab_copies 1")
     return 0
 
 sys.exit(main())

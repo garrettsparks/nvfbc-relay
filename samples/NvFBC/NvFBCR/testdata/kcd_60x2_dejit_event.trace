@@ -7,6 +7,9 @@ description KCD 60x2 map cycles, blend mode, the live -dejit validation run 2026
 field_worst_run 60
 field_long_runs 3
 field_synth_pct 9.0
+# Recorded by a capture loop that stored the grab timeout's re-delivered picture as a new
+# frame; the loader removes those wakes so the replay runs the loop that skips them.
+regrab_copies 1
 # 98.0% placed, just under the x2 default: this run has more source hitches than the
 # walks (map cycles plus real gameplay), and a hitch pauses the flip grid.
 min_placed_pct 97
@@ -14,7 +17,11 @@ min_placed_pct 97
 max_worst_run 60
 max_long_runs 4
 max_synth_pct 9.4
-min_reseeds 75
+# Re-seeds counted on the copy-free timeline (regrab_copies). With the copies in, one that
+# landed just ahead of the next real frame closed a narrow bracket inside the stall and fired
+# an extra re-seed there: removing them took the replay from 78 re-seeds to 54, and every
+# one of the 78 still has a re-seed within 0.5 s on the copy-free run.
+min_reseeds 52
 # THE POSITIVE GATE. Without correction this capture's 5032 us late delivery costs an
 # isolated mid-gameplay blend; arming it removes that blend and adds none. If this
 # ever reads 0 removed, the correction has regressed to a no-op and every do-no-harm

@@ -14,6 +14,9 @@ description KCD 60fps, frame generation OFF, steady walking, -lock -etw, 2026-08
 # p50 +114 us; the steady stretch pairs like the x2 walks). The x2 default of 98% encodes a
 # grid that never pauses, which Smooth Motion provides and FG-off does not.
 min_placed_pct 95
+# Recorded by a capture loop that stored the grab timeout's re-delivered picture as a new
+# frame; the loader removes those wakes so the replay runs the loop that skips them.
+regrab_copies 1
 max_ahead_pct 2
 max_worst_run 115
 max_long_runs 2

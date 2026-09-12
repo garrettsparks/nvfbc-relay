@@ -35,9 +35,9 @@ int64_t WrapHalf(int64_t d, int64_t p) {
 static const int kStallRunPresents = 3;
 
 // Post-resume convergence window. The re-seed measures phase from ONE bracket, picked by
-// the threshold above, and that bracket's before-frame is frequently a grab-timeout
-// re-grab whose timestamp is the timeout instant rather than a source render tick. The
-// resulting estimate is often wrong by a few hundred to a few thousand microseconds, and
+// the threshold above, and that bracket's endpoints can be frames from the capture API's
+// post-stall catch-up burst, stamped at delivery rather than at a source render tick. The
+// resulting estimate can be wrong by a few hundred to a few thousand microseconds, and
 // at the steady-state slew that residual takes 50-190 presents to bleed off: seconds of
 // visible blending after the source has already recovered.
 //
@@ -521,8 +521,8 @@ bool RotationAdvance(RotationPhase& p, int64_t anchorTs, int flipSteps) {
     // sound as a 2-step one; the bound exists only because the caller's count is capped at
     // 24 records, past which the count could be truncated and the position silently wrong.
     // An earlier bound of 8 was inherited from the DIVISION rule's error growth and cost a
-    // capture: real batch gaps exceed 8 flips 137 times in two minutes (grab-timeout
-    // stalls), each one re-origined the vote and cleared its evidence, and the vote -
+    // capture: real batch gaps exceed 8 flips 137 times in two minutes (source stalls),
+    // each one re-origined the vote and cleared its evidence, and the vote -
     // needing 72 batches to converge - never survived to steer (127 of 15366 batches).
     // Gaps past 24 flips: zero in the same capture.
     if (flipSteps < 1 || flipSteps > 24) {

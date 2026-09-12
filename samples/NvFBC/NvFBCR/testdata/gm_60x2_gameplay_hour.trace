@@ -7,13 +7,20 @@ description Get Medieval, 69 min of real streamed gameplay, b:dwm -src 60 -lock 
 field_worst_run 137
 field_long_runs 3
 field_synth_pct 0.6
+# Recorded by a capture loop that stored the grab timeout's re-delivered picture as a new
+# frame; the loader removes those wakes so the replay runs the loop that skips them.
+regrab_copies 1
 # Replay tracks the field exactly here (0.6% synth both, worst run 137 = 137, long runs
 # 3 = 3), which is why this fixture is worth its size: the model reproduces an hour of
 # real gameplay without tuning.
 max_worst_run 137
 max_long_runs 3
 max_synth_pct 1.0
-min_reseeds 125
+# Re-seeds counted on the copy-free timeline (regrab_copies). With the copies in, one that
+# landed just ahead of the next real frame closed a narrow bracket inside the stall and fired
+# an extra re-seed there: removing them took the replay from 129 re-seeds to 108, and only 1
+# of the 129 has no re-seed within 0.5 s on the copy-free run.
+min_reseeds 104
 # THE ISOLATED-BLEND GATE, and the reason this fixture is an hour long. 75 of these 250k
 # presents are blends that dejit removes, and 73 of the 75 are SINGLE-FRAME events sitting
 # seconds clear of any other synthesized frame - the class a viewer actually notices, and

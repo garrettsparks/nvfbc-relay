@@ -212,14 +212,15 @@ bool TemporalCaptureMode::Setup() {
     // accepted as a documented trade alongside the static lag (spec clause 4).
     m_policyCfg.phasePullSlewQpc = m_scheduler.Freq() / 40000;   // 25 us per present
     // Twice the declared source period: wide enough that ordinary jitter and a single
-    // dropped frame stay under it, narrow enough that a frozen source (whose grab-timeout
-    // re-grabs land ~100 ms apart) reads as stalled on the first present.
+    // dropped frame stay under it, narrow enough that a source hitching at ~100 ms per frame
+    // reads as stalled on the first present. A frozen source delivers nothing at all, and
+    // its one-sided brackets read as stalled whatever this is.
     m_policyCfg.stallSpanQpc = m_assumedSrcPeriodQpc * 2;
     // Under phase-aware keep-real the valid-frame cadence is ONE per source period (that is
     // the point), so a single missing real frame opens a bracket span of exactly two source
     // periods - the 2x threshold above with one microsecond of margin, measured. 2.5x keeps
-    // one missing frame from reading as a stall while a genuinely frozen source (grab
-    // timeouts at ~100 ms) still trips it on the first present.
+    // one missing frame from reading as a stall while a genuinely hitching source still
+    // trips it on the first present.
     if (m_phaseKeep) m_policyCfg.stallSpanQpc = m_assumedSrcPeriodQpc * 5 / 2;
     if (m_lock && m_srcRateHint > 0.0f) {
         int combM = 1;
@@ -608,8 +609,17 @@ void TemporalCaptureMode::Run(
                 opFields,
                 flipFields,
                 (long long)(blockTicks * usPerTick));
+            // Once per run rather than once per present: a static screen delivers no new
+            // frames at all, so a run lasts as long as the screen does, and every present in
+            // it already carries after=-1 on its own line.
             if (!bracket.info.hasAfter) {
-                LOG("temporal: no after-frame (source slower than present?) - repeating newest");
+                if (m_noAfterRun == 0) {
+                    LOG("temporal: no after-frame (source slower than present?) - repeating newest");
+                }
+                m_noAfterRun++;
+            } else if (m_noAfterRun > 0) {
+                LOG("temporal: after-frame back after %lld presents without one", m_noAfterRun);
+                m_noAfterRun = 0;
             }
         }
 
@@ -679,6 +689,9 @@ void TemporalCaptureMode::Run(
             m_dejitFenceBlocked, m_dejitLockDeclined, m_dejitSkipped);
     }
     m_ring.Stop();
+    // After Stop: the capture thread has joined, so its counter is settled.
+    LOG("capture summary: %lld grabs waited out the grab timeout and stored nothing (the source drew no new frame)",
+        m_ring.GrabTimeoutsSkipped());
 }
 
 const char* TemporalCaptureMode::GetModeName() const {

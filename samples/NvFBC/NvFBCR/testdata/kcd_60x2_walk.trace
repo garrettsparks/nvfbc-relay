@@ -7,6 +7,9 @@ description KCD 60x2 steady forward walking, gameplay only (trimmed to the video
 field_worst_run 7
 field_long_runs 0
 field_synth_pct 1.1
+# Recorded by a capture loop that stored the grab timeout's re-delivered picture as a new
+# frame; the loader removes those wakes so the replay runs the loop that skips them.
+regrab_copies 1
 # Replay 1.4% / worst 8 against field 1.1% / worst 7 is the closest agreement in the corpus,
 # so these bounds gate the model rather than excuse it. This fixture exists for the regime
 # the map-cycle fixtures cannot see: with no stall recovery in it, synth share is a direct
