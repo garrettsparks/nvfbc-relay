@@ -46,6 +46,23 @@ gm_60x2_gameplay_hour.trace
 # that is why the _steady fixtures exist beside them rather than instead of them.
 avatar_60x2_vsync_steady.trace
 avatar_60x2_vsync_bench.trace
+# The same two windows recaptured 2026-09-16, on the capture loop that skips NvFBC's
+# grab-timeout re-deliveries and with the lock re-engage convergence window live. They sit
+# beside the pair above rather than replacing it, so the older build's behaviour on this
+# configuration stays gated. The regrab_copies difference between the two pairs is inert: the
+# older windows contain no arrival gap anywhere near the 100 ms timeout (0 in the 99-102 ms
+# band, 2 at or above 50 ms across the whole bench window), so the loader has nothing to drop
+# in them either way. What these add is field behaviour from the loop that ships: the steady
+# window passes every present through sharp, and the bench window's worst blend run of 40
+# presents is the lock refusing across one inter-test fade rather than a gameplay sweep.
+# The steady window opens 2.3 s after its fade ENDS rather than the 0.3 s the other fixtures
+# use, so it starts once the benchmark is fully running. That margin is the replay model's
+# requirement rather than the relay's: cut at 0.3 s the model's cold-start
+# convergence outlasts the 200-present warmup and reports a 47-present blend run on a window
+# where the field blended nothing, while the harness replaying the same window with the real
+# linked policy reports none. Shifting the start 2 s removes it and changes nothing else.
+avatar_60x2_vsync_steady_0916.trace
+avatar_60x2_vsync_bench_0916.trace
 # The same configuration with generated-frame substitution armed (-subgen, which implies the
 # driver change map). What it pins is a NEGATIVE: substitution fires 38 times in six minutes
 # and changes nothing. The cause was originally read as the tooth guard having already removed
@@ -120,6 +137,14 @@ avatar_59x2_subgen_bench.trace
 # across nine tests fall inside the first five seconds after a fade, and none after.
 avatar_30x1_vsync_steady.trace
 avatar_30x1_vsync_bench.trace
+# The 2:1 case recaptured 2026-09-16 on the same copy-free capture loop, with the re-engage
+# convergence window live. The alternation is unchanged where it matters: the steady window
+# blends every other present at w=0.5 with a worst blend run of one present and the lock
+# engaged throughout, and the nine tests hold 49.8% synth with a worst run of four. With the
+# 60x2 rows above, these four are the only fixtures in the corpus recorded by the capture loop
+# that ships; every other trace here predates the grab-timeout skip.
+avatar_30x1_vsync_steady_0916.trace
+avatar_30x1_vsync_bench_0916.trace
 # 30 base with frame generation x2, -src 30. The 2:1 alternation again, reached through
 # keep-real: arrivals come at 58/s in pairs 187 us apart, the generated member of each pair is
 # retracted, and the policy sees the same 30 real frames per second the FG-off pair sees. All
