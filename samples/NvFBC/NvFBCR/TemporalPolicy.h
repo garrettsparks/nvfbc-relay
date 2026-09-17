@@ -464,6 +464,11 @@ struct PhaseLockState {
     int stallRun = 0;      // consecutive presents whose bracket carried no phase information
     int recoverRun = 0;    // presents left in the post-resume convergence window
     int reengageRun = -1;  // presents since a re-engage awaiting confirmation; -1 = none
+    int64_t prevErrQpc = 0;  // previous present's wrapped error, for the step detector
+    int monoRun = 0;         // consecutive error moves in the same direction
+    int monoDir = 0;         // that direction, +1 or -1, and 0 before the first move
+    int stableRun = 0;       // consecutive engaged presents with the deviation below comb/16
+    int stepRun = -1;        // presents since a step candidacy opened; -1 = none open
 };
 
 // Fixed at Setup. combQpc == 0 disables the lock entirely (selection then equals the
@@ -515,6 +520,9 @@ int64_t WrapHalf(int64_t d, int64_t p);
 // A re-engage after a disengaged stretch opens the same convergence window once confirmed: the
 // deviation EMA has settled well under the stability gate while the target is still beyond the
 // passthrough threshold (see kEngageStableDiv).
+// A confirmed phase STEP takes the same treatment without waiting for a release: the estimator is
+// re-seeded so the deviation cannot cross the gate at all, which keeps the lock engaged and hands
+// the offset to the convergence window (see kStepStableRequired).
 void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeDiff,
                      bool resumedFromStall = false);
 
