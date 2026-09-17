@@ -100,6 +100,7 @@ private:
     long long m_nextBatch = 0;           // cursor into the ring's batch-start history
     LONGLONG m_maxTargetQpc = 0;         // newest target consumed; the coherence-rule fence
     long long m_noAfterRun = 0;          // consecutive presents with no after-frame; logged per run
+    long long m_stepReseedsLogged = 0;   // step re-seeds already written out; one line per new one
     // Session telemetry, all logged at exit: without the blocked counts, a live A/B cannot
     // distinguish "no late deliveries" from "corrections measured and discarded".
     long long m_dejitMeasured = 0;

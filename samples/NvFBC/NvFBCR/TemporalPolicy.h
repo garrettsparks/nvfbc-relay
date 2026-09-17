@@ -469,6 +469,11 @@ struct PhaseLockState {
     int monoDir = 0;         // that direction, +1 or -1, and 0 before the first move
     int stableRun = 0;       // consecutive engaged presents with the deviation below comb/16
     int stepRun = -1;        // presents since a step candidacy opened; -1 = none open
+    // Counts confirmed step re-seeds, and carries the error the last one corrected. The capture
+    // mode logs both: a rule that changes the lock's mind silently cannot be validated from a
+    // capture, and inferring fires from how fast the pull moved is inference, not evidence.
+    long long stepReseeds = 0;
+    int64_t lastStepErrQpc = 0;
 };
 
 // Fixed at Setup. combQpc == 0 disables the lock entirely (selection then equals the

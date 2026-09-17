@@ -847,6 +847,8 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
             s.recoverRun = kRecoverPresents;
             s.stableRun = 0;
             s.stepRun = -1;
+            s.stepReseeds++;
+            s.lastStepErrQpc = err;
         } else if (s.stepRun >= kStepCandidateMax) {
             s.stepRun = -1;   // never settled, so this is a sweep and the lock should release
         } else {

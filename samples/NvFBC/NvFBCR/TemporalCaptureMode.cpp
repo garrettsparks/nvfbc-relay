@@ -609,6 +609,15 @@ void TemporalCaptureMode::Run(
                 opFields,
                 flipFields,
                 (long long)(blockTicks * usPerTick));
+            // One line per confirmed step re-seed, carrying the error it corrected, so a capture
+            // can be read for where the rule fired rather than for how fast the pull moved
+            // afterwards. Same shape as the dejit verdict lines.
+            if (m_lockState.stepReseeds != m_stepReseedsLogged) {
+                m_stepReseedsLogged = m_lockState.stepReseeds;
+                LOG("lock: step re-seed, phase error %lldus corrected at pull=%lldus",
+                    (long long)(m_lockState.lastStepErrQpc * usPerTick),
+                    (long long)(m_lockState.pullQpc * usPerTick));
+            }
             // Once per run rather than once per present: a static screen delivers no new
             // frames at all, so a run lasts as long as the screen does, and every present in
             // it already carries after=-1 on its own line.
@@ -687,6 +696,10 @@ void TemporalCaptureMode::Run(
             "%lld fence-blocked, %lld lock-declined, %lld skipped",
             m_dejitMeasured, m_dejitLate, m_dejitCorrected,
             m_dejitFenceBlocked, m_dejitLockDeclined, m_dejitSkipped);
+    }
+    if (m_policyCfg.combQpc > 0) {
+        LOG("lock summary: %lld confirmed phase steps re-seeded the estimator",
+            m_lockState.stepReseeds);
     }
     m_ring.Stop();
     // After Stop: the capture thread has joined, so its counter is settled.
