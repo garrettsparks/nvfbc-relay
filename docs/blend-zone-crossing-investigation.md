@@ -269,3 +269,37 @@ with near and flapping controls (the shape `test_lock_engage_window` uses), a CI
 capture, because every number here is replay. Parking it is also legitimate: the artifact is about a
 second of ghosting roughly four times an hour, and the user's own viewing found one of three runs
 noticeable and "not awful", the other two invisible or explained by a source stall.
+
+## Field result, 2026-09-17: the sixth candidate is dead too
+
+Full report: `docs/step-reseed-field-validation.md`. Two captures on the `2ee7c67` build.
+
+On 30 map open/close cycles the rule fired zero times, matching replay's zero on both map-cycle
+fixtures. Zero is structural: every disturbance there is a stall, the stall path re-seeds first and
+resets the quiet-engaged counter, and the step rule never opens a candidacy. No harm, no benefit.
+
+On 32.7 minutes of streamed gameplay it fired six times, all on real source phase events. Two were
+the shape the corpus contains, a dropped frame whose phase change persisted, and the rule corrected
+them in nine and ten presents. Four were a shape the corpus does not contain: the game presents ONE
+frame 6 to 7 ms early, holds that phase for about 0.65 s (about 40 presents), then presents one frame
+late and is back where it was. The rule confirms the step in four presents, slews the pull 6 ms in
+twelve, and puts the target on the frame; the game then takes the phase back, the target is 6 ms off
+the other way, the estimator has already absorbed the new error so the lock stays engaged, the rule's
+own 60-present quiet requirement forbids a second fire, and the pull crawls back at the steady 25 us
+a present. Field: runs >= 50 went 4 in 52.8 min (09-16) to 3 in 32.7 min, worst 65 to 100.
+
+A paired replay of the same log (the corpus `Simulate`, one arm as committed, one with the rule's
+quiet-stretch constant unreachable) carries its own control: the ON arm reproduces the field's six
+fires at the same times and its four long runs within ten percent. The OFF arm, which is the
+`79f33e9` policy, has ZERO runs >= 50 on that log and a worst of exactly 40, the transient's own
+length. On the 09-16 log the rule removes four of six runs >= 40 but lengthens one (45 -> 65) and
+creates one (42). Across both logs: runs >= 50 three with, three without; worst 64 -> 112.
+
+The reason is a design property rather than a tuning error. Any confirmation short enough to save
+presents on a sustained step (four presents here) is far shorter than the transient (forty), so the
+rule cannot tell them apart, and the quiet gate that keeps it from flapping is exactly what forbids
+the undo. A seventh candidate would need an undo path (an error returning to about minus the corrected
+amount inside the transient window re-seeds straight back) or a confirmation longer than the
+transient, which forfeits most of the benefit. Recommendation, per the kickoff's own rule: revert
+`3fe2ace` and the code of `2ee7c67`, ship on `79f33e9`. The 09-17 gameplay trace (cut 120 s to 1955 s)
+is the fixture that gates this class: worst 40, runs >= 50 zero, under the release policy.

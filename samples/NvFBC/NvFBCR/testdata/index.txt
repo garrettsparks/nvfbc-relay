@@ -29,6 +29,13 @@ kcd_60x2_dejit_event.trace
 # (75 removals, 73 of them single-frame events), and the only one carrying the once-per-
 # second NvFBC delivery hitch that produces half of them.
 gm_60x2_gameplay_hour.trace
+# The same content on the D3D11 flip-model present, and the only fixture carrying a phase
+# TRANSIENT: the source jumps its phase 6 to 7 ms for about 0.65 s and then puts it back,
+# four times in half an hour. That shape is what defeated the step re-seed rule on hardware
+# after 43 fixtures called it clean, so this file is the gate for any future rule that acts
+# on a phase step. Its field numbers were recorded under that rule and its bounds under the
+# policy without it; the fixture header explains why those two lines disagree.
+gm_60x2_gameplay_0917.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions
