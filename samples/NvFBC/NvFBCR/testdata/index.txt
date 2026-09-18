@@ -36,6 +36,12 @@ gm_60x2_gameplay_hour.trace
 # on a phase step. Its field numbers were recorded under that rule and its bounds under the
 # policy without it; the fixture header explains why those two lines disagree.
 gm_60x2_gameplay_0917.trace
+# The same content and present path again, 90 minutes of it, captured AFTER that rule was
+# reverted: the only Get Medieval fixture running the policy the tree ships, so its field and
+# replay lines are comparable and agree (8 long runs each, worst 63 against 62). It is the
+# fidelity anchor for b:vsync gameplay and the widest sample of the residual blend-zone class,
+# which is why it earns its 12 MB. Its header explains both.
+gm_60x2_gameplay_0917_1.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions
