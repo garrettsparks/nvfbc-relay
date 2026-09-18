@@ -71,36 +71,6 @@ static const int kEngageStableDiv = 16;
 // re-lock, and stops waiting.
 static const int kEngageConfirmPresents = 120;
 
-// Step re-seed. A phase step leaves the error at a new constant offset, and the /16 estimator needs
-// about a dozen presents to follow it. The deviation it reports meanwhile crosses the stability
-// gate, so the lock releases and the pull decays away from the phase it was holding, leaving the
-// target off the real frames until the deviation decays back under the gate: blend runs of 45 to 65
-// presents whose length is set by the estimator rather than by anything the pull did.
-//
-// A sweep produces the same deviation but NOT the same error. A sweep keeps moving in one
-// direction; a settled step jitters about its new offset. So a step is declared only once the error
-// has stopped moving monotonically while the estimator is still far behind it, and the response is
-// the one a stall resume already uses: re-seed the estimator, which drops the deviation to zero and
-// keeps the lock engaged, then let the convergence window close the offset at comb/32.
-//
-// Each gate is here because its absence was measured:
-//   - A stretch of quiet ENGAGED presents must come first. The direction test alone fires in the
-//     sweep regime, where a jittering sweep flips direction constantly and blending is the correct
-//     output; at a lockable ratio the lock holds engaged on 98 to 99% of presents, while at 59:60
-//     engagement never persists, so this excludes that regime by construction rather than by
-//     threshold.
-//   - Arming and confirming are separate. Arming on the smoothed deviation cannot coexist with the
-//     gate above, which needs that same deviation low, and makes the rule inert.
-//   - The error must sit at least comb/kStepErrFloorDiv from the estimator. Below that the
-//     disturbance is not worth re-seeding for, and one map-cycle event just under this size
-//     re-seeds onto a phase that costs more than the re-seed saves.
-static const int kStepStableRequired  = 60;  // quiet engaged presents required first, about 1 s
-static const int kStepConfirmPresents = 4;   // settled presents before the re-seed
-static const int kStepCandidateMax    = 24;  // never settled by here, so treat it as a sweep
-static const int kStepMonoMax         = 3;   // same-direction moves still called settled
-static const int kStepErrFloorDiv     = 4;   // error must sit at least comb/4 from the estimator
-static const int kStepMoveFloorDiv    = 256; // moves under comb/256 are jitter, not direction
-
 // How far past a search boundary the backward flip walks keep looking before giving up.
 // Both walks rely on flips on ONE head arriving in display order - measured 0 inversions over
 // 400k flips, and counted at runtime by FlipHistory::OutOfOrder() rather than assumed - and
@@ -787,11 +757,6 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     if (!s.seeded || resumedFromStall) {
         s.errEmaQpc = err;
         s.seeded = true;
-        // A re-seed from either path invalidates the quiet-engaged history the step rule reads:
-        // without this the counter keeps its pre-stall value across a map open and a step can be
-        // declared while the phase is still re-acquiring.
-        s.stableRun = 0;
-        s.stepRun = -1;
         // Only a stall resume opens the window here. Cold acquisition converges from a clean
         // timeline and has its own pinned behaviour.
         if (resumedFromStall) s.recoverRun = kRecoverPresents;
@@ -804,58 +769,6 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     if (dev < 0) dev = -dev;
     s.devEmaQpc = (s.devEmaQpc * 15 + dev) / 16;
 
-    // Step detection (see kStepStableRequired). Direction bookkeeping first: how many consecutive
-    // presents the error has moved the same way by more than jitter.
-    if (wasSeeded) {
-        const int64_t move = WrapHalf(err - s.prevErrQpc, cfg.combQpc);
-        const int64_t moveFloor = cfg.combQpc / kStepMoveFloorDiv;
-        int dir = 0;
-        if (move > moveFloor) dir = 1;
-        else if (move < -moveFloor) dir = -1;
-        if (dir != 0) {
-            if (dir == s.monoDir) {
-                s.monoRun++;
-            } else {
-                s.monoDir = dir;
-                s.monoRun = 1;
-            }
-        }
-    }
-    s.prevErrQpc = err;
-
-    int64_t errMag = err;
-    if (errMag < 0) errMag = -errMag;
-    if (s.recoverRun == 0 && wasSeeded && !resumedFromStall && s.stepRun < 0 &&
-        s.stableRun >= kStepStableRequired && dev >= cfg.combQpc / kStepErrFloorDiv) {
-        s.stepRun = 0;
-    } else if (s.stepRun >= 0) {
-        const bool settled = s.monoRun <= kStepMonoMax;
-        // The confirmation tests whether the TARGET is still off a real frame, not whether the
-        // estimator is still behind. Testing the latter cancels the confirmation against itself:
-        // the estimator closes on the error at 1/16 a present, so the deviation falls under the
-        // floor before a four-present wait completes unless the step is enormous. Measured at a
-        // comb/4 floor that left only steps above 5754 us able to confirm, against 8334 us for the
-        // largest error a comb can hold, and the candidacy was abandoned on the very present it
-        // would have fired. The floor decides whether a disturbance is worth re-seeding when the
-        // candidacy OPENS; after that only the target's distance matters.
-        const bool stillOff = cfg.passthroughQpc > 0 && errMag >= cfg.passthroughQpc;
-        if (!stillOff || s.recoverRun > 0 || resumedFromStall) {
-            s.stepRun = -1;   // the disturbance resolved itself, or another path took over
-        } else if (settled && s.stepRun >= kStepConfirmPresents) {
-            s.errEmaQpc = err;
-            s.devEmaQpc = 0;
-            s.recoverRun = kRecoverPresents;
-            s.stableRun = 0;
-            s.stepRun = -1;
-            s.stepReseeds++;
-            s.lastStepErrQpc = err;
-        } else if (s.stepRun >= kStepCandidateMax) {
-            s.stepRun = -1;   // never settled, so this is a sweep and the lock should release
-        } else {
-            s.stepRun++;
-        }
-    }
-
     // Stability gate: stable phase = near-rational ratio, lock possible; sweeping phase =
     // genuine rate conversion, the pull decays to zero and selection proceeds unlocked.
     // Deliberately a bare comparator, no hysteresis: every lockable ratio holds devEma far
@@ -866,13 +779,6 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     const bool wasEngaged = s.engaged;
     s.engaged = s.devEmaQpc < cfg.combQpc / 8;
     ConfirmReengage(s, cfg, wasSeeded, wasEngaged);
-    // The quiet-engaged run the step rule requires. Counted after the gate so the step test above
-    // reads only presents that were already settled, never the present it is deciding about.
-    if (s.engaged && s.devEmaQpc < cfg.combQpc / kEngageStableDiv) {
-        s.stableRun++;
-    } else {
-        s.stableRun = 0;
-    }
     const int64_t want = s.engaged ? s.pullQpc + s.errEmaQpc : 0;
     int64_t delta = want - s.pullQpc;
     // Snap the full correction on an engaged stall-resume; otherwise slew-limit it so

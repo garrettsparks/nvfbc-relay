@@ -723,71 +723,6 @@ static void test_lock_engage_window() {
           flapLock.windows);
 }
 
-// The step re-seed, with the controls that each killed an earlier version of the rule. A lock that
-// has held quietly engaged and then takes a phase STEP must re-seed once and converge through the
-// window, rather than letting the deviation cross the gate and the pull decay away from the phase.
-// A monotonic SWEEP is the 59:60 regime in miniature and must never re-seed, because blending is
-// the correct output there and an earlier version that fired on it cost those captures a fifth of
-// their blend share. A one-present SPIKE must never re-seed, or a jittered sample re-seeds the
-// estimator onto a phase that does not exist. And a step arriving before the quiet engaged stretch
-// is earned must not re-seed either, which is what keeps the rule out of a re-acquiring phase.
-static void test_lock_step_reseed() {
-    PolicyConfig cfg;
-    cfg.stickinessQpc = kStickinessUs;
-    cfg.combQpc = 16667;
-    cfg.phasePullSlewQpc = kSlewUs;
-    cfg.passthroughQpc = 4166;
-    const int64_t comb = cfg.combQpc;
-    struct Outcome { int reseeds; int converged; int presents; };
-    // Runs the real lock over a phase the caller describes per present. quietFirst presents hold
-    // the phase the pull already matches, so the lock earns its quiet engaged stretch, and
-    // phaseAt(k) supplies the offset from there on. A re-seed is counted where the convergence
-    // window opens on a present the caller did not stall.
-    auto drive = [&](int quietFirst, int64_t (*phaseAt)(int), int presents) {
-        PhaseLockState s;
-        s.seeded = true;
-        s.engaged = true;
-        Outcome o{0, -1, presents};
-        for (int k = 0; k < presents; k++) {
-            const int64_t offset = (k < quietFirst) ? 0 : phaseAt(k - quietFirst);
-            const int64_t bd = ((offset - s.pullQpc) % comb + comb) % comb;
-            const int prevRecover = s.recoverRun;
-            policy::UpdatePhaseLock(s, cfg, bd, /*resumedFromStall=*/false);
-            if (prevRecover == 0 && s.recoverRun > 0) o.reseeds++;
-            if (k >= quietFirst) {
-                int64_t phase = policy::WrapHalf(offset - s.pullQpc, comb);
-                if (phase < 0) phase = -phase;
-                if (o.converged < 0 && phase < cfg.passthroughQpc) o.converged = k - quietFirst;
-            }
-        }
-        return o;
-    };
-    // A step to 6000 us, a third of a comb and well past both the passthrough threshold and the
-    // rule's comb/4 floor, which then stays put.
-    const Outcome step = drive(90, [](int) -> int64_t { return 6000; }, 240);
-    // The same size of disturbance reached by sweeping, never settling: 120 us a present is about
-    // a 0.7% rate error, the regime where no comb holds.
-    const Outcome sweep = drive(90, [](int k) -> int64_t { return 120 * (int64_t)k; }, 240);
-    // One present far off phase, then back. The smoothed deviation cannot reach the floor from a
-    // single sample, so nothing should arm.
-    const Outcome spike = drive(90, [](int k) -> int64_t { return (k == 0) ? 7000 : 0; }, 240);
-    // The same step as the first case, but arriving before the quiet stretch is earned.
-    const Outcome early = drive(5, [](int) -> int64_t { return 6000; }, 240);
-    std::printf("  step re-seed: step %d re-seed(s), inside the threshold at present %d; "
-                "sweep %d; spike %d; early step %d\n",
-                step.reseeds, step.converged, sweep.reseeds, spike.reseeds, early.reseeds);
-    CHECK(step.reseeds == 1, "step: %d re-seeds (expected exactly one)", step.reseeds);
-    CHECK(step.converged >= 0 && step.converged <= 30,
-          "step reached the threshold at present %d (expected <= 30; the steady slew needs ~80)",
-          step.converged);
-    CHECK(sweep.reseeds == 0,
-          "SWEEP control re-seeded %d times: blending is correct there and the rule must stay out",
-          sweep.reseeds);
-    CHECK(spike.reseeds == 0, "SPIKE control re-seeded %d times (expected none)", spike.reseeds);
-    CHECK(early.reseeds == 0,
-          "step before the quiet stretch re-seeded %d times (expected none)", early.reseeds);
-}
-
 // A real source stall, in both shapes the ring sees. A FREEZE delivers nothing until the game
 // resumes, so the bracket is one-sided and then closes wide over the gap; a HITCH still
 // delivers the odd frame, so the bracket stays complete and merely grows wide. The re-seed
@@ -3978,7 +3913,6 @@ int main(int argc, char** argv) {
     test_batch_collapse_keep_real();
     test_lock_reseed_wide_bracket_stall();
     test_lock_engage_window();
-    test_lock_step_reseed();
     test_lock_reseed_stall_paired_cadence();
     test_replay_capture_corpus();
 
