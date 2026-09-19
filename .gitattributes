@@ -1,0 +1,21 @@
+# Line endings: every text file is stored LF in the repository and checked out LF, so a file has
+# the same bytes on every machine and to every tool. Visual Studio rewrites its solution and
+# project files with CRLF on every save, so those are checked out CRLF to keep a save from
+# rewriting the whole file; git still stores them LF. cmd.exe misreads batch files with LF
+# endings.
+* text=auto eol=lf
+
+*.sln              text eol=crlf
+*.vcxproj          text eol=crlf
+*.vcxproj.filters  text eol=crlf
+*.vcproj           text eol=crlf
+*.props            text eol=crlf
+*.bat              text eol=crlf
+*.cmd              text eol=crlf
+
+*.exe  binary
+*.dll  binary
+*.lib  binary
+*.pdb  binary
+*.png  binary
+*.mp4  binary
