@@ -13,6 +13,7 @@
 // All synthetic tests run in the microsecond domain; the policy is unit-agnostic.
 
 #include "TemporalPolicy.h"
+#include "LaunchOptions.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -2577,22 +2578,14 @@ static void test_replay_capture_corpus() {
         if (fx.srcHint > 0.0) {
             // Size the declared-rate periods the way TemporalCaptureMode does at startup,
             // so a fixture recorded at -src 30 replays a relay that was told 30. The comb
-            // scan (M = 1..8, a match inside 2% of an integer) is the production rule kept
-            // in step by hand; the passthrough threshold is production's own function, so
-            // the corpus cannot describe a gate the relay does not run. The stall span
+            // denominator and the passthrough threshold are production's own functions, so
+            // the corpus cannot describe a comb or a gate the relay does not run. The stall span
             // follows from srcPeriod inside Simulate and is what made this necessary: at
             // a 60-declared replay it sits exactly on a 30 fps bracket, so half the
             // brackets read as stalls and the model re-seeded five times a second through
             // a window where the field never broke alternation.
             p.srcPeriod = (int64_t)(1e6 / fx.srcHint + 0.5);
-            int combM = 1;
-            const double ratio = fx.srcHint / 60.0;
-            for (int m = 1; m <= 8; m++) {
-                const double nm = ratio * (double)m;
-                const long long nn = (long long)(nm + 0.5);
-                const double frac = nm - (double)nn;
-                if (nn >= 1 && frac > -0.02 && frac < 0.02) { combM = m; break; }
-            }
+            const int combM = policy::CombDenominator(fx.srcHint, 60.0, nullptr);
             p.combQpc = p.srcPeriod / combM;
             p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
             std::printf("    declared -src %.1f: period %lld us, comb %lld us (M=%d), "
@@ -3860,6 +3853,256 @@ static int Replay(const char* path, int64_t combUs, int64_t passUsArg) {
     return mismatches ? 1 : 0;
 }
 
+// ---------------------------------------------------------------------------------
+// Launch options and the capture-mode grammar. These pin what a launch string resolves
+// to, which lives in Windows-only code everywhere else: the relay's globals start from
+// launch::Options and its parser is launch::ApplyOption, so these run the real rules.
+// ---------------------------------------------------------------------------------
+
+// Runs a whole option string through the parser the way both entry points do: a token
+// that consumes nothing is unknown and skipped, otherwise the loop steps past its value.
+static launch::Options ParseOptionString(const char* text, std::vector<std::string>* warnings,
+                                         std::vector<std::string>* unknown) {
+    launch::Options o;
+    const std::vector<std::string> t = launch::SplitTokens(text);
+    for (size_t i = 0; i < t.size(); i++) {
+        std::string w;
+        const size_t n = launch::ApplyOption(t, i, &o, &w);
+        if (!w.empty() && warnings) warnings->push_back(w);
+        if (n == 0) {
+            if (unknown) unknown->push_back(t[i]);
+        } else {
+            i += n - 1;
+        }
+    }
+    return o;
+}
+
+static int CountSwitchesOn(const launch::Options& o) {
+    return (int)o.lock + (int)o.tint + (int)o.etw + (int)o.noJoin + (int)o.dejitter +
+           (int)o.fgPhase + (int)o.phaseKeep + (int)o.flipEx + (int)o.mark;
+}
+
+static void test_launch_defaults() {
+    // What a bare launch runs with. The relay's globals are initialized from this struct,
+    // so this list is the relay's defaults and nothing else can make them differ.
+    const launch::Options o = launch::Options();
+    CHECK(o.srcRateHint == 0.0f, "-src must default to undeclared, got %.1f", o.srcRateHint);
+    CHECK(!o.lock, "-lock must default off");
+    CHECK(!o.etw, "-etw must default off");
+    CHECK(!o.dejitter, "-dejit must default off");
+    CHECK(o.extraLagMs == 0, "-lag must default to 0 ms, got %u", o.extraLagMs);
+    CHECK(CountSwitchesOn(o) == 0 && o.markFrames == 0,
+          "every switch must default off, %d are on", CountSwitchesOn(o));
+    CHECK(launch::ParseMode("").kind == launch::ModeKind::Vsync,
+          "a blank mode answer must select the original vsync mode");
+}
+
+static void test_launch_option_parsing() {
+    std::vector<std::string> warnings, unknown;
+
+    // The release launch string: every token accepted, nothing reported.
+    launch::Options o =
+        ParseOptionString("-src 60 -lock -lag 75 -etw -dejit -mark 7200", &warnings, &unknown);
+    CHECK(o.srcRateHint == 60.0f && o.lock && o.extraLagMs == 75 && o.etw && o.dejitter &&
+              o.mark && o.markFrames == 7200,
+          "the release launch string must set every option it names");
+    CHECK(warnings.empty() && unknown.empty(),
+          "the release launch string must parse clean, got %zu warnings and %zu unknown",
+          warnings.size(), unknown.size());
+
+    // Each switch sets its own field, only that field, and consumes one token.
+    struct Switch { const char* flag; bool launch::Options::*field; };
+    const Switch switches[] = {
+        {"-lock", &launch::Options::lock},         {"-tint", &launch::Options::tint},
+        {"-etw", &launch::Options::etw},           {"-nojoin", &launch::Options::noJoin},
+        {"-dejit", &launch::Options::dejitter},    {"-fgphase", &launch::Options::fgPhase},
+        {"-phasekeep", &launch::Options::phaseKeep}, {"-flipex", &launch::Options::flipEx},
+        {"-mark", &launch::Options::mark},
+    };
+    for (const Switch& s : switches) {
+        launch::Options x;
+        const std::vector<std::string> t = {s.flag};
+        std::string w;
+        const size_t n = launch::ApplyOption(t, 0, &x, &w);
+        CHECK(n == 1 && x.*(s.field) && CountSwitchesOn(x) == 1 && w.empty(),
+              "%s must set exactly its own switch and consume one token", s.flag);
+    }
+
+    // -mark takes an optional count, only when the next token is all digits.
+    {
+        launch::Options x;
+        std::vector<std::string> t = launch::SplitTokens("-mark 7200");
+        CHECK(launch::ApplyOption(t, 0, &x, nullptr) == 2 && x.markFrames == 7200,
+              "-mark 7200 must consume its count");
+        x = launch::Options();
+        t = launch::SplitTokens("-mark -src 60");
+        CHECK(launch::ApplyOption(t, 0, &x, nullptr) == 1 && x.mark && x.markFrames == 0,
+              "-mark followed by a flag must mark every present and leave the flag");
+        x = launch::Options();
+        t = launch::SplitTokens("-mark 12a");
+        CHECK(launch::ApplyOption(t, 0, &x, nullptr) == 1 && x.markFrames == 0,
+              "-mark must not take a count that is not all digits");
+        x = launch::Options();
+        t = launch::SplitTokens("-mark 0");
+        CHECK(launch::ApplyOption(t, 0, &x, nullptr) == 2 && x.markFrames == 0,
+              "-mark 0 must consume the count and mean every present");
+    }
+
+    // -lag accepts 0 to 200 ms. Anything else is still consumed, leaves the value as it
+    // was, and is reported with the exact line the relay logs.
+    {
+        launch::Options x;
+        std::string w;
+        std::vector<std::string> t = launch::SplitTokens("-lag 200");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.extraLagMs == 200 && w.empty(),
+              "-lag 200 must be accepted");
+        w.clear();
+        t = launch::SplitTokens("-lag 0");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.extraLagMs == 0 && w.empty(),
+              "-lag 0 must be accepted");
+        x.extraLagMs = 75;
+        t = launch::SplitTokens("-lag 201");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.extraLagMs == 75 &&
+                  w == "-lag value '201' invalid (0-200 ms) - ignored",
+              "-lag 201 must be consumed, ignored and reported, got '%s'", w.c_str());
+        w.clear();
+        t = launch::SplitTokens("-lag -1");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.extraLagMs == 75 && !w.empty(),
+              "a negative -lag must be ignored and reported");
+        // strtol reads a non-number as 0, and 0 is in range, so it is taken silently.
+        w.clear();
+        t = launch::SplitTokens("-lag abc");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.extraLagMs == 0 && w.empty(),
+              "-lag with a non-number must read as 0");
+        t = launch::SplitTokens("-lag");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 0, "-lag with no value must be unknown");
+    }
+
+    // -src accepts (0, 1000] and reads the longest numeric prefix.
+    {
+        launch::Options x;
+        std::string w;
+        std::vector<std::string> t = launch::SplitTokens("-src 59.94");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.srcRateHint == 59.94f && w.empty(),
+              "-src 59.94 must be accepted");
+        t = launch::SplitTokens("-src 1000");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.srcRateHint == 1000.0f,
+              "-src 1000 must be accepted");
+        x.srcRateHint = 60.0f;
+        for (const char* bad : {"-src 0", "-src 1001", "-src abc"}) {
+            w.clear();
+            t = launch::SplitTokens(bad);
+            CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.srcRateHint == 60.0f && !w.empty(),
+                  "'%s' must be consumed, ignored and reported", bad);
+        }
+        CHECK(w == "-src value 'abc' invalid (1-1000) - ignored",
+              "the -src rejection must be the line the relay logs, got '%s'", w.c_str());
+        t = launch::SplitTokens("-src 60fps");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.srcRateHint == 60.0f,
+              "-src 60fps must read the numeric prefix");
+        t = launch::SplitTokens("-src");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 0, "-src with no value must be unknown");
+    }
+
+    // Flags match exactly: case and spelling variants are unknown, and consume nothing.
+    for (const char* odd : {"-LOCK", "lock", "-locks", "-foo", "--lock"}) {
+        launch::Options x;
+        const std::vector<std::string> t = {odd};
+        CHECK(launch::ApplyOption(t, 0, &x, nullptr) == 0 && CountSwitchesOn(x) == 0,
+              "'%s' must not be recognized", odd);
+    }
+
+    // The tokenizer splits on spaces only.
+    const std::vector<std::string> spaced = launch::SplitTokens("  b:vsync   -src 60 ");
+    CHECK(spaced.size() == 3 && spaced[0] == "b:vsync" && spaced[1] == "-src" && spaced[2] == "60",
+          "leading, repeated and trailing spaces must not make tokens, got %zu", spaced.size());
+    CHECK(launch::SplitTokens("").empty(), "an empty line must make no tokens");
+    CHECK(launch::SplitTokens("a\tb").size() == 1, "a tab must not split a token");
+}
+
+static void test_launch_mode_parsing() {
+    using launch::Compositor;
+    using launch::ModeKind;
+    struct Case {
+        const char* text;
+        ModeKind kind;
+        Compositor compositor;
+        bool vsyncPresent;
+        bool d3d11Present;
+        float framerate;
+    };
+    const Case cases[] = {
+        {"",           ModeKind::Vsync,    Compositor::Nearest, false, false, 0.0f},
+        {"vsync",      ModeKind::Vsync,    Compositor::Nearest, false, false, 0.0f},
+        {"VSync",      ModeKind::Vsync,    Compositor::Nearest, false, false, 0.0f},
+        // The blend on the D3D11 flip-model swapchain, presenting on the sink's vblank.
+        {"b",          ModeKind::Temporal, Compositor::Blend,   true,  true,  60.0f},
+        {"b:vsync",    ModeKind::Temporal, Compositor::Blend,   true,  true,  60.0f},
+        {"B:VSYNC",    ModeKind::Temporal, Compositor::Blend,   true,  true,  60.0f},
+        // The same blend on the D3D9 swapchain, on DWM's compose clock.
+        {"b:dwm",      ModeKind::Temporal, Compositor::Blend,   true,  false, 60.0f},
+        {"t",          ModeKind::Temporal, Compositor::Nearest, true,  false, 60.0f},
+        {"t:vsync",    ModeKind::Temporal, Compositor::Nearest, true,  false, 60.0f},
+        {"o",          ModeKind::Temporal, Compositor::Interp,  true,  false, 60.0f},
+        {"o:vsync",    ModeKind::Temporal, Compositor::Interp,  true,  false, 60.0f},
+        // X:<fps> presents on a QPC timer at that rate, on the D3D9 swapchain.
+        {"b:60",       ModeKind::Temporal, Compositor::Blend,   false, false, 60.0f},
+        {"t:59.94",    ModeKind::Temporal, Compositor::Nearest, false, false, 59.94f},
+        {"o:120",      ModeKind::Temporal, Compositor::Interp,  false, false, 120.0f},
+        {"diag",       ModeKind::Diag,     Compositor::Nearest, false, false, 0.0f},
+        {"diag:vsync", ModeKind::Diag,     Compositor::Nearest, true,  false, 0.0f},
+        {"60",         ModeKind::Timer,    Compositor::Nearest, false, false, 60.0f},
+        {"59.94",      ModeKind::Timer,    Compositor::Nearest, false, false, 59.94f},
+    };
+    for (const Case& c : cases) {
+        const launch::ModeSpec s = launch::ParseMode(c.text);
+        CHECK(s.kind == c.kind && s.compositor == c.compositor &&
+                  s.vsyncPresent == c.vsyncPresent && s.d3d11Present == c.d3d11Present &&
+                  s.framerate == c.framerate,
+              "mode '%s' parsed as kind %d compositor %d vsync %d d3d11 %d fps %.2f", c.text,
+              (int)s.kind, (int)s.compositor, (int)s.vsyncPresent, (int)s.d3d11Present,
+              s.framerate);
+    }
+
+    // Everything else is refused, including the retired b:flip spelling and rates outside
+    // (0, 1000].
+    for (const char* bad : {"b:", "b:abc", "b:flip", "b:0", "0", "1001", "x:60", "abc", "d:60"}) {
+        CHECK(launch::ParseMode(bad).kind == ModeKind::Invalid, "mode '%s' must be refused", bad);
+    }
+}
+
+static void test_lock_anchor_and_comb() {
+    // Every rate-derived quantity is sized from the declared -src, or 60 without one.
+    CHECK(policy::AssumedSrcFps(0.0f) == 60.0f, "an undeclared source must be assumed 60");
+    CHECK(policy::AssumedSrcFps(30.0f) == 30.0f && policy::AssumedSrcFps(90.0f) == 90.0f,
+          "a declared source must be taken as declared");
+
+    // The lock anchors only to a declared rate, and only when asked for.
+    CHECK(policy::LockAnchorFps(true, 90.0f) == 90.0f, "-lock -src 90 must anchor to 90");
+    CHECK(policy::LockAnchorFps(false, 90.0f) == 0.0f, "-src without -lock must not arm the lock");
+    CHECK(policy::LockAnchorFps(true, 0.0f) == 0.0f, "-lock without -src must not arm the lock");
+
+    // The comb denominator against the 60 Hz present, for every regime the corpus declares
+    // and the edges of the 2% tolerance.
+    struct Comb { double src; int m; bool matched; };
+    const Comb combs[] = {
+        {60.0, 1, true},  {30.0, 2, true}, {90.0, 2, true}, {120.0, 1, true},
+        {45.0, 4, true},  {75.0, 4, true}, {72.0, 5, true},
+        {59.0, 1, true},    // within 2% of 1:1, so the stability gate decides
+        {61.3, 1, false},   // no M up to 8 lands within 2%: the M=1 fallback
+    };
+    for (const Comb& c : combs) {
+        bool matched = !c.matched;
+        const int m = policy::CombDenominator(c.src, 60.0, &matched);
+        CHECK(m == c.m && matched == c.matched,
+              "-src %.1f at 60 Hz must give M=%d matched=%d, got M=%d matched=%d", c.src, c.m,
+              (int)c.matched, m, (int)matched);
+    }
+    CHECK(policy::CombDenominator(90.0, 60.0, nullptr) == 2,
+          "the matched flag must be optional");
+}
+
 int main(int argc, char** argv) {
     const char* replayPath = nullptr;
     int64_t combUs = 0;
@@ -3914,6 +4157,10 @@ int main(int argc, char** argv) {
     test_lock_reseed_wide_bracket_stall();
     test_lock_engage_window();
     test_lock_reseed_stall_paired_cadence();
+    test_launch_defaults();
+    test_launch_option_parsing();
+    test_launch_mode_parsing();
+    test_lock_anchor_and_comb();
     test_replay_capture_corpus();
 
     if (g_failures) {

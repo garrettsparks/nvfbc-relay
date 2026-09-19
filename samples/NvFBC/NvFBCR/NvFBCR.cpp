@@ -56,6 +56,7 @@
 #include "TimerCaptureMode.h"
 #include "DiagCaptureMode.h"
 #include "TemporalCaptureMode.h"
+#include "LaunchOptions.h"
 
 using namespace std;
 
@@ -70,138 +71,89 @@ struct DisplayPosition {
     string friendlyName;
 };
 
+// The launch options below all take their defaults from launch::Options, so a default is
+// changed in LaunchOptions.h and nowhere else. The parser writes back into these globals.
+//
 // Assumed source frame rate for the temporal lag (-src <fps>). The lag is static per run:
 // max(present period, 1.25 x assumed source period); 0 means unset and the temporal modes
 // assume sources run at 60 fps or faster. Declare slower sources (-src 30) to avoid
 // after-frame starvation; declare faster ones (-src 240) to ride the present-period floor.
-float g_srcRateHint = 0.0f;
+float g_srcRateHint = launch::Options().srcRateHint;
 
 // Opt in to the phase comb lock (-lock). Off by default: -src alone sizes the static lag
 // (its established meaning) and leaves selection at v15 behavior; -lock adds the comb lock.
 // Needs -src to derive the comb, so -lock without -src is inert.
-bool g_lock = false;
+bool g_lock = launch::Options().lock;
 
 // Burn the frame-counter marker into every present (-mark, debug builds/tests only):
 // the exact video-to-log join key. See docs/frame-marker-spec.md.
-bool g_mark = false;
+bool g_mark = launch::Options().mark;
 
 // Stamp a coloured border on every synthesized (blended) frame (-tint, debug only) so
 // blends are obvious while watching a capture at speed, without log-to-video alignment.
 // Rides the blend shader's existing pass, so it costs no extra draw and leaves
 // passthrough frames untouched.
-bool g_tint = false;
+bool g_tint = launch::Options().tint;
 // Consume the display driver's flip events alongside capture (-etw, debug). Diagnostic
 // only: it adds flip lines to the log and nothing reads them. Off by default so the
 // validated daily-driver path is untouched.
-bool g_etw = false;
+bool g_etw = launch::Options().etw;
 // -nojoin: keep the ETW session and the flip log, skip the per-present grid lookup. Exists
 // so the join can be A/B'd inside ONE binary in ONE session: comparing against an older
 // build confounds the join with everything else that changed, and the -etw off path logs no
 // flips at all, so it cannot answer questions about the flip grid itself.
-bool g_noJoin = false;
+bool g_noJoin = launch::Options().noJoin;
 // -dejit: subtract each capture batch's measured delivery lateness from its ring stamps
 // (needs -etw with the join on). The phantom-blend fix: a frame handed over late is stamped
 // where its flip says it belongs, so the ring stops recording delivery delay as motion.
-bool g_dejitter = false;
+bool g_dejitter = launch::Options().dejitter;
 // -fgphase: the stage-7 gate instrument. Per capture batch, measure the CONTENT phase f of
 // the generated member between its real neighbours (projection in downscaled luma, ring
 // side); the DISPLAY phase g joins offline from the -etw flip lines. If f does not track g,
 // generated frames are mistimed at the content level and no capture backend can fix it.
 // Instrument runs are instrument runs: the readback stalls the capture thread each wake.
-bool g_fgPhase = false;
+bool g_fgPhase = launch::Options().fgPhase;
 // -phasekeep: phase-aware keep-real (needs -etw with the join on). Default keep-real retains
 // member 1 of every batch, which is right wherever batch composition does not rotate. At x3
 // it does - batch stride 2 against a 3-flip source period - so member 1 holds the real frame
 // in only one class of three and the kept sequence runs gen, real, gen, gen, real, gen. This
 // votes the rotation phase from arrival timing and keeps member 0 through the [real,gen]
 // class, lifting real content from 2 of every 6 outputs to 4 of 6. Inert at x2 and FG off.
-bool g_phaseKeep = false;
+bool g_phaseKeep = launch::Options().phaseKeep;
 // -lag N: extra bracketing delay in ms. Trades output latency, which the player never sees
 // (the source display is direct) and which only shifts an already-delayed stream, for holds.
-unsigned int g_extraLagMs = 0;
+unsigned int g_extraLagMs = launch::Options().extraLagMs;
 
 // Optional count for -mark: burn only the first N presents (a head burst that aligns a
 // stream VOD without marking watched gameplay), then run clean. 0 = every present (the
 // bare -mark). The counter keeps advancing past N so mark= stays a continuous present count.
-unsigned int g_markFrames = 0;
+unsigned int g_markFrames = launch::Options().markFrames;
 
-// Single fps validation policy for every entry point that accepts a rate (mode strings,
-// -src): accept (0, 1000].
-static bool ParseFps(const string& value, float* outFps) {
-    try {
-        float v = stof(value);
-        if (v > 0.0f && v <= 1000.0f) { *outFps = v; return true; }
-    }
-    catch (...) {}
-    return false;
-}
-
-// Helper function to parse capture mode string and create appropriate mode instance
+// Builds the capture mode a mode string names. The grammar itself, and which present path
+// each spelling selects, is launch::ParseMode, where the policy suite pins it.
 IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
-    if (modeStr.empty() || _stricmp(modeStr.c_str(), "vsync") == 0) {
-        // Default to vsync mode
+    const launch::ModeSpec spec = launch::ParseMode(modeStr);
+    switch (spec.kind) {
+    case launch::ModeKind::Vsync:
         return new VsyncCaptureMode();
-    }
-
-    // Temporal modes (t = nearest selection, b = blend compositor, o = optical-flow
-    // interp compositor). The bare letter and X:vsync present on vsync, X:<fps> on a QPC
-    // timer. Nominal 60 fps drives the bracketing lag on the vsync present; the actual
-    // present rate is whatever clock the present path blocks on.
-    //
-    // Two present paths carry the vsync present. t and o run on the D3D9 swapchain, whose
-    // windowed INTERVAL_ONE present blocks on DWM's compose clock (card-locked 60 Hz under
-    // a fullscreen game on the source; the DISPLAYED rate under in-game frame generation).
-    // The blend mode has both: b and b:vsync present through a D3D11 flip-model swapchain
-    // on the output window, which Windows promotes to independent flip so the present
-    // blocks on the SINK's own vblank, and b:dwm is the same blend on the D3D9 swapchain.
-    // The D3D11 path carries the blend compositor only: nearest and interp are not ported.
-    {
-        char c0 = modeStr[0];
-        if (c0 >= 'A' && c0 <= 'Z') c0 = (char)(c0 - 'A' + 'a');
+    case launch::ModeKind::Temporal: {
         CompositorKind kind = kCompositorNearest;
-        if (c0 == 'b') kind = kCompositorBlend;
-        else if (c0 == 'o') kind = kCompositorInterp;
-        if (_stricmp(modeStr.c_str(), "t") == 0 || _stricmp(modeStr.c_str(), "t:vsync") == 0 ||
-            _stricmp(modeStr.c_str(), "o") == 0 || _stricmp(modeStr.c_str(), "o:vsync") == 0 ||
-            _stricmp(modeStr.c_str(), "b:dwm") == 0) {
-            return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
-                                           kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
-                                           g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs);
-        }
-        if (_stricmp(modeStr.c_str(), "b") == 0 || _stricmp(modeStr.c_str(), "b:vsync") == 0) {
-            return new TemporalCaptureMode(60.0f, /*vsyncPresent=*/true, g_srcRateHint, g_lock,
-                                           kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
-                                           g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs,
-                                           /*d3d11Present=*/true);
-        }
-
-        // QPC-timer present (t:60 / b:60 / o:60 format), on the D3D9 swapchain.
-        if (modeStr.length() > 2 && (c0 == 't' || c0 == 'b' || c0 == 'o') && modeStr[1] == ':') {
-            float framerate;
-            if (ParseFps(modeStr.substr(2), &framerate)) {
-                return new TemporalCaptureMode(framerate, /*vsyncPresent=*/false, g_srcRateHint, g_lock,
-                                               kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
-                                               g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs);
-            }
-        }
+        if (spec.compositor == launch::Compositor::Blend) kind = kCompositorBlend;
+        else if (spec.compositor == launch::Compositor::Interp) kind = kCompositorInterp;
+        return new TemporalCaptureMode(spec.framerate, spec.vsyncPresent, g_srcRateHint, g_lock,
+                                       kind, g_mark, g_markFrames, g_tint, g_etw, g_noJoin,
+                                       g_dejitter, g_fgPhase, g_phaseKeep, g_extraLagMs,
+                                       spec.d3d11Present);
     }
-
-    // Diagnostic clock probes:
-    //   diag        — QPC 60Hz + IMMEDIATE; logs DWM compose timing + card raster per tick
-    //   diag:vsync  — INTERVAL_ONE; present block time measures DWM's delivery cadence
-    if (_stricmp(modeStr.c_str(), "diag") == 0) {
-        return new DiagCaptureMode(/*vsyncPresent=*/false);
-    }
-    if (_stricmp(modeStr.c_str(), "diag:vsync") == 0) {
-        return new DiagCaptureMode(/*vsyncPresent=*/true);
-    }
-
-    // Try to parse as numeric framerate
-    {
-        float framerate;
-        if (ParseFps(modeStr, &framerate)) {
-            return new TimerCaptureMode(framerate);
-        }
+    // Diagnostic clock probes. diag runs a 60 Hz QPC timer with an IMMEDIATE present and logs
+    // DWM compose timing and the card's raster per tick; diag:vsync presents INTERVAL_ONE, so
+    // the present's block time measures DWM's delivery cadence.
+    case launch::ModeKind::Diag:
+        return new DiagCaptureMode(spec.vsyncPresent);
+    case launch::ModeKind::Timer:
+        return new TimerCaptureMode(spec.framerate);
+    case launch::ModeKind::Invalid:
+        break;
     }
 
     LOGERR("Invalid capture mode: '%s'", modeStr.c_str());
@@ -252,7 +204,7 @@ int g_sourceAdapterIndex = 0;
 // Flip-mode presentation (-flipex): D3DSWAPEFFECT_FLIPEX instead of the bitblt DISCARD. Opt-in
 // because it changes how every frame reaches DWM; see the swap-chain setup for why it is wanted
 // and why the previous attempt failed. Off leaves presentation byte-identical to today.
-bool g_flipEx = false;
+bool g_flipEx = launch::Options().flipEx;
 
 // Hidden window hosting the D3D9 devices when the output window belongs to a D3D11 flip-model
 // swapchain (b:vsync). Flip model allows one swapchain per window and no second API on it, and a
@@ -585,77 +537,53 @@ int ReadIntFromCmd(string prompt) {
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths
 // always split options identically.
 static vector<string> SplitTokens(const string& text) {
-    vector<string> tokens;
-    size_t pos = 0;
-    while (pos < text.length()) {
-        while (pos < text.length() && text[pos] == ' ') pos++;
-        size_t start = pos;
-        while (pos < text.length() && text[pos] != ' ') pos++;
-        if (pos > start) tokens.push_back(text.substr(start, pos - start));
-    }
-    return tokens;
+    return launch::SplitTokens(text);
+}
+
+// The globals as one Options value, and back. The parser works on the struct so the policy
+// suite can drive it; the rest of the relay keeps reading the globals.
+static launch::Options CurrentOptions() {
+    launch::Options o;
+    o.srcRateHint = g_srcRateHint;
+    o.lock = g_lock;
+    o.tint = g_tint;
+    o.etw = g_etw;
+    o.noJoin = g_noJoin;
+    o.dejitter = g_dejitter;
+    o.fgPhase = g_fgPhase;
+    o.phaseKeep = g_phaseKeep;
+    o.flipEx = g_flipEx;
+    o.mark = g_mark;
+    o.markFrames = g_markFrames;
+    o.extraLagMs = g_extraLagMs;
+    return o;
+}
+
+static void StoreOptions(const launch::Options& o) {
+    g_srcRateHint = o.srcRateHint;
+    g_lock = o.lock;
+    g_tint = o.tint;
+    g_etw = o.etw;
+    g_noJoin = o.noJoin;
+    g_dejitter = o.dejitter;
+    g_fgPhase = o.fgPhase;
+    g_phaseKeep = o.phaseKeep;
+    g_flipEx = o.flipEx;
+    g_mark = o.mark;
+    g_markFrames = o.markFrames;
+    g_extraLagMs = o.extraLagMs;
 }
 
 // Option dispatch shared by the command line and the console prompt: applies the option at
-// tokens[i] and returns how many tokens it consumed (0 = not a recognized option). New
-// value-taking options belong here so both entry points accept them.
+// tokens[i] and returns how many tokens it consumed (0 = not a recognized option). The rules
+// are launch::ApplyOption's; this logs whatever it rejected.
 static size_t ApplyOption(const vector<string>& tokens, size_t i) {
-    if (tokens[i] == "-lock") {
-        g_lock = true;
-        return 1;
-    }
-    if (tokens[i] == "-tint") {
-        g_tint = true;
-        return 1;
-    }
-    if (tokens[i] == "-etw") {
-        g_etw = true;
-        return 1;
-    }
-    if (tokens[i] == "-nojoin") {
-        g_noJoin = true;
-        return 1;
-    }
-    if (tokens[i] == "-dejit") {
-        g_dejitter = true;
-        return 1;
-    }
-    if (tokens[i] == "-fgphase") {
-        g_fgPhase = true;
-        return 1;
-    }
-    if (tokens[i] == "-phasekeep") {
-        g_phaseKeep = true;
-        return 1;
-    }
-    if (tokens[i] == "-flipex") {
-        g_flipEx = true;
-        return 1;
-    }
-    if (tokens[i] == "-mark") {
-        g_mark = true;
-        // Optional frame count: consume the next token as N only if it is all digits, so
-        // a bare -mark (or -mark followed by another flag) keeps marking every present.
-        if (i + 1 < tokens.size() && !tokens[i + 1].empty() &&
-            tokens[i + 1].find_first_not_of("0123456789") == string::npos) {
-            g_markFrames = (unsigned int)strtoul(tokens[i + 1].c_str(), NULL, 10);
-            return 2;
-        }
-        return 1;
-    }
-    if (tokens[i] == "-lag" && i + 1 < tokens.size()) {
-        const long v = strtol(tokens[i + 1].c_str(), NULL, 10);
-        if (v >= 0 && v <= 200) g_extraLagMs = (unsigned int)v;
-        else LOGERR("-lag value '%s' invalid (0-200 ms) - ignored", tokens[i + 1].c_str());
-        return 2;
-    }
-    if (tokens[i] == "-src" && i + 1 < tokens.size()) {
-        float v;
-        if (ParseFps(tokens[i + 1], &v)) g_srcRateHint = v;
-        else LOGERR("-src value '%s' invalid (1-1000) - ignored", tokens[i + 1].c_str());
-        return 2;
-    }
-    return 0;
+    launch::Options o = CurrentOptions();
+    string warning;
+    const size_t consumed = launch::ApplyOption(tokens, i, &o, &warning);
+    if (!warning.empty()) LOGERR("%s", warning.c_str());
+    StoreOptions(o);
+    return consumed;
 }
 
 bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, string* framerateStr) {

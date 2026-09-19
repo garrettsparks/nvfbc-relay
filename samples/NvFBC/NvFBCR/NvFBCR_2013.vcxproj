@@ -150,6 +150,7 @@
     <ClInclude Include="DiagCaptureMode.h" />
     <ClInclude Include="TemporalCaptureMode.h" />
     <ClInclude Include="TemporalPolicy.h" />
+    <ClInclude Include="LaunchOptions.h" />
     <ClInclude Include="IFrameCaptureMode.h" />
     <ClInclude Include="PresentScheduler.h" />
     <ClInclude Include="TimerCaptureMode.h" />

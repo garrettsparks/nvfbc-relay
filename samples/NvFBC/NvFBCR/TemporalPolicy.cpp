@@ -1023,4 +1023,27 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
     return d;
 }
 
+float AssumedSrcFps(float srcRateHint) {
+    return (srcRateHint > 0.0f) ? srcRateHint : kDefaultAssumedSrcFps;
+}
+
+float LockAnchorFps(bool lock, float srcRateHint) {
+    return (lock && srcRateHint > 0.0f) ? srcRateHint : 0.0f;
+}
+
+int CombDenominator(double srcFps, double presentFps, bool* matched) {
+    const double ratio = srcFps / presentFps;
+    for (int m = 1; m <= 8; m++) {
+        const double nm = ratio * (double)m;
+        const long long n = (long long)(nm + 0.5);
+        const double frac = nm - (double)n;
+        if (n >= 1 && frac > -0.02 && frac < 0.02) {
+            if (matched) *matched = true;
+            return m;
+        }
+    }
+    if (matched) *matched = false;
+    return 1;
+}
+
 }  // namespace policy

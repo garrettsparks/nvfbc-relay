@@ -654,4 +654,21 @@ int64_t ToothGuardPeriod(int64_t srcPeriodQpc, int64_t sinkPeriodQpc, bool combO
 // full-period step followed by a half-period step where two even steps were available.
 int64_t PassthroughThreshold(int64_t srcPeriodQpc, int64_t presentPeriodQpc);
 
+// The source rate every rate-derived quantity is sized from: the declared -src, or the default
+// when none was declared. The default is the slowest source served without configuration, at
+// any present rate; slower sources need an explicit -src.
+const float kDefaultAssumedSrcFps = 60.0f;
+float AssumedSrcFps(float srcRateHint);
+
+// The source rate the comb lock anchors to, or 0 when the lock does not arm. The lock anchors
+// only to a declared -src: anchoring to the default would lock undeclared sources to a rate
+// nobody stated.
+float LockAnchorFps(bool lock, float srcRateHint);
+
+// The comb denominator M: the smallest M in 1..8 for which the source:present ratio times M
+// lands within 2% of a whole number N >= 1, so the target's phase visits M values per beat.
+// *matched says whether one was found; without a match M is 1 and the lock's stability gate
+// decides. Production and the replay size the comb with this one function.
+int CombDenominator(double srcFps, double presentFps, bool* matched);
+
 }  // namespace policy

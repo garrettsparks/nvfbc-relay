@@ -15,10 +15,6 @@ extern int g_targetRefreshHz;
 // the log quiet, frequent enough that a wrong -src is caught within the first minute.
 static const int kTelemetryPeriodPresents = 600;
 
-// Source rate assumed when -src is not given: the slowest source served without
-// configuration, at any present rate. Slower sources need an explicit -src.
-static const float kDefaultAssumedSrcFps = 60.0f;
-
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
                                          bool tint, bool etw, bool noJoin, bool dejitter,
@@ -156,7 +152,7 @@ bool TemporalCaptureMode::Setup() {
     // ride the present-period floor. Computed once and never moved: the lag is output
     // latency, and only a constant can be compensated for downstream (T10). The measured
     // source period is not fed back into the lag; it only audits the assumption (telemetry).
-    const float assumedFps = (m_srcRateHint > 0.0f) ? m_srcRateHint : kDefaultAssumedSrcFps;
+    const float assumedFps = policy::AssumedSrcFps(m_srcRateHint);
     m_assumedSrcPeriodQpc = (LONGLONG)((double)m_scheduler.Freq() / assumedFps);
     m_bracketingDelayQpc = LagForSourcePeriod(m_assumedSrcPeriodQpc);
     if (m_extraLagMs > 0) {
@@ -222,16 +218,11 @@ bool TemporalCaptureMode::Setup() {
     // one missing frame from reading as a stall while a genuinely hitching source still
     // trips it on the first present.
     if (m_phaseKeep) m_policyCfg.stallSpanQpc = m_assumedSrcPeriodQpc * 5 / 2;
-    if (m_lock && m_srcRateHint > 0.0f) {
-        int combM = 1;
+    const float lockAnchorFps = policy::LockAnchorFps(m_lock, m_srcRateHint);
+    if (lockAnchorFps > 0.0f) {
         bool combMatched = false;
-        const double ratio = (double)m_srcRateHint / (double)m_targetFramerate;
-        for (int m = 1; m <= 8; m++) {
-            const double nm = ratio * (double)m;
-            const long long n = (long long)(nm + 0.5);
-            const double frac = nm - (double)n;
-            if (n >= 1 && frac > -0.02 && frac < 0.02) { combM = m; combMatched = true; break; }
-        }
+        const int combM = policy::CombDenominator((double)lockAnchorFps,
+                                                  (double)m_targetFramerate, &combMatched);
         m_policyCfg.combQpc = m_assumedSrcPeriodQpc / combM;
         LOG("Phase comb lock ACTIVE (-lock): modulus %lld us (ratio denominator M=%d%s); pull=/lk= on the temporal line",
             m_policyCfg.combQpc * 1000000 / m_scheduler.Freq(), combM,
