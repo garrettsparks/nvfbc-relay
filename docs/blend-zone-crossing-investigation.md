@@ -293,7 +293,17 @@ quiet-stretch constant unreachable) carries its own control: the ON arm reproduc
 fires at the same times and its four long runs within ten percent. The OFF arm, which is the
 `79f33e9` policy, has ZERO runs >= 50 on that log and a worst of exactly 40, the transient's own
 length. On the 09-16 log the rule removes four of six runs >= 40 but lengthens one (45 -> 65) and
-creates one (42). Across both logs: runs >= 50 three with, three without; worst 64 -> 112.
+creates one (42). Across those two logs: runs >= 50 three with, three without; worst 64 -> 112.
+
+**Re-examined on a third log after the revert** (`Get_Medieval_2026-09-17_1`, 90 min on the reverted
+policy, replayed with the rule on): the rule removes eleven of eighteen runs >= 40, creates two of
+43-44, lengthens one 43 -> 67. Over all three logs (171 min) it cuts runs >= 50 from 11 to 5, runs
+>= 40 from 27 to 15 and presents inside long runs by 39 percent, while raising the worst from 64 to
+112 with a mechanism ceiling near 170 presents. So the two-log "no net benefit" reading was not
+general: the rule trades FREQUENCY for TAIL SIZE. The revert stands for the release on the tail-risk
+ground, and the benefit is the case for the seventh candidate below, which the three fixtures now in
+the corpus (transients on `gm_60x2_gameplay_0917`, sustained steps on `gm_60x2_gameplay_0917_1` and
+the hour) can gate in replay before a capture is spent.
 
 The reason is a design property rather than a tuning error. Any confirmation short enough to save
 presents on a sustained step (four presents here) is far shorter than the transient (forty), so the

@@ -4,12 +4,16 @@ Build under test: `2ee7c67` (`3fe2ace`, the rule, plus its log evidence), CI run
 jobs green. Everything below `3fe2ace` was already validated in
 `docs/capture-and-lock-field-validation.md`; this report decides only whether the step rule ships.
 
-Status: **both captures analysed. The rule does not hold up and should be reverted.** On the risk
-capture (KCD map cycles) it did no harm because it never fired. On the benefit capture (KCD gameplay,
-streamed) it fired six times, four of them on phase transients the game reverted about 0.65 s later,
-and each of those four turned a run the old policy would have held to 40 presents into 42 to 100. A
-paired replay of the same log with the rule off reproduces the field with the rule on and shows zero
-runs of 50 or more without it. Section 2 and the verdict in section 3.
+Status: **both captures analysed, the rule reverted (`c7d67d4`), and the decision re-examined on a
+third log (section 2.6).** On the risk capture (KCD map cycles) it did no harm because it never fired.
+On the benefit capture (KCD gameplay, streamed) it fired six times, four of them on phase transients
+the game reverted about 0.65 s later, and each of those four turned a run the old policy would have
+held to 40 presents into 42 to 100. The paired replay of that log confirmed it. A later 90-minute
+capture on the reverted policy, replayed with the rule on, showed the other side: over three logs
+the rule halves the number of long runs and cuts the time spent in them by 39 percent, at the cost
+of a fatter tail (one run of 112 against a worst of 64 without it). The revert stands as the release
+position on the tail-risk ground; the benefit is real and is the case for a seventh candidate with an
+undo path. Section 3 has the corrected verdict.
 
 ## What is being decided
 
@@ -290,8 +294,42 @@ under 40 became 47.
 On the 09-16 log the rule does what the corpus said it would, mostly: it removes four of the six runs
 of 40 or more (the 59, 58, 48 and 64, each sitting on a dropped-frame hitch whose phase change
 persisted), but it lengthens one (45 at 2456.6 becomes 65 at 2457.4, two fires 4.7 s apart) and
-creates one (a run under 40 at 2666 becomes 42). Across both logs together the count of runs of 50 or
-more is unchanged, three with the rule and three without, and the worst run goes from 64 to 112.
+creates one (a run under 40 at 2666 becomes 42). Across these two logs together the count of runs of
+50 or more is unchanged, three with the rule and three without, and the worst run goes from 64 to
+112. That two-log statement is what the revert decision rested on, and section 2.6 shows it was
+incomplete.
+
+### 2.6 The third log, replayed after the decision
+
+The revert was already committed when a 90-minute capture on the reverted policy arrived
+(`Get_Medieval_2026-09-17_1`, now `gm_60x2_gameplay_0917_1.trace`). Because its field ran without
+the rule, the OFF arm of the same paired replay is the fidelity control here (it reproduces the field:
+eight runs of 50 or more against eight, worst 63 against 62) and the ON arm shows what the rule would
+have done on a third log it had never seen. Same tally on all three:
+
+| log | arm | fires | runs >= 40 | presents inside them | runs >= 50 | worst | synth |
+|---|---|---|---|---|---|---|---|
+| 09-17_0, 30.6 min | ON | 6 | 4 | 261 | 2 | **112** | 0.6% |
+| | OFF | 0 | 3 | 120 | 0 | 40 | 0.5% |
+| 09-16, 50.7 min | ON | 7 | 2 | 107 | 1 | 65 | 0.4% |
+| | OFF | 0 | 6 | 317 | 3 | 64 | 0.5% |
+| 09-17_1, 89.7 min | ON | 24 | 9 | 431 | 2 | 67 | 0.6% |
+| | OFF | 0 | 18 | 877 | 8 | 63 | 0.7% |
+| **all three, 171 min** | **ON** | 37 | **15** | **799** | **5** | **112** | |
+| | **OFF** | 0 | **27** | **1314** | **11** | **64** | |
+
+On the 90-minute log the rule removes eleven of the eighteen runs of 40 or more, creates two of 43
+and 44 (fires at 319.8 and 480.0 s where the old policy had nothing that long) and lengthens one from
+43 to 67 (the fire at 5372.2 s). Its fires sit on the old policy's own long runs: eleven of the
+eighteen have a fire within a second of their start.
+
+So over the three logs the rule cuts the number of runs of 50 or more from 11 to 5, the number of 40
+or more from 27 to 15, and the presents spent inside long runs by 39 percent. What it costs is the
+tail: one run of 112 in 171 minutes where the old policy's worst is 64, and by the mechanism in
+section 2.2 the ceiling for that class is the crawl-back distance divided by the steady slew, about
+4.2 ms at 25 us a present, or roughly 170 presents (2.8 s) with the lock engaged. The two-log verdict
+that the rule "leaves the count of long runs where it was" was wrong as a general statement; it held
+on the two logs it was measured on and not on the third. The rule trades frequency for tail size.
 
 Why replay called it clean: the 43-fixture corpus holds hitches, stalls and sweeps but no reverting
 transient of this shape. The rule's confirmation delay (four presents, 67 ms) is an order of magnitude
@@ -331,16 +369,25 @@ completes.
 | each fire at a disturbance, none in steady play | all six on a real source phase event; four of the six on a transient the game reverted within 0.65 s |
 | replay against field | ON arm reproduces the field's fires and runs; OFF arm shows the same log with no run >= 50 and worst 40 |
 
-**The rule does not hold up.** It is safe on stall-heavy content only because it never arms there, and
-on gameplay it converts a class of 40-present transients into runs of 42 to 112 while removing the
-sustained-step runs it was built for. Across the two gameplay logs it leaves the count of long runs
-where it was and raises the worst from 64 to 112.
+**What the rule is, on three logs.** It is safe on stall-heavy content only because it never arms
+there. On gameplay it does two things at once: it removes the sustained-step runs it was built for,
+which over 171 minutes halves the number of runs of 50 or more (11 to 5) and cuts the presents spent
+in long runs by 39 percent; and on the reverting-transient class it commits to a phase the source
+takes back, which produced one run of 112 against the old policy's worst of 64, with a mechanism
+ceiling near 170. The two-log verdict written first (section 2.4) said the count was unchanged; the
+third log (section 2.6) shows that was not general. The honest statement is a trade of frequency for
+tail size, and which side of it to be on is a product decision, not a measurement.
 
-**Recommendation, per the plan in the kickoff: revert.** `3fe2ace` is code only. `2ee7c67` is the
-rule's log lines plus two docs it added as new files (`docs/blend-zone-crossing-investigation.md` and
-`docs/capture-and-lock-field-validation.md`), so its code should go and its docs should stay. The
-release then proceeds on `79f33e9` plus the `ed2b4d8` fixtures, which
-`docs/capture-and-lock-field-validation.md` already validates, and nothing else in the plan moves.
+**The revert stands as the release position, on the tail-risk ground.** `c7d67d4` reverted `3fe2ace`
+and the code of `2ee7c67` (its two docs were kept), and the release proceeds on the `79f33e9` policy,
+which `docs/capture-and-lock-field-validation.md` already validates and whose worst case is bounded
+by the transient's own length. The rule's benefit is real and is not thrown away: the three fixtures
+now in the corpus cover both regimes (transients on `gm_60x2_gameplay_0917`, sustained steps on
+`gm_60x2_gameplay_0917_1` and the hour fixture), so a seventh candidate with an undo path can be
+measured against all of them in replay before a capture is spent. If the frequency side of the trade
+is preferred for the release instead, reinstating the rule means moving `max_worst_run` on both
+09-17 fixtures with the reason written in (112 on the first, 67 on the second) and accepting that
+the third log's result is replay, not field.
 
 **Two things worth keeping from this.** The 09-17 gameplay fixture is the corpus member that would
 have caught it, and it is now in the tree as `samples/NvFBC/NvFBCR/testdata/gm_60x2_gameplay_0917.trace`
