@@ -107,16 +107,16 @@ inline const std::vector<UsageRow>& OptionRows() {
         {"-src", "60", "Declared source fps, the BASE render rate (60x2 frame generation is -src "
                        "60); sizes the lag, the comb lock and the passthrough threshold (default: "
                        "60 assumed)", true, false},
-        {"-nolock", "", "Turn the phase comb lock off (on by default)", true, false},
+        {"-nolock", "", "Turn the phase comb lock off (on by default)", false, false},
         {"-lag", "75", "Extra bracketing delay in ms (0-200, default 75; -lag 0 turns it off): "
                        "output latency the player never sees, traded for fewer held frames",
          true, false},
         {"-noetw", "", "Do not read the display driver's scanout times (read by default; -dejit "
-                       "needs them)", true, false},
+                       "needs them)", false, false},
         {"-nodejit", "", "Do not re-stamp late-delivered capture batches onto the flip grid (on by "
-                         "default; needs flip timing and the comb lock)", true, false},
+                         "default; needs flip timing and the comb lock)", false, false},
         {"-mark", "[N]", "Burn the frame-counter marker for offline analysis; N = first N presents "
-                         "only, else every present", true, false},
+                         "only, else every present", false, false},
         {"-lock", "", "The comb lock; on by default, accepted so older launch strings keep working",
          false, false},
         {"-etw", "", "Flip timing; on by default, accepted so older launch strings keep working",
