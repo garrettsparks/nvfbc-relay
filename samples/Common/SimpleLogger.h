@@ -106,18 +106,32 @@ private:
     static constexpr int kSlotSize = 512;    // longest current line ~400 bytes
     static constexpr int kSlotCount = 4096;  // ~2 MB; seconds of headroom at peak line rates
 
+    // The log's path beside the exe. A relative name would resolve against the working
+    // directory, which a shortcut's "Start in" or an elevated launch can put anywhere, and
+    // logging would then quietly stay off with the log file sitting right beside the exe.
+    static std::string LogPath() {
+        char exePath[MAX_PATH];
+        const DWORD n = GetModuleFileNameA(NULL, exePath, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH) return LOG_FILENAME;
+        const std::string path(exePath, n);
+        const size_t slash = path.find_last_of("\\/");
+        if (slash == std::string::npos) return LOG_FILENAME;
+        return path.substr(0, slash + 1) + LOG_FILENAME;
+    }
+
     SimpleLogger() : m_fileHandle(INVALID_HANDLE_VALUE), m_enabled(false),
                      m_head(0), m_tail(0), m_dropped(0), m_stopDrainer(false) {
         // Check if log file exists at startup
+        const std::string logPath = LogPath();
         WIN32_FIND_DATAA findData;
-        HANDLE hFind = FindFirstFileA(LOG_FILENAME, &findData);
+        HANDLE hFind = FindFirstFileA(logPath.c_str(), &findData);
 
         if (hFind != INVALID_HANDLE_VALUE) {
             FindClose(hFind);
 
             // Open file using Win32 API, truncating any existing content
             m_fileHandle = CreateFileA(
-                LOG_FILENAME,
+                logPath.c_str(),
                 GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 NULL,

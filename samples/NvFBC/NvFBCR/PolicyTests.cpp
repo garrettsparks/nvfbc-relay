@@ -4252,6 +4252,54 @@ static void test_launch_command_line() {
           "an option's warning must reach the command line's list");
 }
 
+static void test_launch_relaunch_round_trip() {
+    // The relaunch after enabling NvFBC writes the resolved options out and the new process
+    // parses them over the defaults: every launch must come back exactly as it resolved.
+    const char* launches[] = {
+        "",
+        "-src 60",
+        "-src 59.94",
+        "-src 29.97 -lag 0",
+        "-src 144 -lag 200",
+        "-nolock -noetw -nodejit -lag 0",
+        "-noetw",
+        "-nolock",
+        "-nojoin",
+        "-dejit -noetw",
+        "-dejit -nodejit",
+        "-mark",
+        "-mark 7200 -tint -fgphase -phasekeep -flipex",
+        "-lock -etw -dejit -src 90",
+    };
+    for (const char* text : launches) {
+        launch::Options typed = ParseOptionString(text, nullptr, nullptr);
+        for (int resolved = 0; resolved < 2; resolved++) {
+            launch::Options o = typed;
+            if (resolved) launch::ResolveDependencies(&o);
+            const std::string written = launch::FormatOptions(o);
+            std::vector<std::string> warnings;
+            launch::Options back;
+            const launch::CommandLine c = launch::ParseCommandLine(
+                launch::SplitTokens("-source 0 -target 1 -framerate b:vsync " + written), &back,
+                &warnings);
+            if (resolved) launch::ResolveDependencies(&back);
+            CHECK(SameOptions(back, o) && warnings.empty() && c.sourceIndex == 0 &&
+                      c.targetIndex == 1 && c.mode == "b:vsync",
+                  "'%s' (%s) must survive the relaunch, written as '%s'", text,
+                  resolved ? "resolved" : "as typed", written.c_str());
+        }
+    }
+
+    // A default launch writes nothing, and a rate keeps the spelling it was typed with.
+    CHECK(launch::FormatOptions(launch::Options()).empty(),
+          "a default launch must write no options");
+    CHECK(launch::FormatFps(59.94f) == "59.94" && launch::FormatFps(60.0f) == "60",
+          "a typed rate must be written back as typed, got '%s'",
+          launch::FormatFps(59.94f).c_str());
+    CHECK(std::strtof(launch::FormatFps(59.9400024f).c_str(), NULL) == 59.9400024f,
+          "a rate needing more digits must still read back exactly");
+}
+
 static void test_launch_usage_table() {
     // Every row is parsed: the flag and its sample value are consumed whole, with nothing
     // reported. A bracketed sample is optional and the flag alone must parse.
@@ -4414,6 +4462,7 @@ int main(int argc, char** argv) {
     test_launch_dependencies();
     test_launch_int_parse();
     test_launch_command_line();
+    test_launch_relaunch_round_trip();
     test_launch_usage_table();
     test_lock_anchor_and_comb();
     test_replay_capture_corpus();

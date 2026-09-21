@@ -2,6 +2,7 @@
 
 #include <climits>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -295,6 +296,47 @@ inline CommandLine ParseCommandLine(const std::vector<std::string>& args, Option
         }
     }
     return c;
+}
+
+// The shortest decimal spelling ParseFps reads back as exactly this rate: 59.94 stays
+// "59.94", and a value with more digits than that gets as many as it needs.
+inline std::string FormatFps(float fps) {
+    char text[32];
+    for (int digits = 6; digits <= 9; digits++) {
+        snprintf(text, sizeof(text), "%.*g", digits, (double)fps);
+        if (std::strtof(text, NULL) == fps) break;
+    }
+    return text;
+}
+
+// The option tokens that rebuild *o when parsed over the defaults, so a relaunch runs with the
+// options this launch resolved to. Only what differs from a default is written, and a
+// default launch writes nothing.
+inline std::string FormatOptions(const Options& o) {
+    const Options d;
+    std::string s;
+    auto add = [&s](const std::string& token) {
+        if (!s.empty()) s += ' ';
+        s += token;
+    };
+    if (o.srcRateHint != d.srcRateHint) add("-src " + FormatFps(o.srcRateHint));
+    if (o.lock != d.lock) add(o.lock ? "-lock" : "-nolock");
+    if (o.etw != d.etw) add(o.etw ? "-etw" : "-noetw");
+    if (o.noJoin) add("-nojoin");
+    // A typed -dejit is written as typed, so the relaunch refuses it as loudly as this launch
+    // did; a default one that stepped aside is written as off.
+    if (o.dejitterRequested) {
+        add("-dejit");
+    } else if (o.dejitter != d.dejitter) {
+        add(o.dejitter ? "-dejit" : "-nodejit");
+    }
+    if (o.extraLagMs != d.extraLagMs) add("-lag " + std::to_string(o.extraLagMs));
+    if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
+    if (o.tint) add("-tint");
+    if (o.fgPhase) add("-fgphase");
+    if (o.phaseKeep) add("-phasekeep");
+    if (o.flipEx) add("-flipex");
+    return s;
 }
 
 enum class ModeKind { Invalid, Vsync, Temporal, Diag, Timer };

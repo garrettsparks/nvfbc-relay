@@ -214,6 +214,9 @@ int g_targetRefreshHz = 0;
 
 vector <DisplayPosition> displays;
 
+// The single-instance lock, held for the life of the process.
+HANDLE g_instanceLock = NULL;
+
 void Cleanup()
 {
     LOG("Cleanup started");
@@ -700,9 +703,10 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     // that reads it. Refusing is the only outcome that keeps the evidence.
     //
     // Checked before the first log line, because opening the log is itself what destroys it.
-    // The handle is deliberately never closed: the process exiting releases it.
-    if (!CreateMutexA(NULL, TRUE, "Global\\NvFBCR_SingleInstance") ||
-        GetLastError() == ERROR_ALREADY_EXISTS) {
+    // The process exiting releases the lock; the one other release is the relaunch after
+    // enabling NvFBC, which hands it to the new process.
+    g_instanceLock = CreateMutexA(NULL, TRUE, "Global\\NvFBCR_SingleInstance");
+    if (!g_instanceLock || GetLastError() == ERROR_ALREADY_EXISTS) {
         MessageBoxA(NULL,
                     "Another NvFBCR is already running, and only one can run at a time.\n\n"
                     "Close it first. If no window is visible, end NvFBCR.exe in Task Manager.",
@@ -973,18 +977,33 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
             char exePath[MAX_PATH];
             GetModuleFileNameA(NULL, exePath, MAX_PATH);
 
-            // Build command line with current values
+            // Build command line with current values, the resolved options included, so the
+            // new process runs exactly what this one was asked for.
             // Note: lpCommandLine must include the exe name as first token when lpApplicationName is non-NULL
             // Windows will strip the first token and pass the rest to WinMain's lpCmdLine
-            char newCmdLine[512];
-            sprintf_s(newCmdLine, sizeof(newCmdLine), "\"%s\" -source %d -target %d -framerate %s",
-                exePath, source.dxAdapterIndex, target.dxAdapterIndex,
-                framerateStr.empty() ? "b:vsync" : framerateStr.c_str());
+            string cmd = string("\"") + exePath + "\" -source " +
+                         to_string(source.dxAdapterIndex) + " -target " +
+                         to_string(target.dxAdapterIndex) + " -framerate " +
+                         (framerateStr.empty() ? string("b:vsync") : framerateStr);
+            const string options = launch::FormatOptions(CurrentOptions());
+            if (!options.empty()) cmd += " " + options;
+            vector<char> newCmdLine(cmd.begin(), cmd.end());
+            newCmdLine.push_back('\0');
 
-            LOG("Relaunching with command line: '%s'", newCmdLine);
+            LOG("Relaunching with command line: '%s'", cmd.c_str());
             LOG("Executable path: '%s'", exePath);
 
-            if (CreateProcessA(NULL, newCmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
+            // The new process takes the single-instance lock and truncates the log as it
+            // starts. So this one lets go of both first: the lock, or the new process refuses
+            // to start as a second instance, and the log, whose pending lines would otherwise
+            // land in the new process's file at this one's offset. Nothing more is logged here
+            // unless the relaunch fails, and then there is no new process.
+            SimpleLogger::getInstance().flush();
+            ReleaseMutex(g_instanceLock);
+            CloseHandle(g_instanceLock);
+            g_instanceLock = NULL;
+
+            if (CreateProcessA(NULL, newCmdLine.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
             {
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread);
