@@ -47,8 +47,10 @@ EtwFlipConsumer::EtwFlipConsumer() {}
 EtwFlipConsumer::~EtwFlipConsumer() { Stop(); }
 
 bool EtwFlipConsumer::Start(LONGLONG qpcFreq, LONGLONG baseQpc) {
+    m_startError = 0;
     if (g_instance) {
         LOGERR("ETW: a flip consumer is already running");
+        m_startError = ERROR_ALREADY_EXISTS;
         return false;
     }
     m_qpcFreq = qpcFreq;
@@ -65,6 +67,7 @@ bool EtwFlipConsumer::Start(LONGLONG qpcFreq, LONGLONG baseQpc) {
     if (st != ERROR_SUCCESS) {
         LOGERR("ETW: StartTrace failed (%lu) - flip timing unavailable, capture continues",
                (unsigned long)st);
+        m_startError = st;
         return false;
     }
 
@@ -75,6 +78,7 @@ bool EtwFlipConsumer::Start(LONGLONG qpcFreq, LONGLONG baseQpc) {
     if (st != ERROR_SUCCESS) {
         LOGERR("ETW: EnableTrace failed (%lu) - flip timing unavailable, capture continues",
                (unsigned long)st);
+        m_startError = st;
         ControlTraceW(m_session, kSessionName, &sp.props, EVENT_TRACE_CONTROL_STOP);
         m_session = 0;
         return false;
@@ -90,8 +94,10 @@ bool EtwFlipConsumer::Start(LONGLONG qpcFreq, LONGLONG baseQpc) {
     lf.EventRecordCallback = OnEventThunk;
     m_consumer = OpenTraceW(&lf);
     if (m_consumer == (TRACEHANDLE)INVALID_HANDLE_VALUE) {
+        // Read once, before ControlTraceW can overwrite the thread's last error.
+        m_startError = GetLastError();
         LOGERR("ETW: OpenTrace failed (%lu) - flip timing unavailable, capture continues",
-               (unsigned long)GetLastError());
+               m_startError);
         ControlTraceW(m_session, kSessionName, &sp.props, EVENT_TRACE_CONTROL_STOP);
         m_session = 0;
         return false;

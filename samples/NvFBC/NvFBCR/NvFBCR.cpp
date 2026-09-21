@@ -74,15 +74,15 @@ struct DisplayPosition {
 // The launch options below all take their defaults from launch::Options, so a default is
 // changed in LaunchOptions.h and nowhere else. The parser writes back into these globals.
 //
-// Assumed source frame rate for the temporal lag (-src <fps>). The lag is static per run:
-// max(present period, 1.25 x assumed source period); 0 means unset and the temporal modes
-// assume sources run at 60 fps or faster. Declare slower sources (-src 30) to avoid
-// after-frame starvation; declare faster ones (-src 240) to ride the present-period floor.
+// Declared source frame rate (-src <fps>), the BASE render rate. The lag is static per run:
+// max(present period, 1.25 x assumed source period); 0 means undeclared, and the temporal
+// modes assume 60 for the lag, the comb lock and the passthrough threshold. Declare slower
+// sources (-src 30) to avoid after-frame starvation; declare faster ones (-src 240) to ride
+// the present-period floor.
 float g_srcRateHint = launch::Options().srcRateHint;
 
-// Opt in to the phase comb lock (-lock). Off by default: -src alone sizes the static lag
-// (its established meaning) and leaves selection at v15 behavior; -lock adds the comb lock.
-// Needs -src to derive the comb, so -lock without -src is inert.
+// The phase comb lock, on by default (-nolock turns it off). It anchors to the declared -src,
+// or to the assumed 60 without one.
 bool g_lock = launch::Options().lock;
 
 // Burn the frame-counter marker into every present (-mark, debug builds/tests only):
@@ -94,19 +94,24 @@ bool g_mark = launch::Options().mark;
 // Rides the blend shader's existing pass, so it costs no extra draw and leaves
 // passthrough frames untouched.
 bool g_tint = launch::Options().tint;
-// Consume the display driver's flip events alongside capture (-etw, debug). Diagnostic
-// only: it adds flip lines to the log and nothing reads them. Off by default so the
-// validated daily-driver path is untouched.
+// Consume the display driver's flip events alongside capture, on by default (-noetw turns it
+// off). The flip join, -dejit and -phasekeep read them; without them the relay runs
+// everything except late-batch correction.
 bool g_etw = launch::Options().etw;
 // -nojoin: keep the ETW session and the flip log, skip the per-present grid lookup. Exists
 // so the join can be A/B'd inside ONE binary in ONE session: comparing against an older
 // build confounds the join with everything else that changed, and the -etw off path logs no
 // flips at all, so it cannot answer questions about the flip grid itself.
 bool g_noJoin = launch::Options().noJoin;
-// -dejit: subtract each capture batch's measured delivery lateness from its ring stamps
-// (needs -etw with the join on). The phantom-blend fix: a frame handed over late is stamped
-// where its flip says it belongs, so the ring stops recording delivery delay as motion.
+// -dejit: subtract each capture batch's measured delivery lateness from its ring stamps, on
+// by default (-nodejit turns it off; it needs flip timing with the join on, and the comb
+// lock). The phantom-blend fix: a frame handed over late is stamped where its flip says it
+// belongs, so the ring stops recording delivery delay as motion.
 bool g_dejitter = launch::Options().dejitter;
+// Whether -dejit was typed rather than on by default: a default steps aside when an opt-out
+// removes a prerequisite, a typed one stays and is refused loudly. A global like the rest,
+// because the option dispatch copies every global in and out for each token.
+bool g_dejitterRequested = launch::Options().dejitterRequested;
 // -fgphase: the stage-7 gate instrument. Per capture batch, measure the CONTENT phase f of
 // the generated member between its real neighbours (projection in downscaled luma, ring
 // side); the DISPLAY phase g joins offline from the -etw flip lines. If f does not track g,
@@ -157,20 +162,7 @@ IFrameCaptureMode* ParseCaptureMode(const string& modeStr) {
     }
 
     LOGERR("Invalid capture mode: '%s'", modeStr.c_str());
-    LOGERR("Valid modes:");
-    LOGERR("  vsync          - VSync-driven presentation");
-    LOGERR("  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)");
-    LOGERR("  t:59.94        - Temporal frame selection, presented on a timer at given fps");
-    LOGERR("  b, b:vsync     - Temporal blend compositor (sharp passthrough at the target, lerp otherwise) on a D3D11 flip-model swapchain, presented on the SINK's vblank");
-    LOGERR("  b:dwm, b:60    - The same blend compositor on the D3D9 swapchain: DWM's compose clock (b:dwm) or a timer at the given fps");
-    LOGERR("  60             - Timer mode (simple timer-driven at specified fps)");
-    LOGERR("Options:");
-    LOGERR("  -src 30        - Declared source fps, the BASE render rate (with frame generation at 60x2, pass 60); sizes the static temporal lag (default: assume >= 60)");
-    LOGERR("  -lock          - Enable the phase comb lock (needs -src for the rate); off by default");
-    LOGERR("  -lag 75        - Extra bracketing delay in ms (0-200): output latency the player never sees, traded for fewer held frames");
-    LOGERR("  -etw           - Read the display driver's true scanout times alongside capture; needed by -dejit");
-    LOGERR("  -dejit         - With -etw and -lock: re-stamp late-delivered capture batches onto the flip grid (removes phantom blends)");
-    LOGERR("  -mark [N]      - Burn the frame-counter marker for offline analysis; N = first N presents only, else every present");
+    for (const string& line : launch::UsageLines()) LOGERR("%s", line.c_str());
     return NULL;
 }
 
@@ -527,11 +519,14 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPara
     return DefWindowProc(hWnd, message, wParam, lParam);
 }
 
+// -1 for anything that is not a number, which the callers' range checks answer by asking again.
 int ReadIntFromCmd(string prompt) {
     cout << prompt;
     string cinString;
     getline(cin, cinString);
-    return cinString.empty() ? -1 : stoi(cinString);
+    int value = -1;
+    if (!launch::ParseInt(cinString, &value)) return -1;
+    return value;
 }
 
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths
@@ -550,6 +545,7 @@ static launch::Options CurrentOptions() {
     o.etw = g_etw;
     o.noJoin = g_noJoin;
     o.dejitter = g_dejitter;
+    o.dejitterRequested = g_dejitterRequested;
     o.fgPhase = g_fgPhase;
     o.phaseKeep = g_phaseKeep;
     o.flipEx = g_flipEx;
@@ -566,6 +562,7 @@ static void StoreOptions(const launch::Options& o) {
     g_etw = o.etw;
     g_noJoin = o.noJoin;
     g_dejitter = o.dejitter;
+    g_dejitterRequested = o.dejitterRequested;
     g_fgPhase = o.fgPhase;
     g_phaseKeep = o.phaseKeep;
     g_flipEx = o.flipEx;
@@ -586,6 +583,7 @@ static size_t ApplyOption(const vector<string>& tokens, size_t i) {
     return consumed;
 }
 
+// The rules are launch::ParseCommandLine's; this logs whatever it rejected.
 bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, string* framerateStr) {
     *sourceIndex = -1;
     *targetIndex = -1;
@@ -595,37 +593,16 @@ bool ParseCommandLineArgs(LPSTR lpCmdLine, int* sourceIndex, int* targetIndex, s
         return false;
     }
 
-    vector<string> args = SplitTokens(string(lpCmdLine));
-
-    bool foundAny = false;
-
-    // Parse arguments
-    for (size_t i = 0; i < args.size(); i++) {
-        if (args[i] == "-source" && i + 1 < args.size()) {
-            *sourceIndex = stoi(args[i + 1]);
-            foundAny = true;
-            i++; // Skip the value
-        }
-        else if (args[i] == "-target" && i + 1 < args.size()) {
-            *targetIndex = stoi(args[i + 1]);
-            foundAny = true;
-            i++; // Skip the value
-        }
-        else if (args[i] == "-framerate" && i + 1 < args.size()) {
-            *framerateStr = args[i + 1];  // Store as string instead of converting to int
-            foundAny = true;
-            i++; // Skip the value
-        }
-        else {
-            size_t consumed = ApplyOption(args, i);
-            if (consumed > 0) {
-                foundAny = true;
-                i += consumed - 1;
-            }
-        }
-    }
-
-    return foundAny;
+    launch::Options o = CurrentOptions();
+    vector<string> warnings;
+    const launch::CommandLine c = launch::ParseCommandLine(SplitTokens(string(lpCmdLine)), &o,
+                                                           &warnings);
+    for (const string& w : warnings) LOGERR("%s", w.c_str());
+    StoreOptions(o);
+    *sourceIndex = c.sourceIndex;
+    *targetIndex = c.targetIndex;
+    *framerateStr = c.mode;
+    return c.foundAny;
 }
 
 void ConsoleUserInput(string* framerateStr) {
@@ -659,23 +636,10 @@ void ConsoleUserInput(string* framerateStr) {
         outputIndex = ReadIntFromCmd("Output Display Index ? ");
     }
 
-    cout << endl << "Available capture modes:" << endl;
-    cout << "  vsync          - VSync-driven presentation (matches target display refresh)" << endl;
     cout << endl;
-    cout << "  t, t:vsync     - Temporal frame selection, presented on vsync (DWM compose clock)" << endl;
-    cout << "  t:59.94        - Temporal frame selection, presented on a timer at given fps" << endl;
-    cout << "  b, b:vsync     - Temporal blend compositor on a D3D11 flip-model swapchain, presented on the SINK's vblank" << endl;
-    cout << "  b:dwm, b:60    - The same blend compositor on the D3D9 swapchain: DWM's compose clock (b:dwm) or a timer" << endl;
-    cout << "  b -src 60 -lock - Mode plus options: -src <fps> declares the source's BASE render rate (lag sizing)" << endl;
-    cout << "  -lock          - Enable the phase comb lock (needs -src; off by default)" << endl;
-    cout << "  -lag 75        - Extra bracketing delay in ms (0-200): output latency traded for fewer held frames" << endl;
-    cout << "  -etw           - Read the display driver's scanout times alongside capture; needed by -dejit" << endl;
-    cout << "  -dejit         - With -etw and -lock: re-stamp late-delivered capture batches onto the flip grid" << endl;
-    cout << "  -mark [N]      - Burn the frame-counter marker for offline analysis; N = first N presents only" << endl;
+    for (const string& line : launch::UsageLines()) cout << line << endl;
     cout << endl;
-    cout << "  60             - Timer mode (simple timer-driven at specified fps)" << endl;
-    cout << endl;
-    cout << "Capture/Present framerate (blank for vsync) ? ";
+    cout << "Capture mode and options (blank for b:vsync with the defaults) ? ";
     string cinString;
     getline(cin, cinString);
     if (!cinString.empty()) {
@@ -690,8 +654,10 @@ void ConsoleUserInput(string* framerateStr) {
                 if (consumed > 0) i += consumed - 1;
                 else cout << "Unknown option '" << opts[i] << "' - ignored" << endl;
             }
-            if (g_srcRateHint > 0.0f) cout << "Declared source rate: " << g_srcRateHint << " fps"
-                << (g_lock ? " (comb lock on)" : " (comb lock off)") << endl;
+            if (g_srcRateHint > 0.0f) cout << "Declared source rate: " << g_srcRateHint << " fps";
+            else cout << "Source rate: not declared, " << policy::AssumedSrcFps(g_srcRateHint)
+                      << " fps assumed (declare -src <base fps> otherwise)";
+            cout << (g_lock ? " (comb lock on)" : " (comb lock off)") << endl;
             if (g_tint) cout << "Blend tint: on (synthesized frames bordered)" << endl;
             if (g_mark && g_markFrames) cout << "Frame marker: on (first " << g_markFrames << " presents)" << endl;
             else if (g_mark)            cout << "Frame marker: on" << endl;
@@ -774,6 +740,15 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
         ConsoleUserInput(&framerateStr);
     }
 
+    // Once every token from both paths is in: an option on only as a default steps aside when
+    // an opt-out removed what it needs.
+    {
+        launch::Options o = CurrentOptions();
+        const string note = launch::ResolveDependencies(&o);
+        StoreOptions(o);
+        if (!note.empty()) LOG("%s", note.c_str());
+    }
+
     // Create capture mode instance
     IFrameCaptureMode* captureMode = ParseCaptureMode(framerateStr);
     if (!captureMode) {
@@ -813,19 +788,30 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     if (!g_mark)           snprintf(markDesc, sizeof(markDesc), "off");
     else if (g_markFrames) snprintf(markDesc, sizeof(markDesc), "on (first %u presents)", g_markFrames);
     else                   snprintf(markDesc, sizeof(markDesc), "on (every present)");
+    const bool flipJoinOn = g_etw && !g_noJoin;
+    const char* flipJoinDesc = "on";
+    if (!g_etw)        flipJoinDesc = "off (-noetw)";
+    else if (g_noJoin) flipJoinDesc = "OFF (-nojoin)";
+    const char* dejitterDesc = "off";
+    if (g_dejitter && flipJoinOn && g_lock) {
+        dejitterDesc = "ON (-dejit)";
+    } else if (g_dejitter) {
+        dejitterDesc = "REFUSED (-dejit needs -etw with the join on, and the comb lock)";
+    }
+    const char* phaseKeepDesc = "off";
+    if (g_phaseKeep && flipJoinOn) {
+        phaseKeepDesc = "ON (-phasekeep)";
+    } else if (g_phaseKeep) {
+        phaseKeepDesc = "REFUSED (-phasekeep needs -etw with the join on)";
+    }
     LOG("Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend tint %s, "
         "etw flip capture %s, flip join %s, dejitter %s, fgphase %s, phasekeep %s, "
         "flip mode %s, extra lag %u ms, present path %s",
-        g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (unset; assume >=60)",
+        g_srcRateHint, g_srcRateHint > 0.0f ? "" : " (not declared; 60 assumed)",
         g_lock ? "on" : "off", markDesc, g_tint ? "on" : "off", g_etw ? "on" : "off",
-        !g_etw ? "off (no -etw)" : (g_noJoin ? "OFF (-nojoin)" : "on"),
-        !g_dejitter ? "off"
-                    : (g_etw && !g_noJoin ? "ON (-dejit)"
-                                          : "REFUSED (-dejit needs -etw with the join on)"),
+        flipJoinDesc, dejitterDesc,
         g_fgPhase ? "requested (-fgphase; ACTIVE only when the instrument line follows)" : "off",
-        !g_phaseKeep ? "off"
-                     : (g_etw && !g_noJoin ? "ON (-phasekeep)"
-                                           : "REFUSED (-phasekeep needs -etw with the join on)"),
+        phaseKeepDesc,
         g_flipEx ? "FLIPEX (-flipex)" : "bitblt (DISCARD)",
         g_extraLagMs,
         captureMode->PresentsViaD3D11() ? "D3D11 flip-model swapchain (b:vsync)" : "D3D9 swapchain");
@@ -992,7 +978,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
             char newCmdLine[512];
             sprintf_s(newCmdLine, sizeof(newCmdLine), "\"%s\" -source %d -target %d -framerate %s",
                 exePath, source.dxAdapterIndex, target.dxAdapterIndex,
-                framerateStr.empty() ? "vsync" : framerateStr.c_str());
+                framerateStr.empty() ? "b:vsync" : framerateStr.c_str());
 
             LOG("Relaunching with command line: '%s'", newCmdLine);
             LOG("Executable path: '%s'", exePath);

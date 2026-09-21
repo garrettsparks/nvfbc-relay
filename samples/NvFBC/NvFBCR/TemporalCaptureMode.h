@@ -61,7 +61,7 @@ private:
     IPresentPath* m_present;
     int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
     CompositorKind m_compositorKind;
-    bool m_lock;                    // -lock: opt in to the comb lock (needs -src); default off
+    bool m_lock;                    // the comb lock unless -nolock; -src or the assumed 60
     bool m_mark;                    // -mark: burn the frame-counter marker (debug); default off
     unsigned int m_markFrames;      // -mark N: burn only the first N presents; 0 = all (unset)
     bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: the path's blocking present (t:vsync)
@@ -69,7 +69,7 @@ private:
     float m_targetFramerate;
     float m_srcRateHint;            // declared source fps (-src); 0 = unset, assume >= 60
     IDirect3DDevice9Ex* m_device;
-    bool m_etw;                     // -etw: read the driver's scanout times while capturing
+    bool m_etw;                     // read the driver's scanout times, unless -noetw
     // -nojoin: keep the ETW session and its flip lines, skip the per-present grid lookup.
     // The A/B control for the join itself: -etw off logs no flips, so it cannot answer
     // whether the join affects the flip grid, and an older build differs by more than the
@@ -108,7 +108,7 @@ private:
     long long m_dejitFenceBlocked = 0;
     long long m_dejitLockDeclined = 0;
     long long m_dejitSkipped = 0;        // batches lapped past while the walk was pinned
-    EtwFlipConsumer m_etwConsumer;  // inert unless m_etw; nothing in the policy reads it
+    EtwFlipConsumer m_etwConsumer;  // inert unless m_etw; the join, -dejit, -phasekeep read it
     // How far back PairBatchMember measures the flip grid's step, in QPC ticks. The
     // confidence bound it accepts is derived from that measurement, so nothing here needs to
     // know the frame-generation multiplier. 200 ms holds ~24 flips at 60x2 and ~36 at 60x3,

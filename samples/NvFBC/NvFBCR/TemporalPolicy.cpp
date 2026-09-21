@@ -1028,7 +1028,7 @@ float AssumedSrcFps(float srcRateHint) {
 }
 
 float LockAnchorFps(bool lock, float srcRateHint) {
-    return (lock && srcRateHint > 0.0f) ? srcRateHint : 0.0f;
+    return lock ? AssumedSrcFps(srcRateHint) : 0.0f;
 }
 
 int CombDenominator(double srcFps, double presentFps, bool* matched) {

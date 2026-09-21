@@ -3883,19 +3883,53 @@ static int CountSwitchesOn(const launch::Options& o) {
            (int)o.fgPhase + (int)o.phaseKeep + (int)o.flipEx + (int)o.mark;
 }
 
+static bool SameOptions(const launch::Options& a, const launch::Options& b) {
+    return a.srcRateHint == b.srcRateHint && a.lock == b.lock && a.tint == b.tint &&
+           a.etw == b.etw && a.noJoin == b.noJoin && a.dejitter == b.dejitter &&
+           a.dejitterRequested == b.dejitterRequested && a.fgPhase == b.fgPhase &&
+           a.phaseKeep == b.phaseKeep && a.flipEx == b.flipEx && a.mark == b.mark &&
+           a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs;
+}
+
+// Every switch at one value, so a flag's effect can be seen against either side.
+static launch::Options SwitchesAt(bool on) {
+    launch::Options o;
+    o.lock = o.tint = o.etw = o.noJoin = o.dejitter = on;
+    o.fgPhase = o.phaseKeep = o.flipEx = o.mark = on;
+    o.dejitterRequested = on;
+    return o;
+}
+
 static void test_launch_defaults() {
     // What a bare launch runs with. The relay's globals are initialized from this struct,
     // so this list is the relay's defaults and nothing else can make them differ.
     const launch::Options o = launch::Options();
     CHECK(o.srcRateHint == 0.0f, "-src must default to undeclared, got %.1f", o.srcRateHint);
-    CHECK(!o.lock, "-lock must default off");
-    CHECK(!o.etw, "-etw must default off");
-    CHECK(!o.dejitter, "-dejit must default off");
-    CHECK(o.extraLagMs == 0, "-lag must default to 0 ms, got %u", o.extraLagMs);
-    CHECK(CountSwitchesOn(o) == 0 && o.markFrames == 0,
-          "every switch must default off, %d are on", CountSwitchesOn(o));
-    CHECK(launch::ParseMode("").kind == launch::ModeKind::Vsync,
-          "a blank mode answer must select the original vsync mode");
+    CHECK(o.lock, "the comb lock must default on");
+    CHECK(o.etw, "flip timing must default on");
+    CHECK(o.dejitter, "late-batch correction must default on");
+    CHECK(!o.dejitterRequested, "a default -dejit must not read as typed");
+    CHECK(o.extraLagMs == 75, "-lag must default to 75 ms, got %u", o.extraLagMs);
+    CHECK(CountSwitchesOn(o) == 3 && o.markFrames == 0,
+          "exactly the lock, flip timing and late-batch correction must default on, %d are on",
+          CountSwitchesOn(o));
+
+    // A blank mode answer is the release path, and it is the same mode b:vsync spells.
+    const launch::ModeSpec blank = launch::ParseMode("");
+    const launch::ModeSpec named = launch::ParseMode("b:vsync");
+    CHECK(blank.kind == launch::ModeKind::Temporal &&
+              blank.compositor == launch::Compositor::Blend && blank.vsyncPresent &&
+              blank.d3d11Present && blank.framerate == 60.0f,
+          "a blank mode answer must select b:vsync");
+    CHECK(blank.kind == named.kind && blank.compositor == named.compositor &&
+              blank.vsyncPresent == named.vsyncPresent &&
+              blank.d3d11Present == named.d3d11Present && blank.framerate == named.framerate,
+          "a blank mode answer and b:vsync must resolve identically");
+
+    // The bare launch needs no dependency settled: every default's prerequisite is a default.
+    launch::Options bare = launch::Options();
+    CHECK(launch::ResolveDependencies(&bare).empty() && SameOptions(bare, launch::Options()),
+          "a bare launch must resolve to the defaults unchanged");
 }
 
 static void test_launch_option_parsing() {
@@ -3911,7 +3945,16 @@ static void test_launch_option_parsing() {
           "the release launch string must parse clean, got %zu warnings and %zu unknown",
           warnings.size(), unknown.size());
 
-    // Each switch sets its own field, only that field, and consumes one token.
+    // The full opt-out: every default-on option off, and nothing reported.
+    warnings.clear();
+    unknown.clear();
+    o = ParseOptionString("-nolock -noetw -nodejit -lag 0", &warnings, &unknown);
+    CHECK(!o.lock && !o.etw && !o.dejitter && o.extraLagMs == 0 && CountSwitchesOn(o) == 0,
+          "the opt-outs must turn every default off");
+    CHECK(warnings.empty() && unknown.empty(), "the opt-outs must parse clean");
+
+    // Each switch sets its own field, only that field, and consumes one token: seen from
+    // every switch off, so a switch that is also a default still shows its effect.
     struct Switch { const char* flag; bool launch::Options::*field; };
     const Switch switches[] = {
         {"-lock", &launch::Options::lock},         {"-tint", &launch::Options::tint},
@@ -3921,12 +3964,40 @@ static void test_launch_option_parsing() {
         {"-mark", &launch::Options::mark},
     };
     for (const Switch& s : switches) {
-        launch::Options x;
+        launch::Options x = SwitchesAt(false);
         const std::vector<std::string> t = {s.flag};
         std::string w;
         const size_t n = launch::ApplyOption(t, 0, &x, &w);
         CHECK(n == 1 && x.*(s.field) && CountSwitchesOn(x) == 1 && w.empty(),
               "%s must set exactly its own switch and consume one token", s.flag);
+    }
+
+    // The mirror: each opt-out clears its own field and only that one, from every switch on.
+    const Switch optOuts[] = {
+        {"-nolock", &launch::Options::lock},
+        {"-noetw", &launch::Options::etw},
+        {"-nodejit", &launch::Options::dejitter},
+    };
+    for (const Switch& s : optOuts) {
+        launch::Options x = SwitchesAt(true);
+        const std::vector<std::string> t = {s.flag};
+        std::string w;
+        const size_t n = launch::ApplyOption(t, 0, &x, &w);
+        CHECK(n == 1 && !(x.*(s.field)) && CountSwitchesOn(x) == 8 && w.empty(),
+              "%s must clear exactly its own switch and consume one token", s.flag);
+    }
+
+    // Only a typed -dejit reads as typed, and -nodejit takes that back.
+    {
+        launch::Options x = ParseOptionString("-dejit", nullptr, nullptr);
+        CHECK(x.dejitter && x.dejitterRequested, "-dejit must read as typed");
+        x = ParseOptionString("-dejit -nodejit", nullptr, nullptr);
+        CHECK(!x.dejitter && !x.dejitterRequested, "-nodejit must take back a typed -dejit");
+        x = ParseOptionString("-nodejit -dejit", nullptr, nullptr);
+        CHECK(x.dejitter && x.dejitterRequested, "the last of -nodejit and -dejit must win");
+        x = ParseOptionString("-lock -etw", nullptr, nullptr);
+        CHECK(SameOptions(x, launch::Options()),
+              "the positive spellings of the defaults must leave a default launch unchanged");
     }
 
     // -mark takes an optional count, only when the next token is all digits.
@@ -4005,11 +4076,13 @@ static void test_launch_option_parsing() {
         CHECK(launch::ApplyOption(t, 0, &x, &w) == 0, "-src with no value must be unknown");
     }
 
-    // Flags match exactly: case and spelling variants are unknown, and consume nothing.
-    for (const char* odd : {"-LOCK", "lock", "-locks", "-foo", "--lock"}) {
+    // Flags match exactly: case and spelling variants are unknown, and consume nothing. The
+    // command-line-only flags are unknown here too, since the mode prompt does not take them.
+    for (const char* odd : {"-LOCK", "lock", "-locks", "-foo", "--lock", "-NOLOCK", "-no-lock",
+                            "-source", "-target", "-framerate"}) {
         launch::Options x;
-        const std::vector<std::string> t = {odd};
-        CHECK(launch::ApplyOption(t, 0, &x, nullptr) == 0 && CountSwitchesOn(x) == 0,
+        const std::vector<std::string> t = {odd, "1"};
+        CHECK(launch::ApplyOption(t, 0, &x, nullptr) == 0 && SameOptions(x, launch::Options()),
               "'%s' must not be recognized", odd);
     }
 
@@ -4033,7 +4106,8 @@ static void test_launch_mode_parsing() {
         float framerate;
     };
     const Case cases[] = {
-        {"",           ModeKind::Vsync,    Compositor::Nearest, false, false, 0.0f},
+        // A blank answer is the release path, b:vsync; the original mode needs its name.
+        {"",           ModeKind::Temporal, Compositor::Blend,   true,  true,  60.0f},
         {"vsync",      ModeKind::Vsync,    Compositor::Nearest, false, false, 0.0f},
         {"VSync",      ModeKind::Vsync,    Compositor::Nearest, false, false, 0.0f},
         // The blend on the D3D11 flip-model swapchain, presenting on the sink's vblank.
@@ -4072,16 +4146,193 @@ static void test_launch_mode_parsing() {
     }
 }
 
+static void test_launch_dependencies() {
+    // -dejit on only as a default steps aside when an opt-out removes a prerequisite, and
+    // says which one. Each opt-out gets its own line.
+    struct Case { const char* text; const char* line; };
+    const Case stepAside[] = {
+        {"-noetw", "Delivery-lateness correction off: -dejit needs flip timing, and -noetw "
+                   "turned that off"},
+        {"-nojoin", "Delivery-lateness correction off: -dejit needs the flip join, and -nojoin "
+                    "turned that off"},
+        {"-nolock", "Delivery-lateness correction off: -dejit needs the comb lock, and -nolock "
+                    "turned that off"},
+        // Two prerequisites gone: the first in the order above is named.
+        {"-nolock -noetw", "Delivery-lateness correction off: -dejit needs flip timing, and "
+                           "-noetw turned that off"},
+        // A typed -dejit taken back by -nodejit is a default again, and none is left.
+        {"-dejit -nodejit -noetw", ""},
+    };
+    for (const Case& c : stepAside) {
+        launch::Options o = ParseOptionString(c.text, nullptr, nullptr);
+        const std::string line = launch::ResolveDependencies(&o);
+        CHECK(!o.dejitter && line == c.line, "'%s' must turn -dejit off with '%s', got %d '%s'",
+              c.text, c.line, (int)o.dejitter, line.c_str());
+    }
+
+    // A typed -dejit stays on whatever else was typed: the capture mode refuses it loudly,
+    // as it does any request that contradicts itself.
+    for (const char* typed :
+         {"-dejit -noetw", "-noetw -dejit", "-dejit -nojoin", "-dejit -nolock"}) {
+        launch::Options o = ParseOptionString(typed, nullptr, nullptr);
+        const std::string line = launch::ResolveDependencies(&o);
+        CHECK(o.dejitter && line.empty(), "'%s' must leave a typed -dejit on and silent", typed);
+    }
+
+    // -nodejit is silent: nothing stepped aside, because nothing was on.
+    for (const char* off : {"-nodejit", "-nodejit -noetw", "-nodejit -nolock -nojoin"}) {
+        launch::Options o = ParseOptionString(off, nullptr, nullptr);
+        const std::string line = launch::ResolveDependencies(&o);
+        CHECK(!o.dejitter && line.empty(), "'%s' must be silent", off);
+    }
+
+    // Only -dejit is settled: an opt-out changes nothing else.
+    launch::Options o = ParseOptionString("-noetw -src 90 -lag 50", nullptr, nullptr);
+    launch::ResolveDependencies(&o);
+    CHECK(!o.etw && o.lock && o.srcRateHint == 90.0f && o.extraLagMs == 50,
+          "resolving must leave every other option as typed");
+}
+
+static void test_launch_int_parse() {
+    struct Good { const char* text; int value; };
+    const Good good[] = {
+        {"0", 0}, {"1", 1}, {"12", 12}, {" 3 ", 3}, {"007", 7}, {"-1", -1}, {"+2", 2},
+        {"2147483647", 2147483647}, {"-2147483648", -2147483647 - 1},
+    };
+    for (const Good& g : good) {
+        int v = 99;
+        CHECK(launch::ParseInt(g.text, &v) && v == g.value, "'%s' must parse as %d, got %d",
+              g.text, g.value, v);
+    }
+    for (const char* bad : {"", "   ", "-", "+", "abc", "1a", "a1", "1.5", "1 2", "--1", "0x10",
+                            "2147483648", "-2147483649", "99999999999999999999"}) {
+        int v = 99;
+        CHECK(!launch::ParseInt(bad, &v) && v == 99, "'%s' must be refused and leave the value",
+              bad);
+    }
+}
+
+static void test_launch_command_line() {
+    // A scripted launch: both indices, the mode, and options mixed in.
+    std::vector<std::string> warnings;
+    launch::Options o;
+    launch::CommandLine c = launch::ParseCommandLine(
+        launch::SplitTokens("-source 1 -target 2 -framerate b:vsync -src 60 -nolock"), &o,
+        &warnings);
+    CHECK(c.foundAny && c.sourceIndex == 1 && c.targetIndex == 2 && c.mode == "b:vsync" &&
+              o.srcRateHint == 60.0f && !o.lock && warnings.empty(),
+          "a full scripted launch must parse every token");
+
+    // A non-number index is reported and left unset, so the launch goes to the prompts.
+    warnings.clear();
+    o = launch::Options();
+    c = launch::ParseCommandLine(launch::SplitTokens("-source abc -target 2x"), &o, &warnings);
+    CHECK(c.foundAny && c.sourceIndex == -1 && c.targetIndex == -1 && warnings.size() == 2,
+          "non-number indices must be reported and left at -1, got %d %d with %zu warnings",
+          c.sourceIndex, c.targetIndex, warnings.size());
+    CHECK(!warnings.empty() &&
+              warnings[0] == "-source value 'abc' invalid (not a number) - ignored",
+          "the index rejection must be the line the relay logs, got '%s'",
+          warnings.empty() ? "" : warnings[0].c_str());
+
+    // A flag with no value, an unknown token, and an empty line.
+    warnings.clear();
+    o = launch::Options();
+    c = launch::ParseCommandLine(launch::SplitTokens("-bogus -target"), &o, &warnings);
+    CHECK(!c.foundAny && c.targetIndex == -1 && warnings.empty() &&
+              SameOptions(o, launch::Options()),
+          "unknown tokens and a flag with no value must be skipped");
+    c = launch::ParseCommandLine(launch::SplitTokens(""), &o, &warnings);
+    CHECK(!c.foundAny && c.mode.empty(), "an empty command line must name nothing");
+
+    // Option warnings pass through from ApplyOption.
+    warnings.clear();
+    c = launch::ParseCommandLine(launch::SplitTokens("-lag 500"), &o, &warnings);
+    CHECK(c.foundAny && warnings.size() == 1 && o.extraLagMs == 75,
+          "an option's warning must reach the command line's list");
+}
+
+static void test_launch_usage_table() {
+    // Every row is parsed: the flag and its sample value are consumed whole, with nothing
+    // reported. A bracketed sample is optional and the flag alone must parse.
+    int shownOptions = 0;
+    for (const launch::UsageRow& r : launch::OptionRows()) {
+        std::vector<std::string> t = {r.flag};
+        if (r.arg[0] && r.arg[0] != '[') t.push_back(r.arg);
+        std::vector<std::string> warnings;
+        if (r.commandLineOnly) {
+            launch::Options o;
+            const launch::CommandLine c = launch::ParseCommandLine(t, &o, &warnings);
+            CHECK(c.foundAny && warnings.empty() && SameOptions(o, launch::Options()),
+                  "command-line row '%s %s' must parse", r.flag, r.arg);
+        } else {
+            launch::Options o;
+            std::string w;
+            CHECK(launch::ApplyOption(t, 0, &o, &w) == t.size() && w.empty(),
+                  "option row '%s %s' must parse whole", r.flag, r.arg);
+        }
+        int dupes = 0;
+        for (const launch::UsageRow& s : launch::OptionRows()) {
+            dupes += !std::strcmp(r.flag, s.flag);
+        }
+        CHECK(dupes == 1, "'%s' must have exactly one row, has %d", r.flag, dupes);
+        shownOptions += r.shown;
+    }
+
+    // Every spelling a mode row lists parses to a mode.
+    int shownModes = 0;
+    for (const launch::UsageRow& r : launch::ModeRows()) {
+        std::string spellings = r.flag;
+        size_t pos = 0;
+        while (pos <= spellings.size()) {
+            size_t end = spellings.find(", ", pos);
+            if (end == std::string::npos) end = spellings.size();
+            const std::string m = spellings.substr(pos, end - pos);
+            CHECK(!m.empty() && launch::ParseMode(m).kind != launch::ModeKind::Invalid,
+                  "mode row spelling '%s' must parse", m.c_str());
+            pos = end + 2;
+        }
+        shownModes += r.shown;
+    }
+
+    // The printed list holds exactly the shown rows, and a hidden row never leaks into it.
+    const std::vector<std::string> lines = launch::UsageLines();
+    CHECK((int)lines.size() == 2 + shownModes + shownOptions,
+          "the usage list must be two headers and one line per shown row, got %zu",
+          lines.size());
+    auto listed = [&lines](const char* spelling) {
+        for (const std::string& l : lines) {
+            if (l.compare(0, 2 + std::strlen(spelling), std::string("  ") + spelling) == 0 &&
+                (l.size() == 2 + std::strlen(spelling) || l[2 + std::strlen(spelling)] == ' ')) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (const launch::UsageRow& r : launch::OptionRows()) {
+        CHECK(listed(r.flag) == r.shown, "'%s' must be %s the usage list", r.flag,
+              r.shown ? "in" : "left off");
+    }
+    for (const launch::UsageRow& r : launch::ModeRows()) {
+        CHECK(listed(r.flag) == r.shown, "mode row '%s' must be %s the usage list", r.flag,
+              r.shown ? "in" : "left off");
+    }
+}
+
 static void test_lock_anchor_and_comb() {
     // Every rate-derived quantity is sized from the declared -src, or 60 without one.
     CHECK(policy::AssumedSrcFps(0.0f) == 60.0f, "an undeclared source must be assumed 60");
     CHECK(policy::AssumedSrcFps(30.0f) == 30.0f && policy::AssumedSrcFps(90.0f) == 90.0f,
           "a declared source must be taken as declared");
 
-    // The lock anchors only to a declared rate, and only when asked for.
-    CHECK(policy::LockAnchorFps(true, 90.0f) == 90.0f, "-lock -src 90 must anchor to 90");
-    CHECK(policy::LockAnchorFps(false, 90.0f) == 0.0f, "-src without -lock must not arm the lock");
-    CHECK(policy::LockAnchorFps(true, 0.0f) == 0.0f, "-lock without -src must not arm the lock");
+    // The lock anchors to the declared rate, or to the assumed 60 without one, and never
+    // when it is turned off.
+    CHECK(policy::LockAnchorFps(true, 90.0f) == 90.0f, "-src 90 must anchor the lock to 90");
+    CHECK(policy::LockAnchorFps(true, 0.0f) == 60.0f,
+          "without -src the lock must anchor to the assumed 60");
+    CHECK(policy::LockAnchorFps(false, 90.0f) == 0.0f, "-nolock must not arm the lock");
+    CHECK(policy::LockAnchorFps(false, 0.0f) == 0.0f,
+          "-nolock must not arm the lock without -src either");
 
     // The comb denominator against the 60 Hz present, for every regime the corpus declares
     // and the edges of the 2% tolerance.
@@ -4160,6 +4411,10 @@ int main(int argc, char** argv) {
     test_launch_defaults();
     test_launch_option_parsing();
     test_launch_mode_parsing();
+    test_launch_dependencies();
+    test_launch_int_parse();
+    test_launch_command_line();
+    test_launch_usage_table();
     test_lock_anchor_and_comb();
     test_replay_capture_corpus();
 

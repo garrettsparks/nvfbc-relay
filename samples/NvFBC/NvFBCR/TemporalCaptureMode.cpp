@@ -180,6 +180,11 @@ bool TemporalCaptureMode::Setup() {
 
     LOG("Temporal mode initialized - %s present (%.2f fps nominal), nearest-frame selection + hysteresis",
         m_vsyncPresent ? "vsync/vblank" : "QPC-timer", m_targetFramerate);
+    if (m_srcRateHint <= 0.0f) {
+        LOGERR("Source rate NOT DECLARED: %.1f fps ASSUMED. The lag below is sized for it, and so "
+               "are the comb lock and the passthrough threshold wherever they run. Declare -src "
+               "<base fps> for any other source; 60x2 frame generation is -src 60", assumedFps);
+    }
     LOG("Temporal lag fixed at %lld us (source assumed %s%.1f fps)",
         m_bracketingDelayQpc * 1000000 / m_scheduler.Freq(),
         (m_srcRateHint > 0.0f) ? "-src " : ">= ", assumedFps);
@@ -199,11 +204,12 @@ bool TemporalCaptureMode::Setup() {
     // selection operates at a stable phase just behind each real frame instead of sweeping
     // through the bracket every beat: the boundary-dwell excursions (gate-decline repeat,
     // then a multi-frame catch-up) become unreachable, and one comb-spacing slip per beat
-    // remains - the same slip an unlocked beat already pays. Anchored ONLY to an explicit
-    // -src: anchoring the default-60 fallback would manufacture false locks on undeclared
-    // sources. The denominator scan is capped: past M=8 the comb spacing approaches arrival
-    // jitter, the stability gate cannot close, and the lock refuses - correct for
-    // effectively-irrational ratios. Latency: the pull adds a bounded slow sawtooth
+    // remains - the same slip an unlocked beat already pays. Anchored to the declared -src,
+    // or to the assumed 60 without one: an undeclared source at another rate either shares
+    // that comb or sweeps across it, and a sweeping phase rarely settles the stability gate,
+    // so the lock stays released. The denominator scan is capped: past M=8 the comb spacing
+    // approaches arrival jitter, the stability gate cannot close, and the lock refuses -
+    // correct for effectively-irrational ratios. Latency: the pull adds a bounded slow sawtooth
     // (<= one comb spacing peak-to-peak, drift-rate ramp, one discrete step per beat),
     // accepted as a documented trade alongside the static lag (spec clause 4).
     m_policyCfg.phasePullSlewQpc = m_scheduler.Freq() / 40000;   // 25 us per present
@@ -245,8 +251,7 @@ bool TemporalCaptureMode::Setup() {
         m_policyCfg.srcPeriodQpc =
             policy::ToothGuardPeriod(m_assumedSrcPeriodQpc, sinkPeriodQpc, /*combOn=*/true);
     } else {
-        LOG("Phase comb lock off (%s); target rides the static lag alone",
-            !m_lock ? "-lock not set" : "-lock set but no -src to derive the comb");
+        LOG("Phase comb lock off (-nolock); target rides the static lag alone");
     }
 
     // COMPOSITOR: nearest keeps the validated selection path; the synthesizing
@@ -276,9 +281,9 @@ bool TemporalCaptureMode::Setup() {
             // Stated rather than left as a missing line: a run that quietly lost the guard
             // reads as a parity-lottery blend storm with no explanation in the log.
             LOG("Composite tooth guard off (%s); mid-tooth targets synthesize",
-                !m_lock ? "needs -lock" :
-                m_srcRateHint <= 0.0f ? "needs -src" :
-                "source is slower than the sink, so synthesis is rate conversion");
+                m_policyCfg.combQpc <= 0
+                    ? "needs the comb lock, and -nolock turned it off"
+                    : "source is slower than the sink, so synthesis is rate conversion");
         }
     }
 
@@ -292,8 +297,8 @@ bool TemporalCaptureMode::Setup() {
     // recoveries reads lock state, and without a lock it is vacuously open. Refusing loudly
     // beats running unguarded through exactly the window corrections were measured to harm.
     if (m_dejitter && m_policyCfg.combQpc <= 0) {
-        LOGERR("-dejit REFUSED: needs the comb lock (-lock with -src) for its calm gate; "
-               "running without delivery-lateness correction");
+        LOGERR("-dejit REFUSED: needs the comb lock for its calm gate, and -nolock turned it "
+               "off; running without delivery-lateness correction");
         m_dejitter = false;
     }
     if (m_dejitter) {
@@ -325,15 +330,32 @@ void TemporalCaptureMode::Run(
     LOG("QPC origin %lld ticks, frequency %lld Hz (log times are us since the origin)",
         m_baseQpc.QuadPart, m_scheduler.Freq());
     // Started here rather than in Setup because it needs that origin. A failure never stops
-    // the capture, but it does interrupt: the console is closed by the time this runs, so a
-    // logged-and-ignored failure is invisible until the capture is already spent. Asking for
-    // -etw and silently getting a normal capture has cost a session once already.
+    // the capture: without flip timing the relay runs everything except late-batch
+    // correction, and a stream is not worth taking down over that. It does interrupt, because
+    // the console is closed by the time this runs and a failure that was only logged would
+    // stay invisible until the capture is spent. Administrator rights are rarely the cause,
+    // since the manifest always elevates, so the popup names them only when access was denied.
     if (m_etw && !m_etwConsumer.Start(m_scheduler.Freq(), m_baseQpc.QuadPart)) {
-        MessageBoxA(NULL,
-                    "-etw was requested but the ETW session did not start.\n\n"
-                    "Flip timing will NOT be recorded. The capture will otherwise run "
-                    "normally.\n\nSee NvFBCR.log for the reason.",
-                    "NvFBCR: ETW flip capture unavailable",
+        const bool dejitterLost = m_dejitter;
+        if (m_dejitter) {
+            // Off before the loop, so the dejit summary cannot report work that never ran.
+            LOGERR("Delivery-lateness correction OFF for this run: -dejit needs flip timing, and "
+                   "the ETW session did not start");
+            m_dejitter = false;
+        }
+        const unsigned long code = m_etwConsumer.StartError();
+        char text[640];
+        snprintf(text, sizeof(text),
+                 "The ETW session that reads the display driver's flip timing did not start "
+                 "(error %lu).\n\n"
+                 "The relay keeps running. Flip timing is off for this run%s; everything else "
+                 "runs as normal.%s\n\n"
+                 "To run without flip timing and skip this message, launch with -noetw.",
+                 code, dejitterLost ? ", and with it late-batch correction (-dejit)" : "",
+                 code == ERROR_ACCESS_DENIED
+                     ? "\n\nAccess was denied: run NvFBCR.exe as administrator."
+                     : "");
+        MessageBoxA(NULL, text, "NvFBCR: flip timing unavailable",
                     MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
     }
     const double usPerTick = 1000000.0 / (double)m_scheduler.Freq();

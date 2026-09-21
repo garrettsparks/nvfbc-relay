@@ -1,5 +1,6 @@
 #pragma once
 
+#include <climits>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -15,20 +16,23 @@ namespace launch {
 
 // Every option a launch string can set. The member initializers are the defaults the relay runs
 // with: its globals are initialized from a default-constructed Options, so a default is changed
-// here and nowhere else.
+// here and nowhere else. The comb lock, the extra lag, flip timing and delivery-lateness
+// correction are on by default because the relay-cost ladder measured no cost for any of them;
+// -nolock, -lag 0, -noetw and -nodejit turn them off.
 struct Options {
     float srcRateHint = 0.0f;       // -src: declared BASE render rate; 0 = not declared
-    bool lock = false;              // -lock: the phase comb lock
+    bool lock = true;               // -lock / -nolock: the phase comb lock
     bool tint = false;              // -tint: border synthesized frames
-    bool etw = false;               // -etw: driver flip timing alongside capture
+    bool etw = true;                // -etw / -noetw: driver flip timing alongside capture
     bool noJoin = false;            // -nojoin: keep the ETW session, skip the flip join
-    bool dejitter = false;          // -dejit: re-stamp late-delivered batches
+    bool dejitter = true;           // -dejit / -nodejit: re-stamp late-delivered batches
+    bool dejitterRequested = false; // -dejit was typed, rather than on by default
     bool fgPhase = false;           // -fgphase: the frame-generation phase instrument
     bool phaseKeep = false;         // -phasekeep: phase-aware keep-real
     bool flipEx = false;            // -flipex: D3D9Ex flip-ex swap effect
     bool mark = false;              // -mark: burn the frame-counter marker
     unsigned int markFrames = 0;    // -mark N: first N presents only; 0 = every present
-    unsigned int extraLagMs = 0;    // -lag N: extra bracketing delay, 0 to 200 ms
+    unsigned int extraLagMs = 75;   // -lag N: extra bracketing delay, 0 to 200 ms
 };
 
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths always
@@ -59,17 +63,149 @@ inline bool ParseFps(const std::string& value, float* outFps) {
     return false;
 }
 
+// Integer validation for the display indices. The whole string must be an integer, optionally
+// signed and surrounded by spaces; anything else, including a value outside int, returns false
+// and leaves *out as it was. It never throws: nothing on a launch path catches an exception, so
+// a mistyped index has to come back as a value the caller can refuse.
+inline bool ParseInt(const std::string& text, int* out) {
+    size_t b = text.find_first_not_of(' ');
+    if (b == std::string::npos) return false;
+    const size_t e = text.find_last_not_of(' ') + 1;
+    bool negative = false;
+    if (text[b] == '-' || text[b] == '+') {
+        negative = text[b] == '-';
+        b++;
+    }
+    if (b == e) return false;
+    long long v = 0;
+    for (size_t i = b; i < e; i++) {
+        if (text[i] < '0' || text[i] > '9') return false;
+        v = v * 10 + (text[i] - '0');
+        if (v > (long long)INT_MAX + 1) return false;
+    }
+    if (negative) v = -v;
+    if (v < INT_MIN || v > INT_MAX) return false;
+    *out = (int)v;
+    return true;
+}
+
+// One row of the usage list, and the registry of every flag a launch string can carry: a flag
+// without a row is unknown to ApplyOption, and the suite holds every row to being parsed, so the
+// list a user reads and the parser cannot drift apart. arg is a sample value, shown after the
+// flag; one in brackets is optional. A row that is not shown is a development flag: parsed, and
+// left off the list a release user reads.
+struct UsageRow {
+    const char* flag;
+    const char* arg;
+    const char* text;
+    bool shown;
+    bool commandLineOnly;   // read by ParseCommandLine alone; the mode prompt does not take it
+};
+
+inline const std::vector<UsageRow>& OptionRows() {
+    static const std::vector<UsageRow> rows = {
+        {"-src", "60", "Declared source fps, the BASE render rate (60x2 frame generation is -src "
+                       "60); sizes the lag, the comb lock and the passthrough threshold (default: "
+                       "60 assumed)", true, false},
+        {"-nolock", "", "Turn the phase comb lock off (on by default)", true, false},
+        {"-lag", "75", "Extra bracketing delay in ms (0-200, default 75; -lag 0 turns it off): "
+                       "output latency the player never sees, traded for fewer held frames",
+         true, false},
+        {"-noetw", "", "Do not read the display driver's scanout times (read by default; -dejit "
+                       "needs them)", true, false},
+        {"-nodejit", "", "Do not re-stamp late-delivered capture batches onto the flip grid (on by "
+                         "default; needs flip timing and the comb lock)", true, false},
+        {"-mark", "[N]", "Burn the frame-counter marker for offline analysis; N = first N presents "
+                         "only, else every present", true, false},
+        {"-lock", "", "The comb lock; on by default, accepted so older launch strings keep working",
+         false, false},
+        {"-etw", "", "Flip timing; on by default, accepted so older launch strings keep working",
+         false, false},
+        {"-dejit", "", "Late-batch correction; on by default, and typed it refuses loudly when a "
+                       "prerequisite is off", false, false},
+        {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
+         false, false},
+        {"-tint", "", "Border every synthesized frame", false, false},
+        {"-fgphase", "", "Frame-generation phase instrument; stalls the capture thread every wake",
+         false, false},
+        {"-phasekeep", "", "Phase-aware keep-real, the x3 rotation vote", false, false},
+        {"-flipex", "", "D3D9Ex flip-ex swap effect on the D3D9 present path", false, false},
+        {"-source", "0", "Capture display index, for a launch without the prompts", false, true},
+        {"-target", "1", "Output display index, for a launch without the prompts", false, true},
+        {"-framerate", "b:vsync", "Capture mode, for a launch without the prompts", false, true},
+    };
+    return rows;
+}
+
+// The capture modes, one row per line of the list; flag holds the spellings, comma-separated.
+inline const std::vector<UsageRow>& ModeRows() {
+    static const std::vector<UsageRow> rows = {
+        {"b, b:vsync", "", "Blend compositor on a D3D11 flip-model swapchain, presented on the "
+                           "SINK's vblank (the default: a blank answer selects it)", true, false},
+        {"b:dwm, b:60", "", "The same blend compositor on the D3D9 swapchain: DWM's compose clock "
+                            "(b:dwm) or a timer at the given fps", true, false},
+        {"t, t:vsync", "", "Temporal frame selection, presented on vsync (DWM compose clock)",
+         true, false},
+        {"t:59.94", "", "Temporal frame selection, presented on a timer at the given fps", true,
+         false},
+        {"vsync", "", "The original relay: VSync-driven presentation (matches target display "
+                      "refresh)", true, false},
+        {"60", "", "Timer mode (simple timer-driven at the given fps)", true, false},
+        {"o, o:vsync, o:60", "", "Optical-flow interp compositor on the D3D9 swapchain", false,
+         false},
+        {"diag, diag:vsync", "", "Clock probes: DWM compose timing and the card's raster", false,
+         false},
+    };
+    return rows;
+}
+
+inline const UsageRow* FindOptionRow(const std::string& flag) {
+    for (const UsageRow& r : OptionRows()) {
+        if (flag == r.flag) return &r;
+    }
+    return NULL;
+}
+
+// The usage list both the mode prompt and the invalid-mode path print, one string per line.
+inline std::vector<std::string> UsageLines() {
+    std::vector<std::string> lines;
+    auto add = [&lines](const UsageRow& r) {
+        std::string spelling = r.flag;
+        if (r.arg[0]) spelling += std::string(" ") + r.arg;
+        if (spelling.size() < 15) spelling.resize(15, ' ');
+        lines.push_back("  " + spelling + "- " + r.text);
+    };
+    lines.push_back("Capture modes:");
+    for (const UsageRow& r : ModeRows()) {
+        if (r.shown) add(r);
+    }
+    lines.push_back("Options, typed after the mode (b:vsync -src 90):");
+    for (const UsageRow& r : OptionRows()) {
+        if (r.shown) add(r);
+    }
+    return lines;
+}
+
 // Applies the option at tokens[i] and returns how many tokens it consumed (0 = not a recognized
 // option). A value that fails validation is still consumed, leaves the option as it was, and sets
 // *warning to the line the caller should log. Flags match exactly and are case-sensitive.
 inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Options* o,
                           std::string* warning) {
     const std::string& t = tokens[i];
+    // The usage rows are the registry: a flag with no row is not an option, whatever below
+    // would have done with it.
+    const UsageRow* row = FindOptionRow(t);
+    if (!row || row->commandLineOnly) return 0;
+    // The positive spellings of the default-on options are still accepted, so a launch string
+    // written before they became defaults keeps working unchanged.
     if (t == "-lock")      { o->lock = true;      return 1; }
+    if (t == "-nolock")    { o->lock = false;     return 1; }
     if (t == "-tint")      { o->tint = true;      return 1; }
     if (t == "-etw")       { o->etw = true;       return 1; }
+    if (t == "-noetw")     { o->etw = false;      return 1; }
     if (t == "-nojoin")    { o->noJoin = true;    return 1; }
-    if (t == "-dejit")     { o->dejitter = true;  return 1; }
+    if (t == "-dejit")     { o->dejitter = true;  o->dejitterRequested = true; return 1; }
+    if (t == "-nodejit")   { o->dejitter = false; o->dejitterRequested = false; return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -97,6 +233,66 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
         return 2;
     }
     return 0;
+}
+
+// Settles an option that depends on others, once every token is in. -dejit needs flip timing
+// with the flip join on, and the comb lock. When it is on only as a default and an opt-out
+// removed one of those, it steps aside and this returns the line to log. When it was typed it
+// stays on, and the capture mode refuses it loudly, as it does any request that contradicts
+// itself.
+inline std::string ResolveDependencies(Options* o) {
+    if (!o->dejitter || o->dejitterRequested) return std::string();
+    const char* reason = NULL;
+    if (!o->etw) reason = "flip timing, and -noetw turned that off";
+    else if (o->noJoin) reason = "the flip join, and -nojoin turned that off";
+    else if (!o->lock) reason = "the comb lock, and -nolock turned that off";
+    if (!reason) return std::string();
+    o->dejitter = false;
+    return std::string("Delivery-lateness correction off: -dejit needs ") + reason;
+}
+
+// What a command line names besides the options: the display pair and the capture mode, for a
+// scripted launch that skips the prompts. An index of -1 and an empty mode mean not given.
+struct CommandLine {
+    int sourceIndex = -1;
+    int targetIndex = -1;
+    std::string mode;
+    bool foundAny = false;   // at least one token was recognized
+};
+
+// Parses a whole command line: -source, -target and -framerate here, every other token through
+// ApplyOption, and an unknown token skipped. Each rejected value appends the line to log to
+// *warnings. An index that is not a number is reported and left as it was, so a launch missing
+// either index goes to the interactive prompts rather than closing.
+inline CommandLine ParseCommandLine(const std::vector<std::string>& args, Options* o,
+                                    std::vector<std::string>* warnings) {
+    CommandLine c;
+    for (size_t i = 0; i < args.size(); i++) {
+        const std::string& t = args[i];
+        const bool hasValue = i + 1 < args.size();
+        if ((t == "-source" || t == "-target") && hasValue) {
+            int* index = (t == "-source") ? &c.sourceIndex : &c.targetIndex;
+            if (!ParseInt(args[i + 1], index) && warnings) {
+                warnings->push_back(t + " value '" + args[i + 1] +
+                                    "' invalid (not a number) - ignored");
+            }
+            c.foundAny = true;
+            i++;
+        } else if (t == "-framerate" && hasValue) {
+            c.mode = args[i + 1];
+            c.foundAny = true;
+            i++;
+        } else {
+            std::string w;
+            const size_t consumed = ApplyOption(args, i, o, &w);
+            if (!w.empty() && warnings) warnings->push_back(w);
+            if (consumed > 0) {
+                c.foundAny = true;
+                i += consumed - 1;
+            }
+        }
+    }
+    return c;
 }
 
 enum class ModeKind { Invalid, Vsync, Temporal, Diag, Timer };
@@ -136,12 +332,13 @@ inline bool EqualsNoCase(const std::string& a, const char* b) {
 // promotes to independent flip so the present blocks on the SINK's own vblank, and b:dwm is the
 // same blend on the D3D9 swapchain. The D3D11 path carries the blend compositor only.
 //
-// An empty string and "vsync" select the original vsync mode, "diag" and "diag:vsync" the clock
-// probes, and a bare number the plain timer mode. Anything else is Invalid, and the caller prints
-// the usage list.
+// An empty string is a bare launch and selects b:vsync, the release path. "vsync" selects the
+// original vsync mode, "diag" and "diag:vsync" the clock probes, and a bare number the plain timer
+// mode. Anything else is Invalid, and the caller prints the usage list.
 inline ModeSpec ParseMode(const std::string& modeStr) {
     ModeSpec s;
-    if (modeStr.empty() || EqualsNoCase(modeStr, "vsync")) {
+    if (modeStr.empty()) return ParseMode("b:vsync");
+    if (EqualsNoCase(modeStr, "vsync")) {
         s.kind = ModeKind::Vsync;
         return s;
     }

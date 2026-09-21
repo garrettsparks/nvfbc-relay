@@ -660,9 +660,11 @@ int64_t PassthroughThreshold(int64_t srcPeriodQpc, int64_t presentPeriodQpc);
 const float kDefaultAssumedSrcFps = 60.0f;
 float AssumedSrcFps(float srcRateHint);
 
-// The source rate the comb lock anchors to, or 0 when the lock does not arm. The lock anchors
-// only to a declared -src: anchoring to the default would lock undeclared sources to a rate
-// nobody stated.
+// The source rate the comb lock anchors to, or 0 when the lock is off. Without a declared -src it
+// anchors to the assumed rate, so a bare launch runs locked. An undeclared source at another rate
+// either shares that comb (30 and 120 fps do against a 60 Hz present) or sweeps across it, and a
+// sweeping phase rarely settles the stability gate, so the lock stays released rather than
+// holding a phase the source does not have.
 float LockAnchorFps(bool lock, float srcRateHint);
 
 // The comb denominator M: the smallest M in 1..8 for which the source:present ratio times M

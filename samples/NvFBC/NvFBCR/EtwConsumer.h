@@ -9,14 +9,9 @@
 
 // Reads the display driver's FlipRequest events while the relay runs, so a capture carries
 // the true scanout times alongside its own arrival and present stamps in ONE log on ONE
-// clock. Diagnostic only: it writes log lines and fills a history, and nothing in the
-// policy reads any of it.
-//
-// It exists before anything consumes it on purpose. The relationship between a capture wake
-// and the flip it belongs to is currently an inference drawn from three matched events; the
-// only way to promote that to a rule is to collect thousands of them under real load, and
-// the only comfortable way to collect them is to have the relay do it rather than to
-// choreograph a separate probe against a running game.
+// clock. It writes log lines and fills a history; the per-present flip join, delivery-
+// lateness correction (-dejit) and phase-aware keep-real read the history, and the relay
+// runs everything else without it.
 //
 // SESSION CONFIGURATION IS LOAD-BEARING. Left at defaults, real-time ETW delivers on a ~1 s
 // cadence, which is 70x past the relay's bracketing lag and would make the data useless. The
@@ -28,8 +23,9 @@ public:
     ~EtwFlipConsumer();
 
     // Starts the session and the consumer and flush threads. Returns false and logs the
-    // reason if the session cannot start; the relay carries on regardless, because this is
-    // instrumentation and must never be able to take capture down with it.
+    // reason if the session cannot start, and StartError then holds the failing Win32 code;
+    // the relay carries on regardless, because flip timing must never be able to take
+    // capture down with it.
     // baseQpc is the relay's own log origin, not a fresh reading: flip lines must be in the
     // same units and origin as arr= and dl= or the single-log advantage evaporates.
     bool Start(LONGLONG qpcFreq, LONGLONG baseQpc);
@@ -72,6 +68,9 @@ public:
     // grid phase permanently. Bounded, so a wild range reports the cap rather than walking.
     int CountFlipsBetween(uint32_t head, int64_t lo, int64_t hi) const;
 
+    // The Win32 code of the call that made Start fail, 0 when it has not failed.
+    unsigned long StartError() const { return m_startError; }
+
     long long Flips() const { return m_flips.load(std::memory_order_relaxed); }
     long long DecodeFailures() const { return m_decodeFail.load(std::memory_order_relaxed); }
 
@@ -98,6 +97,7 @@ private:
     std::atomic<long long> m_decodeFail{0};
     LONGLONG m_qpcFreq = 0;
     LONGLONG m_baseQpc = 0;
+    unsigned long m_startError = 0;
 
     mutable std::mutex m_mutex;
     policy::FlipHistory m_history;
