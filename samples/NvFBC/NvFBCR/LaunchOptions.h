@@ -104,13 +104,15 @@ struct UsageRow {
 
 inline const std::vector<UsageRow>& OptionRows() {
     static const std::vector<UsageRow> rows = {
-        {"-src", "60", "Declared source fps, the BASE render rate (60x2 frame generation is -src "
-                       "60); sizes the lag, the comb lock and the passthrough threshold (default: "
-                       "60 assumed)", true, false},
-        {"-nolock", "", "Turn the phase comb lock off (on by default)", false, false},
-        {"-lag", "75", "Extra bracketing delay in ms (0-200, default 75; -lag 0 turns it off): "
-                       "output latency the player never sees, traded for fewer held frames",
+        {"-src", "60", "The game's own frame rate, not counting frames added by DLSS Frame "
+                       "Generation or Smooth Motion. E.g. if frame generation doubles a game to "
+                       "120 FPS, use -src 60. If frame rate varies, bias lower. E.g. for a game "
+                       "running mostly 75 to 90 FPS, use -src 80, not 90. Default 60.",
          true, false},
+        {"-nolock", "", "Turn the phase comb lock off (on by default)", false, false},
+        {"-lag", "75", "Extra delay in ms added to the relayed video (0-200, default 75). More "
+                       "delay means fewer repeated frames. The player never feels it. The stream "
+                       "just runs slightly later.", true, false},
         {"-noetw", "", "Do not read the display driver's scanout times (read by default; -dejit "
                        "needs them)", false, false},
         {"-nodejit", "", "Do not re-stamp late-delivered capture batches onto the flip grid (on by "
@@ -179,7 +181,7 @@ inline std::vector<std::string> UsageLines() {
     for (const UsageRow& r : ModeRows()) {
         if (r.shown) add(r);
     }
-    lines.push_back("Options, typed after the mode (b:vsync -src 90):");
+    lines.push_back("Options, typed after the mode (b:vsync -src 60):");
     for (const UsageRow& r : OptionRows()) {
         if (r.shown) add(r);
     }

@@ -614,32 +614,33 @@ void ConsoleUserInput(string* framerateStr) {
     clog.clear();
     cin.clear();
     cout << endl;
+    // One line per display, in the terms a user picks by: its name, its size and where it sits
+    // on the desktop. The device name stands in when Windows reports no friendly name.
     for (vector<DisplayPosition>::iterator iter = displays.begin(); iter < displays.end(); iter++) {
-
-        cout << "Adapter index [" << iter->dxAdapterIndex << "]"
-            << endl << "\t"
-            << "Scaled Position Top Left [" << iter->position.left << "," << iter->position.top << "]"
-            << " | Scaled Position Bottom Right [" << iter->position.right << "," << iter->position.bottom << "]"
-            << endl << "\t"
-            << "Identifier [" << iter->deviceName << "]"
-            << endl << "\t"
-            << "Name [" << iter->friendlyName << "]"
-            << endl;
+        const string name = iter->friendlyName.empty() ? string(iter->deviceName)
+                                                       : iter->friendlyName;
+        cout << "[" << iter->dxAdapterIndex << "] " << name << ", "
+             << (iter->position.right - iter->position.left) << "x"
+             << (iter->position.bottom - iter->position.top) << " at ("
+             << iter->position.left << "," << iter->position.top << ")" << endl;
     }
+    cout << endl;
 
     int sourceIndex;
     int outputIndex;
-    for (sourceIndex = ReadIntFromCmd("Capture Display Index ? "); sourceIndex < 0 || sourceIndex > displays.size() - 1;) {
-        sourceIndex = ReadIntFromCmd("Capture Display Index ? ");
+    const char* sourcePrompt = "Game display number ? ";
+    const char* outputPrompt = "Capture card display number ? ";
+    for (sourceIndex = ReadIntFromCmd(sourcePrompt); sourceIndex < 0 || sourceIndex > displays.size() - 1;) {
+        sourceIndex = ReadIntFromCmd(sourcePrompt);
     }
-    for (outputIndex = ReadIntFromCmd("Output Display Index ? "); outputIndex < 0 || outputIndex > displays.size() - 1;) {
-        outputIndex = ReadIntFromCmd("Output Display Index ? ");
+    for (outputIndex = ReadIntFromCmd(outputPrompt); outputIndex < 0 || outputIndex > displays.size() - 1;) {
+        outputIndex = ReadIntFromCmd(outputPrompt);
     }
 
     cout << endl;
     for (const string& line : launch::UsageLines()) cout << line << endl;
     cout << endl;
-    cout << "Capture mode and options (blank for b:vsync with the defaults) ? ";
+    cout << "Mode and options (press Enter for the default) ? ";
     string cinString;
     getline(cin, cinString);
     if (!cinString.empty()) {
@@ -654,10 +655,13 @@ void ConsoleUserInput(string* framerateStr) {
                 if (consumed > 0) i += consumed - 1;
                 else cout << "Unknown option '" << opts[i] << "' - ignored" << endl;
             }
-            if (g_srcRateHint > 0.0f) cout << "Declared source rate: " << g_srcRateHint << " fps";
-            else cout << "Source rate: not declared, " << policy::AssumedSrcFps(g_srcRateHint)
-                      << " fps assumed (declare -src <base fps> otherwise)";
-            cout << (g_lock ? " (comb lock on)" : " (comb lock off)") << endl;
+            if (g_srcRateHint > 0.0f) {
+                cout << "Game frame rate set to " << g_srcRateHint << " FPS." << endl;
+            } else {
+                cout << "Game frame rate not set, so " << policy::AssumedSrcFps(g_srcRateHint)
+                     << " FPS is assumed. Set -src to the game's own frame rate if it differs."
+                     << endl;
+            }
             if (g_tint) cout << "Blend tint: on (synthesized frames bordered)" << endl;
             if (g_mark && g_markFrames) cout << "Frame marker: on (first " << g_markFrames << " presents)" << endl;
             else if (g_mark)            cout << "Frame marker: on" << endl;
@@ -700,11 +704,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     if (!CreateMutexA(NULL, TRUE, "Global\\NvFBCR_SingleInstance") ||
         GetLastError() == ERROR_ALREADY_EXISTS) {
         MessageBoxA(NULL,
-                    "Another NvFBCR is already running.\n\n"
-                    "Only one can capture at a time: the second cannot open an NvFBC session, "
-                    "and starting it would overwrite the running one's log.\n\n"
-                    "Close or end the other NvFBCR.exe first. If no window is visible, look "
-                    "for the process in Task Manager.",
+                    "Another NvFBCR is already running, and only one can run at a time.\n\n"
+                    "Close it first. If no window is visible, end NvFBCR.exe in Task Manager.",
                     "NvFBCR: already running",
                     MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
         return -1;

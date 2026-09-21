@@ -99,8 +99,7 @@ public:
 
     const char* Name() const override { return "D3D11 flip-model present"; }
     const char* RefusalAdvice() const override {
-        return "To run on the old present path instead (the D3D9 swapchain on DWM's compose "
-               "clock), use b:dwm.";
+        return "To try the older output method, type b:dwm at the mode prompt.";
     }
     bool OwnsOutputWindow() const override { return true; }
 

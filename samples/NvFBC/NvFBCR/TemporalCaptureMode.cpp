@@ -346,16 +346,17 @@ void TemporalCaptureMode::Run(
         const unsigned long code = m_etwConsumer.StartError();
         char text[640];
         snprintf(text, sizeof(text),
-                 "The ETW session that reads the display driver's flip timing did not start "
-                 "(error %lu).\n\n"
-                 "The relay keeps running. Flip timing is off for this run%s; everything else "
-                 "runs as normal.%s\n\n"
-                 "To run without flip timing and skip this message, launch with -noetw.",
-                 code, dejitterLost ? ", and with it late-batch correction (-dejit)" : "",
+                 "NvFBCR could not read frame timing from the graphics driver (error %lu).\n\n"
+                 "%s%s\n\n"
+                 "To skip this check and this message, launch with -noetw.",
+                 code,
+                 dejitterLost ? "It keeps running, but may show a few more double-image frames "
+                                "this session."
+                              : "It keeps running as normal.",
                  code == ERROR_ACCESS_DENIED
-                     ? "\n\nAccess was denied: run NvFBCR.exe as administrator."
+                     ? "\n\nAccess was denied. Run NvFBCR.exe as administrator."
                      : "");
-        MessageBoxA(NULL, text, "NvFBCR: flip timing unavailable",
+        MessageBoxA(NULL, text, "NvFBCR: frame timing unavailable",
                     MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
     }
     const double usPerTick = 1000000.0 / (double)m_scheduler.Freq();
@@ -387,14 +388,17 @@ void TemporalCaptureMode::Run(
         LOGERR("%s init failed - refusing the mode", m_present->Name());
         m_ring.Stop();
         const char* advice = m_present->RefusalAdvice();
+        // Logging is opt-in, so the reason is only in the log when the log exists.
+        const char* logAdvice = SimpleLogger::getInstance().isEnabled()
+                                    ? "The reason is in NvFBCR.log."
+                                    : "To record the reason, create an empty NvFBCR.log beside "
+                                      "NvFBCR.exe and run again.";
         char text[640];
         snprintf(text, sizeof(text),
-                 "The %s could not be initialized.\n\n"
-                 "The relay will NOT start. It deliberately does not fall back to another "
-                 "present path: a run labelled one way that silently presented another would "
-                 "be worse than no run.\n\nSee NvFBCR.log for the reason.%s%s",
-                 m_present->Name(), advice[0] ? "\n\n" : "", advice);
-        MessageBoxA(NULL, text, "NvFBCR: present path unavailable",
+                 "NvFBCR could not set up its output on the capture card display, so it will "
+                 "not start.%s%s\n\n%s",
+                 advice[0] ? "\n\n" : "", advice, logAdvice);
+        MessageBoxA(NULL, text, "NvFBCR: could not start",
                     MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
         return;
     }
