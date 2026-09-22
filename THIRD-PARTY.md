@@ -9,9 +9,6 @@ ours, and the MIT license in `LICENSE` does not cover them.
 | Path | Origin | Terms |
 | ---- | ------ | ----- |
 | `inc/NvFBC/*.h` | NVIDIA Capture SDK headers | "Copyright 1993-2018 NVIDIA Corporation. All rights reserved." Subject to the applicable NVIDIA license agreement. |
-| `samples/Util/` | NVIDIA Capture SDK sample helpers | Same notice. The four files without a header comment (`NvFBCLibrary.h`, `ReadMe.txt`, and the two project files) are SDK sample material as well. |
-| `inc/NvAPI` | git submodule, https://github.com/NVIDIA/nvapi | Governed by that repository's own license. Referenced, not vendored. |
-| `lib/NvAPI/` | NVIDIA NvAPI import libraries, prebuilt | NVIDIA's terms. |
 | `third_party/NvOFSDK/nvOpticalFlowCommon.h`, `nvOpticalFlowD3D11.h` | NVIDIA Optical Flow SDK interface headers | MIT, with NVIDIA's notice in each file. |
 
 Everything under `samples/NvFBC/NvFBCR/`, `samples/NvFBC/NvFBCEnable/` and
@@ -34,9 +31,9 @@ in the README's `Why?` section is also his.
 
 ## Redistribution
 
-Use of the NvFBC headers and the SDK sample helpers is governed by the NVIDIA
-license agreement accepted when downloading the Capture SDK. Read that
-agreement before redistributing this repository or anything built from it.
+Use of the NvFBC headers is governed by the NVIDIA license agreement accepted
+when downloading the Capture SDK. Read that agreement before redistributing
+this repository or anything built from it.
 
 The NvOFFRUC library used by the optical flow work on other branches is not in
 this repository and must not be committed. The DesignWorks license it ships
@@ -47,16 +44,8 @@ hand.
 
 The intent is to remove third-party code from the tree entirely:
 
-- The CUDA helpers in `samples/Util/` (`helper_cuda.h`, `helper_cuda_gl.h`,
-  `helper_cuda_drvapi.h`, `helper_string.h`, `drvapi_error_string.h`) are not
-  included by anything here.
-- `NvFBCLibrary.h` is a LoadLibrary and GetProcAddress shim and can be
-  rewritten from scratch.
 - The remaining NvFBC headers declare the ABI. This project uses 15 `NVFBC_*`
   constants and a small number of structs, all on the DX9Vid path, so an
   independent declaration of that subset is feasible. It has to land before the
   vendored headers are removed, because the Capture SDK is behind an NVIDIA
   login and CI cannot fetch it.
-- The prebuilt NvAPI libraries in `lib/NvAPI/` appear in no
-  `AdditionalDependencies` entry and are candidates for deletion once a link test
-  confirms it.

@@ -1,4 +1,5 @@
 #include "CaptureRing.h"
+#include <NvFBCLoader.h>
 #include <SimpleLogger.h>
 #include <limits.h>
 #include <math.h>
@@ -8,7 +9,7 @@
 // must update the global so WinMain's Cleanup releases the right session.
 extern IDirect3D9Ex* g_pD3DEx;
 extern int g_sourceAdapterIndex;
-extern NvFBCLibrary* pNVFBCLib;
+extern NvFBCLoader* pNVFBCLib;
 extern NvFBCToDx9Vid* NvFBCDX9;
 
 // With a private capture device the blocking grab can wait as long as it likes — its lock

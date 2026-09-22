@@ -2,7 +2,7 @@
 
 #include <windows.h>
 #include <d3d9.h>
-#include <NvFBCLibrary.h>
+#include <NvFBC/nvFBC.h>
 #include <NvFBC/NvFBCToDx9vid.h>
 #include <atomic>
 #include <thread>

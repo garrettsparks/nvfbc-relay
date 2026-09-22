@@ -12,7 +12,7 @@
 #include <windows.h>
 #include <iostream>
 #include <string>
-#include "NvFBCLibrary.h"
+#include "NvFBCLoader.h"
 #include "NvFBC/nvFBC.h"
 #include "AdminCheck.h"
 
@@ -28,7 +28,7 @@ void PrintUsage()
     cout << "\nNote: Must be run with Administrator privileges.\n";
 }
 
-void PrintStatus(NvFBCLibrary* pLib, int adapter = 0)
+void PrintStatus(NvFBCLoader* pLib, int adapter = 0)
 {
     NvFBCStatusEx status = {};
     status.dwVersion = NVFBC_STATUS_VER;
@@ -78,7 +78,7 @@ void ShowMenu()
     cout << "\nSelect an option (1-4): ";
 }
 
-void HandleEnable(NvFBCLibrary* nvfbcLib, int adapter = 0)
+void HandleEnable(NvFBCLoader* nvfbcLib, int adapter = 0)
 {
     cout << "\nAttempting to enable NvFBC on adapter " << adapter << "...\n";
 
@@ -120,7 +120,7 @@ void HandleEnable(NvFBCLibrary* nvfbcLib, int adapter = 0)
     PrintStatus(nvfbcLib, adapter);
 }
 
-void HandleDisable(NvFBCLibrary* nvfbcLib, int adapter = 0)
+void HandleDisable(NvFBCLoader* nvfbcLib, int adapter = 0)
 {
     cout << "\nAttempting to disable NvFBC on adapter " << adapter << "...\n";
 
@@ -138,7 +138,7 @@ int main(int argc, char* argv[])
     cout << "=========================================\n\n";
 
     // Load NvFBC library first
-    NvFBCLibrary nvfbcLib;
+    NvFBCLoader nvfbcLib;
     if (!nvfbcLib.load())
     {
         cerr << "ERROR: Unable to load NvFBC library.\n";

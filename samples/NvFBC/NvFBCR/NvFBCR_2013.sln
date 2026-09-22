@@ -4,11 +4,6 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 VisualStudioVersion = 18.1.11312.151 d18.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "NvFBCR", "NvFBCR_2013.vcxproj", "{7FE2BDE8-347F-411F-AF60-45D9B0347C12}"
-	ProjectSection(ProjectDependencies) = postProject
-		{1204D7DC-7E0B-4710-87D7-5BBC67FAAC63} = {1204D7DC-7E0B-4710-87D7-5BBC67FAAC63}
-	EndProjectSection
-EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Util", "..\..\Util\Util_2013.vcxproj", "{1204D7DC-7E0B-4710-87D7-5BBC67FAAC63}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Common", "..\..\Common\Common.vcxproj", "{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}"
 EndProject
@@ -26,10 +21,6 @@ Global
 		{7FE2BDE8-347F-411F-AF60-45D9B0347C12}.Debug|x64.Build.0 = Debug|x64
 		{7FE2BDE8-347F-411F-AF60-45D9B0347C12}.Release|x64.ActiveCfg = Release|x64
 		{7FE2BDE8-347F-411F-AF60-45D9B0347C12}.Release|x64.Build.0 = Release|x64
-		{1204D7DC-7E0B-4710-87D7-5BBC67FAAC63}.Debug|x64.ActiveCfg = Debug|x64
-		{1204D7DC-7E0B-4710-87D7-5BBC67FAAC63}.Debug|x64.Build.0 = Debug|x64
-		{1204D7DC-7E0B-4710-87D7-5BBC67FAAC63}.Release|x64.ActiveCfg = Release|x64
-		{1204D7DC-7E0B-4710-87D7-5BBC67FAAC63}.Release|x64.Build.0 = Release|x64
 		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Debug|x64.ActiveCfg = Debug|x64
 		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Release|x64.ActiveCfg = Release|x64
 		{6D5CBBB4-BF06-464C-9A88-1DC8CA9DF39B}.Debug|x64.ActiveCfg = Debug|x64

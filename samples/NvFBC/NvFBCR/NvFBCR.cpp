@@ -46,7 +46,7 @@
 #include <d3d9.h>
 #include <vector>
 
-#include <NvFBCLibrary.h>
+#include <NvFBCLoader.h>
 #include <SimpleLogger.h>
 #include <NvFBC/NvFBCToDx9vid.h>
 #include <AdminCheck.h>
@@ -177,7 +177,7 @@ IDirect3DSurface9* g_backbuffer = NULL;
 bool g_bNvFBCLibLoaded = false;
 
 NvFBCToDx9Vid *NvFBCDX9 = NULL;
-NvFBCLibrary *pNVFBCLib;
+NvFBCLoader *pNVFBCLib;
 
 int BUF_WIDTH;
 int BUF_HEIGHT;
@@ -878,7 +878,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE hInstance,
     NVFBC_TODX9VID_OUT_BUF NvFBC_OutBuf[1] = {};
 
     //! Load the nvfbc Library
-    pNVFBCLib = new NvFBCLibrary();
+    pNVFBCLib = new NvFBCLoader();
     if (!pNVFBCLib->load())
     {
         LOGERR("Unable to load the NvFBC library");
