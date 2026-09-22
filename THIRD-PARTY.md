@@ -12,7 +12,7 @@ ours, and the MIT license in `LICENSE` does not cover them.
 | `samples/Util/` | NVIDIA Capture SDK sample helpers | Same notice. The four files without a header comment (`NvFBCLibrary.h`, `ReadMe.txt`, and the two project files) are SDK sample material as well. |
 | `inc/NvAPI` | git submodule, https://github.com/NVIDIA/nvapi | Governed by that repository's own license. Referenced, not vendored. |
 | `lib/NvAPI/` | NVIDIA NvAPI import libraries, prebuilt | NVIDIA's terms. |
-| `lib/DirectX_Nov2008/` | `ddraw.lib` from the November 2008 DirectX SDK | Microsoft DirectX SDK EULA. |
+| `third_party/NvOFSDK/nvOpticalFlowCommon.h`, `nvOpticalFlowD3D11.h` | NVIDIA Optical Flow SDK interface headers | MIT, with NVIDIA's notice in each file. |
 
 Everything under `samples/NvFBC/NvFBCR/`, `samples/NvFBC/NvFBCEnable/` and
 `samples/Common/` is ours and carries no NVIDIA notice.
@@ -47,8 +47,6 @@ hand.
 
 The intent is to remove third-party code from the tree entirely:
 
-- `inc/NvFBC/nvFBCCuda.h` and `inc/NvFBC/nvFBCToSys.h` cover capture paths this
-  project does not use and can be deleted outright.
 - The CUDA helpers in `samples/Util/` (`helper_cuda.h`, `helper_cuda_gl.h`,
   `helper_cuda_drvapi.h`, `helper_string.h`, `drvapi_error_string.h`) are not
   included by anything here.
@@ -59,5 +57,6 @@ The intent is to remove third-party code from the tree entirely:
   independent declaration of that subset is feasible. It has to land before the
   vendored headers are removed, because the Capture SDK is behind an NVIDIA
   login and CI cannot fetch it.
-- The prebuilt libraries in `lib/` appear in no `AdditionalDependencies` entry
-  and are candidates for deletion once a link test confirms it.
+- The prebuilt NvAPI libraries in `lib/NvAPI/` appear in no
+  `AdditionalDependencies` entry and are candidates for deletion once a link test
+  confirms it.
