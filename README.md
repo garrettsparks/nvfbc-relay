@@ -21,55 +21,166 @@ being characterized against real captures.
 # Prerequisites
 
 As with any application leveraging NvFBC, this is only officially supported
-on Tesla & Quadro professional cards. There are other ways to enable NvFBC
-on GeForce which are unsupported and definitely not the intended target of
-this program.
+on Tesla & Quadro professional cards.
 
 HDCP also needs to be disabled. Thanks, DRM.
 
+NvFBCR needs an NVIDIA graphics card and driver. It uses two files the driver
+installs in `C:\Windows\System32`, `NvFBC64.dll` for capture and
+`nvofapi64.dll` for optical flow. If either one is reported missing, update or
+reinstall the NVIDIA driver.
+
 The exe asks for administrator rights when it starts. Enabling NvFBC on a
-machine where it is off needs them, and so does reading the display driver's
-flip events (`-etw`).
+machine where it is off needs them, and so does reading frame timing from the
+graphics driver, which the relay does by default.
+
+## Windows Defender
+
+Windows Defender sometimes flags `NvFBCEnable.exe` as
+`Trojan:Win32/Sabsik.FL.A!ml`. That's a false positive from Defender's
+machine-learning detection, which the `!ml` at the end marks.
+NvFBCEnable's source is in `samples/NvFBC/NvFBCEnable/`, and it hadn't changed
+in months when the detection first appeared.
+
+If it happens, add a Defender exclusion for the folder you run the relay from.
+Reporting the file to Microsoft as a false positive at
+https://www.microsoft.com/wdsi/filesubmission helps too. The builds aren't
+code-signed. A signing certificate costs more than this project can justify.
 
 ---
 
 # Use
 
-Run `NvFBCR.exe`. It lists your displays and prompts for capture index, target
-index, and mode. Or skip the prompts:
+Run `NvFBCR.exe`. It lists your displays and asks for the game display, the
+capture card display, and a mode. Press Enter at the mode prompt for the
+default, `b:vsync`. Options go on the same line after the mode, for example
+`b:vsync -src 90`.
+
+## Shortcuts
+
+To skip the prompts, put everything on the command line. A Windows shortcut
+works well for this. Right-click `NvFBCR.exe`, choose Create shortcut, open the
+shortcut's Properties, and add the options to the end of Target, after the
+closing quote:
 
 ```
-NvFBCR.exe -source 1 -target 2 -framerate t -src 60 -lock
+"C:\path\to\NvFBCR.exe" -source 0 -target 1 -src 60
 ```
 
-`-source` and `-target` are display indices as listed at startup. `-framerate`
-takes a mode:
+`-source` is the game display and `-target` the capture card display, numbered
+as the relay lists them at startup. Leave out `-framerate` to get the default
+mode, or add `-framerate <mode>` to pick another. Windows asks for
+administrator rights each time, because the relay needs them.
+
+Display numbers can change when you add or remove a display or update the
+graphics driver. A number that no longer exists sends the relay back to asking.
+A number that now points at a different display captures that display instead,
+so after a change like that, run the relay once without the shortcut and check
+its list.
+
+## Modes
+
+`-framerate` takes a mode, and so does the mode prompt:
 
 | Mode | Behavior |
 | ---- | -------- |
-| `vsync` | Default. Capture and present on the vsync interval. The original relay behavior. |
+| `vsync` | Capture and present on the vsync interval. The original relay behavior. |
 | `t` or `t:vsync` | Temporal selection, present blocked on DWM's compose clock. |
 | `t:<fps>` | Temporal selection, present driven by a QPC timer at the given rate. |
-| `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the bracket pair otherwise), presented through a D3D11 flip-model swapchain on the capture card's own vblank. The production mode. |
+| `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the bracket pair otherwise), presented through a D3D11 flip-model swapchain on the capture card's own vblank. The default. |
 | `b:dwm` | The same blend on the D3D9 swapchain, present blocked on DWM's compose clock. The path `t` runs on. |
 | `b:<fps>` | The same blend, present driven by a QPC timer at the given rate. |
 | `<fps>` | Plain timer capture at the given rate. No temporal selection. |
 | `diag` | Diagnostic clock probe: QPC 60Hz, immediate present. Logs DWM compose timing and card raster per tick. |
 | `diag:vsync` | Diagnostic probe on `INTERVAL_ONE`. Present block time measures DWM's delivery cadence. |
 
-Options:
-
-| Option | Effect |
-| ------ | ------ |
-| `-src <fps>` | The source's real frame rate. Drives the bracketing lag, so setting it correctly matters for pacing. This is always the base render rate, never the displayed rate: with frame generation at 60x2, pass 60. |
-| `-lock` | Arms the comb lock. Opt-in. |
-| `-mark` | Writes frame markers into the output for offline pacing analysis. See `docs/frame-marker-spec.md`. |
-
 Under a fullscreen game on the source, the card locks the compose clock to
 60Hz, so `t:vsync` presents at 60 whatever the source is rendering. On the
 desktop there's no such lock and a 240Hz source gives you 240Hz presents.
 That's the DWM compose clock showing through, and it confuses people reading
 present rates out of a desktop capture.
+
+## Options
+
+| Option | Effect |
+| ------ | ------ |
+| `-src <fps>` | The game's own frame rate, not counting frames added by DLSS Frame Generation or Smooth Motion. Default 60. See Choosing `-src` below. |
+| `-lag <ms>` | Extra delay added to the relayed video, 0 to 200 ms, default 75. More delay means fewer repeated frames. The player never feels it. The stream just runs slightly later. |
+| `-mark [N]` | Debug. Burns a frame counter into the output for offline analysis, the first N frames only when N is given. See Frame markers below. |
+
+### Choosing `-src`
+
+Set `-src` to the frame rate the game itself renders. Frames added by frame
+generation don't count. If DLSS Frame Generation or Smooth Motion doubles a game
+to 120 FPS, use `-src 60`.
+
+If the frame rate varies, bias lower. For a game running mostly 75 to 90 FPS,
+use `-src 80`, not 90. Set too high, the relay blends more frames exactly when
+the game dips, which is where a blended frame's double image is easiest to see.
+
+Without `-src` the relay assumes 60.
+
+### Defaults
+
+The relay's frame pacing features are all on by default. It locks onto the
+game's frame timing, adds the 75 ms of extra delay above, and reads frame timing
+from the graphics driver to correct frames that arrive late. None of them costs
+anything measurable (see Present paths). For troubleshooting, each can be
+turned off.
+
+| Option | Turns off |
+| ------ | --------- |
+| `-nolock` | Locking onto the game's frame timing, and with it the late-frame correction |
+| `-noetw` | Reading frame timing from the graphics driver, and with it the late-frame correction |
+| `-nodejit` | The late-frame correction only |
+| `-lag 0` | The extra delay |
+
+The older spellings `-lock`, `-etw` and `-dejit` still work and change nothing.
+If the relay can't read frame timing from the driver, it says so once and keeps
+running without the late-frame correction.
+
+## Logging
+
+Logging is off unless a file named `NvFBCR.log` exists beside `NvFBCR.exe`.
+Create an empty one to turn logging on. Each launch overwrites it. The log is
+for diagnosing problems, and a long session can write about 160 MB an hour.
+
+## Video delay and audio sync
+
+NvFBCR relays video only. Audio through the relay is planned but not there yet.
+
+To pace frames evenly, the relay holds the picture back briefly. At the
+defaults that's between 95 and 113 ms, about 104 ms typically, measured over 90
+minutes of gameplay. A lower `-src` holds it longer, about 20 ms more at
+`-src 30`, and each ms of `-lag` adds one ms.
+
+Audio that reaches the capture card some other way doesn't get that hold, so it
+can arrive ahead of the picture. How far ahead depends on the audio's own route,
+which adds delay of its own. Fix it in OBS by delaying the capture card's audio.
+In the Audio Mixer, open the audio source's menu, choose Advanced Audio
+Properties, and set its Sync Offset. A positive value delays the audio.
+
+With system audio sent over the card's HDMI by Elgato Wave Link, about 20 ms
+has looked right, which suggests the route itself adds most of the relay's delay. For a
+different route, start there and adjust by eye, or with a sync test video that
+flashes and beeps together.
+
+## 1440p output
+
+The relay outputs at the capture card display's resolution, so for 1440p set
+the card to 2560x1440 in Windows display settings. It costs the game no more
+than 1080p does.
+
+Use a mode that runs at exactly 60.000 Hz. The standard 2560x1440 "60 Hz" mode
+many cards offer really runs at 59.95 Hz. Against a 60 FPS game that means a
+skipped frame about every 20 seconds, plus a repeated one where the stream fills
+back up to 60. An NVIDIA custom resolution fixes it. In the NVIDIA Control
+Panel, under Change resolution, choose Customize, create a 2560x1440 mode at
+60 Hz, test it, then select that custom entry. On an EVGA XR1 Pro the custom
+mode measures within a thousandth of a hertz of 60.
+
+To check which one is running, the relay log's `Display mode on adapter` line
+reads `@60Hz` for the custom mode and `@59Hz` for the 59.95 Hz one.
 
 ## Present paths
 
@@ -92,6 +203,24 @@ Measured in one session, Avatar 60x2 with in-game frame generation,
 | content repeats/s in the recording (mean) | 3.55 (worst test 14.27) | 0 |
 | PresentMon presentation mode | Composed | Hardware: Independent Flip (99.2%) |
 | KCD2 anomalies/min (real gameplay) | 0.30 | 0.10, all inside a map close |
+
+What each mode costs the game, from a separate benchmark session. Avatar
+uncapped with DLSS frame generation keeps the GPU fully loaded, so any cost the
+relay adds shows up in the benchmark score.
+
+| Mode | Flags | Score lost |
+| ---- | ----- | ---------- |
+| relay not running | | none (baseline) |
+| `vsync` | | 8.3% |
+| `b:dwm` | `-src 60` | 9.4% |
+| `b:vsync` | `-src 60` | 5.4% |
+| `b:vsync` | `-src 60 -lock -lag 75 -etw -dejit`, today's defaults | 5.6% |
+
+`b:vsync` costs least because it presents only as often as the card can show,
+60 times a second. `b:dwm` presented 137 times a second and DWM copied every
+one. The lock, the extra lag and the late-frame correction together cost less
+than the benchmark can measure, and 1440p output costs no more than 1080p. The
+full numbers are in [`docs/relay-cost-results.md`](docs/relay-cost-results.md).
 
 ---
 
@@ -374,8 +503,14 @@ Work on branches, not yet merged to `dev`:
 # Building
 
 Clone the repo, open `samples/NvFBC/NvFBCR/NvFBCR_2013.vcxproj` in VS2022, and
-build. CI builds on push (`.github/workflows/dev-build.yml`), so the artifact
-from a green run is usually easier than building locally.
+build. CI builds when you start it from the Actions tab
+(`.github/workflows/dev-build.yml`), and the artifact from a green run is
+usually easier than building locally. Pushing a `v*` tag builds and publishes a
+release (`.github/workflows/release.yml`).
+
+`NvOFFRUC.dll` is never included in this repo or its builds. NVIDIA's
+DesignWorks SDK license, which it ships under, grants no right to redistribute
+it, and `NvFBCR.exe` doesn't need it to start.
 
 ---
 
