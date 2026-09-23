@@ -42,6 +42,16 @@ gm_60x2_gameplay_0917.trace
 # fidelity anchor for b:vsync gameplay and the widest sample of the residual blend-zone class,
 # which is why it earns its 12 MB. Its header explains both.
 gm_60x2_gameplay_0917_1.trace
+# The same content, policy and present path, 61 minutes streamed on 2026-09-22. It carries the
+# residual blend-zone class at the highest rate yet seen: 10 runs >= 50 in an hour against
+# 0917_1's 8 in 90 minutes, all after the lock released at a small source hitch and re-engaged
+# slowly. The lock released 44 times an hour against 16 on the 2026-09-16 stream while the game
+# hitched at the same rate (118 against 129 small hitches an hour), so a quarter of this
+# capture's hitches dropped the lock against 6% there. Replaying the logged error sequence
+# through the real lock reproduces the field lock state on 99.8% of presents, so the releases
+# follow from this capture timeline itself. Why this timeline releases so much more often is
+# still unexplained, which is the reason to gate on it.
+gm_60x2_gameplay_0922.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions
