@@ -27,24 +27,6 @@ jobs:
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v3
 
-    - name: Check our NvFBC declarations against NVIDIA's headers
-      shell: cmd
-      run: |
-        for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
-        call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" > nul
-        where cl > nul || (echo vcvars64 did not put the compiler on the path & exit /b 1)
-        set "SRC=%GITHUB_WORKSPACE%\samples\NvFBC\NvFBCR\NvFBCAbiCheck.cpp"
-        set INC=/I "%GITHUB_WORKSPACE%\inc" /I "%GITHUB_WORKSPACE%\samples\Common"
-        cd /d "%RUNNER_TEMP%"
-        cl /nologo /W3 %INC% "%SRC%" /Feabicheck.exe || exit /b 1
-        abicheck.exe || exit /b 1
-        cl /nologo /W3 /DNVFBC_ABI_CHECK_CONTROL_STATIC %INC% "%SRC%" /Fecontrol_static.exe > control_static.txt 2>&1 && (type control_static.txt & echo The static control compiled, so the compile-time checks are not live & exit /b 1)
-        findstr /c:"control: a false size check" control_static.txt > nul || (type control_static.txt & echo The static control failed for some other reason & exit /b 1)
-        cl /nologo /W3 /DNVFBC_ABI_CHECK_CONTROL_RUNTIME %INC% "%SRC%" /Fecontrol_runtime.exe || exit /b 1
-        control_runtime.exe > control_runtime.txt && (type control_runtime.txt & echo The run-time control passed, so the run-time checks are not live & exit /b 1)
-        findstr /c:"MISMATCH control" control_runtime.txt > nul || (type control_runtime.txt & echo The run-time control failed for some other reason & exit /b 1)
-        echo Both controls failed as intended
-
     - name: Build Solution
       run: msbuild samples/NvFBC/NvFBCR/NvFBCR_2013.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
 

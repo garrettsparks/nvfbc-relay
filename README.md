@@ -649,6 +649,6 @@ license, so those lines carry no grant and the file sits outside the MIT scope
 until Collin agrees to relicense.
 
 This repo started as the NvFBC sample from the NVIDIA Capture SDK and still
-has the SDK's layout, so the NvFBC headers in `inc/NvFBC/` are NVIDIA's and
-stay under NVIDIA's terms. `THIRD-PARTY.md` lists exactly what came from
-where, and what the plan is for getting it out of the tree.
+has the SDK's layout. The two NVIDIA optical flow headers in
+`third_party/NvOFSDK/` keep their own MIT notice. `THIRD-PARTY.md` lists
+exactly what came from where.

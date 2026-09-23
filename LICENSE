@@ -22,8 +22,8 @@ author retains all rights to his contributions. This file comes under the MIT
 license below if and when he agrees to it.
 
 Everything else is third-party material and stays under its own terms. That
-includes the NvFBC headers in inc/NvFBC/. See THIRD-PARTY.md for the full
-inventory.
+includes the NVIDIA optical flow headers in third_party/NvOFSDK/. See
+THIRD-PARTY.md for the full inventory.
 
 Nothing in this file grants any rights to that third-party material.
 
