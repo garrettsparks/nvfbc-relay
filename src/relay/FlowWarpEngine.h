@@ -10,7 +10,7 @@
 // nvofapi64.dll, which ships in the driver and resolves as an implicit import when
 // the process loads.
 //
-// The D3D11 session-init declarations come from third_party/NvOFSDK/nvOpticalFlowD3D11.h,
+// The D3D11 session-init declarations come from third_party/nvof/nvOpticalFlowD3D11.h,
 // picked up via __has_include; if that header is ever absent the engine constructs
 // disabled (loud LOGERR) rather than running warp-without-flow, which would be plain
 // blend wearing a costume.

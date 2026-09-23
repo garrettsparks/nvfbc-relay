@@ -2248,7 +2248,7 @@ static std::vector<std::string> FixturePaths() {
     // No <filesystem>: an index file also documents the corpus in one readable place.
     std::FILE* idx = std::fopen((dir + "index.txt").c_str(), "rb");
     if (!idx) {   // out-of-tree build: fall back to the path from the repo root
-        dir = "samples/NvFBC/NvFBCR/testdata/";
+        dir = "tests/testdata/";
         idx = std::fopen((dir + "index.txt").c_str(), "rb");
     }
     if (!idx) return out;
@@ -2503,7 +2503,7 @@ static void test_replay_capture_corpus() {
     // root, which is where CI and the documented local command both run.
     CHECK(!paths.empty(),
           "no replay fixtures found (looked for %sindex.txt and "
-          "samples/NvFBC/NvFBCR/testdata/index.txt). Run the suite from the repository "
+          "tests/testdata/index.txt). Run the suite from the repository "
           "root. The capture corpus is the only gate that has caught a real pacing "
           "regression, so it is a failure rather than a skip.",
           TestDataDir().c_str());

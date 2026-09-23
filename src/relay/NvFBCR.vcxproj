@@ -38,10 +38,10 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
     <_ProjectFileVersion>10.0.40219.1</_ProjectFileVersion>
-    <OutDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(ProjectDir)\..\..\$(Configuration)\$(Platform)\</OutDir>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(ProjectDir)\..\..\build\$(Configuration)\$(Platform)\</OutDir>
     <IntDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(Configuration)\$(Platform)\</IntDir>
     <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</LinkIncremental>
-    <OutDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(ProjectDir)\..\..\$(Configuration)\$(Platform)\</OutDir>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(ProjectDir)\..\..\build\$(Configuration)\$(Platform)\</OutDir>
     <IntDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(Configuration)\$(Platform)\</IntDir>
     <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkIncremental>
   </PropertyGroup>
@@ -52,7 +52,7 @@
     <ClCompile>
       <Optimization>Disabled</Optimization>
       <OmitFramePointers>true</OmitFramePointers>
-      <AdditionalIncludeDirectories>../../Common;%(AdditionalIncludeDirectories);</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>../common;../core;../../third_party;%(AdditionalIncludeDirectories);</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_CRT_SECURE_NO_WARNINGS;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MinimalRebuild>true</MinimalRebuild>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
@@ -87,7 +87,7 @@
       <Optimization>Disabled</Optimization>
       <OmitFramePointers>false</OmitFramePointers>
       <WholeProgramOptimization>false</WholeProgramOptimization>
-      <AdditionalIncludeDirectories>../../Common;%(AdditionalIncludeDirectories);</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>../common;../core;../../third_party;%(AdditionalIncludeDirectories);</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_CRT_SECURE_NO_WARNINGS;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <PrecompiledHeader>
@@ -123,7 +123,7 @@
     <ClCompile Include="FrameCompositors.cpp" />
     <ClCompile Include="InterpSidecar.cpp" />
     <ClCompile Include="TemporalCaptureMode.cpp" />
-    <ClCompile Include="TemporalPolicy.cpp" />
+    <ClCompile Include="..\core\TemporalPolicy.cpp" />
     <ClCompile Include="FrameMarker.cpp" />
     <ClCompile Include="CaptureRing.cpp" />
     <ClCompile Include="FlipDecode.cpp" />
@@ -148,12 +148,16 @@
     <ClInclude Include="InterpSidecar.h" />
     <ClInclude Include="DiagCaptureMode.h" />
     <ClInclude Include="TemporalCaptureMode.h" />
-    <ClInclude Include="TemporalPolicy.h" />
-    <ClInclude Include="LaunchOptions.h" />
+    <ClInclude Include="..\core\TemporalPolicy.h" />
+    <ClInclude Include="..\core\LaunchOptions.h" />
     <ClInclude Include="IFrameCaptureMode.h" />
     <ClInclude Include="PresentScheduler.h" />
     <ClInclude Include="TimerCaptureMode.h" />
     <ClInclude Include="VsyncCaptureMode.h" />
+    <ClInclude Include="..\common\AdminCheck.h" />
+    <ClInclude Include="..\common\NvFBCApi.h" />
+    <ClInclude Include="..\common\NvFBCLoader.h" />
+    <ClInclude Include="..\common\SimpleLogger.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="nvofapi64.def" />

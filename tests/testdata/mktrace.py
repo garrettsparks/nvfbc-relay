@@ -12,8 +12,8 @@ rather than assumed from whichever capture the model was first tuned on.
 Bounds are deliberately NOT written here: they describe the model, which only the test
 can measure. Run the suite once and it prints the lines to paste.
 
-  usage: uv run samples/NvFBC/NvFBCR/testdata/mktrace.py \
-             <log> samples/NvFBC/NvFBCR/testdata/<name>.trace "<description>"
+  usage: uv run tests/testdata/mktrace.py \
+             <log> tests/testdata/<name>.trace "<description>"
              [--skip-us N] [--until-us N]
   then add <name>.trace to index.txt and run the suite: it prints the bounds.
 

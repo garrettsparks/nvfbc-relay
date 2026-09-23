@@ -4,13 +4,13 @@
 
 // The common header (NV OF API v5.0) carries the structs and enums; the D3D11
 // session-init declarations live in nvOpticalFlowD3D11.h. Both are vendored in
-// third_party/NvOFSDK; the __has_include gate keeps the engine buildable (disabled,
+// third_party/nvof; the __has_include gate keeps the engine buildable (disabled,
 // loud) if the D3D11 header is ever absent.
-#include "../../../third_party/NvOFSDK/nvOpticalFlowCommon.h"
+#include "nvof/nvOpticalFlowCommon.h"
 #if defined(__has_include)
-#  if __has_include("../../../third_party/NvOFSDK/nvOpticalFlowD3D11.h")
+#  if __has_include("nvof/nvOpticalFlowD3D11.h")
 #    include <d3d11.h>
-#    include "../../../third_party/NvOFSDK/nvOpticalFlowD3D11.h"
+#    include "nvof/nvOpticalFlowD3D11.h"
 #    define NVOF_D3D11_AVAILABLE 1
      // Import library generated from nvofapi64.def at build time (NVIDIA ships none);
      // the factory resolves through the import table when the process loads.
@@ -138,7 +138,7 @@ bool FlowWarpEngine::CreateWarpPipeline() {
 
 bool FlowWarpEngine::CreateFlowSession() {
 #ifndef NVOF_D3D11_AVAILABLE
-    LOGERR("FlowWarpEngine: nvOpticalFlowD3D11.h was not present in third_party/NvOFSDK/ "
+    LOGERR("FlowWarpEngine: nvOpticalFlowD3D11.h was not present in third_party/nvof/ "
            "at build time - restore it and rebuild to enable the raw-flow path");
     return false;
 #else

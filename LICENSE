@@ -5,14 +5,15 @@ This repository is a modification of the NvFBC sample from the NVIDIA Capture
 SDK, so it contains material from more than one source. The MIT license below
 applies ONLY to the following paths:
 
-    samples/NvFBC/NvFBCR/        (except NvFBCR.cpp, see below)
-    samples/NvFBC/NvFBCEnable/
-    samples/Common/
+    src/          (except src/relay/NvFBCR.cpp, see below)
+    tools/
+    tests/
     docs/
     .github/
+    NvFBCR.sln
     README.md
 
-samples/NvFBC/NvFBCR/NvFBCR.cpp is EXCLUDED. It still contains code from the
+src/relay/NvFBCR.cpp is EXCLUDED. It still contains code from the
 original NvFBC-Relay by Collin Blakley:
 
     https://gitlab.com/DonnerPartyOf1/nvfbc-relay
@@ -22,7 +23,7 @@ author retains all rights to his contributions. This file comes under the MIT
 license below if and when he agrees to it.
 
 Everything else is third-party material and stays under its own terms. That
-includes the NVIDIA optical flow headers in third_party/NvOFSDK/. See
+includes the NVIDIA optical flow headers in third_party/nvof/. See
 THIRD-PARTY.md for the full inventory.
 
 Nothing in this file grants any rights to that third-party material.

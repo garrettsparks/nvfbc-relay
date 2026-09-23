@@ -20,8 +20,8 @@
 // before it was delivered, and a hindsight model shows none of it.
 //
 // Build (locally, no Windows headers involved):
-//   g++ -std=c++17 -O2 -Wall -Werror -o /tmp/replay \
-//       samples/NvFBC/NvFBCR/ReplayHarness.cpp samples/NvFBC/NvFBCR/TemporalPolicy.cpp
+//   g++ -std=c++17 -O2 -Wall -Werror -o /tmp/replay -Isrc/core \
+//       tests/ReplayHarness.cpp src/core/TemporalPolicy.cpp
 // Run:
 //   /tmp/replay <NvFBCR.log>
 

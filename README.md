@@ -39,7 +39,7 @@ graphics driver, which the relay does by default.
 Windows Defender sometimes flags `NvFBCEnable.exe` as
 `Trojan:Win32/Sabsik.FL.A!ml`. That's a false positive from Defender's
 machine-learning detection, which the `!ml` at the end marks.
-NvFBCEnable's source is in `samples/NvFBC/NvFBCEnable/`, and it hadn't changed
+NvFBCEnable's source is in `tools/NvFBCEnable/`, and it hadn't changed
 in months when the detection first appeared.
 
 If it happens, add a Defender exclusion for the folder you run the relay from.
@@ -502,8 +502,7 @@ Work on branches, not yet merged to `dev`:
 
 # Building
 
-Clone the repo, open `samples/NvFBC/NvFBCR/NvFBCR_2013.vcxproj` in VS2022, and
-build. CI builds when you start it from the Actions tab
+Clone the repo, open `NvFBCR.sln` in Visual Studio 2026, and build. CI builds when you start it from the Actions tab
 (`.github/workflows/dev-build.yml`), and the artifact from a green run is
 usually easier than building locally. Pushing a `v*` tag builds and publishes a
 release (`.github/workflows/release.yml`).
@@ -642,13 +641,11 @@ Blakley's work. His commits are in the history.
 
 # License
 
-The code in `samples/NvFBC/NvFBCR/`, `samples/NvFBC/NvFBCEnable/` and
-`samples/Common/` is MIT, see `LICENSE`. The one exception is `NvFBCR.cpp`,
-which still holds code from the original relay. That project shipped without a
-license, so those lines carry no grant and the file sits outside the MIT scope
-until Collin agrees to relicense.
+The code in `src/`, `tools/` and `tests/` is MIT, see `LICENSE`. The one
+exception is `NvFBCR.cpp`, which still holds code from the original relay. That
+project shipped without a license, so those lines carry no grant and the file
+sits outside the MIT scope until Collin agrees to relicense.
 
-This repo started as the NvFBC sample from the NVIDIA Capture SDK and still
-has the SDK's layout. The two NVIDIA optical flow headers in
-`third_party/NvOFSDK/` keep their own MIT notice. `THIRD-PARTY.md` lists
-exactly what came from where.
+This repo started as the NvFBC sample from the NVIDIA Capture SDK. The two
+NVIDIA optical flow headers in `third_party/nvof/` keep their own MIT notice.
+`THIRD-PARTY.md` lists exactly what came from where.
