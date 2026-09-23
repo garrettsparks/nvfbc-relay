@@ -2,8 +2,7 @@
 
 #include <windows.h>
 #include <d3d9.h>
-#include <NvFBC/nvFBC.h>
-#include <NvFBC/NvFBCToDx9vid.h>
+#include <NvFBCApi.h>
 
 // Abstract interface for frame capture modes
 class IFrameCaptureMode {

@@ -9,7 +9,7 @@
 #include <string.h>
 #include <string>
 
-#include "NvFBC/nvFBC.h"
+#include "NvFBCApi.h"
 #include "SimpleLogger.h"
 
 #ifndef _WIN64

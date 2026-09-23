@@ -13,7 +13,7 @@
 #include <iostream>
 #include <string>
 #include "NvFBCLoader.h"
-#include "NvFBC/nvFBC.h"
+#include "NvFBCApi.h"
 #include "AdminCheck.h"
 
 using namespace std;

@@ -48,7 +48,7 @@
 
 #include <NvFBCLoader.h>
 #include <SimpleLogger.h>
-#include <NvFBC/NvFBCToDx9vid.h>
+#include <NvFBCApi.h>
 #include <AdminCheck.h>
 
 #include "IFrameCaptureMode.h"
