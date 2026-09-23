@@ -18,7 +18,7 @@ jobs:
         ./policytests
 
   build:
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
 
     steps:
     - name: Checkout code
@@ -28,7 +28,7 @@ jobs:
       uses: microsoft/setup-msbuild@v3
 
     - name: Build Solution
-      run: msbuild NvFBCR.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+      run: msbuild NvFBCR.sln /p:Configuration=Release /p:Platform=x64
 
     - name: Upload build artifact
       uses: actions/upload-artifact@v6
