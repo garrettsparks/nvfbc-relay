@@ -53,6 +53,16 @@ gm_60x2_gameplay_0917_1.trace
 # follow from this capture timeline itself. Why this timeline releases so much more often is
 # still unexplained, which is the reason to gate on it.
 gm_60x2_gameplay_0922.trace
+# The same game and present path, two short local recordings from 2026-09-23 kept for the LOCK
+# WRAP: the pull is held in [0, comb) with a band of comb/16 either side, and a pull that wanders
+# across the band's edge wraps a whole comb, which re-presents one frame (wrapping up) or skips
+# one (wrapping down). On these captures the pull sat about 1 ms from the wrap point for minutes
+# and wrapped back and forth, a repeat and a skip that cancel, each proven in the recording at
+# frame precision. max_pull_wraps pins today's count, so a fix passes by lowering it. The first
+# carries wraps and nothing else; the second adds a game hitch that releases the lock into a
+# 118-present blend run.
+kcd_60x2_lockwrap_0923.trace
+kcd_60x2_lockwrap_hitch_0923.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions

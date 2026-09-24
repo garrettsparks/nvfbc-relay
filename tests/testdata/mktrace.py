@@ -51,6 +51,11 @@ SRC  = re.compile(r"Resolved options: src rate hint ([\d.]+) fps")
 # the part of a source period it adds moves the lock's pull, so a replay without it runs a
 # relay whose pull wraps at different moments from the one that made the capture.
 LAG  = re.compile(r"Resolved options: .*\bextra lag (\d+) ms")
+# The comb modulus the lock runs, and the pull it reports on every temporal line. A pull that
+# moves by more than half the modulus in one present has wrapped, which re-presents a frame or
+# skips one; the test counts the same thing in the replay.
+MOD  = re.compile(r"Phase comb lock ACTIVE .*\bmodulus (\d+) us")
+PULL = re.compile(r"\bpull=(-?\d+)us")
 # The capture loop's startup line announcing that a grab which waits out NvFBC's timeout
 # stores nothing. A log without it came from a loop that stored the timeout's re-delivered
 # picture as a new frame, and the fixture says so, so the replay can remove those wakes.
@@ -84,6 +89,8 @@ def main():
     have_lag = True
     src_hint = 0.0
     extra_lag_ms = 0
+    comb = 0
+    pulls = []
     skips_copies = False
     for line in open(src, errors="replace"):
         if not skips_copies and SKIPS_COPIES in line:
@@ -101,12 +108,18 @@ def main():
             if m:
                 extra_lag_ms = int(m.group(1))
             continue
+        m = MOD.search(line)
+        if m:
+            comb = int(m.group(1))
+            continue
         m = PRE.search(line)
         if m:
             v = int(m.group(1))
             if keep(v):
                 pres.append(v)
                 synth.append("op=synth" in line)
+                m = PULL.search(line)
+                pulls.append(int(m.group(1)) if m else 0)
             continue
         m = FLIP.search(line)
         if m and m.group(4) == "0":
@@ -135,6 +148,10 @@ def main():
             run = 0
     if run >= 50: longRuns += 1
     pct = 100.0 * nsynth / max(1, len(synth) - WARMUP)
+    wraps = -1
+    if comb > 0:
+        wraps = sum(1 for i in range(max(1, WARMUP), len(pulls))
+                    if abs(pulls[i] - pulls[i - 1]) > comb // 2)
 
     def enc(v):
         return " ".join([str(v[0])] + [str(v[i] - v[i-1]) for i in range(1, len(v))])
@@ -148,6 +165,8 @@ def main():
         f.write(f"field_worst_run {worst}\n")
         f.write(f"field_long_runs {longRuns}\n")
         f.write(f"field_synth_pct {pct:.1f}\n")
+        if wraps >= 0:
+            f.write(f"field_pull_wraps {wraps}\n")
         if src_hint > 0:
             f.write(f"src_hint {src_hint:.1f}\n")
         if extra_lag_ms > 0:
@@ -169,7 +188,8 @@ def main():
           f"{len(flips)} head-0 flips{'' if have_lag and flips else ' (no lag= in log)'}, "
           f"{os.path.getsize(out)/1e6:.2f} MB")
     print(f"  field behaviour past warmup {WARMUP}: synth {pct:.1f}%, "
-          f"runs>=50 {longRuns}, worst {worst}")
+          f"runs>=50 {longRuns}, worst {worst}"
+          f"{f', pull wraps {wraps}' if wraps >= 0 else ''}")
     if not skips_copies:
         print("  capture loop stored grab-timeout copies: wrote regrab_copies 1")
     return 0

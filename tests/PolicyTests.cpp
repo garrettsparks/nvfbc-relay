@@ -2123,6 +2123,12 @@ struct TraceFixture {
     int fieldWorstRun = -1;
     int fieldLongRuns = -1;
     double fieldSynthPct = -1.0;
+    // Presents where the lock's pull moved by more than half the comb: a wrap past the
+    // hysteresis band, which re-presents one frame or skips one, or a re-seed that far. The
+    // field count comes from the log's pull= values, so the two are measured the same way.
+    // The bound is optional: -1 leaves a fixture ungated on it.
+    int fieldPullWraps = -1;
+    int maxPullWraps = -1;
     // Pairing gates, overridable per fixture because the defaults encode the x2 walks:
     // 98% placed assumes the flip grid never pauses, but with frame generation OFF a
     // stalled game stops presenting and the grid stops WITH it, so its transition batches
@@ -2177,6 +2183,10 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         else if (std::strcmp(tag, "field_worst_run") == 0) { num(&n); out->fieldWorstRun = (int)n; }
         else if (std::strcmp(tag, "field_long_runs") == 0) { num(&n); out->fieldLongRuns = (int)n; }
         else if (std::strcmp(tag, "field_synth_pct") == 0) { dbl(&out->fieldSynthPct); }
+        else if (std::strcmp(tag, "field_pull_wraps") == 0) {
+            num(&n); out->fieldPullWraps = (int)n;
+        }
+        else if (std::strcmp(tag, "max_pull_wraps") == 0)   { num(&n); out->maxPullWraps = (int)n; }
         else if (std::strcmp(tag, "src_hint") == 0)         { dbl(&out->srcHint); }
         else if (std::strcmp(tag, "extra_lag_ms") == 0)     { num(&n); out->extraLagMs = (int)n; }
         else if (std::strcmp(tag, "rotation_inert") == 0)   { num(&n); out->rotationInert = n != 0; }
@@ -2644,6 +2654,13 @@ static void test_replay_capture_corpus() {
         if (run >= 50) longRuns++;
         for (size_t i = kWarmup; i < r.snapped.size(); i++) if (r.snapped[i]) reseeds++;
         const double synthPct = 100.0 * synth / (double)(r.ops.size() - kWarmup);
+        // Counted from the pull after each present, the same series the log prints as pull=,
+        // so a stall re-seed that moves the phase that far counts here as it does in the field.
+        int pullWraps = 0;
+        for (size_t i = kWarmup; i < r.pull.size(); i++) {
+            const int64_t d = r.pull[i] - r.pull[i - 1];
+            if (d > p.combQpc / 2 || -d > p.combQpc / 2) pullWraps++;
+        }
 
         // The fixture's own time window, printed because every wrong verdict this project has
         // reached came from comparing two populations windowed differently. Twice it was a
@@ -2657,17 +2674,20 @@ static void test_replay_capture_corpus() {
         const double spanEnd = fx.presents.empty() ? 0.0 : fx.presents.back() / 1e6;
         std::printf("  corpus [%s]\n"
                     "    window: log t %.1fs..%.1fs (%.1f min, %zu presents)\n"
-                    "    replay: synth %.1f%%, runs>=50 %d, worst %d, re-seeds %d\n",
+                    "    replay: synth %.1f%%, runs>=50 %d, worst %d, re-seeds %d, "
+                    "pull wraps %d\n",
                     fx.description.empty() ? path.c_str() : fx.description.c_str(),
                     spanStart, spanEnd, (spanEnd - spanStart) / 60.0, fx.presents.size(),
-                    synthPct, longRuns, worst, reseeds);
+                    synthPct, longRuns, worst, reseeds, pullWraps);
         if (fx.regrabCopies) {
             std::printf("    grab-timeout copies removed before replay: %d\n",
                         fx.regrabCopiesDropped);
         }
         if (fx.fieldWorstRun >= 0) {
-            std::printf("    field : synth %.1f%%, runs>=50 %d, worst %d\n",
+            std::printf("    field : synth %.1f%%, runs>=50 %d, worst %d",
                         fx.fieldSynthPct, fx.fieldLongRuns, fx.fieldWorstRun);
+            if (fx.fieldPullWraps >= 0) std::printf(", pull wraps %d", fx.fieldPullWraps);
+            std::printf("\n");
         }
 
         if (fx.maxWorstRun < 0) {
@@ -2677,8 +2697,10 @@ static void test_replay_capture_corpus() {
                   "this capture exercises, and bounds would be theatre. If they agree, "
                   "paste:\n"
                   "        max_worst_run %d\n        max_long_runs %d\n"
-                  "        max_synth_pct %.1f\n        min_reseeds %d",
-                  path.c_str(), worst, longRuns, synthPct + 0.4, (int)(reseeds * 0.97));
+                  "        max_synth_pct %.1f\n        min_reseeds %d\n"
+                  "        max_pull_wraps %d",
+                  path.c_str(), worst, longRuns, synthPct + 0.4, (int)(reseeds * 0.97),
+                  pullWraps);
             continue;
         }
 
@@ -2708,6 +2730,12 @@ static void test_replay_capture_corpus() {
               "[%s] re-seeds fell to %d (bound %d): a suppressed re-seed means a stall "
               "recovers by slew instead of snapping",
               fx.description.c_str(), reseeds, fx.minReseeds);
+        if (fx.maxPullWraps >= 0) {
+            CHECK(pullWraps <= fx.maxPullWraps,
+                  "[%s] pull wraps grew to %d (bound %d): each one re-presents a frame or "
+                  "skips one",
+                  fx.description.c_str(), pullWraps, fx.maxPullWraps);
+        }
 
         // STAGE 6 GATE: replay the same capture with delivery-lateness correction armed.
         // The design constraint is DO NO HARM on a steady capture: on-time batches are
