@@ -32,7 +32,8 @@ reinstall the NVIDIA driver.
 
 The exe asks for administrator rights when it starts. Enabling NvFBC on a
 machine where it is off needs them, and so does reading frame timing from the
-graphics driver, which the relay does by default.
+graphics driver, which the relay does by default. `NvFBCEnable.exe`, the tool
+that turns NvFBC on and off, asks for them too.
 
 ## Windows Defender
 
