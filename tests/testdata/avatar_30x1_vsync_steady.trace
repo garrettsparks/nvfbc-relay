@@ -8,6 +8,7 @@ field_worst_run 1
 field_long_runs 0
 field_synth_pct 50.0
 src_hint 30.0
+extra_lag_ms 75
 # Replay 50.0% / runs 0 / worst 1 / re-seeds 0 against field 50.0% / runs 0 / worst 1: exact,
 # and the worst run of ONE is the whole claim. A synth run of two here means the alternation
 # broke, so the bound is as tight as it can be. The replay only agrees when it is told the

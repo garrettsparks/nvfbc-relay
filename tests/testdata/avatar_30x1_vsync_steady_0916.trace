@@ -8,6 +8,7 @@ field_worst_run 1
 field_long_runs 0
 field_synth_pct 50.0
 src_hint 30.0
+extra_lag_ms 75
 # Replay 50.0% / worst 1 against field 50.0% / worst 1 over 1651 presents: exact. The 2:1 case
 # doing the lock's real work, one real frame alternating with one w=0.5 midpoint blend for the
 # whole test. max_worst_run 1 is the alternation itself: two blends in a row means the pull

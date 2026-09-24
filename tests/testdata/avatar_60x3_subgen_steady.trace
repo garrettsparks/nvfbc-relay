@@ -8,6 +8,7 @@ field_worst_run 1
 field_long_runs 0
 field_synth_pct 0.3
 src_hint 60.0
+extra_lag_ms 75
 # rotation_inert: 0 of 1319 batches decided, by design; see avatar_60x3_vsync_steady for the
 # member measurement this rests on. The members here carry the change map (-subgen implies it),
 # and it is where the 84% duplicate / 16% distinct split of the later member was read.

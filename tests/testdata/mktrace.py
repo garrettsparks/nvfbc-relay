@@ -47,6 +47,10 @@ FLIP = re.compile(r"flip disp=(-?\d+)us evt=(-?\d+)us(?: lag=(-?\d+)us)? head=(\
 # or it models a different relay: at 30 fps the stall span of a 60-declared replay sits
 # exactly on the source period and re-seeds on half the brackets the field never blinked at.
 SRC  = re.compile(r"Resolved options: src rate hint ([\d.]+) fps")
+# The -lag the relay ran with, on the same line. It sizes the bracketing lag and the ring, and
+# the part of a source period it adds moves the lock's pull, so a replay without it runs a
+# relay whose pull wraps at different moments from the one that made the capture.
+LAG  = re.compile(r"Resolved options: .*\bextra lag (\d+) ms")
 # The capture loop's startup line announcing that a grab which waits out NvFBC's timeout
 # stores nothing. A log without it came from a loop that stored the timeout's re-delivered
 # picture as a new frame, and the fixture says so, so the replay can remove those wakes.
@@ -79,6 +83,7 @@ def main():
     flips, delays = [], []
     have_lag = True
     src_hint = 0.0
+    extra_lag_ms = 0
     skips_copies = False
     for line in open(src, errors="replace"):
         if not skips_copies and SKIPS_COPIES in line:
@@ -92,6 +97,9 @@ def main():
         m = SRC.search(line)
         if m:
             src_hint = float(m.group(1))
+            m = LAG.search(line)
+            if m:
+                extra_lag_ms = int(m.group(1))
             continue
         m = PRE.search(line)
         if m:
@@ -142,6 +150,8 @@ def main():
         f.write(f"field_synth_pct {pct:.1f}\n")
         if src_hint > 0:
             f.write(f"src_hint {src_hint:.1f}\n")
+        if extra_lag_ms > 0:
+            f.write(f"extra_lag_ms {extra_lag_ms}\n")
         if not skips_copies:
             f.write("# Recorded by a capture loop that stored the grab timeout's re-delivered picture as a new\n")
             f.write("# frame; the loader removes those wakes so the replay runs the loop that skips them.\n")

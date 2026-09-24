@@ -8,6 +8,7 @@ field_worst_run 3
 field_long_runs 0
 field_synth_pct 49.9
 src_hint 30.0
+extra_lag_ms 75
 # Replay 49.9% / runs 0 / worst 3 / re-seeds 0 against field 49.9% / runs 0 / worst 3: exact on
 # every field across five minutes and eight fades, where frame generation switches off and
 # the arrivals drop from pairs to singletons under the lock. The worst run of three is the

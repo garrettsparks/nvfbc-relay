@@ -8,13 +8,17 @@ field_worst_run 42
 field_long_runs 0
 field_synth_pct 44.8
 src_hint 60.0
-# Replay 44.8% / runs 0 / worst 39 against field 44.8% / runs 0 / worst 42: an exact match on
-# the synth share over five minutes, the closest agreement in the corpus. Read it beside
+extra_lag_ms 75
+# Replay 44.7% / runs 0 / worst 42 against field 44.8% / runs 0 / worst 42, and the dejitter
+# arm, which is how the relay ran, reads 44.8% / worst 42: an exact match over five minutes.
+# Until 2026-09-23 the replay ran without the 75 ms of extra lag this capture was made with and
+# read 44.8% / runs 0 / worst 39 / re-seeds 5; the numbers here and the bounds are at the
+# capture's lag. Read it beside
 # avatar_59x1_vsync_bench, which is the same source and content one flag apart and lands at
 # 44.3%: the pair pins that a 1.7% -src error is worth half a point of synth and nothing else
 # the model can see. A change that makes the policy genuinely sensitive to the declared rate
 # separates these two.
-max_worst_run 39
+max_worst_run 42
 max_long_runs 0
 max_synth_pct 45.2
 min_reseeds 4

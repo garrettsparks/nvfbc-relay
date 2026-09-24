@@ -8,6 +8,7 @@ field_worst_run 1
 field_long_runs 0
 field_synth_pct 50.0
 src_hint 30.0
+extra_lag_ms 75
 # Replay 50.0% / runs 0 / worst 1 / re-seeds 0 against field 50.0% / runs 0 / worst 1: exact,
 # the same numbers as the FG-off 30 fps steady fixture, which is the claim. A worst run of two
 # means the alternation broke; a synth share off 50 means a retracted member reached a bracket.

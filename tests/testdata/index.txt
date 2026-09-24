@@ -38,7 +38,8 @@ gm_60x2_gameplay_hour.trace
 gm_60x2_gameplay_0917.trace
 # The same content and present path again, 90 minutes of it, captured AFTER that rule was
 # reverted: the only Get Medieval fixture running the policy the tree ships, so its field and
-# replay lines are comparable and agree (8 long runs each, worst 63 against 62). It is the
+# replay lines are comparable and agree (on the dejitter arm, which is how it ran, 8 long runs
+# each and worst 62 against 62). It is the
 # fidelity anchor for b:vsync gameplay and the widest sample of the residual blend-zone class,
 # which is why it earns its 12 MB. Its header explains both.
 gm_60x2_gameplay_0917_1.trace
@@ -217,8 +218,9 @@ avatar_60x3_subgen_bench.trace
 # per-test step deviation from the ideal is 0.8 to 1.8 ms rms. The capture this pair replaced
 # ran the present-period floor (4166 us, widened to 5166 by the hysteresis band against a
 # midpoint 5555 us from either neighbour) and passed 41% of midpoints through it, each pass a
-# 22 ms then 11 ms content step; it replayed at 29.1 and 26.7 percent synth against 49.0 and
-# 48.4 here, with lock engagement at 88% on both, so the difference is the gate alone. A
+# 22 ms then 11 ms content step; it replayed at 29.1 and 26.7 percent synth against 49.8 and
+# 48.4 here (49.0 and 48.4 before these replays ran the capture's extra lag), with lock
+# engagement at 88% on both, so the difference is the gate alone. A
 # min_synth_pct floor on each fixture fails if midpoints start passing again.
 avatar_90x1_vsync_steady.trace
 avatar_90x1_vsync_bench.trace
@@ -249,6 +251,6 @@ avatar_90x2_vsync_bench.trace
 # on a source too different to compare. Read as a record of the observer effect, not as a
 # substitution result. Declared 90, the pair takes the shared threshold rule like every other
 # -src 90 row: the replay went from 26.6 and 24.6 to 52.7 and 51.1 percent synth with the comb
-# and the re-seed counts unchanged.
+# and the re-seed counts unchanged (54.6 and 52.7 once the replay ran the capture's extra lag).
 avatar_90x2_subgen_steady.trace
 avatar_90x2_subgen_bench.trace

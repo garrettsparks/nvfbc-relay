@@ -53,13 +53,14 @@ static const int64_t kSlewUs = 25;
 // 8 us in the field, so the suite could not see the field's real null gate at all.
 static const int64_t kVoteMinSeparationUs = 80;
 
-// The ring depth the CORPUS FIXTURES were captured under - deliberately NOT mirroring the
-// shipping depth: every fixture's field numbers came from ring-8 builds, and the replay
-// must model the relay that produced them. It is the DEFAULT for SimParams::ringSlots, not
-// a global: the shipping relay allocates 16 and sizes up to 32 when the lag asks for it, so
-// a suite that could only run 8 would never exercise the depth the daily driver uses.
-// Fixtures captured on deeper builds would warrant revisiting this default.
+// The ring depth the older CORPUS FIXTURES were captured under - deliberately NOT mirroring
+// the shipping depth: their field numbers came from ring-8 builds, and the replay must model
+// the relay that produced them. It is the DEFAULT for SimParams::ringSlots, not a global.
+// A fixture captured with extra lag says so (extra_lag_ms), and the corpus replays it at the
+// depth the relay sized for that lag, between the two shipping bounds below.
 static const int kRingSlots = 8;
+static const int kShipRingMin = 16;   // CaptureRing's kDefaultRingSlots
+static const int kShipRingMax = 32;   // CaptureRing's RING_SIZE
 
 // Deterministic LCG so every run exercises identical timelines. Every suite RESEEDS it
 // (SeedRng, called from Simulate and from the suites that draw directly), so suites are
@@ -161,6 +162,10 @@ struct SimParams {
     // Slots the ring searches. Defaults to the corpus depth so every pinned census is
     // unmoved; set it to run a timeline at the depth a given configuration ships with.
     int ringSlots = kRingSlots;
+    // Bracketing lag added on top of the rate-sized lag, as -lag adds it. Leaves the comb
+    // decisions nearly unchanged, since the lock absorbs whole source periods, but whatever
+    // is left over moves the pull by that much, and with it every moment the pull wraps.
+    int64_t extraLag = 0;
     // Disable the composite tooth guard (production arms it whenever the comb is on and
     // the source is at or above the SINK rate). Only for differential tests that
     // reproduce the pre-guard decision rule.
@@ -192,6 +197,7 @@ static SimResult Simulate(const SimParams& p) {
 
     int64_t lag = p.srcPeriod + p.srcPeriod / 4;
     if (lag < p.presentPeriod) lag = p.presentPeriod;
+    lag += p.extraLag;
     if (p.lagOverride > 0) lag = p.lagOverride;   // a mis-declared source rate, in effect
 
     // Pre-generate arrivals covering the whole run. Drops are filtered after
@@ -2103,6 +2109,10 @@ struct TraceFixture {
     // and passthrough threshold by production's rules; absent (0) means a 60 fps source,
     // which every fixture recorded before the field existed was.
     double srcHint = 0.0;
+    // The -lag the relay ran with, in ms. Added to the replay's bracketing lag and used to
+    // size its ring the way the relay does; absent (0) means no extra lag and the ring-8
+    // depth, which every fixture recorded before the field existed was.
+    int extraLagMs = 0;
     // An x3 capture on which the rotation vote must REFUSE rather than decide. Smooth
     // Motion x3 rotates a real member through the batch and the vote has to find it; DLSS
     // frame generation delivers members the capture cannot tell apart, so there is no
@@ -2168,6 +2178,7 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         else if (std::strcmp(tag, "field_long_runs") == 0) { num(&n); out->fieldLongRuns = (int)n; }
         else if (std::strcmp(tag, "field_synth_pct") == 0) { dbl(&out->fieldSynthPct); }
         else if (std::strcmp(tag, "src_hint") == 0)         { dbl(&out->srcHint); }
+        else if (std::strcmp(tag, "extra_lag_ms") == 0)     { num(&n); out->extraLagMs = (int)n; }
         else if (std::strcmp(tag, "rotation_inert") == 0)   { num(&n); out->rotationInert = n != 0; }
         else if (std::strcmp(tag, "regrab_copies") == 0)    { num(&n); out->regrabCopies = n != 0; }
         else if (std::strcmp(tag, "min_placed_pct") == 0)  { num(&n); out->minPlacedPct = (int)n; }
@@ -2591,6 +2602,20 @@ static void test_replay_capture_corpus() {
             std::printf("    declared -src %.1f: period %lld us, comb %lld us (M=%d), "
                         "threshold %lld us\n", fx.srcHint, (long long)p.srcPeriod,
                         (long long)p.combQpc, combM, (long long)p.passthroughQpc);
+        }
+        if (fx.extraLagMs > 0) {
+            // Size the lag and the ring the way TemporalCaptureMode does under -lag, so the
+            // replay runs the relay that made the capture. The lock absorbs the whole source
+            // periods of an extra lag, which is how replaying without it went unnoticed, but
+            // the part of a period left over moves the pull by that much (half a period for
+            // 75 ms on a 60 fps source), and with it every moment the pull wraps.
+            p.extraLag = (int64_t)fx.extraLagMs * 1000;
+            int64_t baseLag = p.srcPeriod + p.srcPeriod / 4;   // LagForSourcePeriod
+            if (baseLag < p.presentPeriod) baseLag = p.presentPeriod;
+            p.ringSlots = policy::RingSlotsForLag(baseLag + p.extraLag, p.srcPeriod,
+                                                  kShipRingMin, kShipRingMax);
+            std::printf("    extra lag %d ms: bracketing lag %lld us, ring %d slots\n",
+                        fx.extraLagMs, (long long)(baseLag + p.extraLag), p.ringSlots);
         }
         // Guard deliberately ARMED (production's rule) even though every fixture predates
         // it: at a present clock matching the source rate the target advances a full
@@ -3141,7 +3166,7 @@ static void test_ring_underrun_graceful() {
 // function it lived inside TemporalCaptureMode::Setup, a Windows-only translation unit, so
 // the rule that decides whether the relay runs 16 slots or 32 could not be tested at all.
 static void test_ring_slots_for_lag() {
-    const int kMin = 16, kMax = 32;              // CaptureRing's kDefaultRingSlots, RING_SIZE
+    const int kMin = kShipRingMin, kMax = kShipRingMax;
     const int64_t src60 = 16667;
     const int64_t baseLag60 = src60 + src60 / 4; // LagForSourcePeriod: 1.25 source periods
 

@@ -8,6 +8,7 @@ field_worst_run 3
 field_long_runs 0
 field_synth_pct 49.9
 src_hint 30.0
+extra_lag_ms 75
 # Replay 49.9% / runs 0 / worst 3 / re-seeds 0 against field 49.9% / runs 0 / worst 3: exact on
 # every field across five minutes and eight fades. The worst run of three is the lock
 # re-acquiring after a fade, and it is the same three in the model and the relay.

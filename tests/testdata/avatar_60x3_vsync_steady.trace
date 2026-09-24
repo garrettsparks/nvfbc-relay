@@ -8,6 +8,7 @@ field_worst_run 0
 field_long_runs 0
 field_synth_pct 0.0
 src_hint 60.0
+extra_lag_ms 75
 # rotation_inert: the vote decided 0 of 1439 batches here, and that is the right answer. This
 # is DLSS frame generation, not Smooth Motion. The x3 subgen row measured the members: the
 # later member of a two-member batch is a duplicate of the first on 84% of batches and a

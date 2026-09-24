@@ -8,6 +8,7 @@ field_worst_run 0
 field_long_runs 0
 field_synth_pct 0.0
 src_hint 60.0
+extra_lag_ms 75
 # Replay 0.1% / worst 1 against field 0.0% / worst 0 over 1686 presents. The happy-path gate on
 # the shipping capture loop: the field passed every present of this window through sharp, so any
 # change that blends here at all is visible immediately and the bound has almost no room in it.
