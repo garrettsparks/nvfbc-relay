@@ -17,12 +17,6 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v5
 
-    - name: Create source archive with submodules
-      run: |
-        $tag = $env:GITHUB_REF -replace 'refs/tags/', ''
-        Compress-Archive -Path * -DestinationPath nvfbc-relay-$tag.zip -Force
-      shell: pwsh
-
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v3
 
@@ -40,8 +34,8 @@ jobs:
       uses: softprops/action-gh-release@v3
       with:
         files: |
-          build/Release/x64/*.exe
-          nvfbc-relay-*.zip
+          build/Release/x64/NvFBCR.exe
+          build/Release/x64/NvFBCEnable.exe
         draft: false
         prerelease: false
       env:
