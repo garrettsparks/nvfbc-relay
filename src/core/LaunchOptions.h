@@ -113,8 +113,8 @@ inline const std::vector<UsageRow>& OptionRows() {
          true, false},
         {"-nolock", "", "Turn the phase comb lock off (on by default)", false, false},
         {"-lag", "75", "Extra delay in ms added to the relayed video (0-200, default 75). More "
-                       "delay means fewer repeated frames. The player never feels it. The stream "
-                       "just runs slightly later.", true, false},
+                       "delay means fewer repeated frames. Only the relayed video is delayed, so "
+                       "the player won't notice it.", true, false},
         {"-noetw", "", "Do not read the display driver's scanout times (read by default; -dejit "
                        "needs them)", false, false},
         {"-nodejit", "", "Do not re-stamp late-delivered capture batches onto the flip grid (on by "
@@ -147,7 +147,7 @@ inline const std::vector<UsageRow>& OptionRows() {
 inline const std::vector<UsageRow>& ModeRows() {
     static const std::vector<UsageRow> rows = {
         {"b, b:vsync", "", "Blend compositor on a D3D11 flip-model swapchain, presented on the "
-                           "SINK's vblank (the default: a blank answer selects it)", true, false},
+                           "SINK's vblank (the default: press Enter to select it)", true, false},
         {"b:dwm, b:60", "", "The same blend compositor on the D3D9 swapchain: DWM's compose clock "
                             "(b:dwm) or a timer at the given fps", true, false},
         {"t, t:vsync", "", "Temporal frame selection, presented on vsync (DWM compose clock)",

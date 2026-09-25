@@ -1,8 +1,8 @@
 # Third-party material
 
 This project started as the NvFBC sample from the NVIDIA Capture SDK. The files
-listed below are NVIDIA's, not ours, and the MIT license in `LICENSE` does not
-cover them.
+listed below are NVIDIA's. Each carries NVIDIA's own license notice, and
+`LICENSE` doesn't apply to them.
 
 ## Inventory
 
