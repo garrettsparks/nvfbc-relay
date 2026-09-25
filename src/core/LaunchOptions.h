@@ -137,6 +137,8 @@ inline const std::vector<UsageRow>& OptionRows() {
         {"-source", "0", "Capture display index, for a launch without the prompts", false, true},
         {"-target", "1", "Output display index, for a launch without the prompts", false, true},
         {"-framerate", "b:vsync", "Capture mode, for a launch without the prompts", false, true},
+        {"-relaunched", "", "Added by the relay to the process it starts after turning NvFBC on",
+         false, true},
     };
     return rows;
 }
@@ -278,11 +280,13 @@ struct CommandLine {
     bool foundAny = false;   // at least one token was recognized
     bool hasSource = false;  // -source was given with a number
     bool hasTarget = false;  // -target was given with a number
+    bool relaunched = false; // -relaunched: this process was started by the relay itself
 };
 
-// Parses a whole command line: -source, -target and -framerate here, every other token through
-// ApplyOption. Each rejected value appends what was wrong to *warnings, and each token nothing
-// took goes to *unknown. An index that is not a number is reported and left as it was.
+// Parses a whole command line: -source, -target, -framerate and -relaunched here, every other
+// token through ApplyOption. Each rejected value appends what was wrong to *warnings, and each
+// token nothing took goes to *unknown. An index that is not a number is reported and left as it
+// was.
 inline CommandLine ParseCommandLine(const std::vector<std::string>& args, Options* o,
                                     std::vector<std::string>* warnings,
                                     std::vector<std::string>* unknown = NULL) {
@@ -305,6 +309,9 @@ inline CommandLine ParseCommandLine(const std::vector<std::string>& args, Option
             c.mode = args[i + 1];
             c.foundAny = true;
             i++;
+        } else if (t == "-relaunched") {
+            c.relaunched = true;
+            c.foundAny = true;
         } else {
             std::string w;
             const size_t consumed = ApplyOption(args, i, o, &w);
@@ -329,6 +336,13 @@ inline std::string FormatFps(float fps) {
         if (std::strtof(text, NULL) == fps) break;
     }
     return text;
+}
+
+// Whether a command line carries -relaunched. The relay reads this before anything else,
+// because a relaunched process continues its parent's log instead of starting a new one.
+inline bool IsRelaunch(const std::vector<std::string>& args) {
+    Options ignored;
+    return ParseCommandLine(args, &ignored, NULL).relaunched;
 }
 
 // The option tokens that rebuild *o when parsed over the defaults, so a relaunch runs with the
@@ -359,6 +373,18 @@ inline std::string FormatOptions(const Options& o) {
     if (o.phaseKeep) add("-phasekeep");
     if (o.flipEx) add("-flipex");
     return s;
+}
+
+// The whole command line for the process the relay starts after turning NvFBC on: the choice
+// this launch resolved to, with b:vsync for the default mode, marked so the new process knows
+// it is the relaunch.
+inline std::string RelaunchArguments(int source, int target, const std::string& mode,
+                                     const Options& o) {
+    std::string s = "-source " + std::to_string(source) + " -target " + std::to_string(target) +
+                    " -framerate " + (mode.empty() ? std::string("b:vsync") : mode);
+    const std::string options = FormatOptions(o);
+    if (!options.empty()) s += " " + options;
+    return s + " -relaunched";
 }
 
 enum class ModeKind { Invalid, Vsync, Temporal, Diag, Timer };

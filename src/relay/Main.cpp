@@ -238,12 +238,12 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR c
     HANDLE instanceLock = TakeSingleInstanceLock();
     if (!instanceLock) return ExitWithFailure(AlreadyRunning());
 
-    const bool relaunched = GetEnvironmentVariableA(kRelaunchMarker, NULL, 0) > 0;
+    const std::string arguments = commandLine ? commandLine : "";
+    const bool relaunched = launch::IsRelaunch(launch::SplitTokens(arguments));
     if (relaunched) SimpleLogger::ContinueExistingLog();
     LOG("%s", relaunched ? "NvFBCR starting, relaunched after turning on NvFBC"
                          : "NvFBCR starting");
     LogWallClock();
-    const std::string arguments = commandLine ? commandLine : "";
     LOG("Command line: '%s'", arguments.c_str());
 
     Relay r;
@@ -251,11 +251,8 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR c
     Teardown(r, EndingText(r.ending, failure.has_value()));
     if (failure) return ExitWithFailure(*failure);
     if (r.ending == Ending::Relaunch) {
-        std::string relaunch = "-source " + std::to_string(r.choice.source) + " -target " +
-                               std::to_string(r.choice.target) + " -framerate " +
-                               (r.choice.mode.empty() ? std::string("b:vsync") : r.choice.mode);
-        const std::string options = launch::FormatOptions(r.choice.options);
-        if (!options.empty()) relaunch += " " + options;
+        const std::string relaunch = launch::RelaunchArguments(
+            r.choice.source, r.choice.target, r.choice.mode, r.choice.options);
         if (MaybeFailure f = Relaunch(relaunch, &instanceLock)) return ExitWithFailure(*f);
     }
     return 0;

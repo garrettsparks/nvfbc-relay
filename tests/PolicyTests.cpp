@@ -4336,29 +4336,37 @@ static void test_launch_relaunch_round_trip() {
         for (int resolved = 0; resolved < 2; resolved++) {
             launch::Options o = typed;
             if (resolved) launch::ResolveDependencies(&o);
-            const std::string written = launch::FormatOptions(o);
+            const std::string written = launch::RelaunchArguments(0, 1, "", o);
+            const std::vector<std::string> tokens = launch::SplitTokens(written);
             std::vector<std::string> warnings;
             launch::Options back;
-            const launch::CommandLine c = launch::ParseCommandLine(
-                launch::SplitTokens("-source 0 -target 1 -framerate b:vsync " + written), &back,
-                &warnings);
+            const launch::CommandLine c = launch::ParseCommandLine(tokens, &back, &warnings);
             if (resolved) launch::ResolveDependencies(&back);
             CHECK(SameOptions(back, o) && warnings.empty() && c.sourceIndex == 0 &&
-                      c.targetIndex == 1 && c.mode == "b:vsync",
+                      c.targetIndex == 1 && c.mode == "b:vsync" && c.relaunched &&
+                      launch::IsRelaunch(tokens),
                   "'%s' (%s) must survive the relaunch, written as '%s'", text,
                   resolved ? "resolved" : "as typed", written.c_str());
             // The relaunched process runs its command line without the prompts only when
             // the whole line is accepted.
-            const launch::CommandLineCheck check = launch::CheckCommandLine(
-                launch::SplitTokens("-source 0 -target 1 -framerate b:vsync " + written), 2);
+            const launch::CommandLineCheck check = launch::CheckCommandLine(tokens, 2);
             CHECK(check.usable, "'%s' (%s) must be accepted on relaunch, refused with '%s'",
                   text, resolved ? "resolved" : "as typed", check.reason.c_str());
         }
     }
 
-    // A default launch writes nothing, and a rate keeps the spelling it was typed with.
+    // A default launch writes no options, and only the relay's own relaunch reads as one.
     CHECK(launch::FormatOptions(launch::Options()).empty(),
           "a default launch must write no options");
+    CHECK(launch::RelaunchArguments(1, 0, "t:vsync", launch::Options()) ==
+              "-source 1 -target 0 -framerate t:vsync -relaunched",
+          "the relaunch must keep the mode as typed and mark itself, got '%s'",
+          launch::RelaunchArguments(1, 0, "t:vsync", launch::Options()).c_str());
+    CHECK(!launch::IsRelaunch(launch::SplitTokens("-source 0 -target 1 -src 60")) &&
+              !launch::IsRelaunch(launch::SplitTokens("")),
+          "a launch the user typed must not read as a relaunch");
+
+    // A rate keeps the spelling it was typed with.
     CHECK(launch::FormatFps(59.94f) == "59.94" && launch::FormatFps(60.0f) == "60",
           "a typed rate must be written back as typed, got '%s'",
           launch::FormatFps(59.94f).c_str());

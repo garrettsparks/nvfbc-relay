@@ -54,7 +54,6 @@ MaybeFailure Relaunch(const std::string& arguments, HANDLE* instanceLock) {
     // wrote must be on disk first, and it takes the single-instance lock as it starts, so this
     // process lets go of it here. Nothing more is logged unless the start fails, and then there
     // is no new process to collide with.
-    SetEnvironmentVariableA(kRelaunchMarker, "1");
     SimpleLogger::getInstance().flush();
     ReleaseMutex(*instanceLock);
     CloseHandle(*instanceLock);

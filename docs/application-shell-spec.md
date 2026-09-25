@@ -243,12 +243,18 @@ Behavior unchanged from today; only the structure is new.
   popup. On success, relaunch:
   - tear down what exists (the Direct3D object and the library);
   - build the command line from the resolved choice: `"<exe>" -source <n> -target <n>
-    -framerate <mode> <options>`, with `b:vsync` for an empty mode and the options from
-    `launch::FormatOptions`, as today;
-  - log it, flush the log, release the single-instance lock, mark the environment the child
-    inherits (`NVFBCR_RELAUNCHED=1`), start the child, and exit with 0 without logging again;
+    -framerate <mode> <options> -relaunched`, with `b:vsync` for an empty mode and the options
+    from `launch::FormatOptions`, as today, plus the hidden command-line-only flag
+    `-relaunched` (`launch::RelaunchArguments`);
+  - log it, flush the log, release the single-instance lock, start the child, and exit with 0
+    without logging again;
   - a failed start is a failure with its popup.
-- **The relaunched process:** sees the marker, says so on its first log line, and appends to the
+
+  The marker was first an inherited environment variable. The build with it was flagged by
+  Defender as `Trojan:Win32/Sabsik.FL.A!ml` (2026-09-24), and setting an environment variable
+  before starting itself again was the likeliest new feature, so the marker moved onto the
+  command line, which the relaunch already builds.
+- **The relaunched process:** sees `-relaunched`, says so on its first log line, and appends to the
   log instead of truncating it, so one file holds both processes (decision 4). If capture is
   still not possible, it does not relaunch again: that is a failure with its popup. Today nothing
   stops a relaunched process from enabling and relaunching again.
@@ -455,7 +461,7 @@ rebind, the admin manifest, and every per-frame and summary line.
 | 1 | A command line with a problem: start the prompts from the defaults, or carry its valid parts into them? | **Defaults.** The console says what was wrong, and what the user then types is what runs. Carrying parts over means Enter at the mode prompt may not give the default the prompt promises. A shortcut with a retired flag (`-subgen`) now stops at the prompts saying so, where today the flag is skipped. |
 | 2 | Refuse the same display for game and capture card? | **Yes.** The topmost output window would cover the game it captures. |
 | 3 | Re-ask at the mode prompt for an unknown option or a bad value too, not only for an invalid mode? | **Yes.** Today they are printed and ignored, and the console closes before the line can be read. |
-| 4 | Keep the first process's lines when it relaunches (the child appends, marked through an inherited environment variable)? | **Yes.** The marker is needed anyway to stop a second relaunch; appending costs one branch in the logger's open. |
+| 4 | Keep the first process's lines when it relaunches (the child appends, marked by a hidden `-relaunched` flag)? | **Yes.** The marker is needed anyway to stop a second relaunch; appending costs one branch in the logger's open. |
 | 5 | Popups for a run that stops by itself (capture lost, output stalled)? | **Yes.** The output window closes either way; without a popup the relay seems to vanish mid-stream. |
 | 6 | Pass one `RelayContext` to the modes instead of the twelve `extern` globals? | **Yes.** The session gets one owner, which fixes both ring bugs in section 13, and the mode files are being touched for the message pump regardless. The alternative keeps the globals, defined in the new files. |
 | 7 | A UTC wall-clock line at startup, paired with a QPC reading, to align the log with the OBS frame trace's `unix_ns`? | **Yes.** One line; `startupcmp.py` masks it. |
@@ -492,8 +498,8 @@ rebind, the admin manifest, and every per-frame and summary line.
 
 **Checks:** `git blame -w -M -C` over the tree finds no line by CB; the suite output is the
 baseline's 527 lines, byte for byte; CI green on both jobs; the import check against
-`import-baseline-75af577` with every difference explained (expected: the window, environment
-and time calls the new behavior uses); a Defender scan of all three exes; `tagcheck.py` on every
+`import-baseline-75af577` with every difference explained (expected: the console, window and
+time calls the new behavior uses); a Defender scan of all three exes; `tagcheck.py` on every
 run's log.
 
 **Runs** (`NvFBCR.log` present beside the exe unless the row says otherwise):
