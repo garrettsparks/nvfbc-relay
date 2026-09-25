@@ -4,7 +4,7 @@
 #include "FrameMarker.h"
 
 // THE D3D9 PRESENT PATH: the compositor draws onto the D3D9 device's back buffer and
-// PresentEx shows it through the swapchain main created on the output window.
+// PresentEx shows it through the swapchain the shell created on the output window.
 //
 // A windowed INTERVAL_ONE present does not wait on any monitor's vblank: it blocks on DWM's
 // compose clock, whose rate follows whatever the SOURCE display is doing (the base rate
@@ -25,9 +25,9 @@ public:
     D3D9PresentPath(const D3D9PresentPath&) = delete;
     D3D9PresentPath& operator=(const D3D9PresentPath&) = delete;
 
-    bool Setup(IDirect3DDevice9Ex* device, HWND hwnd, CaptureRing* ring, int width,
-               int height, const policy::PolicyConfig* cfg, bool mark,
-               unsigned int markFrames, LARGE_INTEGER baseQpc, LONGLONG freqQpc) override;
+    bool Setup(const RelayContext& ctx, CaptureRing* ring, const policy::PolicyConfig* cfg,
+               bool mark, unsigned int markFrames, LARGE_INTEGER baseQpc,
+               LONGLONG freqQpc) override;
 
     // Nothing to wait on here: the INTERVAL_ONE PresentEx is this path's pacing wait, and
     // Present reports how long it blocked.
@@ -50,15 +50,17 @@ private:
     void SamplePresentStats();
 
     IFrameCompositor* m_compositor;     // owned
-    IDirect3DDevice9Ex* m_device;       // borrowed: the present device main created
+    IDirect3DDevice9Ex* m_device;       // borrowed: the present device the shell created
     HWND m_hwnd;
     bool m_mark;
     FrameMarker m_marker;               // per-present provenance burn-in (inert unless -mark)
 
     // The back buffer of the present in flight: Compose acquires it, BurnMarker draws on
     // it, Present releases it after PresentEx. m_presentTarget is the surface the
-    // compositor actually drew on, which is the cached global when acquisition failed.
+    // compositor actually drew on, which is the shell's cached back buffer when acquisition
+    // failed.
     IDirect3DSurface9* m_backbuffer;
+    IDirect3DSurface9* m_fallbackBackbuffer;   // borrowed: RelayContext::backBuffer
     IDirect3DSurface9* m_presentTarget;
     long long m_presentFailures;
     long long m_backbufferFailures;

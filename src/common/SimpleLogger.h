@@ -22,6 +22,11 @@ public:
     static constexpr const char* LOG_FILENAME = "NvFBCR.log";
     static constexpr int LOCATION_WIDTH = 24; // Width for [filename:line] padding
 
+    // Makes this process's log continue the file instead of truncating it. It takes effect
+    // only before the first line is logged: a relaunched relay calls it first thing, so one
+    // file holds the process that relaunched it and its own.
+    static void ContinueExistingLog() { s_continueLog = true; }
+
     static SimpleLogger& getInstance() {
         static SimpleLogger instance;
         return instance;
@@ -129,18 +134,22 @@ private:
         if (hFind != INVALID_HANDLE_VALUE) {
             FindClose(hFind);
 
-            // Open file using Win32 API, truncating any existing content
+            const bool append = s_continueLog;
             m_fileHandle = CreateFileA(
                 logPath.c_str(),
                 GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 NULL,
-                CREATE_ALWAYS,  // Always create new file, truncating if exists
+                append ? OPEN_EXISTING : CREATE_ALWAYS,
                 FILE_ATTRIBUTE_NORMAL,
                 NULL
             );
 
             if (m_fileHandle != INVALID_HANDLE_VALUE) {
+                if (append) {
+                    LARGE_INTEGER end = {};
+                    SetFilePointerEx(m_fileHandle, end, NULL, FILE_END);
+                }
                 m_enabled = true;
                 m_drainer = std::thread(&SimpleLogger::drainLoop, this);
             }
@@ -197,6 +206,8 @@ private:
 
     SimpleLogger(const SimpleLogger&) = delete;
     SimpleLogger& operator=(const SimpleLogger&) = delete;
+
+    static inline bool s_continueLog = false;
 
     std::mutex m_mutex;                 // producers: serializes slot claim + copy (sub-us hold)
     std::mutex m_ioMutex;               // WriteFile/FlushFileBuffers (drainer + flush only)

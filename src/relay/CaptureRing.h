@@ -6,6 +6,7 @@
 #include <atomic>
 #include <thread>
 
+#include "RelayContext.h"
 #include "TemporalPolicy.h"
 
 // Result of a bracketing query: the captured frames immediately before and after a target
@@ -80,10 +81,14 @@ public:
     // which has the HWND needed for the capture device).
     bool Setup(IDirect3DDevice9Ex* presentDevice, int width, int height);
 
-    // Create the capture device + shared ring, rebind NvFBC to the capture device (releases
-    // the passed-in session and replaces the global), and start the capture thread.
-    bool Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
-               LARGE_INTEGER baseQpc, HWND hwnd);
+    // Create the capture device + shared ring on ctx.deviceWindow, rebind NvFBC to the capture
+    // device, and start the capture thread. The rebind releases ctx.session and clears it:
+    // from then on the ring owns its own session and releases it before its device.
+    bool Start(RelayContext& ctx, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
+               LARGE_INTEGER baseQpc);
+
+    // Whether a failed Start failed because NvFBC would not create the ring's session.
+    bool SessionRefused() const { return m_sessionRefused; }
 
     // Signal and join the capture thread (idempotent).
     void Stop();
@@ -277,7 +282,8 @@ private:
     IDirect3DDevice9Ex* m_presentDevice;
     IDirect3DDevice9Ex* m_capDevice;      // private capture device
     IDirect3DQuery9* m_capSync;           // event query: flush capture writes before publish
-    NvFBCToDx9Vid* m_nvfbc;               // session bound to the capture device
+    NvFBCToDx9Vid* m_nvfbc;               // session bound to the capture device, owned here
+    bool m_sessionRefused = false;
     int m_width;
     int m_height;
     LARGE_INTEGER m_baseQpc;              // logging origin

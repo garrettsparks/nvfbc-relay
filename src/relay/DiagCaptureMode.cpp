@@ -1,12 +1,10 @@
 #include "DiagCaptureMode.h"
+#include "D3D9Setup.h"
+#include "OutputWindow.h"
 #include <SimpleLogger.h>
 #include <dwmapi.h>
 
 #pragma comment(lib, "dwmapi.lib")
-
-// External globals (NvFBCR.cpp)
-extern IDirect3D9Ex* g_pD3DEx;
-extern int g_targetAdapterIndex;
 
 DiagCaptureMode::DiagCaptureMode(bool vsyncPresent)
     : m_vsyncPresent(vsyncPresent)
@@ -27,66 +25,54 @@ UINT DiagCaptureMode::GetPresentationInterval() const {
     return m_vsyncPresent ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
 }
 
-bool DiagCaptureMode::Setup() {
+MaybeFailure DiagCaptureMode::Setup(const RelayContext& /*ctx*/) {
     if (!m_scheduler.Setup(60.0f)) {
-        return false;
+        return ModeCouldNotStart(GetModeName());
     }
     LOG("Diag mode initialized - %s probe, 60Hz",
         m_vsyncPresent ? "INTERVAL_ONE (DWM delivery cadence)" : "QPC-timer/IMMEDIATE (steady)");
-    return true;
+    return std::nullopt;
 }
 
-void DiagCaptureMode::Run(
-    NvFBCToDx9Vid* nvfbcDx9,
-    NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
-    IDirect3DDevice9Ex* device,
-    HWND hwnd)
-{
+MaybeFailure DiagCaptureMode::Run(RelayContext& ctx, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     LARGE_INTEGER baseQpc;
     QueryPerformanceCounter(&baseQpc);
     const double usPerTick = 1000000.0 / (double)m_scheduler.Freq();
+    IDirect3DDevice9Ex* device = ctx.presentDevice;
 
     // Private device on the TARGET adapter, used ONLY for GetRasterStatus reads of the capture
     // card's raster (the main present device sits on the source adapter). Same pattern as
     // CaptureRing's private device: separate device, same window.
     {
-        D3DPRESENT_PARAMETERS d3dpp = {};
-        d3dpp.Windowed = TRUE;
-        d3dpp.BackBufferFormat = D3DFMT_UNKNOWN;
-        d3dpp.BackBufferWidth = 4;
-        d3dpp.BackBufferHeight = 4;
-        d3dpp.BackBufferCount = 1;
-        d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-        d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
-        d3dpp.hDeviceWindow = hwnd;
-        HRESULT hr = g_pD3DEx->CreateDeviceEx(
-            g_targetAdapterIndex, D3DDEVTYPE_HAL, hwnd,
+        D3DPRESENT_PARAMETERS params = WindowedPresentParams(
+            ctx.deviceWindow, 4, 4, D3DFMT_UNKNOWN, 1, D3DSWAPEFFECT_DISCARD,
+            D3DPRESENT_INTERVAL_IMMEDIATE);
+        HRESULT hr = ctx.d3d->CreateDeviceEx(
+            ctx.targetAdapter, D3DDEVTYPE_HAL, ctx.deviceWindow,
             D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
-            &d3dpp, NULL, &m_rasterDevice);
+            &params, NULL, &m_rasterDevice);
         if (FAILED(hr)) {
             // Not fatal — DWM/present probes still run; raster columns log hr only.
-            LOGERR("diag: raster device on target adapter %d failed (0x%08x)", g_targetAdapterIndex, hr);
+            LOGERR("diag: raster device on target adapter %u failed (0x%08x)", ctx.targetAdapter, hr);
             m_rasterDevice = NULL;
         } else {
-            LOG("diag: raster device on target adapter %d (windowed GetRasterStatus probe)", g_targetAdapterIndex);
+            LOG("diag: raster device on target adapter %u (windowed GetRasterStatus probe)", ctx.targetAdapter);
         }
     }
 
-    MSG msg = {};
     LONGLONG lastPresentQpc = 0;
     m_scheduler.Seed();
 
-    while (TRUE)
-    {
+    for (;;) {
         if (!m_vsyncPresent) {
             m_scheduler.WaitUntilDeadline();
         }
 
         // Keep an image flowing (NOWAIT: returns latest immediately, no timing impact).
-        NVFBCRESULT fbcRes = nvfbcDx9->NvFBCToDx9VidGrabFrame(grabParams);
+        NVFBCRESULT fbcRes = ctx.session->NvFBCToDx9VidGrabFrame(grabParams);
         if (fbcRes == NVFBC_ERROR_INVALIDATED_SESSION) {
             LOGERR("NvFBC session invalidated - stopping");
-            break;
+            return CaptureLost("diag mode");
         }
 
         // Present. INTERVAL_ONE variant: the block time IS the measurement (DWM delivery).
@@ -124,12 +110,7 @@ void DiagCaptureMode::Run(
         if (!m_vsyncPresent) {
             m_scheduler.Advance();
         }
-
-        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-        if (msg.message == WM_QUIT) break;
+        if (!PumpMessages()) return std::nullopt;
     }
 }
 

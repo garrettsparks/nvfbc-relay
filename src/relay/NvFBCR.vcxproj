@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -12,34 +12,38 @@
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>18.0</VCProjectVersion>
-    <ProjectGuid>{7FE2BDE8-347F-411F-AF60-45D9B0347C12}</ProjectGuid>
-    <RootNamespace>NvFBCR</RootNamespace>
     <Keyword>Win32Proj</Keyword>
-    <ProjectName>NvFBCR</ProjectName>
+    <ProjectGuid>{cabdb2aa-9392-4eca-a37c-19d470c87f2a}</ProjectGuid>
+    <RootNamespace>NvFBCR</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
-    <CharacterSet>MultiByte</CharacterSet>
-    <WholeProgramOptimization>true</WholeProgramOptimization>
-    <PlatformToolset>v145</PlatformToolset>
-  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
-    <CharacterSet>MultiByte</CharacterSet>
+    <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>MultiByte</CharacterSet>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
-  <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="PropertySheets">
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
-  <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="PropertySheets">
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
-    <_ProjectFileVersion>10.0.40219.1</_ProjectFileVersion>
     <OutDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(ProjectDir)\..\..\build\$(Configuration)\$(Platform)\</OutDir>
     <IntDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(Configuration)\$(Platform)\</IntDir>
     <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</LinkIncremental>
@@ -48,34 +52,23 @@
     <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkIncremental>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <Midl>
-      <TargetEnvironment>X64</TargetEnvironment>
-    </Midl>
     <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <OmitFramePointers>true</OmitFramePointers>
-      <AdditionalIncludeDirectories>../common;../core;../../third_party;%(AdditionalIncludeDirectories);</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_CRT_SECURE_NO_WARNINGS;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <MinimalRebuild>true</MinimalRebuild>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
-      <LanguageStandard>stdcpp17</LanguageStandard>
-      <PrecompiledHeader>
-      </PrecompiledHeader>
-      <WarningLevel>Level3</WarningLevel>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>../common;../core;../../third_party;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>d3dcompiler.lib;dxva2.lib;d3d9.lib;winmm.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(IntDir);</AdditionalLibraryDirectories>
-      <IgnoreSpecificDefaultLibraries>
-      </IgnoreSpecificDefaultLibraries>
-      <GenerateDebugInformation>true</GenerateDebugInformation>
       <SubSystem>Windows</SubSystem>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
-      <RandomizedBaseAddress>false</RandomizedBaseAddress>
-      <DataExecutionPrevention>
-      </DataExecutionPrevention>
-      <TargetMachine>MachineX64</TargetMachine>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>d3dcompiler.lib;dxva2.lib;d3d9.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(IntDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <PreBuildEvent>
       <Command>lib /nologo /machine:x64 /def:"$(ProjectDir)nvofapi64.def" /out:"$(IntDir)nvofapi64.lib"</Command>
@@ -83,35 +76,27 @@
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <Midl>
-      <TargetEnvironment>X64</TargetEnvironment>
-    </Midl>
     <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <OmitFramePointers>false</OmitFramePointers>
       <WholeProgramOptimization>false</WholeProgramOptimization>
-      <AdditionalIncludeDirectories>../common;../core;../../third_party;%(AdditionalIncludeDirectories);</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_CRT_SECURE_NO_WARNINGS;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <LanguageStandard>stdcpp17</LanguageStandard>
-      <PrecompiledHeader>
-      </PrecompiledHeader>
-      <WarningLevel>Level3</WarningLevel>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>../common;../core;../../third_party;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>d3dcompiler.lib;dxva2.lib;d3d9.lib;winmm.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(IntDir);</AdditionalLibraryDirectories>
-      <GenerateDebugInformation>true</GenerateDebugInformation>
-      <GenerateMapFile>true</GenerateMapFile>
       <SubSystem>Windows</SubSystem>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <GenerateMapFile>true</GenerateMapFile>
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
-      <RandomizedBaseAddress>false</RandomizedBaseAddress>
-      <DataExecutionPrevention>
-      </DataExecutionPrevention>
-      <TargetMachine>MachineX64</TargetMachine>
+      <AdditionalDependencies>d3dcompiler.lib;dxva2.lib;d3d9.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(IntDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <PreBuildEvent>
       <Command>lib /nologo /machine:x64 /def:"$(ProjectDir)nvofapi64.def" /out:"$(IntDir)nvofapi64.lib"</Command>
@@ -119,52 +104,67 @@
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="..\core\TemporalPolicy.cpp" />
     <ClCompile Include="BlendRenderer.cpp" />
-    <ClCompile Include="DiagCaptureMode.cpp" />
+    <ClCompile Include="CaptureRing.cpp" />
     <ClCompile Include="D3D11Present.cpp" />
     <ClCompile Include="D3D9Present.cpp" />
+    <ClCompile Include="D3D9Setup.cpp" />
+    <ClCompile Include="DiagCaptureMode.cpp" />
+    <ClCompile Include="Displays.cpp" />
+    <ClCompile Include="EtwConsumer.cpp" />
+    <ClCompile Include="Failure.cpp" />
+    <ClCompile Include="FlipDecode.cpp" />
     <ClCompile Include="FlowWarpEngine.cpp" />
     <ClCompile Include="FrameCompositors.cpp" />
-    <ClCompile Include="InterpSidecar.cpp" />
-    <ClCompile Include="TemporalCaptureMode.cpp" />
-    <ClCompile Include="..\core\TemporalPolicy.cpp" />
     <ClCompile Include="FrameMarker.cpp" />
-    <ClCompile Include="CaptureRing.cpp" />
-    <ClCompile Include="FlipDecode.cpp" />
-    <ClCompile Include="EtwConsumer.cpp" />
-    <ClCompile Include="NvFBCR.cpp" />
+    <ClCompile Include="InterpSidecar.cpp" />
+    <ClCompile Include="Main.cpp" />
+    <ClCompile Include="NvFBCSession.cpp" />
+    <ClCompile Include="OutputWindow.cpp" />
     <ClCompile Include="PresentScheduler.cpp" />
+    <ClCompile Include="Prompts.cpp" />
+    <ClCompile Include="TemporalCaptureMode.cpp" />
     <ClCompile Include="TimerCaptureMode.cpp" />
     <ClCompile Include="VsyncCaptureMode.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="BlendRenderer.h" />
-    <ClInclude Include="CaptureRing.h" />
-    <ClInclude Include="D3D11Present.h" />
-    <ClInclude Include="D3D9Present.h" />
-    <ClInclude Include="FlowWarpEngine.h" />
-    <ClInclude Include="FrameCompositors.h" />
-    <ClInclude Include="EtwConsumer.h" />
-    <ClInclude Include="FlipDecode.h" />
-    <ClInclude Include="FrameMarker.h" />
-    <ClInclude Include="IFrameCompositor.h" />
-    <ClInclude Include="IPresentPath.h" />
-    <ClInclude Include="InterpSidecar.h" />
-    <ClInclude Include="DiagCaptureMode.h" />
-    <ClInclude Include="TemporalCaptureMode.h" />
-    <ClInclude Include="..\core\TemporalPolicy.h" />
-    <ClInclude Include="..\core\LaunchOptions.h" />
-    <ClInclude Include="IFrameCaptureMode.h" />
-    <ClInclude Include="PresentScheduler.h" />
-    <ClInclude Include="TimerCaptureMode.h" />
-    <ClInclude Include="VsyncCaptureMode.h" />
     <ClInclude Include="..\common\AdminCheck.h" />
     <ClInclude Include="..\common\NvFBCApi.h" />
     <ClInclude Include="..\common\NvFBCLoader.h" />
     <ClInclude Include="..\common\SimpleLogger.h" />
+    <ClInclude Include="..\core\LaunchOptions.h" />
+    <ClInclude Include="..\core\TemporalPolicy.h" />
+    <ClInclude Include="BlendRenderer.h" />
+    <ClInclude Include="CaptureRing.h" />
+    <ClInclude Include="D3D11Present.h" />
+    <ClInclude Include="D3D9Present.h" />
+    <ClInclude Include="D3D9Setup.h" />
+    <ClInclude Include="DiagCaptureMode.h" />
+    <ClInclude Include="Displays.h" />
+    <ClInclude Include="EtwConsumer.h" />
+    <ClInclude Include="Failure.h" />
+    <ClInclude Include="FlipDecode.h" />
+    <ClInclude Include="FlowWarpEngine.h" />
+    <ClInclude Include="FrameCompositors.h" />
+    <ClInclude Include="FrameMarker.h" />
+    <ClInclude Include="IFrameCaptureMode.h" />
+    <ClInclude Include="IFrameCompositor.h" />
+    <ClInclude Include="InterpSidecar.h" />
+    <ClInclude Include="IPresentPath.h" />
+    <ClInclude Include="NvFBCSession.h" />
+    <ClInclude Include="OutputWindow.h" />
+    <ClInclude Include="PresentScheduler.h" />
+    <ClInclude Include="Prompts.h" />
+    <ClInclude Include="RelayContext.h" />
+    <ClInclude Include="TemporalCaptureMode.h" />
+    <ClInclude Include="TimerCaptureMode.h" />
+    <ClInclude Include="VsyncCaptureMode.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="nvofapi64.def" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
 </Project>

@@ -19,14 +19,9 @@ This project began as NvFBC-Relay by Collin Blakley:
 
     https://gitlab.com/DonnerPartyOf1/nvfbc-relay
 
-That repository has no license file, so his work carries no grant and he
-retains all rights to it. 404 lines of his code survive in the current tree,
-all of them in `src/relay/NvFBCR.cpp` (measured with `git blame -w`
-on `dev`). Every other file under the paths listed above is entirely ours.
-
-`NvFBCR.cpp` is therefore excluded from the MIT license in `LICENSE` until its
-original author agrees to relicense his contributions. The comparison writeup
-in the README's `Why?` section is also his.
+That repository has no license file. None of its code or text remains here:
+the parts that had survived into this project were rewritten in September 2026,
+and his commits stay in the history.
 
 ## Redistribution
 

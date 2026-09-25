@@ -4,6 +4,9 @@
 #include <d3d9.h>
 #include <NvFBCApi.h>
 
+#include "Failure.h"
+#include "RelayContext.h"
+
 // Abstract interface for frame capture modes
 class IFrameCaptureMode {
 public:
@@ -22,8 +25,8 @@ public:
     // swapchain to live on the adapter that scans it out.
     //
     // Only modes that DECOUPLE capture from present may move. The legacy single-loop modes
-    // have NvFBC write straight into the present device's back buffer
-    // (NvFBC_OutBuf[0].pPrimary = g_backbuffer), so their present device must stay on the
+    // have NvFBC write straight into the present device's back buffer (the shell's startup
+    // session targets RelayContext::backBuffer), so their present device must stay on the
     // source adapter; the temporal modes rebind NvFBC to CaptureRing's own capture device and
     // are free.
     //
@@ -39,15 +42,14 @@ public:
     // exists because NvFBC, the ring and its aliases are D3D9 objects.
     virtual bool PresentsViaD3D11() const { return false; }
 
-    // Setup mode-specific resources
-    virtual bool Setup() = 0;
+    // Sets up mode-specific resources once the present device and the startup session exist.
+    virtual MaybeFailure Setup(const RelayContext& ctx) = 0;
 
-    // Run the entire capture loop (including message processing)
-    virtual void Run(
-        NvFBCToDx9Vid* nvfbcDx9,
-        NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
-        IDirect3DDevice9Ex* device,
-        HWND hwnd) = 0;
+    // Runs the capture loop until the output window closes, which returns nothing, or until
+    // something stops it, which returns why. A mode that takes over ctx.session owns it from
+    // then on and clears it in ctx when it releases it. The shell shows the popup for a
+    // returned failure after teardown; a mode never shows one for its own end.
+    virtual MaybeFailure Run(RelayContext& ctx, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) = 0;
 
     // Get descriptive name for logging
     virtual const char* GetModeName() const = 0;

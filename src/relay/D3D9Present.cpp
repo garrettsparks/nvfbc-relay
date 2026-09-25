@@ -1,16 +1,13 @@
 #include "D3D9Present.h"
 #include <SimpleLogger.h>
 
-// External globals (NvFBCR.cpp).
-extern IDirect3DSurface9* g_backbuffer;   // main's cached back buffer: the fallback target
-extern bool g_flipEx;                     // -flipex: FLIPEX swap effect, present statistics
-
 D3D9PresentPath::D3D9PresentPath(IFrameCompositor* compositor)
     : m_compositor(compositor)
     , m_device(NULL)
     , m_hwnd(NULL)
     , m_mark(false)
     , m_backbuffer(NULL)
+    , m_fallbackBackbuffer(NULL)
     , m_presentTarget(NULL)
     , m_presentFailures(0)
     , m_backbufferFailures(0)
@@ -29,12 +26,15 @@ D3D9PresentPath::~D3D9PresentPath() {
     delete m_compositor;
 }
 
-bool D3D9PresentPath::Setup(IDirect3DDevice9Ex* device, HWND hwnd, CaptureRing* ring,
-                            int width, int height, const policy::PolicyConfig* /*cfg*/,
-                            bool mark, unsigned int markFrames, LARGE_INTEGER baseQpc,
-                            LONGLONG freqQpc) {
+bool D3D9PresentPath::Setup(const RelayContext& ctx, CaptureRing* ring,
+                            const policy::PolicyConfig* /*cfg*/, bool mark,
+                            unsigned int markFrames, LARGE_INTEGER baseQpc, LONGLONG freqQpc) {
+    IDirect3DDevice9Ex* device = ctx.presentDevice;
+    const int width = ctx.width;
+    const int height = ctx.height;
     m_device = device;
-    m_hwnd = hwnd;
+    m_hwnd = ctx.outputWindow;
+    m_fallbackBackbuffer = ctx.backBuffer;
     m_baseQpc = baseQpc;
     m_usPerTick = 1000000.0 / (double)freqQpc;
 
@@ -60,7 +60,7 @@ bool D3D9PresentPath::Setup(IDirect3DDevice9Ex* device, HWND hwnd, CaptureRing* 
     // Present statistics live on the swapchain, not the device, and are only meaningful
     // under flip mode. Acquired once: the swapchain object is stable even though its buffers
     // rotate.
-    if (g_flipEx) {
+    if (ctx.flipEx) {
         IDirect3DSwapChain9* sc = NULL;
         if (SUCCEEDED(device->GetSwapChain(0, &sc)) && sc) {
             if (FAILED(sc->QueryInterface(__uuidof(IDirect3DSwapChain9Ex),
@@ -82,8 +82,8 @@ void D3D9PresentPath::Compose(const FrameBracket& bracket, CompositeOutcome* out
     // the runtime rotates which handle is the back buffer at presentation time, so a cached
     // pointer composites into a surface that is no longer the one being presented - the
     // "every third frame is blank" that made the earlier FLIPEX attempt fail. Falls back to
-    // the cached global if the call fails, so a failure degrades rather than presenting
-    // whatever the flip queue left behind.
+    // the shell's cached back buffer if the call fails, so a failure degrades rather than
+    // presenting whatever the flip queue left behind.
     if (m_backbuffer) {
         m_backbuffer->Release();
         m_backbuffer = NULL;
@@ -97,7 +97,7 @@ void D3D9PresentPath::Compose(const FrameBracket& bracket, CompositeOutcome* out
                    m_backbufferFailures);
         }
     }
-    m_presentTarget = m_backbuffer ? m_backbuffer : g_backbuffer;
+    m_presentTarget = m_backbuffer ? m_backbuffer : m_fallbackBackbuffer;
 
     m_compositor->Compose(bracket, m_presentTarget, out);
 }

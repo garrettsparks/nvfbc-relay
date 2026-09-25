@@ -60,14 +60,14 @@ public:
     D3D11PresentBackend(const D3D11PresentBackend&) = delete;
     D3D11PresentBackend& operator=(const D3D11PresentBackend&) = delete;
 
-    // Call AFTER CaptureRing::Start (slot shared handles must exist). The D3D9 device is
-    // unused: this path brings its own. cfg is borrowed from the owning mode and must
-    // outlive the backend; mark/markFrames arm the frame marker as FrameMarker::Init does.
-    // Failure is loud and leaves the backend disabled so the caller can refuse the mode
-    // rather than run degraded.
-    bool Setup(IDirect3DDevice9Ex* device, HWND hwnd, CaptureRing* ring, int width,
-               int height, const policy::PolicyConfig* cfg, bool mark,
-               unsigned int markFrames, LARGE_INTEGER baseQpc, LONGLONG freqQpc) override;
+    // Call AFTER CaptureRing::Start (slot shared handles must exist). The swapchain goes on
+    // ctx.outputWindow at ctx's output size; the D3D9 device is unused, since this path
+    // brings its own. cfg is borrowed from the owning mode and must outlive the backend;
+    // mark/markFrames arm the frame marker as FrameMarker::Init does. Failure is loud and
+    // leaves the backend disabled so the caller can refuse the mode rather than run degraded.
+    bool Setup(const RelayContext& ctx, CaptureRing* ring, const policy::PolicyConfig* cfg,
+               bool mark, unsigned int markFrames, LARGE_INTEGER baseQpc,
+               LONGLONG freqQpc) override;
 
     // Decide this present and draw it onto the current back buffer. Fills out exactly as
     // the D3D9 synthesizing compositor would, so the temporal log line reads the same.

@@ -1,16 +1,10 @@
 #include "CaptureRing.h"
+#include "D3D9Setup.h"
 #include <NvFBCLoader.h>
 #include <SimpleLogger.h>
 #include <limits.h>
 #include <math.h>
 #include <string.h>
-
-// External globals (NvFBCR.cpp). Start() rebinds the NvFBC session to the capture device and
-// must update the global so WinMain's Cleanup releases the right session.
-extern IDirect3D9Ex* g_pD3DEx;
-extern int g_sourceAdapterIndex;
-extern NvFBCLoader* pNVFBCLib;
-extern NvFBCToDx9Vid* NvFBCDX9;
 
 // With a private capture device the blocking grab can wait as long as it likes — its lock
 // holds affect nothing the present thread uses. The timeout only bounds how quickly the
@@ -58,6 +52,12 @@ CaptureRing::CaptureRing()
 CaptureRing::~CaptureRing() {
     Stop();
 
+    // The session first: it writes into the capture target, on the capture device below.
+    if (m_nvfbc) {
+        m_nvfbc->NvFBCToDx9VidRelease();
+        m_nvfbc = NULL;
+    }
+
     for (int i = 0; i < RING_SIZE; i++) {
         if (m_ring[i].mainSurface) { m_ring[i].mainSurface->Release(); m_ring[i].mainSurface = NULL; }
         if (m_ring[i].mainTexture) { m_ring[i].mainTexture->Release(); m_ring[i].mainTexture = NULL; }
@@ -94,9 +94,10 @@ bool CaptureRing::Setup(IDirect3DDevice9Ex* presentDevice, int width, int height
     return true;
 }
 
-bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
-                        LARGE_INTEGER baseQpc, HWND hwnd) {
+bool CaptureRing::Start(RelayContext& ctx, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
+                        LARGE_INTEGER baseQpc) {
     m_baseQpc = baseQpc;
+    m_sessionRefused = false;
 
     // ---- Create the private capture device on the SOURCE adapter. ----
     // Pinned explicitly, NOT inherited from the present device: the present device may sit on
@@ -107,23 +108,20 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     // Cross-ordinal sharing of the ring slots still works because both ordinals are the SAME
     // PHYSICAL GPU - D3D9Ex has no cross-GPU sharing, but D3D9 hands out one adapter ordinal
     // per OUTPUT, so two ordinals on one card share fine.
-    D3DPRESENT_PARAMETERS d3dpp = {};
-    d3dpp.Windowed = TRUE;
-    d3dpp.BackBufferFormat = D3DFMT_A2R10G10B10;
-    d3dpp.BackBufferWidth = m_width;
-    d3dpp.BackBufferHeight = m_height;
-    d3dpp.BackBufferCount = 1;
-    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
-    d3dpp.hDeviceWindow = hwnd;
-
-    HRESULT hr = g_pD3DEx->CreateDeviceEx(
-        (UINT)g_sourceAdapterIndex, D3DDEVTYPE_HAL, hwnd,
+    //
+    // It joins the present device on the window every D3D9 device shares: the output window
+    // when the D3D9 swapchain presents there, the hidden host when the output window belongs
+    // to the D3D11 swapchain.
+    D3DPRESENT_PARAMETERS params = WindowedPresentParams(
+        ctx.deviceWindow, m_width, m_height, D3DFMT_A2R10G10B10, 1, D3DSWAPEFFECT_DISCARD,
+        D3DPRESENT_INTERVAL_IMMEDIATE);
+    HRESULT hr = ctx.d3d->CreateDeviceEx(
+        ctx.sourceAdapter, D3DDEVTYPE_HAL, ctx.deviceWindow,
         D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
-        &d3dpp, NULL, &m_capDevice);
+        &params, NULL, &m_capDevice);
     if (FAILED(hr)) {
-        LOGERR("CaptureRing: failed to create capture device on source adapter %d "
-               "(error: 0x%08x)", g_sourceAdapterIndex, hr);
+        LOGERR("CaptureRing: failed to create capture device on source adapter %u "
+               "(error: 0x%08x)", ctx.sourceAdapter, hr);
         return false;
     }
 
@@ -205,16 +203,19 @@ bool CaptureRing::Start(NvFBCToDx9Vid* nvfbc, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* 
     }
 
     // ---- Rebind NvFBC to the capture device. ----
-    // Release the session WinMain created against the present device, create a new one bound
-    // to the capture device, and update the global so Cleanup releases the right session.
-    nvfbc->NvFBCToDx9VidRelease();
+    // Release the shell's startup session, bound to the present device, and clear it so
+    // nothing releases it again; then create the ring's own, bound to the capture device.
+    if (ctx.session) {
+        ctx.session->NvFBCToDx9VidRelease();
+        ctx.session = NULL;
+    }
     DWORD maxW = 0, maxH = 0;
-    m_nvfbc = (NvFBCToDx9Vid*)pNVFBCLib->create(NVFBC_TO_DX9_VID, &maxW, &maxH, 0, (void*)m_capDevice);
+    m_nvfbc = (NvFBCToDx9Vid*)ctx.nvfbc->create(NVFBC_TO_DX9_VID, &maxW, &maxH, 0, (void*)m_capDevice);
     if (!m_nvfbc) {
         LOGERR("CaptureRing: failed to create NvFBC session on the capture device");
+        m_sessionRefused = true;
         return false;
     }
-    NvFBCDX9 = m_nvfbc;
 
     NVFBC_TODX9VID_OUT_BUF outBuf[1] = {};
     outBuf[0].pPrimary = m_captureTarget;

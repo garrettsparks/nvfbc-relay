@@ -21,7 +21,7 @@ jobs:
       uses: microsoft/setup-msbuild@v3
 
     - name: Build Solution
-      run: msbuild NvFBCR.sln /p:Configuration=Release /p:Platform=x64
+      run: msbuild NvFBCR.slnx /p:Configuration=Release /p:Platform=x64
 
     - name: Upload build artifacts
       uses: actions/upload-artifact@v6

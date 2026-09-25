@@ -137,11 +137,8 @@ public:
     virtual bool PresentsOnTargetAdapter() const override { return true; }
     // A property of the chosen present path, not of the mode.
     virtual bool PresentsViaD3D11() const override;
-    virtual bool Setup() override;
-    virtual void Run(
-        NvFBCToDx9Vid* nvfbcDx9,
-        NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
-        IDirect3DDevice9Ex* device,
-        HWND hwnd) override;
+    virtual MaybeFailure Setup(const RelayContext& ctx) override;
+    virtual MaybeFailure Run(RelayContext& ctx,
+                             NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) override;
     virtual const char* GetModeName() const override;
 };

@@ -159,10 +159,13 @@ D3D11PresentBackend::~D3D11PresentBackend() {
     if (m_dev) m_dev->Release();
 }
 
-bool D3D11PresentBackend::Setup(IDirect3DDevice9Ex* /*device*/, HWND hwnd, CaptureRing* ring,
-                                int width, int height, const policy::PolicyConfig* cfg,
-                                bool mark, unsigned int markFrames,
-                                LARGE_INTEGER /*baseQpc*/, LONGLONG /*freqQpc*/) {
+bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
+                                const policy::PolicyConfig* cfg, bool mark,
+                                unsigned int markFrames, LARGE_INTEGER /*baseQpc*/,
+                                LONGLONG /*freqQpc*/) {
+    const HWND hwnd = ctx.outputWindow;
+    const int width = ctx.width;
+    const int height = ctx.height;
     m_width = width;
     m_height = height;
     m_cfg = cfg;

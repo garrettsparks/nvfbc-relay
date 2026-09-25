@@ -5,6 +5,7 @@
 
 #include "CaptureRing.h"
 #include "IFrameCompositor.h"
+#include "RelayContext.h"
 #include "TemporalPolicy.h"
 
 // THE PRESENT PATH: everything between the bracket the present loop found and the frame
@@ -31,14 +32,15 @@ class IPresentPath {
 public:
     virtual ~IPresentPath() {}
 
-    // Call AFTER CaptureRing::Start (the ring's slot shared handles must exist). device is
-    // the D3D9 present device main created; a path with its own device ignores it. cfg is
-    // borrowed from the owning mode and must outlive the path. mark/markFrames arm the frame
-    // marker; baseQpc and freqQpc are the log's time origin and clock. Failure is loud
-    // (LOGERR) and the caller refuses the mode rather than running degraded.
-    virtual bool Setup(IDirect3DDevice9Ex* device, HWND hwnd, CaptureRing* ring, int width,
-                       int height, const policy::PolicyConfig* cfg, bool mark,
-                       unsigned int markFrames, LARGE_INTEGER baseQpc, LONGLONG freqQpc) = 0;
+    // Call AFTER CaptureRing::Start (the ring's slot shared handles must exist). ctx holds
+    // the D3D9 present device the shell created, the output window and the output size; a
+    // path with its own device ignores the D3D9 one. cfg is borrowed from the owning mode and
+    // must outlive the path. mark/markFrames arm the frame marker; baseQpc and freqQpc are
+    // the log's time origin and clock. Failure is loud (LOGERR) and the caller refuses the
+    // mode rather than running degraded.
+    virtual bool Setup(const RelayContext& ctx, CaptureRing* ring,
+                       const policy::PolicyConfig* cfg, bool mark, unsigned int markFrames,
+                       LARGE_INTEGER baseQpc, LONGLONG freqQpc) = 0;
 
     // The frame-pacing wait, where this path has one before the decision. Returns false
     // when a bounded wait timed out, which the caller reads as a present that was not paced.

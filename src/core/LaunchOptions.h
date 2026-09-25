@@ -8,16 +8,17 @@
 #include <string>
 #include <vector>
 
-// Launch-time parsing: the option flags and the capture-mode string, as plain functions over
-// explicit structs. No windows.h and no logging, so the policy suite compiles this header and pins
-// every rule a launch string is decided by. NvFBCR owns the wiring: it keeps the resolved values
-// in its globals, logs any warning returned here, and builds the capture mode a ModeSpec names.
+// Launch-time parsing: the option flags, the capture-mode string, the command line and the prompt
+// answers, as plain functions over explicit structs. No windows.h and no logging, so the policy
+// suite compiles this header and pins every rule a launch is decided by. The relay's shell owns
+// the wiring: it runs a launch through the checks here, logs and shows what they refuse, and
+// builds the capture mode a ModeSpec names.
 
 namespace launch {
 
 // Every option a launch string can set. The member initializers are the defaults the relay runs
-// with: its globals are initialized from a default-constructed Options, so a default is changed
-// here and nowhere else. The comb lock, the extra lag, flip timing and delivery-lateness
+// with: a launch starts from a default-constructed Options, so a default is changed here and
+// nowhere else. The comb lock, the extra lag, flip timing and delivery-lateness
 // correction are on by default because the relay-cost ladder measured no cost for any of them;
 // -nolock, -lag 0, -noetw and -nodejit turn them off.
 struct Options {
@@ -169,7 +170,7 @@ inline const UsageRow* FindOptionRow(const std::string& flag) {
     return NULL;
 }
 
-// The usage list both the mode prompt and the invalid-mode path print, one string per line.
+// The usage list the mode prompt prints, one string per line.
 inline std::vector<std::string> UsageLines() {
     std::vector<std::string> lines;
     auto add = [&lines](const UsageRow& r) {
@@ -191,7 +192,8 @@ inline std::vector<std::string> UsageLines() {
 
 // Applies the option at tokens[i] and returns how many tokens it consumed (0 = not a recognized
 // option). A value that fails validation is still consumed, leaves the option as it was, and sets
-// *warning to the line the caller should log. Flags match exactly and are case-sensitive.
+// *warning to what was wrong with it, in words the console can show. Flags match exactly and are
+// case-sensitive.
 inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Options* o,
                           std::string* warning) {
     const std::string& t = tokens[i];
@@ -226,16 +228,29 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-lag" && i + 1 < tokens.size()) {
         const long v = std::strtol(tokens[i + 1].c_str(), NULL, 10);
         if (v >= 0 && v <= 200) o->extraLagMs = (unsigned int)v;
-        else if (warning) *warning = "-lag value '" + tokens[i + 1] + "' invalid (0-200 ms) - ignored";
+        else if (warning) *warning = "-lag takes a whole number from 0 to 200, not '" + tokens[i + 1] + "'";
         return 2;
     }
     if (t == "-src" && i + 1 < tokens.size()) {
         float v;
         if (ParseFps(tokens[i + 1], &v)) o->srcRateHint = v;
-        else if (warning) *warning = "-src value '" + tokens[i + 1] + "' invalid (1-1000) - ignored";
+        else if (warning) *warning = "-src takes a frame rate above 0 and up to 1000, not '" + tokens[i + 1] + "'";
         return 2;
     }
     return 0;
+}
+
+// What was wrong with a token that neither the option dispatch nor the command line took. A
+// registered flag that takes a value was typed without one; anything else is not an option
+// where it was typed. The display and mode flags are options on the command line only, so at
+// the mode prompt they are unknown like any other stray token.
+inline std::string RefusedToken(const std::string& token, bool atPrompt) {
+    const UsageRow* row = FindOptionRow(token);
+    const bool takesValue = row && row->arg[0] && row->arg[0] != '[';
+    if (takesValue && !(atPrompt && row->commandLineOnly)) {
+        return token + " needs a value after it";
+    }
+    return "'" + token + "' is not one of the options" + (atPrompt ? " listed above" : "");
 }
 
 // Settles an option that depends on others, once every token is in. -dejit needs flip timing
@@ -261,23 +276,28 @@ struct CommandLine {
     int targetIndex = -1;
     std::string mode;
     bool foundAny = false;   // at least one token was recognized
+    bool hasSource = false;  // -source was given with a number
+    bool hasTarget = false;  // -target was given with a number
 };
 
 // Parses a whole command line: -source, -target and -framerate here, every other token through
-// ApplyOption, and an unknown token skipped. Each rejected value appends the line to log to
-// *warnings. An index that is not a number is reported and left as it was, so a launch missing
-// either index goes to the interactive prompts rather than closing.
+// ApplyOption. Each rejected value appends what was wrong to *warnings, and each token nothing
+// took goes to *unknown. An index that is not a number is reported and left as it was.
 inline CommandLine ParseCommandLine(const std::vector<std::string>& args, Options* o,
-                                    std::vector<std::string>* warnings) {
+                                    std::vector<std::string>* warnings,
+                                    std::vector<std::string>* unknown = NULL) {
     CommandLine c;
     for (size_t i = 0; i < args.size(); i++) {
         const std::string& t = args[i];
         const bool hasValue = i + 1 < args.size();
         if ((t == "-source" || t == "-target") && hasValue) {
-            int* index = (t == "-source") ? &c.sourceIndex : &c.targetIndex;
-            if (!ParseInt(args[i + 1], index) && warnings) {
-                warnings->push_back(t + " value '" + args[i + 1] +
-                                    "' invalid (not a number) - ignored");
+            const bool source = t == "-source";
+            int* index = source ? &c.sourceIndex : &c.targetIndex;
+            if (ParseInt(args[i + 1], index)) {
+                if (source) c.hasSource = true;
+                else c.hasTarget = true;
+            } else if (warnings) {
+                warnings->push_back(t + " must be a display number, not '" + args[i + 1] + "'");
             }
             c.foundAny = true;
             i++;
@@ -292,6 +312,8 @@ inline CommandLine ParseCommandLine(const std::vector<std::string>& args, Option
             if (consumed > 0) {
                 c.foundAny = true;
                 i += consumed - 1;
+            } else if (unknown) {
+                unknown->push_back(t);
             }
         }
     }
@@ -435,6 +457,138 @@ inline ModeSpec ParseMode(const std::string& modeStr) {
         s.framerate = fps;
     }
     return s;
+}
+
+// Whether a command line can run as it stands. It can when it names two different displays that
+// exist, a mode ParseMode accepts or none (the default), and nothing but registered options with
+// valid values. Otherwise reason holds what was wrong, in the words the console shows. An empty
+// command line is not refused, it is simply not usable: asking is the normal path then.
+struct CommandLineCheck {
+    bool usable = false;
+    std::string reason;
+    CommandLine line;
+    Options options;
+};
+
+inline CommandLineCheck CheckCommandLine(const std::vector<std::string>& args, int displayCount) {
+    CommandLineCheck c;
+    if (args.empty()) return c;
+    std::vector<std::string> warnings;
+    std::vector<std::string> unknown;
+    c.line = ParseCommandLine(args, &c.options, &warnings, &unknown);
+    const auto noDisplay = [displayCount](int index) {
+        return index < 0 || index >= displayCount;
+    };
+    if (!warnings.empty()) {
+        c.reason = warnings[0];
+    } else if (!unknown.empty()) {
+        c.reason = RefusedToken(unknown[0], false);
+    } else if (!c.line.hasSource) {
+        c.reason = "-source is missing";
+    } else if (!c.line.hasTarget) {
+        c.reason = "-target is missing";
+    } else if (noDisplay(c.line.sourceIndex)) {
+        c.reason = "there is no display " + std::to_string(c.line.sourceIndex);
+    } else if (noDisplay(c.line.targetIndex)) {
+        c.reason = "there is no display " + std::to_string(c.line.targetIndex);
+    } else if (c.line.sourceIndex == c.line.targetIndex) {
+        c.reason = "the game display and the capture card display must be different";
+    } else if (!c.line.mode.empty() && ParseMode(c.line.mode).kind == ModeKind::Invalid) {
+        c.reason = "'" + c.line.mode + "' is not one of the modes";
+    } else {
+        c.usable = true;
+    }
+    return c;
+}
+
+// An answer at a display prompt. Returns true with *index set when it names a display in the
+// list that is not otherDisplay (-1 when there is none to avoid); otherwise *problem holds what
+// the console says before asking again.
+inline bool CheckDisplayAnswer(const std::string& answer, int displayCount, int otherDisplay,
+                               int* index, std::string* problem) {
+    int n = -1;
+    if (!ParseInt(answer, &n)) {
+        *problem = "Type the number in brackets beside the display.";
+    } else if (n < 0 || n >= displayCount) {
+        *problem = "There is no display " + std::to_string(n) + ". Type a number from the list.";
+    } else if (n == otherDisplay) {
+        *problem = "The capture card display must be a different display from the game display.";
+    } else {
+        *index = n;
+        return true;
+    }
+    return false;
+}
+
+// An answer at the mode prompt: a mode, then options, or options alone for the default mode.
+// Options start from the defaults, so what was typed is what runs. problem is empty when the
+// answer can run, and otherwise what the console says before asking again.
+struct PromptAnswer {
+    std::string mode;       // as typed; empty selects the default
+    Options options;
+    std::string problem;
+};
+
+inline PromptAnswer ParsePromptAnswer(const std::string& line) {
+    PromptAnswer a;
+    const std::vector<std::string> tokens = SplitTokens(line);
+    size_t i = 0;
+    if (!tokens.empty() && tokens[0][0] != '-') {
+        a.mode = tokens[0];
+        if (ParseMode(a.mode).kind == ModeKind::Invalid) {
+            a.problem = "'" + a.mode + "' is not one of the modes listed above. Type one of "
+                        "them, or press Enter for the default.";
+            return a;
+        }
+        i = 1;
+    }
+    while (i < tokens.size()) {
+        std::string warning;
+        const size_t consumed = ApplyOption(tokens, i, &a.options, &warning);
+        if (!warning.empty()) {
+            a.problem = warning + ".";
+            return a;
+        }
+        if (consumed == 0) {
+            a.problem = RefusedToken(tokens[i], true) + ".";
+            return a;
+        }
+        i += consumed;
+    }
+    return a;
+}
+
+// The startup line that records every resolved option, including those entered at the prompt,
+// which appear nowhere else. mktrace.py reads its "src rate hint <n> fps" and "extra lag <n> ms"
+// phrases, and relaylog.py echoes it as a header, so its wording and field order stay fixed.
+inline std::string ResolvedOptionsLine(const Options& o, bool d3d11Present) {
+    char mark[48];
+    if (!o.mark) snprintf(mark, sizeof(mark), "off");
+    else if (o.markFrames) snprintf(mark, sizeof(mark), "on (first %u presents)", o.markFrames);
+    else snprintf(mark, sizeof(mark), "on (every present)");
+    const bool joinOn = o.etw && !o.noJoin;
+    const char* join = "on";
+    if (!o.etw) join = "off (-noetw)";
+    else if (o.noJoin) join = "OFF (-nojoin)";
+    const char* dejitter = "off";
+    if (o.dejitter && joinOn && o.lock) dejitter = "ON (-dejit)";
+    else if (o.dejitter) dejitter = "REFUSED (-dejit needs -etw with the join on, and the comb lock)";
+    const char* phaseKeep = "off";
+    if (o.phaseKeep && joinOn) phaseKeep = "ON (-phasekeep)";
+    else if (o.phaseKeep) phaseKeep = "REFUSED (-phasekeep needs -etw with the join on)";
+    char line[768];
+    snprintf(line, sizeof(line),
+             "Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend "
+             "tint %s, etw flip capture %s, flip join %s, dejitter %s, fgphase %s, phasekeep %s, "
+             "flip mode %s, extra lag %u ms, present path %s",
+             (double)o.srcRateHint, o.srcRateHint > 0.0f ? "" : " (not declared; 60 assumed)",
+             o.lock ? "on" : "off", mark, o.tint ? "on" : "off", o.etw ? "on" : "off", join,
+             dejitter,
+             o.fgPhase ? "requested (-fgphase; ACTIVE only when the instrument line follows)"
+                       : "off",
+             phaseKeep, o.flipEx ? "FLIPEX (-flipex)" : "bitblt (DISCARD)", o.extraLagMs,
+             d3d11Present ? "D3D11 flip-model swapchain (b:vsync)" : "D3D9 swapchain");
+    return line;
 }
 
 }  // namespace launch

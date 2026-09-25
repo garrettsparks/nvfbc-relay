@@ -1,11 +1,11 @@
 # NvFBC Relay
 
-Captures one display with NvFBC and presents it on another one. There's no
-encoder, no application hook, and nothing leaves the D3D9 context.
+NvFBCR shows one display's picture on another, captured with NVIDIA's NvFBC.
+The game PC runs no encoder and hooks into no game, and every frame stays on
+the graphics card from capture to output.
 
-If the target display is a capture card, the output ends up on whatever is
-plugged into the other end of that card, usually a second PC doing the
-encoding.
+Point it at a capture card and the picture lands on whatever is plugged into
+the card's other end, usually a second PC that does the encoding.
 
 The original version captured and presented on a fixed timer. Most of the work
 since then has been frame pacing. The capture clock and the present clock
@@ -20,10 +20,9 @@ being characterized against real captures.
 
 # Prerequisites
 
-As with any application leveraging NvFBC, this is only officially supported
-on Tesla & Quadro professional cards.
+NVIDIA documents NvFBC, its capture interface, for its professional cards.
 
-HDCP also needs to be disabled. Thanks, DRM.
+HDCP copy protection has to be off on the game display for NvFBC to capture it.
 
 NvFBCR needs an NVIDIA graphics card and driver. It uses two files the driver
 installs in `C:\Windows\System32`, `NvFBC64.dll` for capture and
@@ -55,7 +54,8 @@ code-signed. A signing certificate costs more than this project can justify.
 Run `NvFBCR.exe`. It lists your displays and asks for the game display, the
 capture card display, and a mode. Press Enter at the mode prompt for the
 default, `b:vsync`. Options go on the same line after the mode, for example
-`b:vsync -src 90`.
+`b:vsync -src 90`, or on their own for the default mode, `-src 90`. An answer
+the relay can't use gets a line saying why, and the question again.
 
 ## Shortcuts
 
@@ -73,9 +73,12 @@ as the relay lists them at startup. Leave out `-framerate` to get the default
 mode, or add `-framerate <mode>` to pick another. Windows asks for
 administrator rights each time, because the relay needs them.
 
-Display numbers can change when you add or remove a display or update the
-graphics driver. A number that no longer exists sends the relay back to asking.
-A number that now points at a different display captures that display instead,
+The relay uses a command line only when all of it works. Anything it can't use,
+a mistyped mode or option or a display number that no longer exists, sends it
+back to asking, with a line saying what was wrong, and nothing from that command
+line is kept. Display numbers can change when you add or remove a display or
+update the graphics driver. A number that now points at a different display
+captures that display instead,
 so after a change like that, run the relay once without the shortcut and check
 its list.
 
@@ -143,7 +146,9 @@ running without the late-frame correction.
 ## Logging
 
 Logging is off unless a file named `NvFBCR.log` exists beside `NvFBCR.exe`.
-Create an empty one to turn logging on. Each launch overwrites it. The log is
+Create an empty one to turn logging on. Each launch overwrites it, except the
+restart that follows the relay turning NvFBC on, which carries on in the same
+file. The log is
 for diagnosing problems, and a long session can write about 160 MB an hour.
 
 ## Video delay and audio sync
@@ -251,7 +256,7 @@ flowchart LR
         GRAB --> COLL --> SR1 --> FLUSH
     end
 
-    RING[("CaptureRing<br/>8 slots: shared texture<br/>+ QPC arrival stamp")]
+    RING[("CaptureRing<br/>32 slots, 16 at -lag 0:<br/>shared texture<br/>+ QPC arrival stamp")]
 
     subgraph PREST["Present thread"]
         direction TB
@@ -484,18 +489,14 @@ Design specs for the non-obvious parts:
 | [`docs/adaptive-bracketing-delay-spec.md`](docs/adaptive-bracketing-delay-spec.md) | Bracketing lag as a function of source rate |
 | [`docs/frame-marker-spec.md`](docs/frame-marker-spec.md) | The `-mark` marker encoding, for offline analysis |
 | [`docs/dual-device-capture-present-spec.md`](docs/dual-device-capture-present-spec.md) | Splitting capture and present across two D3D devices |
-| [`docs/init-cleanup-spec.md`](docs/init-cleanup-spec.md) | Startup and teardown ordering |
+| [`docs/application-shell-spec.md`](docs/application-shell-spec.md) | Launch to exit: the prompts and command line, windows, devices, NvFBC, failure popups, teardown |
 
 ---
 
 # In progress
 
-Work on branches, not yet merged to `dev`:
+Work on a branch, not yet merged:
 
-* `etw-frame-timing` - reading real scanout times in-process from ETW flip
-  events, cross-checked against DxgKrnl VSync DPCs, plus a D3D11 flip-model
-  present backend and a replay harness that runs the production policy against
-  recorded traces offline.
 * `nvofa-warp` - synthesizing intermediate frames with optical flow when
   neither bracket neighbour lands cleanly.
 
@@ -503,7 +504,7 @@ Work on branches, not yet merged to `dev`:
 
 # Building
 
-Clone the repo, open `NvFBCR.sln` in Visual Studio 2026, and build. CI builds when you start it from the Actions tab
+Clone the repo, open `NvFBCR.slnx` in Visual Studio 2026, and build. CI builds when you start it from the Actions tab
 (`.github/workflows/dev-build.yml`), and the artifact from a green run is
 usually easier than building locally. Pushing a `v*` tag builds and publishes a
 release (`.github/workflows/release.yml`).
@@ -514,139 +515,26 @@ it, and `NvFBCR.exe` doesn't need it to start.
 
 ---
 
-# Note about Display coordinates
+# Display arrangement
 
-Displays can be oriented in any fashion, but we don't do any automatic checking
-of output dimensions during runtime. So starting NvFBC and then starting an application fullscreen in a different resolution may 
-cause the coordinate of the output window to break if the target display's coordinate is dependent on the capture display.
-
-In other words, if your target display is to the right/below the capture display, window offset bugs will occur when changing resolutions.
-
-Place the target display to the left of the capture display or keep the capture display at a static resolution.
-
----
-
-# Why?
-
-TL;DR higher FPS lower latency (mostly)
-
-Assuming you do not want to or cannot use HDMI passthrough on a capture card (personally, I 
-need to use DisplayPort to get the most out of my monitor), there are 
-basically 3 ways to do screen capture in Windows, and the functions of these exist on two axes.\
-The first axis is capture method - NvFBC vs. DXGI duplication. NvFBC is unsupported on modern 
-Windows but provides lower capture latency and smaller performance cost in the typical case 
-than DXGI.\
-The second axis is available output formats. The typical use case is to directly encode output
-to a local video file or stream. Using dedicated capture hardware can provide better flexibility
-and lessen the performance impact on the capture system.
-
-| Capture Method | Performance Cost | Positives | Negatives |
-| ------ | ------ | ------ | ------ |
-| OBS | 8-15% | Very flexible outputs, HDR support everywhere | Overall performance cost
-| DXGI & Capture Card | 5-7% | Lowest performance impact for HDR streaming | Heavy performance cost for what is essentially just a screen copy
-| Shadowplay | ~5% | Lowest performance impact for HDR recording | Cannot stream at all from an HDR source, input latency induced by desktop capture mode, need to login to Nvidia & link accounts to use
-| NvFBCR | 2-3% | Lowest total performance impact, requires no application hook, can view an HDR source | Output clamped to SDR can cause HDR sources to look washed out, but restorable in post-processing
-
-### OBS
-The first method is to use some dedicated capture or streaming software to 
-record or transmit without additional hardware. This is something like OBS
-or XSplit, and the most common these days. This works well for many people,
-but it's the highest performance impact on the system under capture. \
-First, these software suites use DXGI capture.\
-Second, directly encoding on the capture system is expensive, though lessened significantly by
-dedicated encoding ASICs aboard modern GPUs. \
-Still, this performance impact 
-as tested on a RTX 4090 can be between 8-10% when using OBS with new NVENC H.264/H.265 for local 
-capture. It can be up to 15% when combined with tonemapping to SDR and streaming. These figures were
-found using application capture mode, and not all 
-applications play nicely with application capture. The 
-performance penalty is even greater than this when using 
-desktop capture.
-
-
-### DXGI & capture card
-The second way is to use DXGI duplication with a capture card.
-This is basically where the capture card acts like a second display output 
-and you just use Windows display settings to clone your primary display to
-the capture card. This is limited in the fact that HDR cannot be enabled
-on either display on this mode, meaning that you are stuck in SDR not only in the capture 
-stream but also on the primary viewing monitor. You can get around this by extending 
-the capture card as a side display instead of setting it as a clone of the primary, then using 
-software like OBS to capture the primary and re-present to the capture card. This nullifies 
-the performance penalty of encoding when paired with a separate PC, but still uses DXGI
-and presents through the OBS rendering pipeline. This is, however, the only way to get
-HDR output to a capture card currently without using HDMI passthrough as far as I can tell.\
-About 5-7% performance impact.
-
-### Shadowplay
-The third way is Shadowplay. Shadowplay uses NvFBC for capture and can perform encoding without 
-the captured frame ever leaving VRAM. It is highly performant and will capture HDR to local 
-recordings. It will not, however, automatically tonemap HDR capture to SDR for streaming, instead 
-just refusing to start. You are also required to use GeForce Experience to utilize Shadowplay.\
-About 5% performance impact for local recording. Slightly higher for streaming. Slightly higher performance impact and much higher input 
-latency when using desktop capture.
-
-## NvFBCR
-NvFBC-Relay lies somewhere between these other options in features and flexibility while being the
-clear-cut performance winner in almost all scenarios. It's incredibly simple in design, as all it 
-does is capture direct to a DX9 surface that is already set up as the backbuffer for a window.
-It is basically a copy, a pointer swap, and 2 more copies:
-
-* Capture and write to backbuffer - scaling is done in hardware by NvFBC
-* Flip backbuffer to front with Present call
-* Blt copy front buffer to DWM surface
-* DWM renders to screen
-
-No shared memory resources are ever explicitly utilized, everything stays in DX9 context like 
-Shadowplay does. The GPU itself does nearly zero work since no rendering resources are utilized;
-we don't even initialize a DX9 rendering pipeline, it's just there to hold the surface and swap 
-chain. \
-This simplicity comes with drawbacks. \
-The most obvious one is that we consider it outside our scope to provide an encoder;
-we explicitly do not want to use NVENC because it has a nonzero,
-though small, performance impact. Encoding the output stream is left to the capture card host.\
-DX9 has no capability to output HDR, and while
-it does seem possible to utilize a shared surface to pass the NvFBC output to DX11, there doesn't
-seem to be any easy way to directly present a surface in DX11 aside from rendering it as a texture,
-which both greatly increases complexity and probably throws away all performance benefits at these 
-small margins.\
-That means that while NvFBCR will capture a display outputting HDR, it will only output on an SDR
-surface.\
-Frame delivery pacing could be better and tearing is allowed for lowest performance impact.\
-Additionally, I have observed a much larger performance impact than is typical using NvFBC in both 
-NvFBCR and in Shadowplay specifically in Horizon: Zero Dawn. I've found no other application to 
-exhibit this apparent CPU-related regression, but HZD also has a weird bug where ReBAR causes 
-CPU-related performance regressions on Intel platforms in this game, so I think this is just an 
-outlier where Nvidia's driver really hates this game.
-
-
-There are some unique benefits to NvFBC-Relay in comparison to the existing options.
-
-* Its performance is the best of the options in most scenarios, typically 2-3% performance impact. 
-* It provides great flexibility with the output stream. Since NvFBCR outputs to any arbitrary display, 
-a capture card can be used to take this output and manipulate it as desired on a separate system. This removes
-some painful limitations like Shadowplay being unable to
-stream HDR sources.
-* Capture is entirely agnostic of running games and does not rely on application hooks, 
-and will capture the desktop without increasing performance impact like OBS or input latency like Shadowplay.
-
+The relay places its window over the capture card display once, when it
+starts. When the capture card display sits to the right of or below the game
+display in Windows' display settings, a game that changes the game display's
+resolution also moves the capture card display across the desktop, and the
+window stays where it was. Put the capture card display to the left of the game
+display, or keep the game display at one resolution while the relay runs.
 
 ---
 
 # Credits
 
-The original NvFBC relay, and the comparison analysis above, are Collin
-Blakley's work. His commits are in the history.
+This project began as Collin Blakley's NvFBC-Relay,
+<https://gitlab.com/DonnerPartyOf1/nvfbc-relay>. His commits are in the history.
 
 ---
 
 # License
 
-The code in `src/`, `tools/` and `tests/` is MIT, see `LICENSE`. The one
-exception is `NvFBCR.cpp`, which still holds code from the original relay. That
-project shipped without a license, so those lines carry no grant and the file
-sits outside the MIT scope until Collin agrees to relicense.
-
-This repo started as the NvFBC sample from the NVIDIA Capture SDK. The two
-NVIDIA optical flow headers in `third_party/nvof/` keep their own MIT notice.
-`THIRD-PARTY.md` lists exactly what came from where.
+Everything in this repo is MIT, see `LICENSE`, except the two NVIDIA optical
+flow headers in `third_party/nvof/`, which keep their own MIT notice.
+`THIRD-PARTY.md` lists what came from where.

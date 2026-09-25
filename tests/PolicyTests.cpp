@@ -3908,8 +3908,9 @@ static int Replay(const char* path, int64_t combUs, int64_t passUsArg) {
 
 // ---------------------------------------------------------------------------------
 // Launch options and the capture-mode grammar. These pin what a launch string resolves
-// to, which lives in Windows-only code everywhere else: the relay's globals start from
-// launch::Options and its parser is launch::ApplyOption, so these run the real rules.
+// to, which lives in Windows-only code everywhere else: every launch starts from
+// launch::Options, and the relay's command line and prompts go through the checks in
+// LaunchOptions.h, so these run the real rules.
 // ---------------------------------------------------------------------------------
 
 // Runs a whole option string through the parser the way both entry points do: a token
@@ -3954,8 +3955,8 @@ static launch::Options SwitchesAt(bool on) {
 }
 
 static void test_launch_defaults() {
-    // What a bare launch runs with. The relay's globals are initialized from this struct,
-    // so this list is the relay's defaults and nothing else can make them differ.
+    // What a bare launch runs with. Every launch starts from this struct, so this list is
+    // the relay's defaults and nothing else can make them differ.
     const launch::Options o = launch::Options();
     CHECK(o.srcRateHint == 0.0f, "-src must default to undeclared, got %.1f", o.srcRateHint);
     CHECK(o.lock, "the comb lock must default on");
@@ -4088,8 +4089,8 @@ static void test_launch_option_parsing() {
         x.extraLagMs = 75;
         t = launch::SplitTokens("-lag 201");
         CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.extraLagMs == 75 &&
-                  w == "-lag value '201' invalid (0-200 ms) - ignored",
-              "-lag 201 must be consumed, ignored and reported, got '%s'", w.c_str());
+                  w == "-lag takes a whole number from 0 to 200, not '201'",
+              "-lag 201 must be consumed, left unset and reported, got '%s'", w.c_str());
         w.clear();
         t = launch::SplitTokens("-lag -1");
         CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.extraLagMs == 75 && !w.empty(),
@@ -4120,8 +4121,8 @@ static void test_launch_option_parsing() {
             CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.srcRateHint == 60.0f && !w.empty(),
                   "'%s' must be consumed, ignored and reported", bad);
         }
-        CHECK(w == "-src value 'abc' invalid (1-1000) - ignored",
-              "the -src rejection must be the line the relay logs, got '%s'", w.c_str());
+        CHECK(w == "-src takes a frame rate above 0 and up to 1000, not 'abc'",
+              "the -src rejection must be what the relay shows, got '%s'", w.c_str());
         t = launch::SplitTokens("-src 60fps");
         CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.srcRateHint == 60.0f,
               "-src 60fps must read the numeric prefix");
@@ -4276,25 +4277,31 @@ static void test_launch_command_line() {
               o.srcRateHint == 60.0f && !o.lock && warnings.empty(),
           "a full scripted launch must parse every token");
 
+    CHECK(c.hasSource && c.hasTarget, "both indices must read as given");
+
     // A non-number index is reported and left unset, so the launch goes to the prompts.
     warnings.clear();
     o = launch::Options();
     c = launch::ParseCommandLine(launch::SplitTokens("-source abc -target 2x"), &o, &warnings);
-    CHECK(c.foundAny && c.sourceIndex == -1 && c.targetIndex == -1 && warnings.size() == 2,
+    CHECK(c.foundAny && c.sourceIndex == -1 && c.targetIndex == -1 && warnings.size() == 2 &&
+              !c.hasSource && !c.hasTarget,
           "non-number indices must be reported and left at -1, got %d %d with %zu warnings",
           c.sourceIndex, c.targetIndex, warnings.size());
-    CHECK(!warnings.empty() &&
-              warnings[0] == "-source value 'abc' invalid (not a number) - ignored",
-          "the index rejection must be the line the relay logs, got '%s'",
+    CHECK(!warnings.empty() && warnings[0] == "-source must be a display number, not 'abc'",
+          "the index rejection must be what the relay shows, got '%s'",
           warnings.empty() ? "" : warnings[0].c_str());
 
-    // A flag with no value, an unknown token, and an empty line.
+    // A flag with no value, an unknown token, and an empty line: nothing is recognized, and
+    // both stray tokens are handed back.
     warnings.clear();
     o = launch::Options();
-    c = launch::ParseCommandLine(launch::SplitTokens("-bogus -target"), &o, &warnings);
+    std::vector<std::string> unknown;
+    c = launch::ParseCommandLine(launch::SplitTokens("-bogus -target"), &o, &warnings, &unknown);
     CHECK(!c.foundAny && c.targetIndex == -1 && warnings.empty() &&
-              SameOptions(o, launch::Options()),
-          "unknown tokens and a flag with no value must be skipped");
+              SameOptions(o, launch::Options()) && unknown.size() == 2 &&
+              unknown[0] == "-bogus" && unknown[1] == "-target",
+          "unknown tokens and a flag with no value must be handed back, got %zu",
+          unknown.size());
     c = launch::ParseCommandLine(launch::SplitTokens(""), &o, &warnings);
     CHECK(!c.foundAny && c.mode.empty(), "an empty command line must name nothing");
 
@@ -4340,6 +4347,12 @@ static void test_launch_relaunch_round_trip() {
                       c.targetIndex == 1 && c.mode == "b:vsync",
                   "'%s' (%s) must survive the relaunch, written as '%s'", text,
                   resolved ? "resolved" : "as typed", written.c_str());
+            // The relaunched process runs its command line without the prompts only when
+            // the whole line is accepted.
+            const launch::CommandLineCheck check = launch::CheckCommandLine(
+                launch::SplitTokens("-source 0 -target 1 -framerate b:vsync " + written), 2);
+            CHECK(check.usable, "'%s' (%s) must be accepted on relaunch, refused with '%s'",
+                  text, resolved ? "resolved" : "as typed", check.reason.c_str());
         }
     }
 
@@ -4418,6 +4431,141 @@ static void test_launch_usage_table() {
         CHECK(listed(r.flag) == r.shown, "mode row '%s' must be %s the usage list", r.flag,
               r.shown ? "in" : "left off");
     }
+}
+
+static void test_launch_command_line_check() {
+    // A shortcut's command line runs without the prompts only when all of it is usable.
+    launch::CommandLineCheck c =
+        launch::CheckCommandLine(launch::SplitTokens("-source 0 -target 1 -src 60"), 2);
+    CHECK(c.usable && c.reason.empty() && c.line.sourceIndex == 0 && c.line.targetIndex == 1 &&
+              c.line.mode.empty() && c.options.srcRateHint == 60.0f,
+          "the README's shortcut must be accepted, refused with '%s'", c.reason.c_str());
+    c = launch::CheckCommandLine(launch::SplitTokens("-source 1 -target 0 -framerate T:VSYNC"), 2);
+    CHECK(c.usable && c.line.mode == "T:VSYNC", "a mode in any case must be accepted");
+
+    // An empty command line is not refused: asking is the normal path.
+    c = launch::CheckCommandLine(launch::SplitTokens(""), 2);
+    CHECK(!c.usable && c.reason.empty(), "an empty command line must ask without a reason");
+
+    // Every way a command line can be unusable, and what the console says about it.
+    const struct {
+        const char* line;
+        const char* reason;
+    } refused[] = {
+        {"-source abc -target 1 -nolock", "-source must be a display number, not 'abc'"},
+        {"-source 7 -target 1", "there is no display 7"},
+        {"-source 0 -target -1", "there is no display -1"},
+        {"-source 0 -target 2", "there is no display 2"},
+        {"-source 1 -target 1", "the game display and the capture card display must be different"},
+        {"-target 1", "-source is missing"},
+        {"-source 0 -src 60", "-target is missing"},
+        {"-src 60", "-source is missing"},
+        {"-source 0 -target 1 -framerate bogus", "'bogus' is not one of the modes"},
+        {"-source 0 -target 1 -subgen", "'-subgen' is not one of the options"},
+        {"-source 0 -target 1 -lag 500", "-lag takes a whole number from 0 to 200, not '500'"},
+        {"-source 0 -target 1 -src", "-src needs a value after it"},
+        {"-source 0 -target 1 -framerate", "-framerate needs a value after it"},
+        {"-target 1 -source", "-source needs a value after it"},
+    };
+    for (const auto& r : refused) {
+        c = launch::CheckCommandLine(launch::SplitTokens(r.line), 2);
+        CHECK(!c.usable && c.reason == r.reason, "'%s' must be refused with '%s', got '%s'",
+              r.line, r.reason, c.reason.c_str());
+    }
+}
+
+static void test_launch_prompt_answers() {
+    // The display prompts: a listed number is taken, anything else says why.
+    int index = -1;
+    std::string problem;
+    CHECK(launch::CheckDisplayAnswer(" 1 ", 2, -1, &index, &problem) && index == 1,
+          "a listed display must be taken");
+    const struct {
+        const char* answer;
+        int other;
+        const char* problem;
+    } displays[] = {
+        {"", -1, "Type the number in brackets beside the display."},
+        {"x", -1, "Type the number in brackets beside the display."},
+        {"5", -1, "There is no display 5. Type a number from the list."},
+        {"-1", -1, "There is no display -1. Type a number from the list."},
+        {"0", 0, "The capture card display must be a different display from the game display."},
+    };
+    for (const auto& d : displays) {
+        problem.clear();
+        CHECK(!launch::CheckDisplayAnswer(d.answer, 2, d.other, &index, &problem) &&
+                  problem == d.problem,
+              "display answer '%s' must be refused with '%s', got '%s'", d.answer, d.problem,
+              problem.c_str());
+    }
+
+    // The mode prompt: a mode with options, options alone for the default mode, or Enter.
+    launch::PromptAnswer a = launch::ParsePromptAnswer("b:vsync -src 60");
+    CHECK(a.problem.empty() && a.mode == "b:vsync" && a.options.srcRateHint == 60.0f,
+          "a mode with options must be taken, refused with '%s'", a.problem.c_str());
+    a = launch::ParsePromptAnswer("-src 60 -nolock");
+    CHECK(a.problem.empty() && a.mode.empty() && a.options.srcRateHint == 60.0f &&
+              !a.options.lock,
+          "options alone must run the default mode, refused with '%s'", a.problem.c_str());
+    a = launch::ParsePromptAnswer("");
+    CHECK(a.problem.empty() && a.mode.empty() && SameOptions(a.options, launch::Options()),
+          "Enter must run the default mode with the default options");
+    a = launch::ParsePromptAnswer("  60  ");
+    CHECK(a.problem.empty() && a.mode == "60", "surrounding spaces must not matter");
+
+    const struct {
+        const char* answer;
+        const char* problem;
+    } refused[] = {
+        {"bogus", "'bogus' is not one of the modes listed above. Type one of them, or press "
+                  "Enter for the default."},
+        {"b:vsync -srcc 60", "'-srcc' is not one of the options listed above."},
+        {"b:vsync -lag 500", "-lag takes a whole number from 0 to 200, not '500'."},
+        {"-src abc", "-src takes a frame rate above 0 and up to 1000, not 'abc'."},
+        {"b:vsync -lag", "-lag needs a value after it."},
+        {"b:vsync -source 0", "'-source' is not one of the options listed above."},
+        {"b:vsync b:dwm", "'b:dwm' is not one of the options listed above."},
+    };
+    for (const auto& r : refused) {
+        a = launch::ParsePromptAnswer(r.answer);
+        CHECK(a.problem == r.problem, "mode answer '%s' must be refused with '%s', got '%s'",
+              r.answer, r.problem, a.problem.c_str());
+    }
+}
+
+static void test_launch_resolved_options_line() {
+    // The default launch's line, word for word as the reference logs carry it: mktrace.py reads
+    // two of its phrases, so the wording is part of the log contract.
+    const std::string bare = launch::ResolvedOptionsLine(launch::Options(), true);
+    CHECK(bare == "Resolved options: src rate hint 0.0 fps (not declared; 60 assumed), comb lock "
+                  "on, frame marker off, blend tint off, etw flip capture on, flip join on, "
+                  "dejitter ON (-dejit), fgphase off, phasekeep off, flip mode bitblt (DISCARD), "
+                  "extra lag 75 ms, present path D3D11 flip-model swapchain (b:vsync)",
+          "the default launch's resolved-options line must not change, got '%s'", bare.c_str());
+
+    // The two phrases mktrace.py reads, at other values.
+    launch::Options o;
+    o.srcRateHint = 59.94f;
+    o.extraLagMs = 0;
+    const std::string line = launch::ResolvedOptionsLine(o, false);
+    CHECK(line.find("Resolved options: src rate hint 59.9 fps, ") == 0 &&
+              line.find(", extra lag 0 ms, present path D3D9 swapchain") != std::string::npos,
+          "the parsed phrases must carry the values, got '%s'", line.c_str());
+
+    // The refused and requested states read as the relay reports them.
+    o = launch::Options();
+    o.etw = false;
+    o.phaseKeep = true;
+    o.mark = true;
+    o.markFrames = 7200;
+    const std::string refused = launch::ResolvedOptionsLine(o, true);
+    CHECK(refused.find("frame marker on (first 7200 presents)") != std::string::npos &&
+              refused.find("flip join off (-noetw)") != std::string::npos &&
+              refused.find("dejitter REFUSED (-dejit needs -etw with the join on, and the comb "
+                           "lock)") != std::string::npos &&
+              refused.find("phasekeep REFUSED (-phasekeep needs -etw with the join on)") !=
+                  std::string::npos,
+          "refusals must be spelled out, got '%s'", refused.c_str());
 }
 
 static void test_lock_anchor_and_comb() {
@@ -4517,6 +4665,9 @@ int main(int argc, char** argv) {
     test_launch_command_line();
     test_launch_relaunch_round_trip();
     test_launch_usage_table();
+    test_launch_command_line_check();
+    test_launch_prompt_answers();
+    test_launch_resolved_options_line();
     test_lock_anchor_and_comb();
     test_replay_capture_corpus();
 

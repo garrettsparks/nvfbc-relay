@@ -2,14 +2,10 @@
 #include "FrameCompositors.h"
 #include "D3D9Present.h"
 #include "D3D11Present.h"
+#include "NvFBCSession.h"
+#include "OutputWindow.h"
 #include <SimpleLogger.h>
 #include <cstdio>
-
-// External global variables
-extern IDirect3DDevice9Ex* g_pD3D9Device;
-extern int BUF_WIDTH;
-extern int BUF_HEIGHT;
-extern int g_targetRefreshHz;
 
 // Presents between estimator-vs-assumption audits (about 10 s at 60 Hz): rare enough to keep
 // the log quiet, frequent enough that a wrong -src is caught within the first minute.
@@ -128,8 +124,8 @@ bool TemporalCaptureMode::AnchorAndSteps(long long batchStartTs, long long prevA
     return true;
 }
 
-bool TemporalCaptureMode::Setup() {
-    m_device = g_pD3D9Device;
+MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
+    m_device = ctx.presentDevice;
 
     // Before the ring starts: the instrument allocates its readback resources in Start.
     if (m_fgPhase) {
@@ -138,11 +134,9 @@ bool TemporalCaptureMode::Setup() {
     if (m_phaseKeep) {
         m_ring.EnablePhaseKeep(this);
     }
-    if (!m_ring.Setup(m_device, BUF_WIDTH, BUF_HEIGHT)) {
-        return false;
-    }
-    if (!m_scheduler.Setup(m_targetFramerate)) {
-        return false;
+    if (!m_ring.Setup(m_device, ctx.width, ctx.height) ||
+        !m_scheduler.Setup(m_targetFramerate)) {
+        return ModeCouldNotStart(GetModeName());
     }
     // STATIC BRACKETING LAG: max(present period, 1.25 x assumed source period). The lag
     // exists so that a frame newer than the target has already arrived at pick time; the
@@ -245,8 +239,8 @@ bool TemporalCaptureMode::Setup() {
         // decouples the two, and reading the present period there would disarm the guard
         // in exactly the regime it exists for. Falls back to the present period when the
         // refresh could not be read, which is the pre-existing behavior.
-        const LONGLONG sinkPeriodQpc = g_targetRefreshHz > 0
-                                           ? m_scheduler.Freq() / g_targetRefreshHz
+        const LONGLONG sinkPeriodQpc = ctx.sinkRefreshHz > 0
+                                           ? m_scheduler.Freq() / ctx.sinkRefreshHz
                                            : m_scheduler.PeriodQpc();
         m_policyCfg.srcPeriodQpc =
             policy::ToothGuardPeriod(m_assumedSrcPeriodQpc, sinkPeriodQpc, /*combOn=*/true);
@@ -313,15 +307,11 @@ bool TemporalCaptureMode::Setup() {
         LOGERR("-phasekeep REFUSED: needs -etw with the join on (the rotation is read from "
                "the flip grid); running plain keep-real");
     }
-    return true;
+    return std::nullopt;
 }
 
-void TemporalCaptureMode::Run(
-    NvFBCToDx9Vid* nvfbcDx9,
-    NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams,
-    IDirect3DDevice9Ex* device,
-    HWND hwnd)
-{
+MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
+                                      NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     QueryPerformanceCounter(&m_baseQpc);
     // Every time in this log (arr=, dl=, tgt=, before=, after=) is microseconds since this
     // origin, not absolute QPC. Anything correlating the log against another QPC-stamped
@@ -356,54 +346,30 @@ void TemporalCaptureMode::Run(
                  code == ERROR_ACCESS_DENIED
                      ? "\n\nAccess was denied. Run NvFBCR.exe as administrator."
                      : "");
-        MessageBoxA(NULL, text, "NvFBCR: frame timing unavailable",
-                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+        ShowWarning("frame timing unavailable", text);
     }
     const double usPerTick = 1000000.0 / (double)m_scheduler.Freq();
     const long long lagUs = (long long)(m_bracketingDelayQpc * usPerTick);
 
-    // Note: Start releases nvfbcDx9 (the session bound to the present device) and rebinds
-    // NvFBC to the ring's private capture device. nvfbcDx9 must not be used after this call.
-    // The capture device joins the present device on whatever window main created it on:
-    // the output window when the D3D9 swapchain presents there, a hidden host window when
-    // the output window belongs to another API's swapchain (flip model allows one swapchain
-    // per window and no second API on it).
-    HWND deviceWnd = hwnd;
-    D3DDEVICE_CREATION_PARAMETERS creation;
-    ZeroMemory(&creation, sizeof(creation));
-    if (SUCCEEDED(device->GetCreationParameters(&creation)) && creation.hFocusWindow) {
-        deviceWnd = creation.hFocusWindow;
-    }
-    if (!m_ring.Start(nvfbcDx9, grabParams, m_baseQpc, deviceWnd)) {
-        return;
+    // Start releases the shell's startup session (bound to the present device) and rebinds
+    // NvFBC to the ring's private capture device, which it creates on the window every D3D9
+    // device shares. From here the ring owns the session.
+    if (!m_ring.Start(ctx, grabParams, m_baseQpc)) {
+        if (m_ring.SessionRefused()) return SessionRefused(ctx.nvfbc, "CaptureRing");
+        return CaptureCouldNotStart("CaptureRing");
     }
 
     // The present path finishes initializing now that the ring's slot shared handles exist:
     // the D3D9 compositor and its capture-side aliases, or the whole D3D11 backend. Either
     // refuses the mode when it cannot finish instead of silently running a different one,
-    // and it refuses LOUDLY: the console is closed by now, so a logged refusal alone would
-    // read as the relay vanishing.
-    if (!m_present->Setup(device, hwnd, &m_ring, BUF_WIDTH, BUF_HEIGHT, &m_policyCfg, m_mark,
-                          m_markFrames, m_baseQpc, m_scheduler.Freq())) {
-        LOGERR("%s init failed - refusing the mode", m_present->Name());
+    // and the refusal ends the run with its popup.
+    if (!m_present->Setup(ctx, &m_ring, &m_policyCfg, m_mark, m_markFrames, m_baseQpc,
+                          m_scheduler.Freq())) {
         m_ring.Stop();
-        const char* advice = m_present->RefusalAdvice();
-        // Logging is opt-in, so the reason is only in the log when the log exists.
-        const char* logAdvice = SimpleLogger::getInstance().isEnabled()
-                                    ? "The reason is in NvFBCR.log."
-                                    : "To record the reason, create an empty NvFBCR.log beside "
-                                      "NvFBCR.exe and run again.";
-        char text[640];
-        snprintf(text, sizeof(text),
-                 "NvFBCR could not set up its output on the capture card display, so it will "
-                 "not start.%s%s\n\n%s",
-                 advice[0] ? "\n\n" : "", advice, logAdvice);
-        MessageBoxA(NULL, text, "NvFBCR: could not start",
-                    MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
-        return;
+        return PresentPathRefused(m_present->Name(), m_present->RefusalAdvice());
     }
 
-    MSG msg = {};
+    MaybeFailure ended;
     LONGLONG lastPresentQpc = 0;
     m_scheduler.Seed();
 
@@ -667,12 +633,12 @@ void TemporalCaptureMode::Run(
 
         if (!m_vsyncPresent) m_scheduler.Advance();   // vsync paces via the blocking present
 
-        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+        if (!PumpMessages()) break;
+        if (m_ring.HasStopped()) {
+            // The capture thread stops itself only when NvFBC invalidates its session.
+            ended = CaptureLost("CaptureRing");
+            break;
         }
-        if (msg.message == WM_QUIT) break;
-        if (m_ring.HasStopped()) break;  // capture thread hit a fatal error
         if (m_present->SwapChainStalled()) {
             // The swapchain stopped retiring frames and does not come back. Stopping is the
             // only correct move: nothing reaches the screen either way, and a loop left
@@ -681,6 +647,7 @@ void TemporalCaptureMode::Run(
             LOGERR("%s: swapchain stalled - no paced present for seconds. Stopping the "
                    "capture so the session is released and this run ends attributably.",
                    m_present->Name());
+            ended = OutputStalled(m_present->Name());
             break;
         }
     }
@@ -709,6 +676,7 @@ void TemporalCaptureMode::Run(
     // After Stop: the capture thread has joined, so its counter is settled.
     LOG("capture summary: %lld grabs waited out the grab timeout and stored nothing (the source drew no new frame)",
         m_ring.GrabTimeoutsSkipped());
+    return ended;
 }
 
 const char* TemporalCaptureMode::GetModeName() const {

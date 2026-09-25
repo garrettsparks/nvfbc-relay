@@ -13,7 +13,7 @@ jobs:
 
     - name: Build and run policy tests
       run: |
-        g++ -std=c++17 -O2 -Wall -Werror -o policytests -Isrc/core \
+        g++ -std=c++20 -O2 -Wall -Werror -o policytests -Isrc/core \
           tests/PolicyTests.cpp src/core/TemporalPolicy.cpp
         ./policytests
 
@@ -28,7 +28,7 @@ jobs:
       uses: microsoft/setup-msbuild@v3
 
     - name: Build Solution
-      run: msbuild NvFBCR.sln /p:Configuration=Release /p:Platform=x64
+      run: msbuild NvFBCR.slnx /p:Configuration=Release /p:Platform=x64
 
     - name: Upload build artifact
       uses: actions/upload-artifact@v6

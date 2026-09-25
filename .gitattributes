@@ -6,6 +6,7 @@
 * text=auto eol=lf
 
 *.sln              text eol=crlf
+*.slnx             text eol=crlf
 *.vcxproj          text eol=crlf
 *.vcxproj.filters  text eol=crlf
 *.vcproj           text eol=crlf
