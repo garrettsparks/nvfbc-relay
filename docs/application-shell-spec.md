@@ -251,9 +251,10 @@ Behavior unchanged from today; only the structure is new.
   - a failed start is a failure with its popup.
 
   The marker was first an inherited environment variable. The build with it was flagged by
-  Defender as `Trojan:Win32/Sabsik.FL.A!ml` (2026-09-24), and setting an environment variable
-  before starting itself again was the likeliest new feature, so the marker moved onto the
-  command line, which the relaunch already builds.
+  Defender as `Trojan:Win32/Sabsik.FL.A!ml` (2026-09-24), so the marker moved onto the command
+  line, which the relaunch already builds. Scanned in one sitting, the flagged build was flagged
+  again while the build before it and the fixed build were clean: setting an environment
+  variable before starting itself again was the trigger.
 - **The relaunched process:** sees `-relaunched`, says so on its first log line, and appends to the
   log instead of truncating it, so one file holds both processes (decision 4). If capture is
   still not possible, it does not relaunch again: that is a failure with its popup. Today nothing
