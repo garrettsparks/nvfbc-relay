@@ -182,8 +182,8 @@ many cards offer really runs at 59.95 Hz. Against a 60 FPS game that means a
 skipped frame about every 20 seconds, plus a repeated one where the stream fills
 back up to 60. An NVIDIA custom resolution fixes it. In the NVIDIA Control
 Panel, under Change resolution, choose Customize, create a 2560x1440 mode at
-60 Hz, test it, then select that custom entry. On an EVGA XR1 Pro the custom
-mode measures within a thousandth of a hertz of 60.
+60 Hz, test it, then select that custom entry. On the card this was tested
+with, the custom mode measures within a thousandth of a hertz of 60.
 
 To check which one is running, the relay log's `Display mode on adapter` line
 reads `@60Hz` for the custom mode and `@59Hz` for the 59.95 Hz one.
@@ -197,8 +197,8 @@ blocks on the capture card's own vblank. `b:dwm` presents through the D3D9
 swapchain, blocked on DWM's compose clock, which is the path `t` runs on. Under in-game frame generation that clock runs at the displayed rate, two
 presents per source frame into a 60Hz sink, and the recording shows it.
 
-Measured in one session, Avatar 60x2 with in-game frame generation,
-`-src 60 -lock -lag 75 -mark -etw -dejit`, inside the benchmark tests:
+Measured in one session, a game at 60x2 with in-game frame generation, on the
+default settings plus `-mark`, inside the game's benchmark tests:
 
 | | `b:dwm` (D3D9, DWM compose clock) | `b:vsync` (D3D11 flip model, sink vblank) |
 | --- | --- | --- |
@@ -208,19 +208,19 @@ Measured in one session, Avatar 60x2 with in-game frame generation,
 | hold-comb/s | 53 to 60 | 0 |
 | content repeats/s in the recording (mean) | 3.55 (worst test 14.27) | 0 |
 | PresentMon presentation mode | Composed | Hardware: Independent Flip (99.2%) |
-| KCD2 anomalies/min (real gameplay) | 0.30 | 0.10, all inside a map close |
+| anomalies/min in another game's real gameplay | 0.30 | 0.10, all while closing the game's map |
 
-What each mode costs the game, from a separate benchmark session. Avatar
-uncapped with DLSS frame generation keeps the GPU fully loaded, so any cost the
-relay adds shows up in the benchmark score.
+What each mode costs the game, from a separate benchmark session. A game's
+built-in benchmark, uncapped with DLSS frame generation, keeps the GPU fully
+loaded, so any cost the relay adds shows up in the benchmark score.
 
-| Mode | Flags | Score lost |
-| ---- | ----- | ---------- |
+| Mode | Settings | Score lost |
+| ---- | -------- | ---------- |
 | relay not running | | none (baseline) |
 | `vsync` | | 8.3% |
-| `b:dwm` | `-src 60` | 9.4% |
-| `b:vsync` | `-src 60` | 5.4% |
-| `b:vsync` | `-src 60 -lock -lag 75 -etw -dejit`, today's defaults | 5.6% |
+| `b:dwm` | pacing features off (`-nolock -noetw -lag 0`) | 9.4% |
+| `b:vsync` | pacing features off (`-nolock -noetw -lag 0`) | 5.4% |
+| `b:vsync` | defaults | 5.6% |
 
 `b:vsync` costs least because it presents only as often as the card can show,
 60 times a second. `b:dwm` presented 137 times a second and DWM copied every
@@ -385,10 +385,10 @@ Those six outcomes are the `Pick` enum. Their integer values are frozen,
 because they're the 3-bit pick code burned into every `-mark` recording. New
 outcomes can only be appended.
 
-With `-lock`, a closed-loop control step runs on top of selection. Arrivals
-from the source land on a comb of repeating phases; the lock measures the
-error against that comb and adds a small extra lag ("pull") to hold the
-selection target on a stable tooth. It filters with an EMA, gates on stability,
+With the comb lock on, as it is by default, a closed-loop control step runs on
+top of selection. Arrivals from the source land on a comb of repeating
+phases; the lock measures the error against that comb and adds a small extra
+lag ("pull") to hold the selection target on a stable tooth. It filters with an EMA, gates on stability,
 slews the pull symmetrically under a bound, and wraps modulo the comb behind a
 hysteresis band. It freezes rather than integrating when a bracket is
 one-sided, so gaps do not poison the loop.
@@ -537,4 +537,5 @@ This project began as Collin Blakley's NvFBC-Relay,
 
 Everything in this repo is MIT, see `LICENSE`, except the two NVIDIA optical
 flow headers in `third_party/nvof/`, which keep their own MIT notice.
-`THIRD-PARTY.md` lists what came from where.
+`THIRD-PARTY.md` lists what came from where. `REUSE.toml` records the same
+thing file by file, and the dev build fails if a file has no license.

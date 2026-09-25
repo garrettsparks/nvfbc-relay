@@ -17,6 +17,9 @@ jobs:
           tests/PolicyTests.cpp src/core/TemporalPolicy.cpp
         ./policytests
 
+    - name: Check every file has license information
+      run: pipx run --spec 'reuse[charset-normalizer]==6.2.0' reuse lint
+
   build:
     runs-on: windows-2025-vs2026
 
