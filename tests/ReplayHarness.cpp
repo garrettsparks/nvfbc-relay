@@ -714,9 +714,9 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
             lastPresentTs = p.deadline;
         }
 
-        // TemporalCaptureMode's own sequence: target from the deadline and the CURRENT pull,
-        // bracket, then advance the lock for the NEXT present, then select.
-        const int64_t target = p.deadline - (cfg.lag + lockState.pullQpc);
+        // TemporalCaptureMode's own sequence: target from the deadline and the CURRENT pull and
+        // wrap ease, bracket, then advance the lock for the NEXT present, then select.
+        const int64_t target = p.deadline - (cfg.lag + lockState.pullQpc + lockState.easeQpc);
 
         // Corrections the field had computed by this point in the present sequence, and no
         // later ones: TemporalCaptureMode walks new batches and inserts before it brackets,

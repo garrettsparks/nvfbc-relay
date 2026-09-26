@@ -457,6 +457,9 @@ struct SelectionState {
 // Comb-lock control state. pull is the extra lag holding the target on the comb.
 struct PhaseLockState {
     int64_t pullQpc = 0;
+    // The part of a wrap the target has not crossed yet. The target includes it; the lock's own
+    // measurement takes it back out, so the ramp is invisible to the control loop.
+    int64_t easeQpc = 0;
     int64_t errEmaQpc = 0;
     int64_t devEmaQpc = 0;
     bool engaged = false;
@@ -465,6 +468,15 @@ struct PhaseLockState {
     int recoverRun = 0;    // presents left in the post-resume convergence window
     int reengageRun = -1;  // presents since a re-engage awaiting confirmation; -1 = none
 };
+
+// Presents over which the target crosses the comb after a wrap, in the blend modes. The lock
+// wraps its pull in one present; the target follows over this many, so a wrap shows as a short
+// run of in-between frames instead of a repeated or skipped one. At or below 1 the target jumps
+// with the pull.
+// A wrap that re-presents moves the target (1 - 1/N) of a period per present, and the composite
+// refuses to blend below 7/8 of a period of target advance (SynthWouldManufactureTooth), so N
+// must stay well above 8 or the ramp turns back into repeats.
+const int kWrapEasePresents = 12;
 
 // Fixed at Setup. combQpc == 0 disables the lock entirely (selection then equals the
 // pre-lock v0.0.15 behavior). passthroughQpc is the blend-mode passthrough threshold
@@ -484,6 +496,9 @@ struct PolicyConfig {
     // sources leave it 0 because mid-tooth synthesis is that regime's entire output, not
     // an artifact of a fast present clock.
     int64_t srcPeriodQpc = 0;
+    // Wrap ramp length in presents (see kWrapEasePresents); at or below 1 a wrap jumps. Only the
+    // blend modes ease, since selection cannot show an in-between frame.
+    int wrapEasePresents = kWrapEasePresents;
 };
 
 // Ring depth for a bracketing lag. The ring must reach back past the target, and NvFBC

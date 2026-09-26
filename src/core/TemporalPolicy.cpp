@@ -749,7 +749,14 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     // want = pull + errEma converges instead of integrating. Error and EMAs live on the
     // circular comb domain; a linear controller here saturates against clock skew and
     // drains through a disengaged sweep every beat (measured - see the comb-lock spec).
-    const int64_t err = WrapHalf(beforeDiff, cfg.combQpc);
+    // The bracket was read at a target that includes the wrap ease; adding it back measures
+    // the phase at the target the lock itself holds. The comb is periodic, so this is exact.
+    const int64_t err = WrapHalf(beforeDiff + s.easeQpc, cfg.combQpc);
+    // Whether the target as shown this present sits on the comb, within the passthrough
+    // threshold of a real frame, or between frames. Read by the wrap easing at the end.
+    int64_t shownOff = WrapHalf(beforeDiff, cfg.combQpc);
+    if (shownOff < 0) shownOff = -shownOff;
+    const bool shownOnComb = shownOff < cfg.passthroughQpc;
     const bool wasSeeded = s.seeded;
     // Re-seed on stall-resume treats the resumed phase like a fresh acquisition: the fresh
     // err (not the /16-lagged EMA) both drives dev to zero (so the lock stays engaged
@@ -800,8 +807,30 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     // wrapped sits one band inside the far edge, so it must cross both bands to wrap back, and
     // the two together set how much wander is absorbed. The band above the comb is the wider
     // one because it only adds lag; the band below takes the lag's margin away.
-    if (s.pullQpc < -PullWrapBelow(cfg.combQpc)) s.pullQpc += cfg.combQpc;
-    else if (s.pullQpc >= cfg.combQpc + PullWrapAbove(cfg.combQpc)) s.pullQpc -= cfg.combQpc;
+    int64_t wrap = 0;
+    if (s.pullQpc < -PullWrapBelow(cfg.combQpc)) wrap = cfg.combQpc;
+    else if (s.pullQpc >= cfg.combQpc + PullWrapAbove(cfg.combQpc)) wrap = -cfg.combQpc;
+    s.pullQpc += wrap;
+
+    // Wrap easing: the ease takes the opposite of the wrap, so the target does not move on the
+    // wrap present, then gives it back a step per present. A stall resume drops it: the snap
+    // lands on a frozen picture, and a ramp would only delay the resumed phase. Blend modes
+    // only: selection cannot show an in-between frame, so a ramp there turns the wrap's one
+    // repeat into a repeat and a double advance. And only a wrap taken while the target is on
+    // the comb: when the target is already between frames the output is already blending, and
+    // jumping with the pull reaches real frames sooner than a ramp would.
+    if (cfg.wrapEasePresents <= 1 || resumedFromStall || cfg.passthroughQpc <= 0 ||
+        (wrap != 0 && !shownOnComb)) {
+        s.easeQpc = 0;
+        return;
+    }
+    const int64_t step = cfg.combQpc / cfg.wrapEasePresents;
+    if (s.easeQpc > step) s.easeQpc -= step;
+    else if (s.easeQpc < -step) s.easeQpc += step;
+    else s.easeQpc = 0;
+    s.easeQpc -= wrap;
+    if (s.easeQpc > cfg.combQpc) s.easeQpc = cfg.combQpc;
+    else if (s.easeQpc < -cfg.combQpc) s.easeQpc = -cfg.combQpc;
 }
 
 Pick SelectFrame(const BracketInfo& b, SelectionState& s, const PolicyConfig& cfg) {
@@ -1009,7 +1038,7 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
 
     // MONOTONE OUTPUT GUARD: the composite counterpart of SelectFrame's newer-than-
     // lastShown constraint. Output content time (frame ts for a passthrough, target
-    // for a blend) may repeat - a pull wrap legitimately re-presents one instant per
+    // for a blend) may repeat - a wrap with easing off re-presents one instant per
     // beat, the same slip nearest mode pays - but never regress. Passthrough
     // quantizes output time by up to the threshold, so a threshold wider than the
     // present period (sub-quarter-rate sources) could otherwise step backward.

@@ -402,8 +402,10 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
         }
         // Comb lock applies the pull as extra lag; zero when disabled or disengaged. The
         // pull was computed from LAST present's bracket (closed loop, one-present latency
-        // in the control path - negligible at 25 us/present slew).
-        const LONGLONG target = deadline - (m_bracketingDelayQpc + m_lockState.pullQpc);
+        // in the control path - negligible at 25 us/present slew). The ease is what is left of
+        // a wrap the target is still crossing.
+        const LONGLONG target =
+            deadline - (m_bracketingDelayQpc + m_lockState.pullQpc + m_lockState.easeQpc);
 
         // Stage 6: settle delivery-lateness corrections BEFORE the bracket reads the ring.
         // The walk consumes the ring's batch-start history (never slot fields, which the
@@ -574,10 +576,17 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
                     snprintf(opFields + n, sizeof(opFields) - n, " pt=%lld", outcome.synthUs);
                 }
             }
-            // blk= goes LAST, after the appended op/flip fields. The offline parsers match this
-            // line as a contiguous chain of named fields, so a field inserted between two
-            // existing ones silently drops every field after it rather than failing.
-            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld%s%s blk=%lldus",
+            // The ease left after this present's lock update, printed only while a wrap is being
+            // crossed, like pull= beside it.
+            char easeField[32] = "";
+            if (m_lockState.easeQpc != 0) {
+                snprintf(easeField, sizeof(easeField), " ease=%lldus",
+                         (long long)(m_lockState.easeQpc * usPerTick));
+            }
+            // blk= goes after the appended op/flip fields, followed only by ease=. The offline
+            // parsers match this line as a contiguous chain of named fields, so a field inserted
+            // between two existing ones silently drops every field after it rather than failing.
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld%s%s blk=%lldus%s",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((bracket.info.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
@@ -591,7 +600,8 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
                 markN,
                 opFields,
                 flipFields,
-                (long long)(blockTicks * usPerTick));
+                (long long)(blockTicks * usPerTick),
+                easeField);
             // Once per run rather than once per present: a static screen delivers no new
             // frames at all, so a run lasts as long as the screen does, and every present in
             // it already carries after=-1 on its own line.

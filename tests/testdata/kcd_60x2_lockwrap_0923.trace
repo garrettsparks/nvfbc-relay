@@ -31,11 +31,13 @@ field_pull_wraps 3
 #
 # Bounds on the REPLAY (not the field): inequalities, so an improvement passes and only a
 # regression fails. max_pull_wraps is the one this fixture is for: a fix for the wrap lowers it.
+# It read 3 on the comb/16 band; with the band above the comb at comb/8 it reads 1, and the
+# bound holds that.
 max_worst_run 47
 max_long_runs 0
 max_synth_pct 1.2
 min_reseeds 0
-max_pull_wraps 3
+max_pull_wraps 1
 src_hint 60.0
 extra_lag_ms 75
 arrivals 37097

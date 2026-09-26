@@ -28,9 +28,13 @@ regrab_copies 1
 # The one addition allowed is lock path, not correction: at t=12.461s, as the lock re-engages,
 # the plain and dejitted replays' pulls sit 495 us apart, so the two runs are not comparing the
 # same target there.
+# Worst run 51 since wrap easing, on the dejitter arm only (the plain arm reads 49): the run at
+# t=11.64s ends as the target reaches the comb, the pull wraps on that present, and the eased
+# wrap holds the target one present longer before the ramp's own blends follow. The field ran
+# 50 on the pre-easing policy.
 max_blends_added 1
 min_blends_removed 3
-max_worst_run 50
+max_worst_run 51
 max_long_runs 1
 max_synth_pct 8.8
 min_reseeds 13

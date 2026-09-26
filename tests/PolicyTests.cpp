@@ -87,6 +87,7 @@ struct SimResult {
     std::vector<Pick> picks;
     std::vector<int64_t> shownTs;     // after each present (Repeat carries forward)
     std::vector<int64_t> pull;        // lock pull after each present's update
+    std::vector<int64_t> ease;        // wrap ease after each present's update (0 outside a ramp)
     std::vector<bool> engaged;
     std::vector<int64_t> beforeDiff;  // at the pulled target (when hasBefore)
     std::vector<size_t> wrapAt;       // present indices where the pull wrapped
@@ -170,6 +171,9 @@ struct SimParams {
     // the source is at or above the SINK rate). Only for differential tests that
     // reproduce the pre-guard decision rule.
     bool noToothGuard = false;
+    // Wrap the target with the pull in one present, the rule before wrap easing. Only for
+    // controls that must show what easing removes.
+    bool noWrapEase = false;
     // The SINK period: the target display's refresh, which is what production compares the
     // source against when arming the guard. presentPeriod above is the tick spacing the
     // present loop actually runs at - DWM's compose clock under a vsync present (twice the
@@ -177,6 +181,14 @@ struct SimParams {
     // declared rate under a timer present. The two coincide only at 1x.
     int64_t sinkPeriod = 16667;
 };
+
+// True for a present whose target still carried part of a wrap's ease: the lock had wrapped and
+// the target was crossing the comb on purpose. A blend or a near-boundary target there is the
+// ramp at work, so the checks that pin the locked regime, count hole blends or diff two replays
+// skip it; the census pins still count every present.
+static bool EasedTarget(const SimResult& r, size_t i) {
+    return i > 0 && i - 1 < r.ease.size() && r.ease[i - 1] != 0;
+}
 
 static SimResult Simulate(const SimParams& p) {
     SeedRng();   // each simulation owns its jitter stream; see kRngSeed
@@ -194,6 +206,7 @@ static SimResult Simulate(const SimParams& p) {
         cfg.srcPeriodQpc =
             policy::ToothGuardPeriod(p.srcPeriod, p.sinkPeriod, cfg.combQpc > 0);
     }
+    if (p.noWrapEase) cfg.wrapEasePresents = 1;
 
     int64_t lag = p.srcPeriod + p.srcPeriod / 4;
     if (lag < p.presentPeriod) lag = p.presentPeriod;
@@ -296,7 +309,7 @@ static SimResult Simulate(const SimParams& p) {
         const int64_t deadline = p.explicitPresents.empty()
                                      ? k * p.presentPeriod
                                      : p.explicitPresents[(size_t)(k - 1)];
-        const int64_t target = deadline - (lag + lock.pullQpc);
+        const int64_t target = deadline - (lag + lock.pullQpc + lock.easeQpc);
 
         // Frames visible to the bracket: arrived by pick time (the ring can't contain
         // the future) AND still inside the ring window (each publish evicts the slot
@@ -394,6 +407,7 @@ static SimResult Simulate(const SimParams& p) {
         r.picks.push_back(policy::SelectFrame(b, sel, cfg));
         r.shownTs.push_back(sel.lastShownTs);
         r.pull.push_back(lock.pullQpc);
+        r.ease.push_back(lock.easeQpc);
         r.engaged.push_back(lock.engaged);
         r.beforeDiff.push_back(b.hasBefore ? b.beforeDiff : -1);
 
@@ -665,13 +679,18 @@ static void test_lock_reseed_recovery() {
         return s;
     };
 
+    // The target the relay shows carries the wrap ease as well as the pull.
     int slewPresents = 0;
-    for (PhaseLockState s = settledLock(); !passing(s.pullQpc) && slewPresents < 10000; slewPresents++)
-        policy::UpdatePhaseLock(s, cfg, beforeDiffAt(s.pullQpc), /*resumedFromStall=*/false);
+    for (PhaseLockState s = settledLock();
+         !passing(s.pullQpc + s.easeQpc) && slewPresents < 10000; slewPresents++)
+        policy::UpdatePhaseLock(s, cfg, beforeDiffAt(s.pullQpc + s.easeQpc),
+                                /*resumedFromStall=*/false);
 
     int snapPresents = 0;
-    for (PhaseLockState s = settledLock(); !passing(s.pullQpc) && snapPresents < 10000; snapPresents++)
-        policy::UpdatePhaseLock(s, cfg, beforeDiffAt(s.pullQpc), /*resumedFromStall=*/snapPresents == 0);
+    for (PhaseLockState s = settledLock();
+         !passing(s.pullQpc + s.easeQpc) && snapPresents < 10000; snapPresents++)
+        policy::UpdatePhaseLock(s, cfg, beforeDiffAt(s.pullQpc + s.easeQpc),
+                                /*resumedFromStall=*/snapPresents == 0);
 
     std::printf("  reseed recovery: without a resume=%d presents (~%.2fs of blend) vs snap=%d present\n",
                 slewPresents, slewPresents * 16667.0 / 1e6, snapPresents);
@@ -710,13 +729,15 @@ static void test_lock_engage_window() {
         s.devEmaQpc = 3000;
         Outcome o{0, 0, -1};
         for (int k = 0; k < presents; k++) {
-            const int64_t bd = ((offset - s.pullQpc + jitterAt(k)) % comb + comb) % comb;
+            // The target the relay shows carries the wrap ease as well as the pull.
+            const int64_t bd =
+                ((offset - (s.pullQpc + s.easeQpc) + jitterAt(k)) % comb + comb) % comb;
             const bool wasEngaged = s.engaged;
             const int prevRecover = s.recoverRun;
             policy::UpdatePhaseLock(s, cfg, bd, /*resumedFromStall=*/false);
             if (!wasEngaged && s.engaged) o.reengages++;
             if (prevRecover == 0 && s.recoverRun > 0) o.windows++;
-            int64_t phase = policy::WrapHalf(offset - s.pullQpc, comb);
+            int64_t phase = policy::WrapHalf(offset - (s.pullQpc + s.easeQpc), comb);
             if (phase < 0) phase = -phase;
             if (o.converged < 0 && phase < cfg.passthroughQpc) o.converged = k;
         }
@@ -2807,9 +2828,13 @@ static void test_replay_capture_corpus() {
             // is dominated by transition bursts that swamp the isolated gameplay blends
             // entirely. Reading the aggregate is what led this project to conclude the
             // feature did nothing, on a capture where it removed a visible artifact.
-            int removed = 0, added = 0, sideSwitch = 0;
+            // A wrap ramp in either arm is skipped: the two arms' pulls differ by microseconds,
+            // so a wrap can land a present or two apart in each, and its ramp blends would read
+            // as blends the correction added or removed.
+            int removed = 0, added = 0, sideSwitch = 0, inRamp = 0;
             for (size_t i = kWarmup; i < r.ops.size() && i < r6.ops.size(); i++) {
                 if (r.ops[i] == r6.ops[i]) continue;
+                if (EasedTarget(r, i) || EasedTarget(r6, i)) { inRamp++; continue; }
                 const bool wasSynth = r.ops[i] == policy::CompositeOp::Synthesize;
                 const bool isSynth = r6.ops[i] == policy::CompositeOp::Synthesize;
                 if (wasSynth && !isSynth) removed++;
@@ -2817,7 +2842,8 @@ static void test_replay_capture_corpus() {
                 else sideSwitch++;
             }
             std::printf("    stage6 effect: %d blends removed, %d added, %d passthrough "
-                        "side switches\n", removed, added, sideSwitch);
+                        "side switches (%d differences inside wrap ramps not counted)\n",
+                        removed, added, sideSwitch, inRamp);
             if (fx.maxBlendsAdded >= 0) {
                 CHECK(added <= fx.maxBlendsAdded,
                       "[%s] dejit ADDED %d blends (fixture allows %d): the correction is "
@@ -2895,7 +2921,9 @@ static void test_composite_passthrough_at_lock() {
     CHECK(pass >= total * 98 / 100, "passthrough %d/%d post-warmup (< 98%%)", pass, total);
     CHECK(blend <= total / 100, "%d blends at lock (> 1%%)", blend);
     CHECK(hold <= 5, "%d holds at lock", hold);
-    PinCensus(r, warmup, 9000, 0, 0, 0, "passthrough_at_lock");
+    // The beat wraps the pull three times after warmup. Each wrap eases into a short run of
+    // blends where it used to re-present a frame (before easing: 9000/0/0/0).
+    PinCensus(r, warmup, 8990, 10, 0, 4, "passthrough_at_lock");
 }
 
 // Gate placement: at locked operating points the nearest-real-frame distance sits
@@ -2918,7 +2946,7 @@ static void test_composite_gate_placement() {
     bool prevPass = true;
     int flips = 0;
     for (size_t i = warmup; i < r.ops.size(); i++) {
-        if (!r.engaged[i]) continue;
+        if (!r.engaged[i] || EasedTarget(r, i)) continue;
         if (r.minDiff[i] >= T / 2 && r.minDiff[i] < T + T / 2) nearBoundary++;
         const bool isPass = IsPass(r.ops[i]);
         if (i > warmup && isPass != prevPass) {
@@ -2931,7 +2959,8 @@ static void test_composite_gate_placement() {
     }
     CHECK(nearBoundary == 0, "%d engaged presents inside the threshold boundary band", nearBoundary);
     CHECK(alternations == 0, "%d pass/blend alternation windows while locked", alternations);
-    PinCensus(r, warmup, 9000, 0, 0, 0, "gate_placement");
+    // Same timeline as passthrough_at_lock: three eased wraps (before easing: 9000/0/0/0).
+    PinCensus(r, warmup, 8990, 10, 0, 4, "gate_placement");
 }
 
 // Dropped source frames need no detection. Each isolated drop widens one bracket;
@@ -2954,7 +2983,7 @@ static void test_composite_hole_classification() {
     for (size_t i = warmup; i < r.ops.size(); i++) {
         if (!r.engaged[i]) engagedAll = 0;
         if (r.ops[i] == policy::CompositeOp::Hold) holds++;
-        if (r.ops[i] != policy::CompositeOp::Synthesize) continue;
+        if (r.ops[i] != policy::CompositeOp::Synthesize || EasedTarget(r, i)) continue;
         blends++;
         if (r.weights[i] < wLo) wLo = r.weights[i];
         if (r.weights[i] > wHi) wHi = r.weights[i];
@@ -2966,7 +2995,9 @@ static void test_composite_hole_classification() {
     CHECK(engagedAll, "lock disturbed by hole injection");
     CHECK(blends == 0 || (wLo >= 0.40 && wHi <= 0.60),
           "hole blend weights [%.3f, %.3f] not centered", wLo, wHi);
-    PinCensus(r, warmup, 9075, 25, 0, 50, "hole_classification");
+    // 25 hole blends plus the eased wraps' ramp blends on this timeline (before easing:
+    // 9075/25/0/50).
+    PinCensus(r, warmup, 9064, 36, 0, 54, "hole_classification");
 }
 
 // Recovery depth: at 1.25x lag a two-frame hole cannot fully recover. The in-gap
@@ -2989,7 +3020,7 @@ static void test_composite_two_frame_hole() {
     int engagedAll = 1;
     for (size_t i = warmup; i < r.ops.size(); i++) {
         if (!r.engaged[i]) engagedAll = 0;
-        if (!IsPass(r.ops[i])) nonPass.push_back(i);
+        if (!IsPass(r.ops[i]) && !EasedTarget(r, i)) nonPass.push_back(i);
     }
     CHECK(nonPass.size() >= 1 && nonPass.size() <= 2,
           "%zu non-pass presents for a two-frame hole", nonPass.size());
@@ -3004,7 +3035,9 @@ static void test_composite_two_frame_hole() {
         }
     }
     CHECK(engagedAll, "lock disturbed by the two-frame hole");
-    PinCensus(r, warmup, 8998, 1, 1, 2, "two_frame_hole");
+    // The hole's hold and blend plus the eased wraps' ramp blends on this timeline (before
+    // easing: 8998/1/1/2).
+    PinCensus(r, warmup, 8988, 11, 1, 6, "two_frame_hole");
 }
 
 // Oversampled source, no lock: the presentP-floored threshold exceeds srcP/2, so a
@@ -3147,28 +3180,56 @@ static void test_composite_gate_hysteresis() {
     }
 }
 
-// Enabling the composite config must leave the nearest selection byte-identical:
-// the shared PolicyConfig is the only coupling surface between the two decision
-// paths, and this pins it.
+// Enabling the composite config must leave the lock and the nearest selection unchanged: the
+// shared PolicyConfig is the only coupling surface between the two decision paths, and this
+// pins it. The one intended coupling is wrap easing, which runs in the blend modes only. During
+// a ramp the target is off the comb on purpose and reads a different frame pair, whose arrival
+// jitter moves the lock's measurement by microseconds, so after the first ramp the two runs are
+// different timelines. Hence two cases: a timeline that never wraps must match on every
+// present, and a beating one must match on every present before its first ramp.
 static void test_composite_v16_differential() {
-    SimParams p{};
-    p.srcPeriod = 16672;
-    p.presentPeriod = 16667;
-    p.arrivalJitter = 300;
-    p.combQpc = 16672;
-    p.presents = 12000;
-    // Both runs get the same jitter stream because Simulate reseeds; the differential is
-    // then purely the composite config.
-    p.passthroughQpc = 0;
-    SimResult off = Simulate(p);
-    p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
-    SimResult on = Simulate(p);
-    CHECK(off.picks.size() == on.picks.size(), "differential run sizes diverged");
-    for (size_t i = 0; i < off.picks.size() && i < on.picks.size(); i++) {
-        CHECK(off.picks[i] == on.picks[i] && off.shownTs[i] == on.shownTs[i] &&
-              off.pull[i] == on.pull[i],
-              "selection diverged at present %zu with composite config set", i);
-        if (g_failures) return;
+    struct Case { const char* label; int64_t srcPeriod; int64_t phaseOffset; bool wraps; };
+    // Matched rates with the arrivals placed so the lock settles about a fifth of a comb above
+    // zero and never reaches a wrap; and the 59.98-vs-60.00 beat, which wraps about once a
+    // minute.
+    const Case cases[] = {
+        {"no wrap", 16667, 9167, false},
+        {"beat", 16672, 0, true},
+    };
+    for (const Case& c : cases) {
+        SimParams p{};
+        p.srcPeriod = c.srcPeriod;
+        p.presentPeriod = 16667;
+        p.arrivalJitter = 300;
+        p.combQpc = c.srcPeriod;
+        p.presents = 12000;
+        p.phaseOffset = c.phaseOffset;
+        // Both runs get the same jitter stream because Simulate reseeds; the differential is
+        // then purely the composite config.
+        p.passthroughQpc = 0;
+        SimResult off = Simulate(p);
+        p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
+        SimResult on = Simulate(p);
+        CHECK(off.picks.size() == on.picks.size(), "%s: differential run sizes diverged", c.label);
+        size_t compared = 0;
+        for (size_t i = 0; i < off.picks.size() && i < on.picks.size(); i++) {
+            if (EasedTarget(on, i)) break;
+            compared++;
+            CHECK(off.picks[i] == on.picks[i] && off.shownTs[i] == on.shownTs[i] &&
+                      off.pull[i] == on.pull[i],
+                  "%s: selection or lock diverged at present %zu with composite config set",
+                  c.label, i);
+            if (g_failures) return;
+        }
+        // Controls: the no-wrap case must cover the whole run, and the beat must reach a ramp,
+        // or the exception was never exercised.
+        if (c.wraps) {
+            CHECK(compared < on.picks.size(), "%s: no ramp in %zu presents", c.label, compared);
+        } else {
+            CHECK(on.wraps == 0 && compared == on.picks.size(),
+                  "%s: %d wraps, compared %zu of %zu presents", c.label, on.wraps, compared,
+                  on.picks.size());
+        }
     }
 }
 
@@ -3352,6 +3413,73 @@ static void test_ring_depth_under_burst_delivery() {
                 "32-slot %d\n", starved[0], starved[1]);
 }
 
+// Wrap easing, in the blend modes. On the beat in both directions every wrap crosses the comb
+// over the ramp: after warmup no content step is a repeat (under 0.05 of a period) or a skip
+// (over 1.5 periods), and each wrap costs a short run of blends. The control runs the same
+// timelines with the pull and target wrapping together, which must show the repeats and skips
+// easing removes. A stall resume drops a ramp in progress, and selection mode never starts one.
+static void test_wrap_easing() {
+    for (const int64_t srcPeriod : {(int64_t)16672, (int64_t)16662}) {
+        int repeats[2] = {0, 0}, skips[2] = {0, 0}, blends[2] = {0, 0}, wraps[2] = {0, 0};
+        for (int eased = 0; eased < 2; eased++) {
+            SimParams p{};
+            p.srcPeriod = srcPeriod;
+            p.presentPeriod = 16667;
+            p.arrivalJitter = 300;
+            p.combQpc = srcPeriod;
+            p.presents = 24000;
+            p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
+            p.noWrapEase = !eased;
+            const SimResult r = Simulate(p);
+            const size_t warmup = 3000;
+            for (size_t w : r.wrapAt) wraps[eased] += w >= warmup;
+            for (size_t i = warmup; i < r.outTs.size(); i++) {
+                const int64_t step = r.outTs[i] - r.outTs[i - 1];
+                CHECK(step >= 0, "src %" PRId64 ": output regressed at present %zu", srcPeriod, i);
+                if (g_failures) return;
+                repeats[eased] += step * 20 < srcPeriod;
+                skips[eased] += step * 2 > srcPeriod * 3;
+                blends[eased] += r.ops[i] == policy::CompositeOp::Synthesize;
+            }
+        }
+        CHECK(wraps[1] >= 3, "src %" PRId64 ": only %d wraps after warmup", srcPeriod, wraps[1]);
+        CHECK(repeats[1] == 0 && skips[1] == 0,
+              "src %" PRId64 ": %d repeats and %d skips across %d eased wraps", srcPeriod,
+              repeats[1], skips[1], wraps[1]);
+        CHECK(blends[1] >= wraps[1] * 2 && blends[1] <= wraps[1] * policy::kWrapEasePresents,
+              "src %" PRId64 ": %d blends for %d eased wraps", srcPeriod, blends[1], wraps[1]);
+        CHECK(repeats[0] + skips[0] >= wraps[0],
+              "src %" PRId64 ": control shows only %d repeats and skips for %d instant wraps",
+              srcPeriod, repeats[0] + skips[0], wraps[0]);
+    }
+
+    // A wrap on a settled lock: the pull sits past the top band with no error left, so this
+    // present wraps it by a comb.
+    PolicyConfig cfg;
+    cfg.stickinessQpc = kStickinessUs;
+    cfg.combQpc = 16667;
+    cfg.phasePullSlewQpc = kSlewUs;
+    cfg.passthroughQpc = 4166;
+    auto wrapping = [&]() {
+        PhaseLockState s;
+        s.seeded = true;
+        s.engaged = true;
+        s.pullQpc = cfg.combQpc + policy::PullWrapAbove(cfg.combQpc) + 100;
+        return s;
+    };
+    PhaseLockState s = wrapping();
+    policy::UpdatePhaseLock(s, cfg, 0, /*resumedFromStall=*/false);
+    CHECK(s.easeQpc == cfg.combQpc, "blend mode: wrap left ease %" PRId64 ", expected %" PRId64,
+          s.easeQpc, cfg.combQpc);
+    policy::UpdatePhaseLock(s, cfg, 0, /*resumedFromStall=*/true);
+    CHECK(s.easeQpc == 0, "a stall resume left ease %" PRId64 " in place", s.easeQpc);
+    PolicyConfig selection = cfg;
+    selection.passthroughQpc = 0;
+    s = wrapping();
+    policy::UpdatePhaseLock(s, selection, 0, /*resumedFromStall=*/false);
+    CHECK(s.easeQpc == 0, "selection mode started a ramp (ease %" PRId64 ")", s.easeQpc);
+}
+
 // Composite output content time is non-decreasing across pull wraps (the monotone
 // guard), on a run long enough to contain several beats.
 static void test_composite_monotone_output() {
@@ -3371,7 +3499,9 @@ static void test_composite_monotone_output() {
               i, r.outTs[i - 1], r.outTs[i]);
         if (g_failures) return;
     }
-    PinCensus(r, 100, 23900, 0, 0, 0, "monotone_output");
+    // Seven beats wrap the pull; each eases into a short run of blends where it used to
+    // re-present a frame (before easing: 23900/0/0/0).
+    PinCensus(r, 100, 23862, 38, 0, 14, "monotone_output");
 }
 
 // Lock acquisition traverses the gate band. Parked outside the threshold with the
@@ -3406,7 +3536,8 @@ static void test_composite_lock_acquisition() {
     CHECK(r.engaged.back(), "lock not engaged at the end of the acquisition run");
     // The hold is the tooth guard on the one present after the acquisition pull snap,
     // whose re-phased target sits sub-tooth from the last consumed one: a re-present in
-    // place of a blend during re-lock (pre-guard pin: 62 synths, 0 holds).
+    // place of a blend during re-lock (pre-guard pin: 62 synths, 0 holds). That pull wraps
+    // while the target is still between frames, so the wrap jumps rather than eases.
     PinCensus(r, warmup, 5928, 61, 1, 1, "lock_acquisition");
 }
 
@@ -3726,6 +3857,7 @@ static void test_composite_tooth_guard_differential() {
 
 struct LogLine {
     int64_t tgt, before, after, pull;
+    int64_t ease;    // ease= after the lock update; absent (0) outside a wrap's ramp
     int lk;
     char pick[16];
     bool hasOp;      // blend/interp-mode line: op=/bw= present after mark=
@@ -3754,6 +3886,10 @@ static bool ParseTemporalLine(const char* line, LogLine* out) {
     if (o && std::sscanf(o, " op=%15s bw=%lf", out->op, &out->bw) == 2) {
         out->hasOp = true;
     }
+    out->ease = 0;
+    const char* e = std::strstr(t, " ease=");
+    long long ease;
+    if (e && std::sscanf(e, " ease=%lldus", &ease) == 1) out->ease = ease;
     return true;
 }
 
@@ -3898,10 +4034,11 @@ static int Replay(const char* path, int64_t combUs, int64_t passUsArg) {
         // be exact.
         size_t lkAgree = 0, lkTotal = 0;
         std::vector<int64_t> diffs;
-        int64_t prevLoggedPull = 0;
+        int64_t prevLoggedPull = 0, prevLoggedEase = 0;
         for (const LogLine& l : lines) {
             if (l.lk < 0) continue;
             lock.pullQpc = prevLoggedPull;
+            lock.easeQpc = prevLoggedEase;   // the ease this present's logged tgt= was built with
             BracketInfo b;
             b.hasBefore = true;
             b.hasAfter = l.after >= 0;
@@ -3914,6 +4051,7 @@ static int Replay(const char* path, int64_t combUs, int64_t passUsArg) {
             if (d < 0) d = -d;
             diffs.push_back(d);
             prevLoggedPull = l.pull;
+            prevLoggedEase = l.ease;
         }
         std::sort(diffs.begin(), diffs.end());
         const int64_t p50 = diffs.empty() ? 0 : diffs[diffs.size() / 2];
@@ -4660,6 +4798,7 @@ int main(int argc, char** argv) {
     test_composite_gate_hysteresis();
     test_composite_v16_differential();
     test_composite_monotone_output();
+    test_wrap_easing();
     test_ring_underrun_graceful();
     test_ring_slots_for_lag();
     test_ring_depth_at_shipping_lag();

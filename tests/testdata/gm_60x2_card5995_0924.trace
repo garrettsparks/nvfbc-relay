@@ -24,10 +24,12 @@ field_pull_wraps 104
 # arm, which is how the stream ran, reads synth 0.7%.
 #
 # Bounds on the REPLAY (not the field), measured with the band above the comb at comb/8:
-# inequalities, so an improvement passes and only a regression fails.
+# inequalities, so an improvement passes and only a regression fails. With wrap easing each
+# forced wrap crosses the comb as a short run of blends where it used to skip a frame, so the
+# synth share reads 1.3% (1.1% on the dejitter arm) against 0.8% before easing.
 max_worst_run 44
 max_long_runs 0
-max_synth_pct 1.2
+max_synth_pct 1.7
 min_reseeds 38
 max_pull_wraps 101
 extra_lag_ms 75
