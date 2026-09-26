@@ -60,7 +60,7 @@
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>../common;../core;../../third_party;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>../common;../core;../../third_party;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
     <Link>
@@ -85,7 +85,7 @@
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>../common;../core;../../third_party;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>../common;../core;../../third_party;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
     <Link>
@@ -167,4 +167,24 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
+  <!-- The commit the relay was built from, as BuildCommit.h in the intermediate folder, logged at
+       startup. "-dirty" marks a tree with uncommitted changes to tracked files, and "unknown" a
+       build without git. The header is rewritten only when its text changes, so an unchanged
+       tree does not recompile. -->
+  <Target Name="WriteBuildCommit" BeforeTargets="ClCompile">
+    <Exec Command="git rev-parse --short=7 HEAD" WorkingDirectory="$(ProjectDir)" ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="BuildCommit" />
+      <Output TaskParameter="ExitCode" PropertyName="BuildCommitExitCode" />
+    </Exec>
+    <Exec Command="git status --porcelain --untracked-files=no" WorkingDirectory="$(ProjectDir)" ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low" Condition="'$(BuildCommitExitCode)' == '0'">
+      <Output TaskParameter="ConsoleOutput" PropertyName="BuildTreeChanges" />
+    </Exec>
+    <PropertyGroup>
+      <BuildCommit Condition="'$(BuildCommitExitCode)' != '0'">unknown</BuildCommit>
+      <BuildCommit Condition="'$(BuildCommitExitCode)' == '0' And '$(BuildTreeChanges)' != ''">$(BuildCommit)-dirty</BuildCommit>
+    </PropertyGroup>
+    <MakeDir Directories="$(IntDir)" />
+    <WriteLinesToFile File="$(IntDir)BuildCommit.h" Lines="#define NVFBCR_BUILD_COMMIT &quot;$(BuildCommit)&quot;" Overwrite="true" WriteOnlyWhenDifferent="true" />
+    <Message Text="NvFBCR build commit: $(BuildCommit)" Importance="high" />
+  </Target>
 </Project>

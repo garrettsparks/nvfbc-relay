@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "BuildCommit.h"
 #include "D3D9Setup.h"
 #include "DiagCaptureMode.h"
 #include "Displays.h"
@@ -243,6 +244,7 @@ _Use_decl_annotations_ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR c
     if (relaunched) SimpleLogger::ContinueExistingLog();
     LOG("%s", relaunched ? "NvFBCR starting, relaunched after turning on NvFBC"
                          : "NvFBCR starting");
+    LOG("Build: commit %s", NVFBCR_BUILD_COMMIT);
     LogWallClock();
     LOG("Command line: '%s'", arguments.c_str());
 
