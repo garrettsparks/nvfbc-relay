@@ -1,5 +1,7 @@
 #include "TemporalPolicy.h"
 
+#include <algorithm>
+
 namespace policy {
 
 const char* PickLabel(Pick p) {
@@ -744,7 +746,7 @@ static void ConfirmReengage(PhaseLockState& s, const PolicyConfig& cfg, bool was
 }
 
 void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeDiff,
-                     bool resumedFromStall) {
+                     bool resumedFromStall, int64_t afterDiff) {
     // Closed loop: the pull is already inside the target this error was measured at, so
     // want = pull + errEma converges instead of integrating. Error and EMAs live on the
     // circular comb domain; a linear controller here saturates against clock skew and
@@ -752,11 +754,15 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     // The bracket was read at a target that includes the wrap ease; adding it back measures
     // the phase at the target the lock itself holds. The comb is periodic, so this is exact.
     const int64_t err = WrapHalf(beforeDiff + s.easeQpc, cfg.combQpc);
-    // Whether the target as shown this present sits on the comb, within the passthrough
-    // threshold of a real frame, or between frames. Read by the wrap easing at the end.
+    // Whether the target as shown this present sits on a real frame, within the passthrough
+    // threshold of one on either side, or between frames. Read by the wrap easing at the end.
+    // The after side counts because source spacing is irregular exactly where it matters: at a
+    // late frame the before frame is more than a period back while the after frame is on
+    // target.
     int64_t shownOff = WrapHalf(beforeDiff, cfg.combQpc);
     if (shownOff < 0) shownOff = -shownOff;
-    const bool shownOnComb = shownOff < cfg.passthroughQpc;
+    const bool shownOnComb = shownOff < cfg.passthroughQpc ||
+                             (afterDiff >= 0 && afterDiff < cfg.passthroughQpc);
     const bool wasSeeded = s.seeded;
     // Re-seed on stall-resume treats the resumed phase like a fresh acquisition: the fresh
     // err (not the /16-lagged EMA) both drives dev to zero (so the lock stays engaged
@@ -831,6 +837,108 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     s.easeQpc -= wrap;
     if (s.easeQpc > cfg.combQpc) s.easeQpc = cfg.combQpc;
     else if (s.easeQpc < -cfg.combQpc) s.easeQpc = -cfg.combQpc;
+}
+
+// Phase-step lookahead thresholds, as fractions of the comb so they hold in any time unit.
+// The newest frames are a step when their median sits more than a fifth of a comb off the
+// phase the target is on: steady engaged jitter is about a hundredth of a comb, and a single
+// gameplay frame strays past 3 ms on under 1% of presents. They must agree with each other
+// within an eighth of a comb, which a messy stretch of mixed phases never does, and hold the
+// new phase for two new frames. The move lands on the present whose target comes within a
+// quarter of a comb of the step's first frame.
+static const int kLookaheadFrames = 4;          // newest frames whose median is the new phase
+static const int kLookaheadConfirmFrames = 2;   // new frames the new phase must hold for
+static int64_t LookaheadStep(int64_t comb) { return comb / 5; }
+static int64_t LookaheadSpread(int64_t comb) { return comb / 8; }
+
+static int64_t MedianOf(int64_t* v, int n) {
+    std::sort(v, v + n);
+    return (v[(n - 1) / 2] + v[n / 2]) / 2;
+}
+
+int64_t ApplyLookahead(PhaseLookahead& la, PhaseLockState& lock, const PolicyConfig& cfg,
+                       int64_t target) {
+    if (!la.pending || target < la.firstTs + la.size - cfg.combQpc / 4) return 0;
+    lock.pullQpc += la.size;
+    la.pending = false;
+    return la.size;
+}
+
+LookaheadEvent UpdateLookahead(PhaseLookahead& la, const PhaseLockState& lock,
+                               const PolicyConfig& cfg, int64_t target, const RecentFrames& rf,
+                               bool resumedFromStall) {
+    int newFrames = 0;
+    long long newestSeq = la.lastSeq;
+    for (int j = 0; j < rf.nAhead; j++) {
+        if (rf.aheadSeq[j] > la.lastSeq) newFrames++;
+        if (rf.aheadSeq[j] > newestSeq) newestSeq = rf.aheadSeq[j];
+    }
+    la.lastSeq = newestSeq;
+
+    // Only while the lock holds steady: a stall, its resume and the convergence window after
+    // one move the pull on their own terms, and a disengaged lock has no phase to compare with.
+    const int64_t comb = cfg.combQpc;
+    if (!cfg.phaseLookahead || comb <= 0 || !lock.engaged || lock.stallRun != 0 ||
+        lock.recoverRun != 0 || resumedFromStall) {
+        la.confirmFrames = 0;
+        if (la.pending) {
+            la.pending = false;
+            return LookaheadEvent::Cancelled;
+        }
+        return LookaheadEvent::None;
+    }
+    if (rf.nAhead < kLookaheadFrames || rf.nAt < RecentFrames::kMaxAt) return LookaheadEvent::None;
+
+    int64_t at[RecentFrames::kMaxAt];
+    for (int j = 0; j < rf.nAt; j++) at[j] = WrapHalf(target - rf.atTs[j], comb);
+    int64_t ahead[kLookaheadFrames], sorted[kLookaheadFrames];
+    for (int j = 0; j < kLookaheadFrames; j++) {
+        ahead[j] = WrapHalf(target - rf.aheadTs[j], comb);
+        sorted[j] = ahead[j];
+    }
+    const int64_t cur = MedianOf(at, rf.nAt);                    // the phase the target is on
+    const int64_t up = MedianOf(sorted, kLookaheadFrames);       // the phase the newest agree on
+    int64_t lo = 0, hi = 0;
+    for (int j = 0; j < kLookaheadFrames; j++) {
+        const int64_t d = WrapHalf(ahead[j] - up, comb);
+        if (j == 0 || d < lo) lo = d;
+        if (j == 0 || d > hi) hi = d;
+    }
+    const int64_t dev = WrapHalf(up - cur, comb);
+    const int64_t step = LookaheadStep(comb);
+    const bool onComb = (cur < 0 ? -cur : cur) < cfg.passthroughQpc;
+    const bool newPhase = hi - lo < LookaheadSpread(comb) && onComb && (dev > step || -dev > step);
+
+    if (la.pending) {
+        // Cancelled when the newest frames go back before the target reaches the step: a swap
+        // back inside the lookahead then costs nothing.
+        const bool stillOff = (dev > 0) == (la.size > 0) && (dev > step / 2 || -dev > step / 2);
+        if (stillOff) return LookaheadEvent::None;
+        la.pending = false;
+        return LookaheadEvent::Cancelled;
+    }
+    if (!newPhase) {
+        la.confirmFrames = 0;
+        return LookaheadEvent::None;
+    }
+    la.confirmFrames += newFrames;
+    if (la.confirmFrames < kLookaheadConfirmFrames) return LookaheadEvent::None;
+    la.confirmFrames = 0;
+
+    // The first frame ahead of the target from which every newer one sits at the new phase.
+    bool found = false;
+    int64_t first = 0;
+    for (int j = 0; j < rf.nAhead; j++) {
+        const int64_t d = WrapHalf(WrapHalf(target - rf.aheadTs[j], comb) - cur, comb);
+        if ((d > 0) != (dev > 0) || (d <= step / 2 && -d <= step / 2)) break;
+        first = rf.aheadTs[j];
+        found = true;
+    }
+    if (!found) return LookaheadEvent::None;
+    la.pending = true;
+    la.size = dev;
+    la.firstTs = first;
+    return LookaheadEvent::Planned;
 }
 
 Pick SelectFrame(const BracketInfo& b, SelectionState& s, const PolicyConfig& cfg) {

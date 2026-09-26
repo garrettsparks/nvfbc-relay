@@ -88,6 +88,9 @@ struct SimResult {
     std::vector<int64_t> shownTs;     // after each present (Repeat carries forward)
     std::vector<int64_t> pull;        // lock pull after each present's update
     std::vector<int64_t> ease;        // wrap ease after each present's update (0 outside a ramp)
+    std::vector<char> rephased;       // a planned phase-step move landed on this present
+    int lookaheadPlanned = 0;
+    int lookaheadCancelled = 0;
     std::vector<bool> engaged;
     std::vector<int64_t> beforeDiff;  // at the pulled target (when hasBefore)
     std::vector<size_t> wrapAt;       // present indices where the pull wrapped
@@ -174,6 +177,8 @@ struct SimParams {
     // Wrap the target with the pull in one present, the rule before wrap easing. Only for
     // controls that must show what easing removes.
     bool noWrapEase = false;
+    // Leave the phase-step lookahead off, the rule before it. Only for controls.
+    bool noLookahead = false;
     // The SINK period: the target display's refresh, which is what production compares the
     // source against when arming the guard. presentPeriod above is the tick spacing the
     // present loop actually runs at - DWM's compose clock under a vsync present (twice the
@@ -207,6 +212,10 @@ static SimResult Simulate(const SimParams& p) {
             policy::ToothGuardPeriod(p.srcPeriod, p.sinkPeriod, cfg.combQpc > 0);
     }
     if (p.noWrapEase) cfg.wrapEasePresents = 1;
+    // Production's rule: a blend mode whose source is near the sink rate (comb ratio
+    // denominator 1).
+    cfg.phaseLookahead = !p.noLookahead && cfg.combQpc > 0 && cfg.combQpc == p.srcPeriod &&
+                         cfg.passthroughQpc > 0;
 
     int64_t lag = p.srcPeriod + p.srcPeriod / 4;
     if (lag < p.presentPeriod) lag = p.presentPeriod;
@@ -299,6 +308,7 @@ static SimResult Simulate(const SimParams& p) {
 
     SelectionState sel;
     PhaseLockState lock;
+    policy::PhaseLookahead lookahead;
     policy::CompositeState comp;
     SimResult r;
     size_t published = 0;
@@ -309,7 +319,7 @@ static SimResult Simulate(const SimParams& p) {
         const int64_t deadline = p.explicitPresents.empty()
                                      ? k * p.presentPeriod
                                      : p.explicitPresents[(size_t)(k - 1)];
-        const int64_t target = deadline - (lag + lock.pullQpc + lock.easeQpc);
+        int64_t target = deadline - (lag + lock.pullQpc + lock.easeQpc);
 
         // Frames visible to the bracket: arrived by pick time (the ring can't contain
         // the future) AND still inside the ring window (each publish evicts the slot
@@ -321,6 +331,12 @@ static SimResult Simulate(const SimParams& p) {
         while (published < arrivals.size() && arrivals[published] <= deadline) published++;
         const size_t oldest =
             published > (size_t)p.ringSlots ? published - (size_t)p.ringSlots : 0;
+
+        // Phase-step lookahead, in production's order: a planned move lands before anything
+        // reads the target, on the present whose target reaches the step's first frame.
+        const int64_t moved = policy::ApplyLookahead(lookahead, lock, cfg, target);
+        target -= moved;
+        r.rephased.push_back(moved != 0);
 
         // Stage 6, the same sequence production runs before its bracket read: measure each
         // batch's delivery lateness against its stride-anchored flip, gate on lock calm
@@ -392,7 +408,8 @@ static SimResult Simulate(const SimParams& p) {
         if (cfg.combQpc > 0) {
             resumedFromStall = policy::UpdateStallRun(lock, cfg, b);
             if (!policy::BracketIsStalled(b, cfg)) {
-                policy::UpdatePhaseLock(lock, cfg, b.beforeDiff, resumedFromStall);
+                policy::UpdatePhaseLock(lock, cfg, b.beforeDiff, resumedFromStall,
+                                        b.hasAfter ? b.afterDiff : -1);
                 if (lock.pullQpc - prevPull > cfg.combQpc / 2 ||
                     prevPull - lock.pullQpc > cfg.combQpc / 2) {
                     r.wraps++;
@@ -400,6 +417,28 @@ static SimResult Simulate(const SimParams& p) {
                 }
                 prevPull = lock.pullQpc;
             }
+            // The frames around the target, read as production's ring reads them: newest
+            // first, dejitter corrections applied, the ring's write index as the sequence.
+            policy::RecentFrames rf;
+            for (size_t i = published; i-- > oldest;) {
+                if (!valid[i]) continue;
+                int64_t ts = stamps[i];
+                if (flipDejitter) ts -= overlay.CorrectionFor(ts);
+                if (ts > target) {
+                    if (rf.nAhead < policy::RecentFrames::kMaxAhead) {
+                        rf.aheadTs[rf.nAhead] = ts;
+                        rf.aheadSeq[rf.nAhead] = (long long)i;
+                        rf.nAhead++;
+                    }
+                } else {
+                    rf.atTs[rf.nAt++] = ts;
+                    if (rf.nAt == policy::RecentFrames::kMaxAt) break;
+                }
+            }
+            const policy::LookaheadEvent ev =
+                policy::UpdateLookahead(lookahead, lock, cfg, target, rf, resumedFromStall);
+            if (ev == policy::LookaheadEvent::Planned) r.lookaheadPlanned++;
+            if (ev == policy::LookaheadEvent::Cancelled) r.lookaheadCancelled++;
         }
         r.snapped.push_back(resumedFromStall);
         r.span.push_back((b.hasBefore && b.hasAfter) ? (b.afterTs - b.beforeTs) : -1);
@@ -3480,6 +3519,107 @@ static void test_wrap_easing() {
     CHECK(s.easeQpc == 0, "selection mode started a ramp (ease %" PRId64 ")", s.easeQpc);
 }
 
+// The phase-step lookahead, on synthetic 60 fps timelines with the extra lag the relay runs by
+// default. Each case runs twice, with the lookahead and without it (the control), and a step is
+// a shift of every later frame's arrival. A step that holds is met with one move and a handful
+// of blends where the control slews across it blending for most of a second; a step that swaps
+// back later is met both ways; a swap back inside the lookahead never moves anything; an
+// alternating phase gets one move per step and no more; jitter alone never plans; and neither
+// selection mode nor a 90 fps comb arms it. No case may repeat or skip a frame.
+static void test_phase_lookahead() {
+    struct Case {
+        const char* label;
+        int64_t (*shift)(int);
+        int moves;           // exact moves expected, or -1 for "one per step" (checked below)
+        bool identical;      // output must equal the control's
+    };
+    const Case cases[] = {
+        {"jitter only", [](int) -> int64_t { return 0; }, 0, true},
+        {"late step that holds", [](int i) -> int64_t { return i >= 6000 ? 6000 : 0; }, 1, false},
+        {"early step that holds", [](int i) -> int64_t { return i >= 6000 ? -6000 : 0; }, 1, false},
+        {"step back after 0.7 s",
+         [](int i) -> int64_t { return (i >= 6000 && i < 6042) ? 6000 : 0; }, 2, false},
+        {"step back inside the lookahead",
+         [](int i) -> int64_t { return (i >= 6000 && i < 6002) ? 6000 : 0; }, 0, true},
+        {"alternating every 5 s",
+         [](int i) -> int64_t { return (i >= 3600 && (i / 300) % 2 == 0) ? 7700 : 0; }, -1, false},
+    };
+    auto timeline = [](int64_t (*shift)(int)) {
+        std::vector<int64_t> a;
+        for (int i = 0; i < 9100; i++) {
+            const int64_t jitter = (int64_t)((i * 7919) % 401) - 200;   // +-200 us, fixed
+            a.push_back((int64_t)i * 16667 + shift(i) + jitter);
+        }
+        return a;
+    };
+    auto setup = [&](int64_t (*shift)(int)) {
+        SimParams p{};
+        p.srcPeriod = 16667;
+        p.presentPeriod = 16667;
+        p.combQpc = 16667;
+        p.presents = 9000;
+        p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
+        p.extraLag = 75000;
+        p.ringSlots = policy::RingSlotsForLag(p.srcPeriod + p.srcPeriod / 4 + p.extraLag,
+                                              p.srcPeriod, kShipRingMin, kShipRingMax);
+        p.explicitArrivals = timeline(shift);
+        return p;
+    };
+    struct Count { int blends, repeats, skips, moves; };
+    auto count = [](const SimResult& r, int64_t period) {
+        Count c{0, 0, 0, 0};
+        for (size_t i = 3000; i < r.ops.size(); i++) {   // past lock acquisition
+            c.blends += r.ops[i] == policy::CompositeOp::Synthesize;
+            const int64_t step = r.outTs[i] - r.outTs[i - 1];
+            c.repeats += step * 20 < period;
+            c.skips += step * 2 > period * 3;
+            c.moves += r.rephased[i];
+        }
+        return c;
+    };
+    for (const Case& c : cases) {
+        SimParams p = setup(c.shift);
+        const SimResult on = Simulate(p);
+        p.noLookahead = true;
+        const SimResult off = Simulate(p);
+        const Count a = count(on, p.srcPeriod), z = count(off, p.srcPeriod);
+        CHECK(a.repeats == 0 && a.skips == 0, "%s: %d repeats and %d skips with the lookahead",
+              c.label, a.repeats, a.skips);
+        if (c.identical) {
+            CHECK(a.moves == 0 && on.ops == off.ops && on.outTs == off.outTs,
+                  "%s: %d moves, output differs from the control", c.label, a.moves);
+            continue;
+        }
+        if (c.moves >= 0) {
+            CHECK(a.moves == c.moves, "%s: %d moves, expected %d", c.label, a.moves, c.moves);
+            // The control is what makes the case a test: without the lookahead the step costs
+            // a long run of blends.
+            CHECK(z.blends >= 30, "%s: control blends only %d; the step is not exercised",
+                  c.label, z.blends);
+            CHECK(a.blends * 4 <= z.blends, "%s: %d blends against the control's %d",
+                  c.label, a.blends, z.blends);
+        } else {
+            // 18 steps in the window after acquisition: one move each, never a flap.
+            CHECK(a.moves >= 16 && a.moves <= 18, "%s: %d moves for 18 steps", c.label, a.moves);
+            CHECK(on.lookaheadCancelled == 0, "%s: %d cancelled plans (flapping)", c.label,
+                  on.lookaheadCancelled);
+            CHECK(a.blends * 4 <= z.blends, "%s: %d blends against the control's %d", c.label,
+                  a.blends, z.blends);
+        }
+        if (g_failures) return;
+    }
+
+    // Arming: selection mode (no passthrough threshold) and a comb finer than a source frame
+    // (90 fps into 60 Hz, M=2) never plan, even across a step that holds.
+    SimParams sel = setup(cases[1].shift);
+    sel.passthroughQpc = 0;
+    CHECK(Simulate(sel).lookaheadPlanned == 0, "selection mode planned a move");
+    SimParams fine = setup(cases[1].shift);
+    fine.srcPeriod = 11111;
+    fine.combQpc = 5555;
+    CHECK(Simulate(fine).lookaheadPlanned == 0, "a comb finer than a source frame planned a move");
+}
+
 // Composite output content time is non-decreasing across pull wraps (the monotone
 // guard), on a run long enough to contain several beats.
 static void test_composite_monotone_output() {
@@ -4799,6 +4939,7 @@ int main(int argc, char** argv) {
     test_composite_v16_differential();
     test_composite_monotone_output();
     test_wrap_easing();
+    test_phase_lookahead();
     test_ring_underrun_graceful();
     test_ring_slots_for_lag();
     test_ring_depth_at_shipping_lag();

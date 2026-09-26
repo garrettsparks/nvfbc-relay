@@ -499,6 +499,10 @@ struct PolicyConfig {
     // Wrap ramp length in presents (see kWrapEasePresents); at or below 1 a wrap jumps. Only the
     // blend modes ease, since selection cannot show an in-between frame.
     int wrapEasePresents = kWrapEasePresents;
+    // Watch the frames ahead of the target for a phase step and move the pull at the step
+    // (UpdateLookahead). Armed by the caller only for a blend mode whose source is near the
+    // sink rate (comb ratio denominator 1), where a step leaves the target between frames.
+    bool phaseLookahead = false;
 };
 
 // Ring depth for a bracketing lag. The ring must reach back past the target, and NvFBC
@@ -536,8 +540,51 @@ inline int64_t PullWrapAbove(int64_t comb) { return comb / 8; }
 // A re-engage after a disengaged stretch opens the same convergence window once confirmed: the
 // deviation EMA has settled well under the stability gate while the target is still beyond the
 // passthrough threshold (see kEngageStableDiv).
+// afterDiff: the bracket's after side, -1 when it has none. Read only to judge whether the
+// target sits on a real frame, which decides whether a wrap eases (see kWrapEasePresents).
 void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeDiff,
-                     bool resumedFromStall = false);
+                     bool resumedFromStall = false, int64_t afterDiff = -1);
+
+// The real frames around the target, as the ring holds them: those newer than the target,
+// newest first, with their ring write sequence numbers, and up to three at or before it,
+// nearest first. Stamps are read the way the bracket reads them (dejitter corrections
+// applied).
+struct RecentFrames {
+    static const int kMaxAhead = 16;
+    static const int kMaxAt = 3;
+    int nAhead = 0;
+    int nAt = 0;
+    int64_t aheadTs[kMaxAhead] = {};
+    long long aheadSeq[kMaxAhead] = {};
+    int64_t atTs[kMaxAt] = {};
+};
+
+// Phase-step lookahead. The target trails the newest capture by the whole bracketing lag, so
+// the ring already holds the frames the target will reach over the next few presents. When
+// those frames settle on a new phase, the step is known before the target gets there, and the
+// pull can move by the step on the present the target reaches its first frame: every real
+// frame is shown once, with no run of blends while the lock slews across.
+struct PhaseLookahead {
+    bool pending = false;     // a planned move waiting for the target to reach its first frame
+    int64_t size = 0;         // the planned pull change
+    int64_t firstTs = 0;      // stamp of the first frame at the new phase
+    int confirmFrames = 0;    // new frames the candidate phase has held for
+    long long lastSeq = -1;   // newest ring sequence already counted
+};
+
+enum class LookaheadEvent { None, Planned, Cancelled };
+
+// Before the bracket read: when a planned move's first frame has come up, move the pull by
+// the step. Returns the change, which the caller subtracts from the target it reads the
+// bracket at; 0 when nothing moved.
+int64_t ApplyLookahead(PhaseLookahead& la, PhaseLockState& lock, const PolicyConfig& cfg,
+                       int64_t target);
+
+// After the lock update: compare the phase the target sits on with the phase the newest
+// frames agree on, and plan, keep or cancel a move.
+LookaheadEvent UpdateLookahead(PhaseLookahead& la, const PhaseLockState& lock,
+                               const PolicyConfig& cfg, int64_t target, const RecentFrames& rf,
+                               bool resumedFromStall);
 
 // True when a bracket carries no usable phase information: one-sided, or spanning far
 // more than a source period. A frozen source produces both in turn: the capture loop stores

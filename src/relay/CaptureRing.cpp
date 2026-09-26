@@ -739,3 +739,29 @@ void CaptureRing::FindBracket(LONGLONG targetQpc, const policy::StampOverlay* ov
     }
 }
 
+void CaptureRing::ReadRecentFrames(LONGLONG targetQpc, const policy::StampOverlay* overlay,
+                                   policy::RecentFrames* out) const {
+    *out = policy::RecentFrames{};
+
+    const long long p = m_published.load();
+    long long oldest = p - (m_ringSlots - 1);
+    if (oldest < 0) oldest = 0;
+
+    for (long long i = p - 1; i >= oldest; i--) {
+        const int slot = (int)(i % m_ringSlots);
+        if (!m_ring[slot].valid) continue;
+        LONGLONG ts = m_ring[slot].timestamp.QuadPart;
+        if (overlay) ts -= overlay->CorrectionFor(m_ring[slot].batchStart.QuadPart);
+        if (ts > targetQpc) {
+            if (out->nAhead < policy::RecentFrames::kMaxAhead) {
+                out->aheadTs[out->nAhead] = ts;
+                out->aheadSeq[out->nAhead] = i;
+                out->nAhead++;
+            }
+        } else {
+            out->atTs[out->nAt++] = ts;
+            if (out->nAt == policy::RecentFrames::kMaxAt) break;
+        }
+    }
+}
+

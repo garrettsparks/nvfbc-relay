@@ -115,6 +115,12 @@ public:
     void FindBracket(LONGLONG targetQpc, const policy::StampOverlay* overlay,
                      FrameBracket* out) const;
 
+    // The real frames around targetQpc for the phase-step lookahead: every one newer than the
+    // target, newest first, and up to three at or before it. Read exactly as FindBracket reads
+    // (same window, same overlay corrections), with the slot's write index as its sequence.
+    void ReadRecentFrames(LONGLONG targetQpc, const policy::StampOverlay* overlay,
+                          policy::RecentFrames* out) const;
+
     // Batch-start history for the stage-6 walk, so the present thread never reads slot
     // fields the capture thread may be recycling: the capture thread appends each batch's
     // start stamp here at batch open (single producer), the present thread reads entries

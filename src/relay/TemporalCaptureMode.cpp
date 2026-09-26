@@ -267,6 +267,14 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
             interp ? "Interp" : "Blend", m_present->Name(),
             m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq(),
             interp ? "op=/bw=/pt=" : "op=/bw=");
+        // The phase-step lookahead needs the comb to be one source frame, which is where a step
+        // leaves the target between real frames. It reads frames ahead of the target, so it
+        // only has room to work when the lag is longer than a few source periods.
+        m_policyCfg.phaseLookahead =
+            m_policyCfg.combQpc > 0 && m_policyCfg.combQpc == m_assumedSrcPeriodQpc;
+        LOG("Phase-step lookahead %s", m_policyCfg.phaseLookahead
+                                            ? "ACTIVE: rephase: lines when a step is seen, moved or cancelled"
+                                            : "off (comb lock off, or its comb is finer than a source frame)");
         if (m_policyCfg.srcPeriodQpc > 0) {
             LOG("Composite tooth guard ACTIVE: synthesis must advance a full source period "
                 "(%lld us teeth); op=hold-comb between teeth",
@@ -404,8 +412,17 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
         // pull was computed from LAST present's bracket (closed loop, one-present latency
         // in the control path - negligible at 25 us/present slew). The ease is what is left of
         // a wrap the target is still crossing.
-        const LONGLONG target =
+        LONGLONG target =
             deadline - (m_bracketingDelayQpc + m_lockState.pullQpc + m_lockState.easeQpc);
+        // A phase step seen in the ring lands here, before anything reads the target, on the
+        // present whose target reaches the step's first frame.
+        const LONGLONG rephase =
+            policy::ApplyLookahead(m_lookahead, m_lockState, m_policyCfg, target);
+        if (rephase != 0) {
+            target -= rephase;
+            LOG("rephase: pull moved %+lld us onto a phase step",
+                (long long)(rephase * usPerTick));
+        }
 
         // Stage 6: settle delivery-lateness corrections BEFORE the bracket reads the ring.
         // The walk consumes the ring's batch-start history (never slot fields, which the
@@ -471,7 +488,22 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
                 policy::UpdateStallRun(m_lockState, m_policyCfg, bracket.info);
             if (!policy::BracketIsStalled(bracket.info, m_policyCfg)) {
                 policy::UpdatePhaseLock(m_lockState, m_policyCfg, bracket.info.beforeDiff,
-                                        resumedFromStall);
+                                        resumedFromStall,
+                                        bracket.info.hasAfter ? bracket.info.afterDiff : -1);
+            }
+            if (m_policyCfg.phaseLookahead) {
+                policy::RecentFrames recent;
+                m_ring.ReadRecentFrames(target, m_dejitter ? &m_overlay : NULL, &recent);
+                const policy::LookaheadEvent ev = policy::UpdateLookahead(
+                    m_lookahead, m_lockState, m_policyCfg, target, recent, resumedFromStall);
+                if (ev == policy::LookaheadEvent::Planned) {
+                    LOG("rephase: step of %+lld us seen in the ring, first frame %lld us ahead "
+                        "of the target",
+                        (long long)(m_lookahead.size * usPerTick),
+                        (long long)((m_lookahead.firstTs - target) * usPerTick));
+                } else if (ev == policy::LookaheadEvent::Cancelled) {
+                    LOG("rephase: cancelled, the newest frames went back before the step");
+                }
             }
         }
 

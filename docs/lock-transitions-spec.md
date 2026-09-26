@@ -159,7 +159,59 @@ A scratch sweep of N in {8, 12, 16, 24, 32} on the corpus and on the held-out lo
   content steps of 0 or 2 periods at wraps taken on the comb: the target is zero.
 - **Undo:** `kWrapEasePresents` = 1 is the instant wrap.
 
-## 4. Step 3: re-phasing quickly after a phase step
+## 4. Step 3: re-phasing quickly after a phase step (implemented)
+
+### As built
+
+The sections after this one are the plan. What was built differs from it in these ways, each for
+a reason the corpus showed:
+
+- **The comparison.** The phase the target is on now is the median of the three real frames at
+  or before the target, not the lock's error EMA. The first detector compared the newest frames
+  with the EMA and fired thousands of times, steady fixtures included: while the lock is still
+  converging, its EMA can sit far from the frames the target is on (-0.7 ms against a target 8 ms
+  off, measured). A per-frame noise study showed the signal itself was clean (median 0.16 to
+  0.34 ms, under 3 ms on 99% of frames, the newest frames no noisier than older ones).
+- **Consistency.** The newest four frames must agree with each other within an eighth of a comb.
+  A messy stretch of mixed phases never plans.
+- **Guards.** Only with the lock engaged, outside a stall run, outside the recovery window, and
+  only while the target is on a real frame.
+- **Thresholds,** as fractions of the comb: a step is more than a fifth of a comb (3.33 ms at 60
+  fps), and must hold for two new frames. Swept against 3 ms, comb/6 and 2 ms of spread: all
+  within a few blends of each other; comb/5 makes the fewest moves.
+- **No re-seed.** A move lands exactly as the step reaches the target, so the lock never sees an
+  error to re-seed.
+- **Wrap easing learned to see the after frame.** A move can push the pull past a band edge, so it
+  wraps on the same present, and step 2 judged "on the comb" from the before frame alone. At the
+  late frame of a step that frame is more than a period back, so the wrap jumped and repeated a
+  frame. `UpdatePhaseLock` now takes the bracket's after side too, which on its own removes 4
+  repeats and 5 skips across the corpus.
+- **The ring reader.** `CaptureRing::ReadRecentFrames` reads the same window and dejitter
+  corrections as `FindBracket`, with the slot's write index as each frame's sequence.
+- **Not built:** the reactive fallback for `-lag 0`. With no extra lag the ring holds about one frame
+  ahead of the target, so the lookahead never plans there and the lock behaves as before.
+- **Known gap:** a step of about half a comb. Its frames straddle the half-comb fold, so they never
+  agree and the lookahead leaves the step to the slew. A circular median fixed the arithmetic but
+  made the rest of the corpus worse (long runs 20 to 25), so it was left out.
+
+Results, dejitter replay (how the relay runs), against step 2:
+
+| | step 2 | with the lookahead |
+|---|---|---|
+| corpus blends | 117,167 | 114,785 |
+| corpus runs >= 50 | 31 | 20 |
+| corpus repeats / skips | 11,541 / 31,559 | 11,537 / 31,557 |
+| moves (planned, cancelled) | | 204 (212, 8) |
+| steady fixtures, plans | | 0 |
+| held-out 09-23: blends, worst run, runs >= 50 | 995, 87, 3 | 600, 47, 0 |
+
+The suite's `test_phase_lookahead` runs synthetic steps with a lookahead-off control each: a
+step that holds (1 move, 0 to 5 blends against 46 to 67), one that swaps back after 0.7 s (2 moves,
+10 against 41), one that swaps back inside the lookahead (no move, output identical), an
+alternating phase (one move per step, 98 blends against 1,049), jitter alone (no plan), and
+selection mode and a 90 fps comb (never armed). The 59.95 Hz fixture is the one whose bounds
+loosen: its worst run 44 to 49, at a half-comb step the lookahead does not catch, and one more
+wrap.
 
 ### What the captures show
 

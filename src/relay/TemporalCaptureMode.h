@@ -54,6 +54,7 @@ private:
     LONGLONG m_assumedSrcPeriodQpc; // declared/default source period the lag was sized for
     policy::PolicyConfig m_policyCfg;    // stickiness band, comb spacing (0 = lock off), pull slew, passthrough gate
     policy::PhaseLockState m_lockState;  // comb-lock pull/EMAs/gate (pure policy state)
+    policy::PhaseLookahead m_lookahead;  // a phase step seen in the ring, waiting for the target
     // THE PRESENT PATH. Owned. Constructed with the mode, before any device exists, so main
     // can ask whether the output window belongs to it before creating the D3D9 device; its
     // device work happens in Setup, after the ring has started. The compositor lives behind

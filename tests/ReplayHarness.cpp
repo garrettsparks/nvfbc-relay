@@ -514,6 +514,30 @@ struct RingModel {
             }
         }
     }
+    // CaptureRing::ReadRecentFrames: the same window and corrections as FindBracket, the
+    // frames newer than the target newest first, and up to three at or before it.
+    void ReadRecentFrames(int64_t target, const policy::StampOverlay* overlay,
+                          policy::RecentFrames* out) const {
+        *out = policy::RecentFrames();
+        long long oldest = published - (size - 1);
+        if (oldest < 0) oldest = 0;
+        for (long long i = published - 1; i >= oldest; i--) {
+            const Slot& s = slots[(size_t)(i % size)];
+            if (!s.valid) continue;
+            const int64_t stamp =
+                overlay ? s.stamp - overlay->CorrectionFor(s.batchStart) : s.stamp;
+            if (stamp > target) {
+                if (out->nAhead < policy::RecentFrames::kMaxAhead) {
+                    out->aheadTs[out->nAhead] = stamp;
+                    out->aheadSeq[out->nAhead] = i;
+                    out->nAhead++;
+                }
+            } else {
+                out->atTs[out->nAt++] = stamp;
+                if (out->nAt == policy::RecentFrames::kMaxAt) break;
+            }
+        }
+    }
 };
 
 struct PresentCensus {
@@ -687,6 +711,9 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
         pcfg.srcPeriodQpc = policy::ToothGuardPeriod(cfg.assumedSrcPeriod, cfg.sinkPeriod,
                                                      cfg.comb > 0);
     }
+    // As TemporalCaptureMode::Setup arms it: a blend mode whose comb is one source frame.
+    pcfg.phaseLookahead = cfg.blend && cfg.comb > 0 && cfg.comb == cfg.assumedSrcPeriod;
+    policy::PhaseLookahead lookahead;
     size_t nextPresent = 0;
     int64_t lastShownStamp = 0;
     bool haveShown = false;
@@ -716,7 +743,8 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
 
         // TemporalCaptureMode's own sequence: target from the deadline and the CURRENT pull and
         // wrap ease, bracket, then advance the lock for the NEXT present, then select.
-        const int64_t target = p.deadline - (cfg.lag + lockState.pullQpc + lockState.easeQpc);
+        int64_t target = p.deadline - (cfg.lag + lockState.pullQpc + lockState.easeQpc);
+        target -= policy::ApplyLookahead(lookahead, lockState, pcfg, target);
 
         // Corrections the field had computed by this point in the present sequence, and no
         // later ones: TemporalCaptureMode walks new batches and inserts before it brackets,
@@ -737,7 +765,13 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
         if (pcfg.combQpc > 0) {
             const bool resumed = policy::UpdateStallRun(lockState, pcfg, b);
             if (!policy::BracketIsStalled(b, pcfg))
-                policy::UpdatePhaseLock(lockState, pcfg, b.beforeDiff, resumed);
+                policy::UpdatePhaseLock(lockState, pcfg, b.beforeDiff, resumed,
+                                        b.hasAfter ? b.afterDiff : -1);
+            if (pcfg.phaseLookahead) {
+                policy::RecentFrames recent;
+                ring.ReadRecentFrames(target, cap.dejits.empty() ? NULL : &overlay, &recent);
+                policy::UpdateLookahead(lookahead, lockState, pcfg, target, recent, resumed);
+            }
         }
 
         // Blend mode decides with DecideComposite, not SelectFrame - and the two differ in
