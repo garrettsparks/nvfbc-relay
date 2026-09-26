@@ -795,11 +795,13 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
     if (s.recoverRun > 0) s.recoverRun--;
     s.pullQpc += delta;
 
-    // Wrap hysteresis: the pull may overshoot the [0, comb) domain by a band before
-    // wrapping, so jitter-scale wander at the boundary cannot chatter one-frame slips.
-    const int64_t band = cfg.combQpc / 16;
-    if (s.pullQpc < -band) s.pullQpc += cfg.combQpc;
-    else if (s.pullQpc >= cfg.combQpc + band) s.pullQpc -= cfg.combQpc;
+    // Wrap hysteresis: the pull may pass the [0, comb) domain by a band on each side before
+    // wrapping, so wander at a boundary does not chatter one-frame slips. A pull that has just
+    // wrapped sits one band inside the far edge, so it must cross both bands to wrap back, and
+    // the two together set how much wander is absorbed. The band above the comb is the wider
+    // one because it only adds lag; the band below takes the lag's margin away.
+    if (s.pullQpc < -PullWrapBelow(cfg.combQpc)) s.pullQpc += cfg.combQpc;
+    else if (s.pullQpc >= cfg.combQpc + PullWrapAbove(cfg.combQpc)) s.pullQpc -= cfg.combQpc;
 }
 
 Pick SelectFrame(const BracketInfo& b, SelectionState& s, const PolicyConfig& cfg) {

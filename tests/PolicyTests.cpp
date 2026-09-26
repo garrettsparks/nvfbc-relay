@@ -501,30 +501,50 @@ static void test_lock_off_matches_v15() {
 }
 
 static void test_monotonic_and_pull_bounds_across_wrap() {
-    // 59.98-vs-60.00-style mismatch, lock on at M=1: the pull ramps and wraps roughly
-    // once per beat. Output timestamps must never step backward, wraps included, and
-    // the pull must respect its wrap-hysteresis bounds every present.
-    SimParams p{};
-    p.srcPeriod = 16672;
-    p.presentPeriod = 16667;
-    p.arrivalJitter = 300;
-    p.combQpc = 16672;
-    p.presents = 12000;   // ~200 s
-    SimResult r = Simulate(p);
-    for (size_t i = 1; i < r.shownTs.size(); i++) {
-        CHECK(r.shownTs[i] >= r.shownTs[i - 1],
-              "shown ts stepped back at present %zu (%" PRId64 " -> %" PRId64 ")",
-              i, r.shownTs[i - 1], r.shownTs[i]);
-        if (g_failures) return;
+    // 59.98-vs-60.00-style mismatch, lock on at M=1, in both directions: the pull ramps and
+    // wraps roughly once per beat, at the bottom edge when the source is the slower clock and
+    // at the top edge when it is the faster one. Output timestamps must never step backward,
+    // wraps included, and the pull must respect its wrap bounds every present.
+    for (const int64_t srcPeriod : {(int64_t)16672, (int64_t)16662}) {
+        SimParams p{};
+        p.srcPeriod = srcPeriod;
+        p.presentPeriod = 16667;
+        p.arrivalJitter = 300;
+        p.combQpc = srcPeriod;
+        p.presents = 12000;   // ~200 s
+        SimResult r = Simulate(p);
+        for (size_t i = 1; i < r.shownTs.size(); i++) {
+            CHECK(r.shownTs[i] >= r.shownTs[i - 1],
+                  "src %" PRId64 ": shown ts stepped back at present %zu (%" PRId64 " -> %" PRId64 ")",
+                  srcPeriod, i, r.shownTs[i - 1], r.shownTs[i]);
+            if (g_failures) return;
+        }
+        const int64_t below = policy::PullWrapBelow(p.combQpc);
+        const int64_t above = policy::PullWrapAbove(p.combQpc);
+        int64_t lowest = INT64_MAX, highest = INT64_MIN;
+        for (size_t i = 0; i < r.pull.size(); i++) {
+            CHECK(r.pull[i] >= -below && r.pull[i] < p.combQpc + above,
+                  "src %" PRId64 ": pull %" PRId64 " out of bounds at present %zu", srcPeriod,
+                  r.pull[i], i);
+            if (g_failures) return;
+            if (r.pull[i] < lowest) lowest = r.pull[i];
+            if (r.pull[i] > highest) highest = r.pull[i];
+        }
+        // Each drift direction must carry the pull into the band it wraps from, or that side's
+        // bound was never exercised. The faster source must go past comb + below, a pull only
+        // the wider band above allows.
+        if (srcPeriod > p.presentPeriod) {
+            CHECK(lowest < 0, "src %" PRId64 ": pull never went below zero (lowest %" PRId64 ")",
+                  srcPeriod, lowest);
+        } else {
+            CHECK(highest >= p.combQpc + below,
+                  "src %" PRId64 ": pull never passed comb + %" PRId64 " (highest %" PRId64 ")",
+                  srcPeriod, below, highest);
+        }
+        // drift ~5 us/present -> one comb traversal per ~55 s -> 2-5 wraps in 200 s
+        CHECK(r.wraps >= 1 && r.wraps <= 6, "src %" PRId64 ": expected 1-6 wraps per 200 s beat, got %d",
+              srcPeriod, r.wraps);
     }
-    const int64_t band = p.combQpc / 16;
-    for (size_t i = 0; i < r.pull.size(); i++) {
-        CHECK(r.pull[i] >= -band && r.pull[i] < p.combQpc + band,
-              "pull %" PRId64 " out of bounds at present %zu", r.pull[i], i);
-        if (g_failures) return;
-    }
-    // drift ~5 us/present -> one comb traversal per ~55 s -> 2-5 wraps in 200 s
-    CHECK(r.wraps >= 1 && r.wraps <= 6, "expected 1-6 wraps per 200 s beat, got %d", r.wraps);
 }
 
 static void test_refusal_at_fine_ratio() {

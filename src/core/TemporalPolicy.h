@@ -502,10 +502,16 @@ int RingSlotsForLag(int64_t bracketingDelayQpc, int64_t srcPeriodQpc, int minSlo
 // The signed distance to the nearest point on a p-periodic timeline, in [-p/2, p/2).
 int64_t WrapHalf(int64_t d, int64_t p);
 
+// How far the pull may pass each edge of [0, comb) before it wraps by a comb. Below zero the
+// pull shortens the lag and uses up the quarter source period of margin the lag was sized
+// with, so that side stays narrow. Above the comb the pull only adds lag, so that side is wider.
+inline int64_t PullWrapBelow(int64_t comb) { return comb / 16; }
+inline int64_t PullWrapAbove(int64_t comb) { return comb / 8; }
+
 // One comb-lock step, closed-loop: consumes THIS present's beforeDiff (measured at the
 // already-pulled target, so the pull is inside the error) and updates the pull for the
 // NEXT present. EMA filter, stability gate, symmetric bounded slew, wrap modulo the
-// comb behind a hysteresis band. Call only with a complete bracket (both sides): the
+// comb behind the hysteresis bands above. Call only with a complete bracket (both sides): the
 // pull freezes across gaps rather than integrating a one-sided error.
 // resumedFromStall: this present is the first complete bracket after a multi-present source
 // stall (map open/close, alt-tab). The frozen pull is now far from the resumed phase, so

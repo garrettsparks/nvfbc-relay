@@ -54,15 +54,24 @@ gm_60x2_gameplay_0917_1.trace
 # still unexplained, which is the reason to gate on it.
 gm_60x2_gameplay_0922.trace
 # The same game and present path, two short local recordings from 2026-09-23 kept for the LOCK
-# WRAP: the pull is held in [0, comb) with a band of comb/16 either side, and a pull that wanders
-# across the band's edge wraps a whole comb, which re-presents one frame (wrapping up) or skips
-# one (wrapping down). On these captures the pull sat about 1 ms from the wrap point for minutes
-# and wrapped back and forth, a repeat and a skip that cancel, each proven in the recording at
-# frame precision. max_pull_wraps pins today's count, so a fix passes by lowering it. The first
-# carries wraps and nothing else; the second adds a game hitch that releases the lock into a
-# 118-present blend run.
+# WRAP: the pull is held in [0, comb) with a band either side, and a pull that wanders across a
+# band's edge wraps a whole comb, which re-presents one frame (wrapping up) or skips one
+# (wrapping down). On these captures the pull sat about 1 ms from the wrap point for minutes and,
+# with a band of comb/16 on both sides, wrapped back and forth, a repeat and a skip that cancel,
+# each proven in the recording at frame precision. Widening the band above the comb to comb/8
+# took their wraps from 3 and 6 to 1 and 4. max_pull_wraps pins the count, so a fix passes by
+# lowering it. The first carries wraps and nothing else; the second adds a game hitch that
+# releases the lock into a 118-present blend run.
 kcd_60x2_lockwrap_0923.trace
 kcd_60x2_lockwrap_hitch_0923.trace
+# The same game, present path and policy, 30 minutes of the 2026-09-24 stream with the capture
+# card on its standard 2560x1440 mode, which runs at 59.95 Hz, instead of the custom 60.000 Hz
+# one. A 60 fps source into a 59.95 Hz output gains a frame about every 20 s, so the pull drifts
+# steadily and has to wrap each time, a skip no band can prevent. This is not a setup to tune
+# for, since the custom mode fixes it, but the card fell back to it without anyone changing a
+# setting, so the fixture pins how the relay behaves there: one wrap per beat, no back and forth,
+# no long blend runs.
+gm_60x2_card5995_0924.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions
