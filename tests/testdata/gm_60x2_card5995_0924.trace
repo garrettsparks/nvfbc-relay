@@ -34,6 +34,9 @@ field_pull_wraps 104
 # between frames where the other one's landed on them, and it blends for 49 presents. The moves
 # shift the pull enough to add one wrap. Repeats and skips are no higher than without the
 # lookahead.
+# With the lookahead's late moves, the run at that step is gone and the one at 1034.66 s falls from
+# 48 presents to 30: worst run 30 on both arms, synth 1.1% (1.0% dejittered). The bounds stay
+# where they were.
 max_worst_run 49
 max_long_runs 0
 max_synth_pct 1.7

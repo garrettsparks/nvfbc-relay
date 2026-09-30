@@ -17,7 +17,11 @@ extra_lag_ms 75
 # Until 2026-09-23 the replay ran without the 75 ms of extra lag this capture was made with and
 # read 44.6% / worst 43 / re-seeds 4, a gap then put down to the fades; at the capture's lag it
 # closes, so it was the missing lag. The numbers above and the bounds are at the capture's lag.
-max_worst_run 39
+# With the lookahead's late moves the worst run is 40. The declared 60 against a 59 fps source
+# makes the phase sweep, and every beat blends for 30 to 35 presents. The late moves fire 4 times
+# here and shift where the beats land: one beat at 119.9 s runs 40 presents, where the longest
+# before was 39 at 118.2 s. Across the window blends fall by 29 and the one repeat goes.
+max_worst_run 40
 max_long_runs 0
 max_synth_pct 45.5
 min_reseeds 2

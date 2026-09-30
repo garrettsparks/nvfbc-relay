@@ -91,6 +91,7 @@ struct SimResult {
     std::vector<char> rephased;       // a planned phase-step move landed on this present
     int lookaheadPlanned = 0;
     int lookaheadCancelled = 0;
+    int lookaheadLate = 0;            // late moves planned (lateLookahead)
     std::vector<bool> engaged;
     std::vector<int64_t> beforeDiff;  // at the pulled target (when hasBefore)
     std::vector<size_t> wrapAt;       // present indices where the pull wrapped
@@ -179,6 +180,10 @@ struct SimParams {
     bool noWrapEase = false;
     // Leave the phase-step lookahead off, the rule before it. Only for controls.
     bool noLookahead = false;
+    // Leave out the lookahead's late moves, or the tooth guard's stall-resume exemption: the rule
+    // before each. Only for controls.
+    bool noLateLookahead = false;
+    bool noResumeGuardExemption = false;
     // The SINK period: the target display's refresh, which is what production compares the
     // source against when arming the guard. presentPeriod above is the tick spacing the
     // present loop actually runs at - DWM's compose clock under a vsync present (twice the
@@ -216,6 +221,10 @@ static SimResult Simulate(const SimParams& p) {
     // denominator 1).
     cfg.phaseLookahead = !p.noLookahead && cfg.combQpc > 0 && cfg.combQpc == p.srcPeriod &&
                          cfg.passthroughQpc > 0;
+    // Production arms late moves with the lookahead, and the guard's resume exemption in the
+    // blend modes, the only ones that run the composite decision.
+    cfg.lateLookahead = cfg.phaseLookahead && !p.noLateLookahead;
+    if (!p.noResumeGuardExemption) cfg.resumeGuardExemptPresents = policy::kResumeGuardExemptPresents;
 
     int64_t lag = p.srcPeriod + p.srcPeriod / 4;
     if (lag < p.presentPeriod) lag = p.presentPeriod;
@@ -313,6 +322,7 @@ static SimResult Simulate(const SimParams& p) {
     SimResult r;
     size_t published = 0;
     int64_t prevPull = 0;
+    policy::PresentHistory presentHist;
     const int64_t presentCount =
         p.explicitPresents.empty() ? p.presents : (int64_t)p.explicitPresents.size();
     for (int64_t k = 1; k <= presentCount; k++) {
@@ -320,6 +330,7 @@ static SimResult Simulate(const SimParams& p) {
                                      ? k * p.presentPeriod
                                      : p.explicitPresents[(size_t)(k - 1)];
         int64_t target = deadline - (lag + lock.pullQpc + lock.easeQpc);
+        const int64_t meanPresent = policy::RecordPresent(presentHist, deadline);
 
         // Frames visible to the bracket: arrived by pick time (the ring can't contain
         // the future) AND still inside the ring window (each publish evicts the slot
@@ -417,6 +428,7 @@ static SimResult Simulate(const SimParams& p) {
                 }
                 prevPull = lock.pullQpc;
             }
+            if (resumedFromStall) policy::ArmResumeGuardExemption(lock, cfg, meanPresent);
             // The frames around the target, read as production's ring reads them: newest
             // first, dejitter corrections applied, the ring's write index as the sequence.
             policy::RecentFrames rf;
@@ -439,7 +451,9 @@ static SimResult Simulate(const SimParams& p) {
                 policy::UpdateLookahead(lookahead, lock, cfg, target, rf, resumedFromStall);
             if (ev == policy::LookaheadEvent::Planned) r.lookaheadPlanned++;
             if (ev == policy::LookaheadEvent::Cancelled) r.lookaheadCancelled++;
+            if (ev == policy::LookaheadEvent::PlannedLate) r.lookaheadLate++;
         }
+        b.toothGuardExempt = policy::ConsumeGuardExemption(lock);
         r.snapped.push_back(resumedFromStall);
         r.span.push_back((b.hasBefore && b.hasAfter) ? (b.afterTs - b.beforeTs) : -1);
 
@@ -3620,6 +3634,184 @@ static void test_phase_lookahead() {
     CHECK(Simulate(fine).lookaheadPlanned == 0, "a comb finer than a source frame planned a move");
 }
 
+// The lookahead's late moves, against a control with late moves alone left out. A step whose first
+// frames arrive uneven (as after a hitch) settles in the ring too late to be planned ahead, so the
+// target reaches it first; the late move meets it where the control slews across. A source a
+// little off the declared rate sweeps its phase, and the late move must never mistake that for a
+// step.
+static void test_lookahead_late_moves() {
+    auto timeline = [](int64_t (*shift)(int)) {
+        std::vector<int64_t> a;
+        for (int i = 0; i < 9100; i++) {
+            const int64_t jitter = (int64_t)((i * 7919) % 401) - 200;   // +-200 us, fixed
+            a.push_back((int64_t)i * 16667 + shift(i) + jitter);
+        }
+        return a;
+    };
+    auto setup = [&](int64_t (*shift)(int)) {
+        SimParams p{};
+        p.srcPeriod = 16667;
+        p.presentPeriod = 16667;
+        p.combQpc = 16667;
+        p.presents = 9000;
+        p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
+        p.extraLag = 75000;
+        p.ringSlots = policy::RingSlotsForLag(p.srcPeriod + p.srcPeriod / 4 + p.extraLag,
+                                              p.srcPeriod, kShipRingMin, kShipRingMax);
+        p.explicitArrivals = timeline(shift);
+        return p;
+    };
+    struct Count { int blends, repeats, skips, moves; };
+    auto count = [](const SimResult& r, int64_t period) {
+        Count c{0, 0, 0, 0};
+        for (size_t i = 3000; i < r.ops.size(); i++) {   // past lock acquisition
+            c.blends += r.ops[i] == policy::CompositeOp::Synthesize;
+            const int64_t step = r.outTs[i] - r.outTs[i - 1];
+            c.repeats += step * 20 < period;
+            c.skips += step * 2 > period * 3;
+            c.moves += r.rephased[i];
+        }
+        return c;
+    };
+
+    // A 6 ms step whose first six frames scatter 1.5 ms either side of the new phase.
+    SimParams p = setup([](int i) -> int64_t {
+        if (i < 6000) return 0;
+        if (i < 6006) return 6000 + ((i % 2) ? 1500 : -1500);
+        return 6000;
+    });
+    const SimResult late = Simulate(p);
+    p.noLateLookahead = true;
+    const SimResult lateOff = Simulate(p);
+    Count a = count(late, p.srcPeriod), z = count(lateOff, p.srcPeriod);
+    CHECK(lateOff.lookaheadPlanned == 0 && z.blends >= 30,
+          "uneven step: control planned %d moves and blended %d; the step is not late",
+          lateOff.lookaheadPlanned, z.blends);
+    CHECK(late.lookaheadLate == 1 && a.moves == 1, "uneven step: %d late plans, %d moves",
+          late.lookaheadLate, a.moves);
+    CHECK(a.repeats == 0 && a.skips == 0, "uneven step: %d repeats and %d skips", a.repeats,
+          a.skips);
+    CHECK(a.blends * 3 <= z.blends, "uneven step: %d blends against the control's %d", a.blends,
+          z.blends);
+
+    // 59 fps declared as 60: the phase sweeps a period a second.
+    p = setup([](int i) -> int64_t { return (int64_t)i * 283; });
+    const SimResult sweep = Simulate(p);
+    p.noLateLookahead = true;
+    const SimResult sweepOff = Simulate(p);
+    CHECK(sweep.lookaheadLate == 0 && sweep.ops == sweepOff.ops && sweep.outTs == sweepOff.outTs,
+          "sweep: %d late plans, output differs from the control", sweep.lookaheadLate);
+
+}
+
+// The tooth guard's stall-resume exemption. A game coming back from a freeze delivers its first
+// frames unevenly (51, 25 and 13 ms apart, measured on streams) before settling on a new phase.
+// The resume snap, and the wrap it can push the pull into, can leave the next target less than a
+// tooth past the last one and between two of those frames, where the guard re-presents a frame.
+// Across a sweep of resume phases the control must show that repeat, and with the exemption no
+// resume may hold a frame for the guard or add a repeat or skip. The exemption arms only while
+// the relay presents at the source rate: on a doubled clock the guard keeps holding every
+// mid-tooth target (the hole-cover test runs that clock end to end).
+static void test_resume_guard_exemption() {
+    static int64_t resumePhase = 0;
+    int controlHolds = 0;
+    for (resumePhase = 0; resumePhase < 16667; resumePhase += 500) {
+        int holds[2] = {0, 0}, repeats[2] = {0, 0}, skips[2] = {0, 0};
+        for (int exempt = 0; exempt < 2; exempt++) {
+            SimParams p{};
+            p.srcPeriod = 16667;
+            p.presentPeriod = 16667;
+            p.combQpc = 16667;
+            p.presents = 5000;
+            p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
+            p.extraLag = 75000;
+            p.ringSlots = policy::RingSlotsForLag(p.srcPeriod + p.srcPeriod / 4 + p.extraLag,
+                                                  p.srcPeriod, kShipRingMin, kShipRingMax);
+            int64_t t = 0;
+            for (int i = 0; i < 3000; i++) {
+                p.explicitArrivals.push_back(t + (int64_t)((i * 7919) % 401) - 200);
+                t += 16667;
+            }
+            t += 300000 + resumePhase;   // the freeze
+            for (const int64_t gap : {(int64_t)51000, (int64_t)25000, (int64_t)13000}) {
+                p.explicitArrivals.push_back(t);
+                t += gap;
+            }
+            for (int i = 0; i < 2100; i++) {
+                p.explicitArrivals.push_back(t + (int64_t)((i * 7919) % 401) - 200);
+                t += 16667;
+            }
+            p.noResumeGuardExemption = !exempt;
+            const SimResult r = Simulate(p);
+            for (size_t i = 2500; i < r.ops.size(); i++) {
+                holds[exempt] += r.ops[i] == policy::CompositeOp::HoldComb;
+                const int64_t step = r.outTs[i] - r.outTs[i - 1];
+                repeats[exempt] += step * 20 < p.srcPeriod;
+                skips[exempt] += step * 2 > p.srcPeriod * 3;
+            }
+        }
+        CHECK(holds[1] == 0, "resume phase %" PRId64 ": the guard held %d frames with the exemption",
+              resumePhase, holds[1]);
+        CHECK(repeats[1] <= repeats[0] && skips[1] <= skips[0],
+              "resume phase %" PRId64 ": %d repeats and %d skips against the control's %d and %d",
+              resumePhase, repeats[1], skips[1], repeats[0], skips[0]);
+        controlHolds += holds[0];
+        if (g_failures) return;
+    }
+    CHECK(controlHolds > 0, "no resume phase made the control's guard hold a frame; unexercised");
+
+    // The decision itself: a sub-tooth target between two frames holds for the guard, and the
+    // same bracket blends when the guard stands aside.
+    PolicyConfig dc;
+    dc.stickinessQpc = kStickinessUs;
+    dc.passthroughQpc = 4166;
+    dc.srcPeriodQpc = 16667;
+    policy::CompositeState cs;
+    cs.lastTargetTs = 100000;
+    BracketInfo sub;
+    sub.hasBefore = sub.hasAfter = true;
+    sub.beforeTs = 98000;
+    sub.afterTs = 114667;
+    sub.beforeDiff = 8000;    // target 106000: 6 ms past the last, 8 ms from either frame
+    sub.afterDiff = 8667;
+    policy::CompositeState held = cs;
+    CHECK(policy::DecideComposite(sub, held, dc).op == policy::CompositeOp::HoldComb,
+          "the guard did not hold a sub-tooth target");
+    sub.toothGuardExempt = true;
+    policy::CompositeState exemptState = cs;
+    CHECK(policy::DecideComposite(sub, exemptState, dc).op == policy::CompositeOp::Synthesize,
+          "the exempt decision did not blend");
+
+    PolicyConfig cfg;
+    cfg.srcPeriodQpc = 16667;
+    cfg.resumeGuardExemptPresents = policy::kResumeGuardExemptPresents;
+    PhaseLockState s;
+    policy::ArmResumeGuardExemption(s, cfg, 8333);
+    CHECK(s.guardExemptLeft == 0, "a doubled present clock armed the exemption");
+    policy::ArmResumeGuardExemption(s, cfg, 16667);
+    CHECK(s.guardExemptLeft == policy::kResumeGuardExemptPresents,
+          "the source-rate clock armed %d presents", s.guardExemptLeft);
+    int taken = 0;
+    for (int i = 0; i < 5; i++) taken += policy::ConsumeGuardExemption(s);
+    CHECK(taken == policy::kResumeGuardExemptPresents, "the exemption covered %d presents", taken);
+    PolicyConfig noGuard = cfg;
+    noGuard.srcPeriodQpc = 0;
+    PhaseLockState g;
+    policy::ArmResumeGuardExemption(g, noGuard, 16667);
+    CHECK(g.guardExemptLeft == 0, "armed with the tooth guard off");
+
+    // The mean present interval: nothing until a full span came before, then the span's mean.
+    for (const int64_t period : {(int64_t)16667, (int64_t)8333}) {
+        policy::PresentHistory h;
+        int64_t mean = -1;
+        for (int i = 0; i <= policy::kPresentMeanSpan; i++) {
+            mean = policy::RecordPresent(h, 1000000 + i * period);
+            if (i < policy::kPresentMeanSpan) CHECK(mean == 0, "mean %" PRId64 " after %d presents", mean, i);
+        }
+        CHECK(mean == period, "mean %" PRId64 " for presents %" PRId64 " apart", mean, period);
+    }
+}
+
 // Composite output content time is non-decreasing across pull wraps (the monotone
 // guard), on a run long enough to contain several beats.
 static void test_composite_monotone_output() {
@@ -4940,6 +5132,8 @@ int main(int argc, char** argv) {
     test_composite_monotone_output();
     test_wrap_easing();
     test_phase_lookahead();
+    test_lookahead_late_moves();
+    test_resume_guard_exemption();
     test_ring_underrun_graceful();
     test_ring_slots_for_lag();
     test_ring_depth_at_shipping_lag();

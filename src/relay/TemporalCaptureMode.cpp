@@ -272,13 +272,19 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
         // only has room to work when the lag is longer than a few source periods.
         m_policyCfg.phaseLookahead =
             m_policyCfg.combQpc > 0 && m_policyCfg.combQpc == m_assumedSrcPeriodQpc;
+        // A step that settles in the ring too late to plan ahead (right after a hitch) is met
+        // once the target reaches it.
+        m_policyCfg.lateLookahead = m_policyCfg.phaseLookahead;
         LOG("Phase-step lookahead %s", m_policyCfg.phaseLookahead
-                                            ? "ACTIVE: rephase: lines when a step is seen, moved or cancelled"
+                                            ? "ACTIVE with late moves: rephase: lines when a step is seen, moved or cancelled"
                                             : "off (comb lock off, or its comb is finer than a source frame)");
         if (m_policyCfg.srcPeriodQpc > 0) {
+            m_policyCfg.resumeGuardExemptPresents = policy::kResumeGuardExemptPresents;
             LOG("Composite tooth guard ACTIVE: synthesis must advance a full source period "
-                "(%lld us teeth); op=hold-comb between teeth",
-                m_policyCfg.srcPeriodQpc * 1000000 / m_scheduler.Freq());
+                "(%lld us teeth); op=hold-comb between teeth; stands aside for %d presents after a "
+                "stall resume while presenting at the source rate",
+                m_policyCfg.srcPeriodQpc * 1000000 / m_scheduler.Freq(),
+                m_policyCfg.resumeGuardExemptPresents);
         } else {
             // Stated rather than left as a missing line: a run that quietly lost the guard
             // reads as a parity-lottery blend storm with no explanation in the log.
@@ -408,6 +414,7 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
             m_scheduler.WaitUntilDeadline();
             deadline = m_scheduler.Deadline();
         }
+        const LONGLONG meanPresentQpc = policy::RecordPresent(m_presentHist, deadline);
         // Comb lock applies the pull as extra lag; zero when disabled or disengaged. The
         // pull was computed from LAST present's bracket (closed loop, one-present latency
         // in the control path - negligible at 25 us/present slew). The ease is what is left of
@@ -491,6 +498,9 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
                                         resumedFromStall,
                                         bracket.info.hasAfter ? bracket.info.afterDiff : -1);
             }
+            if (resumedFromStall) {
+                policy::ArmResumeGuardExemption(m_lockState, m_policyCfg, meanPresentQpc);
+            }
             if (m_policyCfg.phaseLookahead) {
                 policy::RecentFrames recent;
                 m_ring.ReadRecentFrames(target, m_dejitter ? &m_overlay : NULL, &recent);
@@ -503,9 +513,13 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
                         (long long)((m_lookahead.firstTs - target) * usPerTick));
                 } else if (ev == policy::LookaheadEvent::Cancelled) {
                     LOG("rephase: cancelled, the newest frames went back before the step");
+                } else if (ev == policy::LookaheadEvent::PlannedLate) {
+                    LOG("rephase: late step of %+lld us, the target already sits on it",
+                        (long long)(m_lookahead.size * usPerTick));
                 }
             }
         }
+        bracket.info.toothGuardExempt = policy::ConsumeGuardExemption(m_lockState);
 
         // The DECISION is pure policy (selection or composite, in TemporalPolicy.cpp with
         // the mechanism rationale); the present path executes it onto its own target,

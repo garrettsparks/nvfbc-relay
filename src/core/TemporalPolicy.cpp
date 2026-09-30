@@ -860,7 +860,11 @@ int64_t ApplyLookahead(PhaseLookahead& la, PhaseLockState& lock, const PolicyCon
                        int64_t target) {
     if (!la.pending || target < la.firstTs + la.size - cfg.combQpc / 4) return 0;
     lock.pullQpc += la.size;
+    // A late move lands after the lock has started chasing the step. Its error estimate moves
+    // with the pull, so the lock sees the target back on the comb and does not pull it back.
+    if (la.late) lock.errEmaQpc = WrapHalf(lock.errEmaQpc - la.size, cfg.combQpc);
     la.pending = false;
+    la.late = false;
     return la.size;
 }
 
@@ -908,6 +912,23 @@ LookaheadEvent UpdateLookahead(PhaseLookahead& la, const PhaseLockState& lock,
     const int64_t step = LookaheadStep(comb);
     const bool onComb = (cur < 0 ? -cur : cur) < cfg.passthroughQpc;
     const bool newPhase = hi - lo < LookaheadSpread(comb) && onComb && (dev > step || -dev > step);
+    // A step the target has already reached: the frames at the target sit on the phase the
+    // newest agree on, and that phase is off the comb.
+    // Not during a wrap ramp, whose target leaves the comb on purpose.
+    bool latePhase = false;
+    if (cfg.lateLookahead && !onComb && !la.pending && lock.easeQpc == 0) {
+        int64_t lateLo = lo, lateHi = hi;
+        for (int j = 0; j < rf.nAt; j++) {
+            const int64_t d = WrapHalf(at[j] - up, comb);
+            if (d < lateLo) lateLo = d;
+            if (d > lateHi) lateHi = d;
+        }
+        // A phase that sweeps (a source a little off the declared rate) drifts between the
+        // frames at the target and the newest ones; a step that has settled does not.
+        const int64_t drift = WrapHalf(up - cur, comb);
+        latePhase = lateHi - lateLo < LookaheadSpread(comb) && drift < comb / 16 &&
+                    -drift < comb / 16 && (up > step || -up > step);
+    }
 
     if (la.pending) {
         // Cancelled when the newest frames go back before the target reaches the step: a swap
@@ -917,13 +938,22 @@ LookaheadEvent UpdateLookahead(PhaseLookahead& la, const PhaseLockState& lock,
         la.pending = false;
         return LookaheadEvent::Cancelled;
     }
-    if (!newPhase) {
+    if (!newPhase && !latePhase) {
         la.confirmFrames = 0;
         return LookaheadEvent::None;
     }
     la.confirmFrames += newFrames;
     if (la.confirmFrames < kLookaheadConfirmFrames) return LookaheadEvent::None;
     la.confirmFrames = 0;
+
+    if (latePhase) {
+        // Move onto the phase on the next present: there is no first frame left to wait for.
+        la.pending = true;
+        la.late = true;
+        la.size = up;
+        la.firstTs = INT64_MIN / 4;
+        return LookaheadEvent::PlannedLate;
+    }
 
     // The first frame ahead of the target from which every newer one sits at the new phase.
     bool found = false;
@@ -1066,6 +1096,28 @@ int64_t PassthroughThreshold(int64_t srcPeriodQpc, int64_t presentPeriodQpc) {
     return srcPeriodQpc / 4;
 }
 
+int64_t RecordPresent(PresentHistory& h, int64_t presentTime) {
+    int64_t mean = 0;
+    if (h.count >= kPresentMeanSpan) mean = (presentTime - h.times[h.next]) / kPresentMeanSpan;
+    h.times[h.next] = presentTime;
+    h.next = (h.next + 1) % kPresentMeanSpan;
+    if (h.count < kPresentMeanSpan) h.count++;
+    return mean;
+}
+
+void ArmResumeGuardExemption(PhaseLockState& s, const PolicyConfig& cfg,
+                             int64_t meanPresentIntervalQpc) {
+    if (cfg.resumeGuardExemptPresents <= 0 || cfg.srcPeriodQpc <= 0) return;
+    if (meanPresentIntervalQpc * 8 < cfg.srcPeriodQpc * 7) return;
+    s.guardExemptLeft = cfg.resumeGuardExemptPresents;
+}
+
+bool ConsumeGuardExemption(PhaseLockState& s) {
+    if (s.guardExemptLeft <= 0) return false;
+    s.guardExemptLeft--;
+    return true;
+}
+
 CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
                                   const PolicyConfig& cfg) {
     // PASSTHROUGH ELIGIBILITY: a real frame close enough to the target that blending
@@ -1121,7 +1173,7 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
         // rather than manufacture a frame the source never produced. State is left
         // untouched exactly as a Hold leaves it, so the guarded presents are invisible
         // to the Schmitt loops and the next on-tooth present decides from clean state.
-        if (SynthWouldManufactureTooth(b, s, cfg)) {
+        if (!b.toothGuardExempt && SynthWouldManufactureTooth(b, s, cfg)) {
             d.op = CompositeOp::HoldComb;
             return d;
         }

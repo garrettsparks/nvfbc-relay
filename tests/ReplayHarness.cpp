@@ -713,7 +713,12 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
     }
     // As TemporalCaptureMode::Setup arms it: a blend mode whose comb is one source frame.
     pcfg.phaseLookahead = cfg.blend && cfg.comb > 0 && cfg.comb == cfg.assumedSrcPeriod;
+    pcfg.lateLookahead = pcfg.phaseLookahead;
+    if (cfg.blend && pcfg.srcPeriodQpc > 0) {
+        pcfg.resumeGuardExemptPresents = policy::kResumeGuardExemptPresents;
+    }
     policy::PhaseLookahead lookahead;
+    policy::PresentHistory presentHist;
     size_t nextPresent = 0;
     int64_t lastShownStamp = 0;
     bool haveShown = false;
@@ -731,6 +736,7 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
     PresentCensus discard;
     auto DoPresent = [&](const PresentRec& p) {
         if (!pcOut) return;
+        const int64_t meanPresent = policy::RecordPresent(presentHist, p.deadline);
         const bool inWindow = p.deadline >= cfg.fromTs && p.deadline <= cfg.toTs;
         PresentCensus* const pc = inWindow ? pcOut : &discard;
         if (!p.usable) { pc->skipped++; return; }
@@ -767,12 +773,14 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
             if (!policy::BracketIsStalled(b, pcfg))
                 policy::UpdatePhaseLock(lockState, pcfg, b.beforeDiff, resumed,
                                         b.hasAfter ? b.afterDiff : -1);
+            if (resumed) policy::ArmResumeGuardExemption(lockState, pcfg, meanPresent);
             if (pcfg.phaseLookahead) {
                 policy::RecentFrames recent;
                 ring.ReadRecentFrames(target, cap.dejits.empty() ? NULL : &overlay, &recent);
                 policy::UpdateLookahead(lookahead, lockState, pcfg, target, recent, resumed);
             }
         }
+        b.toothGuardExempt = policy::ConsumeGuardExemption(lockState);
 
         // Blend mode decides with DecideComposite, not SelectFrame - and the two differ in
         // exactly the case that matters here: a one-sided bracket HOLDS (a duplicate) unless

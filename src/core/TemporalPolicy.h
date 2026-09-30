@@ -43,6 +43,8 @@ struct BracketInfo {
     int64_t afterTs = 0;
     int64_t beforeDiff = 0;
     int64_t afterDiff = 0;
+    // The composite's tooth guard stands aside for this decision (ConsumeGuardExemption).
+    bool toothGuardExempt = false;
 };
 
 // Batch-collapse memory across capture wakes. Under driver-level frame generation the
@@ -467,6 +469,9 @@ struct PhaseLockState {
     int stallRun = 0;      // consecutive presents whose bracket carried no phase information
     int recoverRun = 0;    // presents left in the post-resume convergence window
     int reengageRun = -1;  // presents since a re-engage awaiting confirmation; -1 = none
+    // Presents left on which the composite's tooth guard stands aside after a stall resume
+    // (ArmResumeGuardExemption).
+    int guardExemptLeft = 0;
 };
 
 // Presents over which the target crosses the comb after a wrap, in the blend modes. The lock
@@ -503,7 +508,19 @@ struct PolicyConfig {
     // (UpdateLookahead). Armed by the caller only for a blend mode whose source is near the
     // sink rate (comb ratio denominator 1), where a step leaves the target between frames.
     bool phaseLookahead = false;
+    // Let the lookahead move after the target has already reached a step, once the frames at
+    // the target agree with the newest frames on one phase off the comb. A step right after a
+    // hitch settles in the ring too late to be planned ahead, and the lock would slew across it.
+    bool lateLookahead = false;
+    // Presents from a stall resume on which the tooth guard stands aside, so a resume that moves
+    // the target back blends instead of repeating a frame (kResumeGuardExemptPresents in the
+    // blend modes). 0 keeps the guard.
+    int resumeGuardExemptPresents = 0;
 };
+
+// The resume snap moves the pull on the resume present and the target on the next one, so two
+// presents cover the one decision the guard would have held.
+const int kResumeGuardExemptPresents = 2;
 
 // Ring depth for a bracketing lag. The ring must reach back past the target, and NvFBC
 // delivers in bursts (a ~100 ms pause then a flush) that consume several slots at once, so
@@ -570,9 +587,10 @@ struct PhaseLookahead {
     int64_t firstTs = 0;      // stamp of the first frame at the new phase
     int confirmFrames = 0;    // new frames the candidate phase has held for
     long long lastSeq = -1;   // newest ring sequence already counted
+    bool late = false;        // the target already sits on the new phase: move on the next present
 };
 
-enum class LookaheadEvent { None, Planned, Cancelled };
+enum class LookaheadEvent { None, Planned, Cancelled, PlannedLate };
 
 // Before the bracket read: when a planned move's first frame has come up, move the pull by
 // the step. Returns the change, which the caller subtracts from the target it reads the
@@ -660,6 +678,29 @@ struct CompositeState {
     // delivery lateness (milliseconds), and the guard's cut sits between the two.
     int64_t lastTargetTs = INT64_MIN;
 };
+
+// The last presents' times, for the mean present interval the resume exemption reads.
+const int kPresentMeanSpan = 16;
+struct PresentHistory {
+    int64_t times[kPresentMeanSpan] = {};
+    int count = 0;
+    int next = 0;
+};
+
+// Once per present, with the present's time: records it and returns the mean interval over the
+// last kPresentMeanSpan presents, or 0 until that many came before this one.
+int64_t RecordPresent(PresentHistory& h, int64_t presentTime);
+
+// At a stall resume, lets the tooth guard stand aside for cfg.resumeGuardExemptPresents
+// presents, but only while the relay presents at about the source period (the mean interval
+// over recent presents, at least 7/8 of the guard's period). On a faster present clock every
+// other target is mid-tooth by design, and the guard must keep holding those.
+void ArmResumeGuardExemption(PhaseLockState& s, const PolicyConfig& cfg,
+                             int64_t meanPresentIntervalQpc);
+
+// Once per present, after the lock update and before the composite decision: whether the guard
+// stands aside this present (the value for BracketInfo::toothGuardExempt).
+bool ConsumeGuardExemption(PhaseLockState& s);
 
 // The per-present composite decision for blend mode. A real frame within the
 // passthrough gate of the target is presented sharp (PASSTHROUGH). The gate is

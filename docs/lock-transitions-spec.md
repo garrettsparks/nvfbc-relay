@@ -1,6 +1,7 @@
 # Lock transitions: easing wraps and re-phasing after phase steps
 
-Draft for sign-off, 2026-09-25. Step 1 is implemented. Steps 2 and 3 are proposals.
+Steps 1 to 3 are implemented. Section 8 covers two follow-ups to step 3: late moves and the tooth
+guard at a stall resume.
 
 ## 1. The rule this serves
 
@@ -395,3 +396,99 @@ data.
 - The forced wraps at 59.95 Hz. The fix is the card's custom 60 Hz mode. The 09-24 fixture only
   pins that the relay behaves sensibly there.
 - Stall resumes. They keep the instant snap.
+
+## 8. After step 3: late moves and the tooth guard at a resume
+
+Measured on replays of five current-setup streams (09-17, 09-17 second, 09-22, and the held-out
+09-23 and 09-25): 3.91 hours of gameplay, dejitter arm, as the relay runs.
+
+### Where the blends were left
+
+With the lookahead in, 1,198 blends an hour:
+
+| where the blend falls | per hour |
+|---|---|
+| a bracket wider than 1.25 periods: the game drew no frame there | 677 |
+| around a lock release | 239 |
+| after a stall resume, normal bracket | 95 |
+| wrap ramps | 90 |
+| short runs under 8 | 67 |
+| runs of 8 or more with the lock holding | 30 |
+
+The lookahead had already cut lock releases from 24.1 to 6.9 an hour. Of the 27 left, 16 were
+phase steps it missed: the frames after the release hold a new phase 4 to 9 ms off the comb. 12 of
+the 16 sit 6 ms or more off, and 14 follow a flip hitch.
+
+### Late moves
+
+The lookahead needs about six frames at the new phase (four that agree, then two more) before the
+target reaches the step, which is most of the 96 ms the ring holds ahead of it. A hitch's uneven
+frames use up that margin, and once the target is on the step the rule that plans only while the
+target sits on a real frame never lets it plan.
+
+A late move covers that case. When the three frames at or before the target and the newest four
+agree within an eighth of a comb, their phase is more than a fifth of a comb off, and the phase at
+the target and the newest phase agree within a sixteenth of a comb, the pull moves onto that phase
+on the next present and the lock's error estimate moves with it. It needs the same two new frames
+of confirmation, never runs during a wrap ramp, and has the lookahead's other guards (lock
+engaged, no stall, no recovery window). `PolicyConfig::lateLookahead`, armed with the lookahead.
+
+Both extra conditions came from the corpus. Without the wrap-ramp guard the late move fired inside
+ramps, whose target leaves the comb on purpose: 1,797 late moves, and wraps went from 37 to 203 an
+hour. Without the sixteenth-of-a-comb test it fired on a source a little off its declared rate
+(59 fps declared 60), whose phase drifts about 1.7 ms across the ring.
+
+### The tooth guard at a resume
+
+The guard's 15.4 repeats an hour all came right after stall resumes. A game coming back from a
+freeze delivers its first frames unevenly (51, 25 and 13 ms apart on the streams). The resume snap,
+and the wrap it can push the pull into, moves the target back, so the next target advances less
+than a tooth and sits between two of those frames, and the guard re-presents a frame. For two
+presents from a resume (`kResumeGuardExemptPresents`) the guard stands aside and those presents
+blend. Only while the mean present interval over the last 16 presents is at least 7/8 of the
+source period: on a present clock twice the source rate every other target is mid-tooth by design
+and the guard has to hold it. The suite's doubled-clock hole test failed on a first version without
+that condition.
+
+### Results
+
+| | blends/h | repeats/h | skips/h | worst run | runs >= 50 |
+|---|---|---|---|---|---|
+| five streams, step 3 | 1,198 | 319 | 135 | 62 | 12 |
+| five streams, with both | 1,055 | 305 | 124 | 39 | 0 |
+| held-out 09-23, step 3 → with both | 810 → 788 | 321 → 308 | 104 → 95 | 47 → 28 | 0 → 0 |
+| held-out 09-24 (59.95 Hz), step 3 → with both | 2,277 → 2,198 | 507 → 481 | 206 → 184 | 66 → 43 | 2 → 0 |
+
+Late moves: 28 in the 3.91 hours. Tooth-guard repeats: 15.4 an hour to 1.0. Across the corpus no
+fixture is worse on worst run, long runs, repeats or skips, apart from two bounds moved with their
+reasons in the fixtures: the 59 fps Avatar benchmark on the VRR panel (worst run 39 to 40, a
+different beat of its sweep; blends fall by 29) and the x3 subgen benchmark (re-seeds 8 to 5, three
+re-seeds within 233 ms becoming one, with fewer blends and a shorter worst run). On the 59.95 Hz
+fixture the late moves remove the 49-present run at the half-comb step and the worst run is 30.
+
+### Tried and left out
+
+- **Seeding a stall resume from the ring's settled frames.** Blends after resumes 95 to 52 an hour
+  and wraps 37 to 29 an hour, once the snap took its own move out of the lock's error estimate and
+  the lock held across the uneven brackets after it (without those, lock releases rose from 6.9 to
+  29 an hour). It still lost a little on some Avatar clips (59 fps subgen +24 blends, x3 skips 2
+  to 4, a few 90 fps skips), so it is not in.
+- **Reading the newest frames around the half-comb fold.** With late moves in, 15 fewer blends an
+  hour for 3 more skips in the 3.91 hours. At a step near half a comb a planned move shows the
+  source's own late frame on time, a content step of 1.5 periods that counts as a skip. Not in.
+- **A lock error taken from several frames.** After the lookahead, the releases it could address
+  (mixed phases, or a phase back inside the gate) cost at most 76 blends an hour. Not built.
+
+### Log, undo and checks
+
+- Startup: `Phase-step lookahead ACTIVE with late moves`, and the tooth guard line adds `stands
+  aside for 2 presents after a stall resume while presenting at the source rate`.
+- A late move logs `rephase: late step of +N us, the target already sits on it`, then the usual
+  `rephase: pull moved` on the present it lands.
+- Undo: `lateLookahead` false; `resumeGuardExemptPresents` 0.
+- Suite: `test_lookahead_late_moves` (a step whose first frames scatter, and a 59 fps sweep that
+  must not move, each against a control) and `test_resume_guard_exemption` (uneven resumes across
+  phases, the decision itself, arming at the source rate only, the present-interval mean).
+- Field check, on the stream after the lookahead's own: `rephase: late step` lines per hour (the
+  replay gives about 7), `op=hold-comb` within 20 presents of a resume (about 1 an hour), worst run
+  and runs >= 50 against the lookahead stream.
