@@ -512,6 +512,12 @@ struct PolicyConfig {
     // the target agree with the newest frames on one phase off the comb. A step right after a
     // hitch settles in the ring too late to be planned ahead, and the lock would slew across it.
     bool lateLookahead = false;
+    // Refuse a plan whose step's first frame is already within an eighth of a comb ahead of the
+    // target. Right after a hitch the frames at the target can be the hitch's uneven ones, which
+    // puts the phase they give off the one the game keeps: a step measured from them is then not
+    // there at all, or is one the pull has just moved onto, and its first frame sits at the
+    // target. A real step met that late is left to a late move or the lock.
+    bool lookaheadNeedsLead = false;
     // Presents from a stall resume on which the tooth guard stands aside, so a resume that moves
     // the target back blends instead of repeating a frame (kResumeGuardExemptPresents in the
     // blend modes). 0 keeps the guard.
@@ -590,7 +596,9 @@ struct PhaseLookahead {
     bool late = false;        // the target already sits on the new phase: move on the next present
 };
 
-enum class LookaheadEvent { None, Planned, Cancelled, PlannedLate };
+// Refused: a step whose first frame was already at the target (lookaheadNeedsLead); size and
+// firstTs describe it, and nothing is pending.
+enum class LookaheadEvent { None, Planned, Cancelled, PlannedLate, Refused };
 
 // Before the bracket read: when a planned move's first frame has come up, move the pull by
 // the step. Returns the change, which the caller subtracts from the target it reads the

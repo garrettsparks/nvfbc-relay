@@ -845,11 +845,15 @@ void UpdatePhaseLock(PhaseLockState& s, const PolicyConfig& cfg, int64_t beforeD
 // gameplay frame strays past 3 ms on under 1% of presents. They must agree with each other
 // within an eighth of a comb, which a messy stretch of mixed phases never does, and hold the
 // new phase for two new frames. The move lands on the present whose target comes within a
-// quarter of a comb of the step's first frame.
+// quarter of a comb of the step's first frame. With lookaheadNeedsLead a plan needs that first
+// frame more than an eighth of a comb ahead of the target: on a gameplay stream, four of the five
+// moves that landed off the comb after a hitch were seen under 2.3 ms ahead, and the ones that
+// landed on it 18 to 44 ms ahead, with one at 2.8 ms.
 static const int kLookaheadFrames = 4;          // newest frames whose median is the new phase
 static const int kLookaheadConfirmFrames = 2;   // new frames the new phase must hold for
 static int64_t LookaheadStep(int64_t comb) { return comb / 5; }
 static int64_t LookaheadSpread(int64_t comb) { return comb / 8; }
+static int64_t LookaheadLead(int64_t comb) { return comb / 8; }
 
 static int64_t MedianOf(int64_t* v, int n) {
     std::sort(v, v + n);
@@ -965,9 +969,11 @@ LookaheadEvent UpdateLookahead(PhaseLookahead& la, const PhaseLockState& lock,
         found = true;
     }
     if (!found) return LookaheadEvent::None;
-    la.pending = true;
     la.size = dev;
     la.firstTs = first;
+    if (cfg.lookaheadNeedsLead && first - target < LookaheadLead(comb))
+        return LookaheadEvent::Refused;
+    la.pending = true;
     return LookaheadEvent::Planned;
 }
 

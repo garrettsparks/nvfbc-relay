@@ -92,6 +92,7 @@ struct SimResult {
     int lookaheadPlanned = 0;
     int lookaheadCancelled = 0;
     int lookaheadLate = 0;            // late moves planned (lateLookahead)
+    int lookaheadRefused = 0;         // steps refused with their first frame at the target
     std::vector<bool> engaged;
     std::vector<int64_t> beforeDiff;  // at the pulled target (when hasBefore)
     std::vector<size_t> wrapAt;       // present indices where the pull wrapped
@@ -184,6 +185,9 @@ struct SimParams {
     // before each. Only for controls.
     bool noLateLookahead = false;
     bool noResumeGuardExemption = false;
+    // Let the lookahead plan a step whose first frame is already at the target, the rule before
+    // lookaheadNeedsLead. Only for controls.
+    bool noLookaheadLead = false;
     // The SINK period: the target display's refresh, which is what production compares the
     // source against when arming the guard. presentPeriod above is the tick spacing the
     // present loop actually runs at - DWM's compose clock under a vsync present (twice the
@@ -224,6 +228,7 @@ static SimResult Simulate(const SimParams& p) {
     // Production arms late moves with the lookahead, and the guard's resume exemption in the
     // blend modes, the only ones that run the composite decision.
     cfg.lateLookahead = cfg.phaseLookahead && !p.noLateLookahead;
+    cfg.lookaheadNeedsLead = cfg.phaseLookahead && !p.noLookaheadLead;
     if (!p.noResumeGuardExemption) cfg.resumeGuardExemptPresents = policy::kResumeGuardExemptPresents;
 
     int64_t lag = p.srcPeriod + p.srcPeriod / 4;
@@ -452,6 +457,7 @@ static SimResult Simulate(const SimParams& p) {
             if (ev == policy::LookaheadEvent::Planned) r.lookaheadPlanned++;
             if (ev == policy::LookaheadEvent::Cancelled) r.lookaheadCancelled++;
             if (ev == policy::LookaheadEvent::PlannedLate) r.lookaheadLate++;
+            if (ev == policy::LookaheadEvent::Refused) r.lookaheadRefused++;
         }
         b.toothGuardExempt = policy::ConsumeGuardExemption(lock);
         r.snapped.push_back(resumedFromStall);
@@ -3704,6 +3710,98 @@ static void test_lookahead_late_moves() {
 
 }
 
+// The lookahead's refusal of a step whose first frame is already at the target. After a hitch
+// the game's catch-up frames land 23.6, 13.4 and 14.0 ms apart (a stream's, measured) and then
+// back on its comb, with the target sitting 47 us before its next frame. The frames at the target
+// are the catch-up ones, so the phase they give is 3.7 ms off the comb the newest frames and the
+// target share: the control plans that phantom step, and the refusal must not. A real step seen
+// well ahead plans the same with the refusal as without it, and a clean step through the replay
+// gives the same output either way.
+static void test_lookahead_needs_lead() {
+    const int64_t comb = 16667;
+    policy::PolicyConfig cfg;
+    cfg.combQpc = comb;
+    cfg.passthroughQpc = policy::PassthroughThreshold(comb, comb);
+    cfg.phaseLookahead = true;
+    cfg.lateLookahead = true;
+    PhaseLockState lock;
+    lock.engaged = true;
+    const int64_t T = 100 * comb;
+    // Plan from one read of the ring, with or without the refusal.
+    auto decide = [&](const policy::RecentFrames& rf, bool needsLead, policy::PhaseLookahead* la) {
+        policy::PolicyConfig c = cfg;
+        c.lookaheadNeedsLead = needsLead;
+        *la = policy::PhaseLookahead{};
+        return policy::UpdateLookahead(*la, lock, c, T, rf, false);
+    };
+    // Ahead of the target, oldest first: `n` frames on the comb from `first`, then `m` more
+    // moved by `shift`; written newest first with rising sequence numbers, as the ring reads.
+    auto ahead = [&](policy::RecentFrames& rf, int64_t first, int n, int m, int64_t shift) {
+        std::vector<int64_t> ts;
+        for (int k = 0; k < n; k++) ts.push_back(first + k * comb);
+        for (int k = 0; k < m; k++) ts.push_back(first + (n + k) * comb + shift);
+        rf.nAhead = (int)ts.size();
+        for (int j = 0; j < rf.nAhead; j++) {
+            rf.aheadTs[j] = ts[ts.size() - 1 - j];
+            rf.aheadSeq[j] = 1000 + (long long)(ts.size() - 1 - j);
+        }
+    };
+
+    // The phantom: catch-up frames at the target, the comb ahead of it from 47 us on.
+    policy::RecentFrames hitch;
+    ahead(hitch, T + 47, 6, 0, 0);
+    hitch.nAt = 3;
+    hitch.atTs[0] = T + 47 - 15723;
+    hitch.atTs[1] = hitch.atTs[0] - 13972;
+    hitch.atTs[2] = hitch.atTs[1] - 13404;
+    policy::PhaseLookahead la;
+    const policy::LookaheadEvent control = decide(hitch, false, &la);
+    const int64_t phantom = la.size;
+    CHECK(control == policy::LookaheadEvent::Planned && (phantom > comb / 5 || -phantom > comb / 5),
+          "catch-up frames: the control did not plan the phantom step (event %d, step %lld us); "
+          "the case is not exercised", (int)control, (long long)phantom);
+    const policy::LookaheadEvent refused = decide(hitch, true, &la);
+    CHECK(refused == policy::LookaheadEvent::Refused && !la.pending,
+          "catch-up frames: event %d, pending %d; the phantom step was not refused", (int)refused,
+          (int)la.pending);
+
+    // A real 4 ms step whose first frame is 37 ms ahead: planned either way, at the same size.
+    policy::RecentFrames early;
+    ahead(early, T + 50, 2, 4, 4000);
+    early.nAt = 3;
+    for (int j = 0; j < 3; j++) early.atTs[j] = T + 50 - (j + 1) * comb;
+    const policy::LookaheadEvent e0 = decide(early, false, &la);
+    const int64_t size0 = la.size;
+    const policy::LookaheadEvent e1 = decide(early, true, &la);
+    CHECK(e0 == policy::LookaheadEvent::Planned && e1 == policy::LookaheadEvent::Planned &&
+              la.size == size0 && la.firstTs - T > comb * 2,
+          "early step: events %d and %d, sizes %lld and %lld, first frame %lld us ahead", (int)e0,
+          (int)e1, (long long)size0, (long long)la.size, (long long)(la.firstTs - T));
+
+    // Through the replay: a 6 ms step that holds, clean frames. The refusal never fires there.
+    SimParams p{};
+    p.srcPeriod = comb;
+    p.presentPeriod = comb;
+    p.combQpc = comb;
+    p.presents = 9000;
+    p.passthroughQpc = cfg.passthroughQpc;
+    p.extraLag = 75000;
+    p.ringSlots = policy::RingSlotsForLag(p.srcPeriod + p.srcPeriod / 4 + p.extraLag, p.srcPeriod,
+                                          kShipRingMin, kShipRingMax);
+    for (int i = 0; i < 9100; i++) {
+        const int64_t jitter = (int64_t)((i * 7919) % 401) - 200;   // +-200 us, fixed
+        p.explicitArrivals.push_back((int64_t)i * comb + (i >= 6000 ? 6000 : 0) + jitter);
+    }
+    const SimResult on = Simulate(p);
+    p.noLookaheadLead = true;
+    const SimResult off = Simulate(p);
+    int moves = 0;
+    for (char m : on.rephased) moves += m;
+    CHECK(moves == 1 && on.lookaheadRefused == 0 && on.ops == off.ops && on.outTs == off.outTs,
+          "clean step: %d moves, %d refused, output differs from the control", moves,
+          on.lookaheadRefused);
+}
+
 // The tooth guard's stall-resume exemption. A game coming back from a freeze delivers its first
 // frames unevenly (51, 25 and 13 ms apart, measured on streams) before settling on a new phase.
 // The resume snap, and the wrap it can push the pull into, can leave the next target less than a
@@ -5133,6 +5231,7 @@ int main(int argc, char** argv) {
     test_wrap_easing();
     test_phase_lookahead();
     test_lookahead_late_moves();
+    test_lookahead_needs_lead();
     test_resume_guard_exemption();
     test_ring_underrun_graceful();
     test_ring_slots_for_lag();

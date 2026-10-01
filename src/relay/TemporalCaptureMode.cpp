@@ -275,8 +275,11 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
         // A step that settles in the ring too late to plan ahead (right after a hitch) is met
         // once the target reaches it.
         m_policyCfg.lateLookahead = m_policyCfg.phaseLookahead;
+        // Right after a hitch a step can be measured from the hitch's uneven frames; one whose
+        // first frame is already at the target is refused and left to a late move or the lock.
+        m_policyCfg.lookaheadNeedsLead = m_policyCfg.phaseLookahead;
         LOG("Phase-step lookahead %s", m_policyCfg.phaseLookahead
-                                            ? "ACTIVE with late moves: rephase: lines when a step is seen, moved or cancelled"
+                                            ? "ACTIVE with late moves, refusing a step first seen at the target: rephase: lines when a step is seen, moved, cancelled or refused"
                                             : "off (comb lock off, or its comb is finer than a source frame)");
         if (m_policyCfg.srcPeriodQpc > 0) {
             m_policyCfg.resumeGuardExemptPresents = policy::kResumeGuardExemptPresents;
@@ -516,6 +519,11 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
                 } else if (ev == policy::LookaheadEvent::PlannedLate) {
                     LOG("rephase: late step of %+lld us, the target already sits on it",
                         (long long)(m_lookahead.size * usPerTick));
+                } else if (ev == policy::LookaheadEvent::Refused) {
+                    LOG("rephase: refused a step of %+lld us, first frame only %lld us ahead of "
+                        "the target",
+                        (long long)(m_lookahead.size * usPerTick),
+                        (long long)((m_lookahead.firstTs - target) * usPerTick));
                 }
             }
         }

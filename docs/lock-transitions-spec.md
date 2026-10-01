@@ -1,7 +1,7 @@
 # Lock transitions: easing wraps and re-phasing after phase steps
 
-Steps 1 to 3 are implemented. Section 8 covers two follow-ups to step 3: late moves and the tooth
-guard at a stall resume.
+Steps 1 to 3 are implemented. Section 8 covers three follow-ups to step 3: late moves, the tooth
+guard at a stall resume, and refusing a step first seen at the target.
 
 ## 1. The rule this serves
 
@@ -397,7 +397,7 @@ data.
   pins that the relay behaves sensibly there.
 - Stall resumes. They keep the instant snap.
 
-## 8. After step 3: late moves and the tooth guard at a resume
+## 8. After step 3: late moves, the tooth guard at a resume, and refusing late-seen steps
 
 Measured on replays of five current-setup streams (09-17, 09-17 second, 09-22, and the held-out
 09-23 and 09-25): 3.91 hours of gameplay, dejitter arm, as the relay runs.
@@ -479,16 +479,63 @@ fixture the late moves remove the 49-present run at the half-comb step and the w
 - **A lock error taken from several frames.** After the lookahead, the releases it could address
   (mixed phases, or a phase back inside the gate) cost at most 76 blends an hour. Not built.
 
+### Refusing a step first seen at the target
+
+The 09-29 stream, the lookahead's first in the field, matched its replay move for move, and
+showed what the lookahead gets wrong. Of its 17 moves, 12 left the target within 0.85 ms of real
+frames and 5 left it 2.5 to 3.7 ms off, each right after a hitch. The lookahead judges where the
+target sits from the three frames at or before it, and after a hitch those are the game's
+catch-up frames (on 09-29 they came 23.6, 13.4 and 14.0 ms apart, from the flip times, so the
+game's own). Two kinds of move follow:
+
+- a phantom step: the newest frames already sit on the target, but the catch-up frames put the
+  target's phase 3.6 ms away, so the lookahead moves the target 3.6 ms off (2127.9 s and 2275.0 s);
+- a double count: two presents after a correct move, two of the three frames are still from
+  before the hitch, so the same step is moved again (1337.8 s).
+
+The lock slews each back at 25 us a present, about 2 s of real frames shown 2 to 4 ms off time,
+rarely a blend. Across six streams the replay finds 22 phantom moves in 212 and 11 double counts.
+
+In both the step's first frame is already next to the target when the lookahead plans: under
+2.3 ms ahead on 4 of the 5 bad moves, 18 to 44 ms on 11 of the 12 good ones (the last at 2.8 ms).
+`PolicyConfig::lookaheadNeedsLead`, armed with the lookahead, refuses a plan whose first frame is
+under an eighth of a comb (2.1 ms) ahead of the target, and leaves the step to a late move or the
+lock.
+
+| six streams, 4.64 h | without | with the refusal |
+|---|---|---|
+| presents more than 2 ms off a real frame | 17,284 | 15,479 |
+| blends / repeats / skips | 4,767 / 1,406 / 564 | 4,756 / 1,406 / 563 |
+| worst run / runs >= 50 | 39 / 0 | 39 / 0 |
+| moves / refused | 241 / 0 | 207 / 33 |
+
+Every stream is better or equal. On 09-29 it removes both phantom moves and the double count's
+second move, and leaves the good moves alone; it misses 1554.4 s, first seen 2.3 ms ahead. Across
+the corpus 46 fixtures are unchanged, 2 better (09-22, 12 fewer blends and one skip; the 60x3
+vsync benchmark, 13 fewer blends) and one worse by a single event (the 60x3 subgen benchmark, one
+more blend, or one more release without dejitter), and every fixture that changes shows fewer
+presents off time. Two other rules were measured and left out: refusing a second plan until the
+three frames at the target all come after the last move adds nothing on top of this one, and
+requiring the newest frames to sit off the target itself is about as good in total but worse on
+three fixtures.
+
 ### Log, undo and checks
 
-- Startup: `Phase-step lookahead ACTIVE with late moves`, and the tooth guard line adds `stands
-  aside for 2 presents after a stall resume while presenting at the source rate`.
+- Startup: `Phase-step lookahead ACTIVE with late moves, refusing a step first seen at the
+  target`, and the tooth guard line adds `stands aside for 2 presents after a stall resume while
+  presenting at the source rate`.
 - A late move logs `rephase: late step of +N us, the target already sits on it`, then the usual
-  `rephase: pull moved` on the present it lands.
-- Undo: `lateLookahead` false; `resumeGuardExemptPresents` 0.
+  `rephase: pull moved` on the present it lands. A refusal logs `rephase: refused a step of +N us,
+  first frame only N us ahead of the target`.
+- Undo: `lateLookahead` false; `resumeGuardExemptPresents` 0; `lookaheadNeedsLead` false.
+- Suite: `test_lookahead_needs_lead` (the 09-29 catch-up frames against a control that plans the
+  phantom step, a step seen 37 ms ahead that plans the same either way, a clean step through the
+  replay with output identical to the control).
 - Suite: `test_lookahead_late_moves` (a step whose first frames scatter, and a 59 fps sweep that
   must not move, each against a control) and `test_resume_guard_exemption` (uneven resumes across
   phases, the decision itself, arming at the source rate only, the present-interval mean).
-- Field check, on the stream after the lookahead's own: `rephase: late step` lines per hour (the
-  replay gives about 7), `op=hold-comb` within 20 presents of a resume (about 1 an hour), worst run
-  and runs >= 50 against the lookahead stream.
+- Field check, on the stream after the lookahead's own, with all three in one build: `rephase:
+  late step` lines per hour (the replay gives about 6), `rephase: refused` lines per hour (about
+  7), `op=hold-comb` within 20 presents of a resume (about 1 an hour), presents more than 2 ms off
+  a real frame, worst run and runs >= 50 against the lookahead stream. The replay arms (`nolead`,
+  `nolate`, `notg` in the measurement tools) split the stream into each change's part.

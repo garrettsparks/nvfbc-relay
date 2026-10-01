@@ -714,6 +714,7 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
     // As TemporalCaptureMode::Setup arms it: a blend mode whose comb is one source frame.
     pcfg.phaseLookahead = cfg.blend && cfg.comb > 0 && cfg.comb == cfg.assumedSrcPeriod;
     pcfg.lateLookahead = pcfg.phaseLookahead;
+    pcfg.lookaheadNeedsLead = pcfg.phaseLookahead;
     if (cfg.blend && pcfg.srcPeriodQpc > 0) {
         pcfg.resumeGuardExemptPresents = policy::kResumeGuardExemptPresents;
     }
