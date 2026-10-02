@@ -17,7 +17,7 @@ class IPresentPath;
 //   CaptureRing      - capture thread fills a ring with source frames stamped at arrival.
 //   Present timing   - two options (the <selection>:<present> framework's present axis):
 //                      timer  (t:60)    - PresentScheduler's absolute-QPC deadline drives it.
-//                      vsync  (t:vsync) - the present path's own blocking wait drives it, and
+//                      vsync  (t:dwm)   - the present path's own blocking wait drives it, and
 //                                         which clock that is belongs to the path: DWM's
 //                                         compose clock on the D3D9 swapchain (regime-
 //                                         dependent: the source display's rate on a composed
@@ -66,7 +66,7 @@ private:
     bool m_lock;                    // the comb lock unless -nolock; -src or the assumed 60
     bool m_mark;                    // -mark: burn the frame-counter marker (debug); default off
     unsigned int m_markFrames;      // -mark N: burn only the first N presents; 0 = all (unset)
-    bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: the path's blocking present (t:vsync)
+    bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: the path's blocking present (t:dwm, b:vsync)
     LARGE_INTEGER m_baseQpc;        // logging time origin
     float m_targetFramerate;
     float m_srcRateHint;            // declared source fps (-src); 0 = unset, assume >= 60

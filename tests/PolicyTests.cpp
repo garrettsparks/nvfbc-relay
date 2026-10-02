@@ -4759,7 +4759,8 @@ static void test_launch_mode_parsing() {
         // The same blend on the D3D9 swapchain, on DWM's compose clock.
         {"b:dwm",      ModeKind::Temporal, Compositor::Blend,   true,  false, 60.0f},
         {"t",          ModeKind::Temporal, Compositor::Nearest, true,  false, 60.0f},
-        {"t:vsync",    ModeKind::Temporal, Compositor::Nearest, true,  false, 60.0f},
+        {"t:dwm",      ModeKind::Temporal, Compositor::Nearest, true,  false, 60.0f},
+        {"T:DWM",      ModeKind::Temporal, Compositor::Nearest, true,  false, 60.0f},
         {"o",          ModeKind::Temporal, Compositor::Interp,  true,  false, 60.0f},
         {"o:vsync",    ModeKind::Temporal, Compositor::Interp,  true,  false, 60.0f},
         // X:<fps> presents on a QPC timer at that rate, on the D3D9 swapchain.
@@ -4781,9 +4782,11 @@ static void test_launch_mode_parsing() {
               s.framerate);
     }
 
-    // Everything else is refused, including the retired b:flip spelling and rates outside
+    // Everything else is refused, including the retired b:flip spelling, t:vsync (frame selection
+    // has no path on the sink's vblank yet, and the name waits for one), and rates outside
     // (0, 1000].
-    for (const char* bad : {"b:", "b:abc", "b:flip", "b:0", "0", "1001", "x:60", "abc", "d:60"}) {
+    for (const char* bad : {"b:", "b:abc", "b:flip", "t:vsync", "b:0", "0", "1001", "x:60", "abc",
+                            "d:60"}) {
         CHECK(launch::ParseMode(bad).kind == ModeKind::Invalid, "mode '%s' must be refused", bad);
     }
 }
@@ -4946,10 +4949,10 @@ static void test_launch_relaunch_round_trip() {
     // A default launch writes no options, and only the relay's own relaunch reads as one.
     CHECK(launch::FormatOptions(launch::Options()).empty(),
           "a default launch must write no options");
-    CHECK(launch::RelaunchArguments(1, 0, "t:vsync", launch::Options()) ==
-              "-source 1 -target 0 -framerate t:vsync -relaunched",
+    CHECK(launch::RelaunchArguments(1, 0, "t:dwm", launch::Options()) ==
+              "-source 1 -target 0 -framerate t:dwm -relaunched",
           "the relaunch must keep the mode as typed and mark itself, got '%s'",
-          launch::RelaunchArguments(1, 0, "t:vsync", launch::Options()).c_str());
+          launch::RelaunchArguments(1, 0, "t:dwm", launch::Options()).c_str());
     CHECK(!launch::IsRelaunch(launch::SplitTokens("-source 0 -target 1 -src 60")) &&
               !launch::IsRelaunch(launch::SplitTokens("")),
           "a launch the user typed must not read as a relaunch");
@@ -5080,8 +5083,8 @@ static void test_launch_command_line_check() {
     CHECK(c.usable && c.reason.empty() && c.line.sourceIndex == 0 && c.line.targetIndex == 1 &&
               c.line.mode.empty() && c.options.srcRateHint == 60.0f,
           "the README's shortcut must be accepted, refused with '%s'", c.reason.c_str());
-    c = launch::CheckCommandLine(launch::SplitTokens("-source 1 -target 0 -framerate T:VSYNC"), 2);
-    CHECK(c.usable && c.line.mode == "T:VSYNC", "a mode in any case must be accepted");
+    c = launch::CheckCommandLine(launch::SplitTokens("-source 1 -target 0 -framerate T:DWM"), 2);
+    CHECK(c.usable && c.line.mode == "T:DWM", "a mode in any case must be accepted");
 
     // An empty command line is not refused: asking is the normal path.
     c = launch::CheckCommandLine(launch::SplitTokens(""), 2);

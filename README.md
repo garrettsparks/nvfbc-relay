@@ -82,7 +82,7 @@ update its numbers.
 | Mode | Behavior |
 | ---- | -------- |
 | `vsync` | Plain capture, present blocked on DWM's compose clock. No temporal selection. |
-| `t` or `t:vsync` | Temporal selection, present blocked on DWM's compose clock. |
+| `t` or `t:dwm` | Temporal selection, present blocked on DWM's compose clock. |
 | `t:<fps>` | Temporal selection, present driven by a QPC timer at the given rate. |
 | `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the bracket pair otherwise), presented through a D3D11 flip-model swapchain on the capture card's own vblank. The default. |
 | `b:dwm` | The same blend on the D3D9 swapchain, present blocked on DWM's compose clock. The path `t` runs on. |
@@ -91,8 +91,8 @@ update its numbers.
 | `diag` | Diagnostic clock probe: QPC 60Hz, immediate present. Logs DWM compose timing and card raster per tick. |
 | `diag:vsync` | Diagnostic probe on `INTERVAL_ONE`. Present block time measures DWM's delivery cadence. |
 
-`t:vsync` presents on DWM's compose clock. While a game runs fullscreen on the
-source, the card holds that clock at 60 Hz, so `t:vsync` presents 60 times a
+`t:dwm` presents on DWM's compose clock. While a game runs fullscreen on the
+source, the card holds that clock at 60 Hz, so `t:dwm` presents 60 times a
 second whatever the game renders. On the desktop nothing holds it, and a 240 Hz
 source display gives 240 presents a second. Expect that when reading present
 rates from a desktop capture.
@@ -326,7 +326,7 @@ for. The ring also measures the source period, but only to log it for checking
 flowchart TD
     A{"present axis"}
     A -- "t:60 timer" --> B["wait on absolute QPC deadline"]
-    A -- "t:vsync" --> C["deadline = now<br/>the blocking present is the wait"]
+    A -- "t:dwm<br/>DWM's compose clock" --> C["deadline = now<br/>the blocking PresentEx is the wait"]
     B --> D["target = deadline - bracketingDelay - pull"]
     C --> D
     D --> E["ring.FindBracket target"]

@@ -151,8 +151,8 @@ inline const std::vector<UsageRow>& ModeRows() {
                            "The default: press Enter to pick it.", true, false},
         {"b:dwm, b:60", "", "The same, in step with Windows' desktop (b:dwm) or on a timer at "
                             "the given frame rate (b:60).", true, false},
-        {"t, t:vsync", "", "Shows the nearest real frame and never blends, in step with "
-                           "Windows' desktop.", true, false},
+        {"t, t:dwm", "", "Shows the nearest real frame and never blends, in step with "
+                         "Windows' desktop.", true, false},
         {"t:59.94", "", "The same, on a timer at the given frame rate.", true, false},
         {"vsync", "", "Shows the newest frame, in step with Windows' desktop.", true, false},
         {"60", "", "Shows the newest frame, on a timer at the given frame rate. This is how "
@@ -487,7 +487,7 @@ inline ModeSpec ParseMode(const std::string& modeStr) {
     if (c0 == 'b') comp = Compositor::Blend;
     else if (c0 == 'o') comp = Compositor::Interp;
 
-    if (EqualsNoCase(modeStr, "t") || EqualsNoCase(modeStr, "t:vsync") ||
+    if (EqualsNoCase(modeStr, "t") || EqualsNoCase(modeStr, "t:dwm") ||
         EqualsNoCase(modeStr, "o") || EqualsNoCase(modeStr, "o:vsync") ||
         EqualsNoCase(modeStr, "b:dwm")) {
         s.kind = ModeKind::Temporal;
