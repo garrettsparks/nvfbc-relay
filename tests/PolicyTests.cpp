@@ -5005,11 +5005,55 @@ static void test_launch_usage_table() {
         shownModes += r.shown;
     }
 
-    // The printed list holds exactly the shown rows, and a hidden row never leaks into it.
+    // The printed list holds exactly the shown rows, and a hidden row never leaks into it. A row
+    // starts on a line indented two spaces; its description wraps onto lines indented further.
     const std::vector<std::string> lines = launch::UsageLines();
-    CHECK((int)lines.size() == 2 + shownModes + shownOptions,
-          "the usage list must be two headers and one line per shown row, got %zu",
-          lines.size());
+    int headers = 0, blanks = 0, starts = 0;
+    for (const std::string& l : lines) {
+        if (l.empty()) blanks++;
+        else if (l[0] != ' ') headers++;
+        else if (l.compare(0, 3, "   ") != 0) starts++;
+    }
+    CHECK(headers == 2 && blanks == 1 && starts == shownModes + shownOptions,
+          "the usage list must be two headers, one blank line and one start per shown row, got "
+          "%d, %d, %d", headers, blanks, starts);
+
+    // Wrapping: no line past the width, every continuation starts in the description column, and
+    // each shown description reads back word for word from its lines.
+    std::vector<std::string> shownTexts;
+    size_t column = 0;
+    for (const std::vector<launch::UsageRow>* rows : {&launch::ModeRows(), &launch::OptionRows()}) {
+        for (const launch::UsageRow& r : *rows) {
+            if (!r.shown) continue;
+            shownTexts.push_back(r.text);
+            const size_t len = std::strlen(r.flag) + (r.arg[0] ? 1 + std::strlen(r.arg) : 0);
+            if (len + 4 > column) column = len + 4;
+        }
+    }
+    for (size_t width : {size_t(79), size_t(60)}) {
+        const std::vector<std::string> w = launch::UsageLines(width);
+        std::vector<std::string> readBack;
+        bool aligned = true;
+        size_t longest = 0;
+        for (const std::string& l : w) {
+            if (l.size() > longest) longest = l.size();
+            if (l.empty() || l[0] != ' ') continue;
+            const bool start = l.compare(0, 3, "   ") != 0;
+            if (l.size() <= column || l[column] == ' ' ||
+                l.find_first_not_of(' ', start ? column - 2 : 0) != column) {
+                aligned = false;
+                continue;
+            }
+            if (start) readBack.push_back(l.substr(column));
+            else if (!readBack.empty()) readBack.back() += " " + l.substr(column);
+        }
+        CHECK(longest <= width, "no usage line may pass %zu columns, the longest is %zu", width,
+              longest);
+        CHECK(aligned, "at %zu columns every description line must start at column %zu", width,
+              column);
+        CHECK(readBack == shownTexts,
+              "at %zu columns the descriptions must read back word for word", width);
+    }
     auto listed = [&lines](const char* spelling) {
         for (const std::string& l : lines) {
             if (l.compare(0, 2 + std::strlen(spelling), std::string("  ") + spelling) == 0 &&

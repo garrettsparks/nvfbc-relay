@@ -81,13 +81,13 @@ update its numbers.
 
 | Mode | Behavior |
 | ---- | -------- |
-| `vsync` | Capture and present on the vsync interval. The original relay behavior. |
+| `vsync` | Plain capture, present blocked on DWM's compose clock. No temporal selection. |
 | `t` or `t:vsync` | Temporal selection, present blocked on DWM's compose clock. |
 | `t:<fps>` | Temporal selection, present driven by a QPC timer at the given rate. |
 | `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the bracket pair otherwise), presented through a D3D11 flip-model swapchain on the capture card's own vblank. The default. |
 | `b:dwm` | The same blend on the D3D9 swapchain, present blocked on DWM's compose clock. The path `t` runs on. |
 | `b:<fps>` | The same blend, present driven by a QPC timer at the given rate. |
-| `<fps>` | Plain timer capture at the given rate. No temporal selection. |
+| `<fps>` | Plain timer capture at the given rate. No temporal selection. How the original relay ran. |
 | `diag` | Diagnostic clock probe: QPC 60Hz, immediate present. Logs DWM compose timing and card raster per tick. |
 | `diag:vsync` | Diagnostic probe on `INTERVAL_ONE`. Present block time measures DWM's delivery cadence. |
 
@@ -227,17 +227,20 @@ full numbers are in [`docs/relay-cost-results.md`](docs/relay-cost-results.md).
 
 # Architecture
 
-Capture and present run on separate threads, each with its own D3D9Ex device.
-With one shared device, the blocking NvFBC grab held the device lock while it
-waited, which tied present timing to capture arrivals and measured as present
-jitter of half a capture period.
+Capture and present run on separate threads with separate devices. Capture
+grabs into its own D3D9Ex device. `b:vsync` presents through a D3D11 device and
+a flip-model swapchain, and every other mode presents through a second D3D9Ex
+device. With one shared device, the blocking NvFBC grab held the device lock
+while it waited, which tied present timing to capture arrivals and measured as
+present jitter of half a capture period.
 
-Ring slots are render target textures created on the capture device and opened
-on the present device through D3D9Ex shared handles, so the present thread
-never touches the capture device. D3D9Ex shared surfaces have no cross-device
-sync primitive, so the ordering between the two devices relies on driver
-behavior. If the output shows tearing or partial frames inside a slot, look
-there first.
+Ring slots are render target textures created on the capture device with shared
+handles. The present side opens the same textures through those handles, as
+D3D9Ex textures on the D3D9 present device or as D3D11 textures on the
+`b:vsync` path, so the present thread never touches the capture device. The
+shared textures have no cross-device sync primitive, so the ordering between
+the devices relies on driver behavior. If the output shows tearing or partial
+frames inside a slot, look there first.
 
 ```mermaid
 flowchart LR
@@ -258,9 +261,9 @@ flowchart LR
         direction TB
         TGT["target = deadline - lag - pull"]
         FB["FindBracket"]
-        SEL["SelectFrame"]
-        SR2["StretchRect into backbuffer<br/>present device"]
-        PX["PresentEx"]
+        SEL["SelectFrame (t)<br/>or blend decision (b)"]
+        SR2["Compose into the back buffer<br/>StretchRect (D3D9) or blend shader (D3D11)"]
+        PX["Present<br/>PresentEx (D3D9) or flip-model Present (D3D11)"]
         TGT --> FB --> SEL --> SR2 --> PX
     end
 
@@ -270,7 +273,7 @@ flowchart LR
 
     SRCD --> GRAB
     FLUSH -- "publish slot" --> RING
-    RING -- "present-device alias<br/>via D3D9Ex shared handle" --> FB
+    RING -- "opened by shared handle<br/>as a D3D9Ex or D3D11 texture" --> FB
     PX --> OUTD --> CARD --> PC2
 ```
 
@@ -486,15 +489,6 @@ Design specs for the non-obvious parts:
 | [`docs/frame-marker-spec.md`](docs/frame-marker-spec.md) | The `-mark` marker encoding, for offline analysis |
 | [`docs/dual-device-capture-present-spec.md`](docs/dual-device-capture-present-spec.md) | Splitting capture and present across two D3D devices |
 | [`docs/application-shell-spec.md`](docs/application-shell-spec.md) | Launch to exit: the prompts and command line, windows, devices, NvFBC, failure popups, teardown |
-
----
-
-# In progress
-
-Work on a branch, not yet merged:
-
-* `nvofa-warp`: synthesizing intermediate frames with optical flow when
-  neither frame in the bracket is close enough to the target.
 
 ---
 

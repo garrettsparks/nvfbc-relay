@@ -146,17 +146,17 @@ inline const std::vector<UsageRow>& OptionRows() {
 // The capture modes, one row per line of the list; flag holds the spellings, comma-separated.
 inline const std::vector<UsageRow>& ModeRows() {
     static const std::vector<UsageRow> rows = {
-        {"b, b:vsync", "", "Blend compositor on a D3D11 flip-model swapchain, presented on the "
-                           "SINK's vblank (the default: press Enter to select it)", true, false},
-        {"b:dwm, b:60", "", "The same blend compositor on the D3D9 swapchain: DWM's compose clock "
-                            "(b:dwm) or a timer at the given fps", true, false},
-        {"t, t:vsync", "", "Temporal frame selection, presented on vsync (DWM compose clock)",
-         true, false},
-        {"t:59.94", "", "Temporal frame selection, presented on a timer at the given fps", true,
-         false},
-        {"vsync", "", "The original relay: VSync-driven presentation (matches target display "
-                      "refresh)", true, false},
-        {"60", "", "Timer mode (simple timer-driven at the given fps)", true, false},
+        {"b, b:vsync", "", "Shows each real frame on time and blends the two nearest frames "
+                           "when none lines up, in step with the capture card's own refresh. "
+                           "The default: press Enter to pick it.", true, false},
+        {"b:dwm, b:60", "", "The same, in step with Windows' desktop (b:dwm) or on a timer at "
+                            "the given frame rate (b:60).", true, false},
+        {"t, t:vsync", "", "Shows the nearest real frame and never blends, in step with "
+                           "Windows' desktop.", true, false},
+        {"t:59.94", "", "The same, on a timer at the given frame rate.", true, false},
+        {"vsync", "", "Shows the newest frame, in step with Windows' desktop.", true, false},
+        {"60", "", "Shows the newest frame, on a timer at the given frame rate. This is how "
+                   "the original relay ran.", true, false},
         {"o, o:vsync, o:60", "", "Optical-flow interp compositor on the D3D9 swapchain", false,
          false},
         {"diag, diag:vsync", "", "Clock probes: DWM compose timing and the card's raster", false,
@@ -172,19 +172,66 @@ inline const UsageRow* FindOptionRow(const std::string& flag) {
     return NULL;
 }
 
-// The usage list the mode prompt prints, one string per line.
-inline std::vector<std::string> UsageLines() {
+// The usage list the mode prompt prints, one string per line, no line wider than width. The
+// spellings sit in one column and each description beside them, wrapped at spaces so that a
+// long one continues under its own first word rather than at the console's left edge. A blank
+// line separates the modes from the options. The default fits the narrowest console likely, 80
+// columns; a line that fills a console's width exactly can take a second row there, hence 79.
+inline std::vector<std::string> UsageLines(size_t width = 79) {
+    auto spelling = [](const UsageRow& r) {
+        std::string s = r.flag;
+        if (r.arg[0]) s += std::string(" ") + r.arg;
+        return s;
+    };
+    size_t longest = 0;
+    for (const std::vector<UsageRow>* rows : {&ModeRows(), &OptionRows()}) {
+        for (const UsageRow& r : *rows) {
+            if (r.shown && spelling(r).size() > longest) longest = spelling(r).size();
+        }
+    }
+    // Two spaces before the spellings and two after the longest one.
+    const size_t column = longest + 4;
+    const size_t textWidth = width > column + 30 ? width - column : 30;
+
     std::vector<std::string> lines;
-    auto add = [&lines](const UsageRow& r) {
-        std::string spelling = r.flag;
-        if (r.arg[0]) spelling += std::string(" ") + r.arg;
-        if (spelling.size() < 15) spelling.resize(15, ' ');
-        lines.push_back("  " + spelling + "- " + r.text);
+    auto add = [&](const UsageRow& r) {
+        std::string line = "  " + spelling(r);
+        line.resize(column, ' ');
+        size_t used = 0;   // description characters on the current line
+        const std::string text = r.text;
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t end = text.find(' ', pos);
+            if (end == std::string::npos) end = text.size();
+            std::string word = text.substr(pos, end - pos);
+            pos = end + 1;
+            if (word.empty()) continue;
+            // A flag keeps its value on its own line: "-src 80" never splits.
+            if (word.size() > 1 && word[0] == '-' && pos < text.size()) {
+                size_t valueEnd = text.find(' ', pos);
+                if (valueEnd == std::string::npos) valueEnd = text.size();
+                word += " " + text.substr(pos, valueEnd - pos);
+                pos = valueEnd + 1;
+            }
+            if (used > 0 && used + 1 + word.size() > textWidth) {
+                lines.push_back(line);
+                line.assign(column, ' ');
+                used = 0;
+            }
+            if (used > 0) {
+                line += ' ';
+                used++;
+            }
+            line += word;
+            used += word.size();
+        }
+        lines.push_back(line);
     };
     lines.push_back("Capture modes:");
     for (const UsageRow& r : ModeRows()) {
         if (r.shown) add(r);
     }
+    lines.push_back("");
     lines.push_back("Options, typed after the mode (b:vsync -src 60):");
     for (const UsageRow& r : OptionRows()) {
         if (r.shown) add(r);
@@ -425,7 +472,7 @@ inline bool EqualsNoCase(const std::string& a, const char* b) {
 // same blend on the D3D9 swapchain. The D3D11 path carries the blend compositor only.
 //
 // An empty string is a bare launch and selects b:vsync, the release path. "vsync" selects the
-// original vsync mode, "diag" and "diag:vsync" the clock probes, and a bare number the plain timer
+// plain vsync mode, "diag" and "diag:vsync" the clock probes, and a bare number the plain timer
 // mode. Anything else is Invalid, and the caller prints the usage list.
 inline ModeSpec ParseMode(const std::string& modeStr) {
     ModeSpec s;
