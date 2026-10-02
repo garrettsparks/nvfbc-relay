@@ -20,6 +20,7 @@ struct DisplayInfo {
     int Height() const { return rect.bottom - rect.top; }
 };
 
-// One entry per Direct3D 9 adapter, in ordinal order, each logged. Friendly names are best
-// effort: a display Windows gives no name keeps its device name.
+// One entry per Direct3D 9 adapter, in ordinal order, each logged along with the graphics driver
+// behind it. Friendly names are best effort: a display Windows gives no name keeps its device
+// name.
 std::vector<DisplayInfo> EnumerateDisplays(IDirect3D9Ex* d3d);

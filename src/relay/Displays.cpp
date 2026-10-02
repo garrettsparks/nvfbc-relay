@@ -2,6 +2,7 @@
 
 #include <SimpleLogger.h>
 
+#include <cstdio>
 #include <cstring>
 
 namespace {
@@ -63,6 +64,43 @@ void AddFriendlyNames(std::vector<DisplayInfo>* displays) {
     }
 }
 
+// The graphics driver each display runs on, one line per distinct driver, so a log says which
+// driver it was captured on. NVIDIA's own release number is the last five digits of the third
+// and fourth parts of the Windows driver version.
+void LogDrivers(IDirect3D9Ex* d3d, const std::vector<DisplayInfo>& displays) {
+    std::vector<std::string> drivers;
+    std::vector<std::string> shownOn;
+    for (const DisplayInfo& d : displays) {
+        D3DADAPTER_IDENTIFIER9 id = {};
+        if (FAILED(d3d->GetAdapterIdentifier(d.adapter, 0, &id))) {
+            LOGERR("Display [%u]: its graphics driver could not be identified", d.adapter);
+            continue;
+        }
+        const unsigned product = HIWORD(id.DriverVersion.HighPart);
+        const unsigned version = LOWORD(id.DriverVersion.HighPart);
+        const unsigned subVersion = HIWORD(id.DriverVersion.LowPart);
+        const unsigned build = LOWORD(id.DriverVersion.LowPart);
+        char text[640];
+        const int used = snprintf(text, sizeof(text), "%s, version %u.%u.%u.%u", id.Description,
+                                  product, version, subVersion, build);
+        if (id.VendorId == 0x10DE && used > 0 && used < (int)sizeof(text)) {
+            const unsigned release = (subVersion % 10) * 10000 + build;
+            snprintf(text + used, sizeof(text) - used, " (NVIDIA %u.%02u)", release / 100,
+                     release % 100);
+        }
+        size_t k = 0;
+        while (k < drivers.size() && drivers[k] != text) k++;
+        if (k == drivers.size()) {
+            drivers.push_back(text);
+            shownOn.push_back("");
+        }
+        shownOn[k] += (shownOn[k].empty() ? "[" : " [") + std::to_string(d.adapter) + "]";
+    }
+    for (size_t k = 0; k < drivers.size(); k++) {
+        LOG("Graphics driver for display %s: %s", shownOn[k].c_str(), drivers[k].c_str());
+    }
+}
+
 }  // namespace
 
 std::vector<DisplayInfo> EnumerateDisplays(IDirect3D9Ex* d3d) {
@@ -94,5 +132,6 @@ std::vector<DisplayInfo> EnumerateDisplays(IDirect3D9Ex* d3d) {
         LOG("Display [%u] %s (%s), %dx%d at (%ld,%ld), %d Hz", d.adapter, d.Name().c_str(),
             d.deviceName.c_str(), d.Width(), d.Height(), d.rect.left, d.rect.top, d.refreshHz);
     }
+    LogDrivers(d3d, displays);
     return displays;
 }

@@ -481,6 +481,7 @@ Design specs for the non-obvious parts:
 | ---- | ------ |
 | [`docs/policy-extraction-spec.md`](docs/policy-extraction-spec.md) | Pulling the decision logic out into a testable unit |
 | [`docs/phase-comb-lock-spec.md`](docs/phase-comb-lock-spec.md) | The comb lock control loop |
+| [`docs/lock-transitions-spec.md`](docs/lock-transitions-spec.md) | How the comb lock changes its timing when it runs out of range, when the game's frame timing shifts, and after a freeze |
 | [`docs/adaptive-bracketing-delay-spec.md`](docs/adaptive-bracketing-delay-spec.md) | Bracketing lag as a function of source rate |
 | [`docs/frame-marker-spec.md`](docs/frame-marker-spec.md) | The `-mark` marker encoding, for offline analysis |
 | [`docs/dual-device-capture-present-spec.md`](docs/dual-device-capture-present-spec.md) | Splitting capture and present across two D3D devices |
