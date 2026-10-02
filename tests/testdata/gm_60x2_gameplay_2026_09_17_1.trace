@@ -12,9 +12,9 @@ field_synth_pct 0.8
 # directly comparable and they agree: the dejitter arm, which is how the stream ran, reads runs
 # >= 50 eight against eight, worst 62 against 62, synth 0.8% against 0.8%, over 90 minutes and
 # 322658 presents, and the plain replay nine, 60 and 0.9%. That is the evidence the
-# replay model tracks this present path on real gameplay, and it is what gm_60x2_gameplay_0917
-# cannot give (that one ran the reverted step re-seed rule, so its two lines disagree by
-# construction). When the model is doubted, re-measure THIS fixture first.
+# replay model tracks this present path on real gameplay, and it is what
+# gm_60x2_gameplay_2026_09_17_0 cannot give (that one ran the reverted step re-seed rule, so
+# its two lines disagree by construction). When the model is doubted, re-measure THIS fixture first.
 #
 # WHAT IT COVERS that the rest of the corpus does not: 90 minutes of one regime, which is the
 # only way to see events that happen a few times an hour. The eight runs >= 50 are the residual

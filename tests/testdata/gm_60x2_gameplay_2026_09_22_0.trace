@@ -9,7 +9,7 @@ field_long_runs 10
 field_synth_pct 1.0
 #
 # WHAT IT COVERS: the residual blend-zone class at the highest rate yet seen, 10 runs >= 50 in
-# an hour against 0917_1's 8 in 90 minutes. Every one follows a lock release at a small source
+# an hour against 2026_09_17_1's 8 in 90 minutes. Every one follows a lock release at a small source
 # hitch (a 29 to 31 ms gap in the game's flips about 3 s before) and a slow re-engage. The lock
 # released 44 times an hour here against 16 on the 2026-09-16 stream, at the same rate of small
 # hitches (118 against 129 an hour): 29 of 120 hitches dropped the lock here, 5 of 88 there.
