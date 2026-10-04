@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="src/relay/NvFBCR.vcxproj" />
+  <Project Path="tools/NvFBCEnable/NvFBCEnable.vcxproj" />
+  <Project Path="tools/EtwProbe/EtwProbe.vcxproj" />
+</Solution>

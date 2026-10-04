@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{cabdb2aa-9392-4eca-a37c-19d470c87f2a}</ProjectGuid>
+    <RootNamespace>NvFBCR</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(ProjectDir)\..\..\build\$(Configuration)\$(Platform)\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(Configuration)\$(Platform)\</IntDir>
+    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</LinkIncremental>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(ProjectDir)\..\..\build\$(Configuration)\$(Platform)\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(Configuration)\$(Platform)\</IntDir>
+    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkIncremental>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <OmitFramePointers>true</OmitFramePointers>
+      <PreprocessorDefinitions>WIN32;_CRT_SECURE_NO_WARNINGS;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>../common;../core;../../third_party;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>d3dcompiler.lib;dxva2.lib;d3d9.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(IntDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+    <PreBuildEvent>
+      <Command>lib /nologo /machine:x64 /def:"$(ProjectDir)nvofapi64.def" /out:"$(IntDir)nvofapi64.lib"</Command>
+      <Message>Generating the NVIDIA optical flow import library from its module definition file</Message>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <OmitFramePointers>false</OmitFramePointers>
+      <WholeProgramOptimization>false</WholeProgramOptimization>
+      <PreprocessorDefinitions>WIN32;_CRT_SECURE_NO_WARNINGS;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>../common;../core;../../third_party;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <GenerateMapFile>true</GenerateMapFile>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <AdditionalDependencies>d3dcompiler.lib;dxva2.lib;d3d9.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(IntDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+    <PreBuildEvent>
+      <Command>lib /nologo /machine:x64 /def:"$(ProjectDir)nvofapi64.def" /out:"$(IntDir)nvofapi64.lib"</Command>
+      <Message>Generating the NVIDIA optical flow import library from its module definition file</Message>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="..\core\TemporalPolicy.cpp" />
+    <ClCompile Include="BlendRenderer.cpp" />
+    <ClCompile Include="CaptureRing.cpp" />
+    <ClCompile Include="D3D11Present.cpp" />
+    <ClCompile Include="D3D9Present.cpp" />
+    <ClCompile Include="D3D9Setup.cpp" />
+    <ClCompile Include="DiagCaptureMode.cpp" />
+    <ClCompile Include="Displays.cpp" />
+    <ClCompile Include="EtwConsumer.cpp" />
+    <ClCompile Include="Failure.cpp" />
+    <ClCompile Include="FlipDecode.cpp" />
+    <ClCompile Include="FlowWarpEngine.cpp" />
+    <ClCompile Include="FrameCompositors.cpp" />
+    <ClCompile Include="FrameMarker.cpp" />
+    <ClCompile Include="InterpSidecar.cpp" />
+    <ClCompile Include="Main.cpp" />
+    <ClCompile Include="NvFBCSession.cpp" />
+    <ClCompile Include="OutputWindow.cpp" />
+    <ClCompile Include="PresentScheduler.cpp" />
+    <ClCompile Include="Prompts.cpp" />
+    <ClCompile Include="TemporalCaptureMode.cpp" />
+    <ClCompile Include="TimerCaptureMode.cpp" />
+    <ClCompile Include="VsyncCaptureMode.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\common\AdminCheck.h" />
+    <ClInclude Include="..\common\NvFBCApi.h" />
+    <ClInclude Include="..\common\NvFBCLoader.h" />
+    <ClInclude Include="..\common\SimpleLogger.h" />
+    <ClInclude Include="..\core\LaunchOptions.h" />
+    <ClInclude Include="..\core\TemporalPolicy.h" />
+    <ClInclude Include="BlendRenderer.h" />
+    <ClInclude Include="CaptureRing.h" />
+    <ClInclude Include="D3D11Present.h" />
+    <ClInclude Include="D3D9Present.h" />
+    <ClInclude Include="D3D9Setup.h" />
+    <ClInclude Include="DiagCaptureMode.h" />
+    <ClInclude Include="Displays.h" />
+    <ClInclude Include="EtwConsumer.h" />
+    <ClInclude Include="Failure.h" />
+    <ClInclude Include="FlipDecode.h" />
+    <ClInclude Include="FlowWarpEngine.h" />
+    <ClInclude Include="FrameCompositors.h" />
+    <ClInclude Include="FrameMarker.h" />
+    <ClInclude Include="IFrameCaptureMode.h" />
+    <ClInclude Include="IFrameCompositor.h" />
+    <ClInclude Include="InterpSidecar.h" />
+    <ClInclude Include="IPresentPath.h" />
+    <ClInclude Include="NvFBCSession.h" />
+    <ClInclude Include="OutputWindow.h" />
+    <ClInclude Include="PresentScheduler.h" />
+    <ClInclude Include="Prompts.h" />
+    <ClInclude Include="RelayContext.h" />
+    <ClInclude Include="TemporalCaptureMode.h" />
+    <ClInclude Include="TimerCaptureMode.h" />
+    <ClInclude Include="VsyncCaptureMode.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="nvofapi64.def" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+  <!-- The commit the relay was built from, as BuildCommit.h in the intermediate folder, logged at
+       startup. "-dirty" marks a tree with uncommitted changes to tracked files, and "unknown" a
+       build without git. The header is rewritten only when its text changes, so an unchanged
+       tree does not recompile. -->
+  <Target Name="WriteBuildCommit" BeforeTargets="ClCompile">
+    <Exec Command="git rev-parse --short=7 HEAD" WorkingDirectory="$(ProjectDir)" ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="BuildCommit" />
+      <Output TaskParameter="ExitCode" PropertyName="BuildCommitExitCode" />
+    </Exec>
+    <Exec Command="git status --porcelain --untracked-files=no" WorkingDirectory="$(ProjectDir)" ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low" Condition="'$(BuildCommitExitCode)' == '0'">
+      <Output TaskParameter="ConsoleOutput" PropertyName="BuildTreeChanges" />
+    </Exec>
+    <PropertyGroup>
+      <BuildCommit Condition="'$(BuildCommitExitCode)' != '0'">unknown</BuildCommit>
+      <BuildCommit Condition="'$(BuildCommitExitCode)' == '0' And '$(BuildTreeChanges)' != ''">$(BuildCommit)-dirty</BuildCommit>
+    </PropertyGroup>
+    <MakeDir Directories="$(IntDir)" />
+    <WriteLinesToFile File="$(IntDir)BuildCommit.h" Lines="#define NVFBCR_BUILD_COMMIT &quot;$(BuildCommit)&quot;" Overwrite="true" WriteOnlyWhenDifferent="true" />
+    <Message Text="NvFBCR build commit: $(BuildCommit)" Importance="high" />
+  </Target>
+</Project>

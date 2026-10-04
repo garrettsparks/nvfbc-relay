@@ -1,0 +1,7 @@
+; Import library source for the driver's optical flow API. NVIDIA ships no .lib for
+; nvofapi64.dll (the API surface is a function table filled in by this one factory),
+; so the build generates an import library from this file and the factory resolves
+; through the import table when the process loads.
+LIBRARY nvofapi64.dll
+EXPORTS
+    NvOFAPICreateInstanceD3D11

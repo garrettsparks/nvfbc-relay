@@ -13,28 +13,29 @@ jobs:
 
     - name: Build and run policy tests
       run: |
-        g++ -std=c++17 -O2 -Wall -Werror -o policytests \
-          samples/NvFBC/NvFBCR/PolicyTests.cpp samples/NvFBC/NvFBCR/TemporalPolicy.cpp
+        g++ -std=c++20 -O2 -Wall -Werror -o policytests -Isrc/core \
+          tests/PolicyTests.cpp src/core/TemporalPolicy.cpp
         ./policytests
 
+    - name: Check every file has license information
+      run: pipx run --spec 'reuse[charset-normalizer]==6.2.0' reuse lint
+
   build:
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
 
     steps:
-    - name: Checkout code with submodules
+    - name: Checkout code
       uses: actions/checkout@v5
-      with:
-        submodules: recursive
 
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v3
 
     - name: Build Solution
-      run: msbuild samples/NvFBC/NvFBCR/NvFBCR_2013.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+      run: msbuild NvFBCR.slnx /p:Configuration=Release /p:Platform=x64
 
     - name: Upload build artifact
       uses: actions/upload-artifact@v6
       with:
         name: nvfbc-relay-dev-build
-        path: samples/Release/x64/*.exe
+        path: build/Release/x64/*.exe
         retention-days: 3

@@ -1,0 +1,104 @@
+#pragma once
+
+#include "TemporalPolicy.h"
+
+#include <windows.h>
+#include <evntrace.h>
+#include <atomic>
+#include <mutex>
+
+// Reads the display driver's FlipRequest events while the relay runs, so a capture carries
+// the true scanout times alongside its own arrival and present stamps in ONE log on ONE
+// clock. It writes log lines and fills a history; the per-present flip join, delivery-
+// lateness correction (-dejit) and phase-aware keep-real read the history, and the relay
+// runs everything else without it.
+//
+// SESSION CONFIGURATION IS LOAD-BEARING. Left at defaults, real-time ETW delivers on a ~1 s
+// cadence, which is 70x past the relay's bracketing lag and would make the data useless. The
+// settings in the .cpp were measured, not chosen; see the spec's session configuration
+// section before changing any of them.
+class EtwFlipConsumer {
+public:
+    EtwFlipConsumer();
+    ~EtwFlipConsumer();
+
+    // Starts the session and the consumer and flush threads. Returns false and logs the
+    // reason if the session cannot start, and StartError then holds the failing Win32 code;
+    // the relay carries on regardless, because flip timing must never be able to take
+    // capture down with it.
+    // baseQpc is the relay's own log origin, not a fresh reading: flip lines must be in the
+    // same units and origin as arr= and dl= or the single-log advantage evaporates.
+    bool Start(LONGLONG qpcFreq, LONGLONG baseQpc);
+    void Stop();
+
+    // Snapshot under the lock. The history is written from the ETW thread, so a reader on
+    // the present thread must go through here rather than touching it directly.
+    void CopyHistory(policy::FlipHistory* out) const;
+
+    // Place one captured frame on the flip grid, holding the lock only for the lookup.
+    //
+    // Preferred over CopyHistory for the present thread: the history is ~48 KB, so a
+    // snapshot is a memcpy of the same order as the entire measured present jitter (p50
+    // 3 us), while the lookup itself is a few bounded scans. It also needs no 48 KB of
+    // somewhere to live on a thread that runs every 16.67 ms.
+    //
+    // Callers must gate on whether ETW was requested at all rather than relying on this
+    // returning an empty verdict: with -etw off the session never starts, and not taking
+    // the lock keeps that configuration on exactly the code path it had before any of this
+    // existed, which is what makes an on/off comparison meaningful.
+    policy::FlipPairing PairCapture(uint32_t head, int64_t batchStartTs, int member,
+                                    int64_t cadenceWindow) const;
+
+    // Stage-6 lateness measurement, holding the lock only for the lookup, like PairCapture.
+    // The chain is the CALLER's state (it is sequential across batches and belongs to the
+    // present thread); only the flip history is shared and locked.
+    policy::LateCorrection MeasureLateness(uint32_t head, int64_t batchStartTs,
+                                           policy::AnchorChain& chain,
+                                           int64_t cadenceWindow) const;
+
+    // Measured flip spacing on a head over the recent window, 0 when the grid is not known
+    // yet. Same lock discipline as PairCapture: held for one bounded lookup. Exists so a
+    // caller can DERIVE the frame-generation multiplier from the grid instead of declaring
+    // it - the rotation length that phase-aware keep-real needs is one such derivation.
+    long long MedianFlipSpacing(uint32_t head, int64_t cadenceWindow) const;
+
+    // Head-0 flips strictly after lo, up to and including hi. Counting DISCRETE EVENTS is
+    // what lets a caller advance a grid position exactly; dividing (hi - lo) by the spacing
+    // instead makes a rounding decision that, when wrong, shifts the caller's notion of
+    // grid phase permanently. Bounded, so a wild range reports the cap rather than walking.
+    int CountFlipsBetween(uint32_t head, int64_t lo, int64_t hi) const;
+
+    // The Win32 code of the call that made Start fail, 0 when it has not failed.
+    unsigned long StartError() const { return m_startError; }
+
+    long long Flips() const { return m_flips.load(std::memory_order_relaxed); }
+    long long DecodeFailures() const { return m_decodeFail.load(std::memory_order_relaxed); }
+
+    // Logs event counts, decode failures, and the session's own loss counters. Losses are
+    // logged even when zero: an estimator fed silently incomplete data is the failure this
+    // project keeps rediscovering, so the number should be present in every capture rather
+    // than only when someone thinks to look.
+    void LogSummary();
+
+private:
+    static void WINAPI OnEventThunk(PEVENT_RECORD ev);
+    static DWORD WINAPI ConsumeThunk(LPVOID self);
+    static DWORD WINAPI FlushThunk(LPVOID self);
+    void OnEvent(PEVENT_RECORD ev);
+    void FlushLoop();
+
+    TRACEHANDLE m_session = 0;
+    TRACEHANDLE m_consumer = (TRACEHANDLE)INVALID_HANDLE_VALUE;
+    HANDLE m_consumeThread = NULL;
+    HANDLE m_flushThread = NULL;
+    std::atomic<bool> m_stop{false};
+    std::atomic<long long> m_flips{0};
+    std::atomic<long long> m_events{0};
+    std::atomic<long long> m_decodeFail{0};
+    LONGLONG m_qpcFreq = 0;
+    LONGLONG m_baseQpc = 0;
+    unsigned long m_startError = 0;
+
+    mutable std::mutex m_mutex;
+    policy::FlipHistory m_history;
+};

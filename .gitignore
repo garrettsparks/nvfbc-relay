@@ -1,0 +1,12 @@
+# Build output. The solution builds into build/, and each project keeps its intermediate files
+# in Debug/ or Release/ beside its project file.
+build/
+Debug/
+Release/
+.vs/
+*.vcxproj.user
+
+# Runtime files placed beside a built exe. An NvFBCR.log turns logging on, and no DLL is ever
+# committed: NVIDIA's runtime libraries are not ours to redistribute.
+NvFBCR.log
+*.dll

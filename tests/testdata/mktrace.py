@@ -1,0 +1,197 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""Turn an NvFBCR.log into a PolicyTests replay fixture.
+
+The fixture holds the capture timeline (NvFBC wake times, relay present deadlines) plus
+what the relay ACTUALLY DID with it. The timeline is the test input; the recorded
+behaviour is how the replay model's fidelity gets checked for this specific capture,
+rather than assumed from whichever capture the model was first tuned on.
+
+Bounds are deliberately NOT written here: they describe the model, which only the test
+can measure. Run the suite once and it prints the lines to paste.
+
+  usage: uv run tests/testdata/mktrace.py \
+             <log> tests/testdata/<name>.trace "<description>"
+             [--skip-us N] [--until-us N]
+  then add <name>.trace to index.txt and run the suite: it prints the bounds.
+
+A log from a capture loop that stored the grab timeout's re-delivered picture (no startup
+line saying a timed-out grab stores nothing) gets regrab_copies 1, and the test removes
+those wakes before replaying.
+
+--skip-us drops everything before an absolute log time, and --until-us everything at or
+after one, for a fixture that must isolate one regime. A capture whose early minutes carry
+source hitches reports the hitch recovery as its headline synth share, which buries a
+steady-state regression: measured on the 60x2 walk, whole-log synth is 9.1% against 1.1%
+past the hitches, so a steady-state doubling would sit inside any bound loose enough to hold
+the whole log. Trim only when another fixture already covers the regime being cut; stall
+recovery lives in the map-cycle fixtures.
+
+A long session usually needs BOTH ends cut, because the desktop before and after the game
+is a different regime at a different rate: on the hour-long gameplay capture the post-exit
+240 Hz tail was 6% of presents but 28% of all synthesized frames, and the replay model
+tracks it far worse than gameplay (74% of synth decisions against 97%). Left in, it sets
+every bound in the fixture and gates nothing anyone plays through.
+"""
+import re, sys, os
+
+CAP  = re.compile(r"capture #\d+ arr=(\d+)us")
+PRE  = re.compile(r"temporal dl=(-?\d+)us")
+# lag= is optional: logs recorded before it existed still carry usable scanout times, they
+# just cannot say when the relay could first have known them.
+FLIP = re.compile(r"flip disp=(-?\d+)us evt=(-?\d+)us(?: lag=(-?\d+)us)? head=(\d+)")
+# The declared source rate. Every period the policy derives (lag, passthrough threshold,
+# comb modulus, stall span) is sized from it, so the replay has to run the same declaration
+# or it models a different relay: at 30 fps the stall span of a 60-declared replay sits
+# exactly on the source period and re-seeds on half the brackets the field never blinked at.
+SRC  = re.compile(r"Resolved options: src rate hint ([\d.]+) fps")
+# The -lag the relay ran with, on the same line. It sizes the bracketing lag and the ring, and
+# the part of a source period it adds moves the lock's pull, so a replay without it runs a
+# relay whose pull wraps at different moments from the one that made the capture.
+LAG  = re.compile(r"Resolved options: .*\bextra lag (\d+) ms")
+# The comb modulus the lock runs, and the pull it reports on every temporal line. A pull that
+# moves by more than half the modulus in one present has wrapped, which re-presents a frame or
+# skips one; the test counts the same thing in the replay.
+MOD  = re.compile(r"Phase comb lock ACTIVE .*\bmodulus (\d+) us")
+PULL = re.compile(r"\bpull=(-?\d+)us")
+# The capture loop's startup line announcing that a grab which waits out NvFBC's timeout
+# stores nothing. A log without it came from a loop that stored the timeout's re-delivered
+# picture as a new frame, and the fixture says so, so the replay can remove those wakes.
+SKIPS_COPIES = "timeout stores nothing"
+WARMUP = 200          # must match the test: skips the lock's cold-start acquisition
+
+def main():
+    argv = [a for a in sys.argv[1:]]
+    skip_us = 0
+    until_us = None
+    if "--skip-us" in argv:
+        i = argv.index("--skip-us")
+        skip_us = int(argv[i + 1])
+        del argv[i:i + 2]
+    if "--until-us" in argv:
+        i = argv.index("--until-us")
+        until_us = int(argv[i + 1])
+        del argv[i:i + 2]
+
+    def keep(v):
+        return v >= skip_us and (until_us is None or v < until_us)
+    if len(argv) < 2:
+        print(__doc__); return 2
+    src, out = argv[0], argv[1]
+    desc = argv[2] if len(argv) > 2 else os.path.basename(src)
+    arr, pres, synth = [], [], []
+    # Head 0 only: head 1 is the relay's own output, which no pairing rule reads. Kept in
+    # DELIVERY order rather than sorted by scanout time, because the replay has to model
+    # when each flip became knowable, and sorting would erase that.
+    flips, delays = [], []
+    have_lag = True
+    src_hint = 0.0
+    extra_lag_ms = 0
+    comb = 0
+    pulls = []
+    skips_copies = False
+    for line in open(src, errors="replace"):
+        if not skips_copies and SKIPS_COPIES in line:
+            skips_copies = True
+            continue
+        m = CAP.search(line)
+        if m:
+            v = int(m.group(1))
+            if keep(v): arr.append(v)
+            continue
+        m = SRC.search(line)
+        if m:
+            src_hint = float(m.group(1))
+            m = LAG.search(line)
+            if m:
+                extra_lag_ms = int(m.group(1))
+            continue
+        m = MOD.search(line)
+        if m:
+            comb = int(m.group(1))
+            continue
+        m = PRE.search(line)
+        if m:
+            v = int(m.group(1))
+            if keep(v):
+                pres.append(v)
+                synth.append("op=synth" in line)
+                m = PULL.search(line)
+                pulls.append(int(m.group(1)) if m else 0)
+            continue
+        m = FLIP.search(line)
+        if m and m.group(4) == "0":
+            disp, evt, lag = int(m.group(1)), int(m.group(2)), m.group(3)
+            if not keep(disp):
+                continue
+            flips.append(disp)
+            if lag is None:
+                have_lag = False
+            else:
+                # When the relay could FIRST have known this flip, relative to the flip
+                # itself. Drives the coherence rule offline: an upgrade that arrives after
+                # the policy already bracketed the slot has to be declined, and that is
+                # only testable if the fixture records arrival as well as occurrence.
+                delays.append(int(evt) + int(lag) - disp)
+    if not arr or not pres:
+        print("no capture/temporal lines found"); return 1
+
+    # What the relay really did, measured the same way the replay test measures itself.
+    run = worst = longRuns = nsynth = 0
+    for v in synth[WARMUP:]:
+        if v:
+            nsynth += 1; run += 1; worst = max(worst, run)
+        else:
+            if run >= 50: longRuns += 1
+            run = 0
+    if run >= 50: longRuns += 1
+    pct = 100.0 * nsynth / max(1, len(synth) - WARMUP)
+    wraps = -1
+    if comb > 0:
+        wraps = sum(1 for i in range(max(1, WARMUP), len(pulls))
+                    if abs(pulls[i] - pulls[i - 1]) > comb // 2)
+
+    def enc(v):
+        return " ".join([str(v[0])] + [str(v[i] - v[i-1]) for i in range(1, len(v))])
+    with open(out, "w") as f:
+        f.write("# nvfbc-relay policy replay fixture\n")
+        f.write(f"# {desc}\n")
+        f.write("# units: microseconds. first value absolute, rest are deltas.\n")
+        f.write(f"description {desc}\n")
+        f.write("# What the RELAY did on this capture. The replay model is only trustworthy\n")
+        f.write("# for a configuration where it reproduces these; the test checks that.\n")
+        f.write(f"field_worst_run {worst}\n")
+        f.write(f"field_long_runs {longRuns}\n")
+        f.write(f"field_synth_pct {pct:.1f}\n")
+        if wraps >= 0:
+            f.write(f"field_pull_wraps {wraps}\n")
+        if src_hint > 0:
+            f.write(f"src_hint {src_hint:.1f}\n")
+        if extra_lag_ms > 0:
+            f.write(f"extra_lag_ms {extra_lag_ms}\n")
+        if not skips_copies:
+            f.write("# Recorded by a capture loop that stored the grab timeout's re-delivered picture as a new\n")
+            f.write("# frame; the loader removes those wakes so the replay runs the loop that skips them.\n")
+            f.write("regrab_copies 1\n")
+        f.write(f"arrivals {len(arr)}\n{enc(arr)}\n")
+        f.write(f"presents {len(pres)}\n{enc(pres)}\n")
+        if flips:
+            f.write("# Head-0 scanout times in delivery order, and how long after each flip\n")
+            f.write("# the relay could first have known it. A fixture without flips_h0_delay\n")
+            f.write("# predates the lag= field and can drive pairing but not the timing rule.\n")
+            f.write(f"flips_h0 {len(flips)}\n{enc(flips)}\n")
+            if have_lag and len(delays) == len(flips):
+                f.write(f"flips_h0_delay {len(delays)}\n{' '.join(str(d) for d in delays)}\n")
+    print(f"{out}: {len(arr)} arrivals, {len(pres)} presents, "
+          f"{len(flips)} head-0 flips{'' if have_lag and flips else ' (no lag= in log)'}, "
+          f"{os.path.getsize(out)/1e6:.2f} MB")
+    print(f"  field behaviour past warmup {WARMUP}: synth {pct:.1f}%, "
+          f"runs>=50 {longRuns}, worst {worst}"
+          f"{f', pull wraps {wraps}' if wraps >= 0 else ''}")
+    if not skips_copies:
+        print("  capture loop stored grab-timeout copies: wrote regrab_copies 1")
+    return 0
+
+sys.exit(main())

@@ -1,0 +1,22 @@
+version = 1
+
+# Ours, MIT: everything outside third_party/, plus the README there. A file added anywhere else
+# fails the lint until it gets an entry of its own.
+[[annotations]]
+path = ["*", ".github/**", "docs/**", "src/**", "tests/**", "tools/**", "third_party/nvof/README.md"]
+precedence = "override"
+SPDX-FileCopyrightText = "2025-2026 Garrett Sparks"
+SPDX-License-Identifier = "MIT"
+
+# NVIDIA's optical flow headers, unmodified, each with its own MIT notice.
+[[annotations]]
+path = "third_party/nvof/nvOpticalFlowCommon.h"
+precedence = "override"
+SPDX-FileCopyrightText = "2018-2023 NVIDIA Corporation"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "third_party/nvof/nvOpticalFlowD3D11.h"
+precedence = "override"
+SPDX-FileCopyrightText = "2019-2023 NVIDIA Corporation"
+SPDX-License-Identifier = "MIT"

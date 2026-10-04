@@ -1,0 +1,295 @@
+# Capture corpus for the policy replay gate. One fixture per line.
+# Build with: uv run mktrace.py <NvFBCR.log> <name>.trace "<description>"
+# (mktrace.py lives in this directory; run the suite afterwards for the bounds)
+kcd_60x2_mapcycles.trace
+kcd_60x2_mapcycles_postfix.trace
+# Steady walking, the regime the map-cycle fixtures do not cover: they are dominated by
+# stall recovery, so a selection change that quietly raised gameplay synth would pass them.
+kcd_60x2_walk.trace
+# Same content and flip rate as the walk above, but a scanout grid that jitters 5.5x more
+# (step IQR 1610us vs 291us) for reasons still unexplained. Kept because the jitter broke a
+# fixed anchor bound that the clean walk passed: a rule tuned on one grid is not a rule.
+kcd_60x2_walk_jitter.trace
+# Varied content WITH flip data (the walks are steady; the map cycles carry no flips): the
+# fixture that exercises stage-6 delivery-lateness correction against real late events.
+kcd_60x2_join_events.trace
+# The regimes the x2 corpus cannot gate. An x2 assumption that fails silently-inert (or
+# silently-wrong) elsewhere must break one of these instead: x3 rotates the batch
+# composition through the source period; FG-off is 1-member batches on a metronome grid.
+kcd_60x3_walk.trace
+kcd_60x1_fgoff.trace
+# The live -dejit validation run: the only fixture carrying a proven blend REMOVAL (a
+# 5032us late delivery costing an isolated mid-gameplay blend). Every other fixture proves
+# the correction does no harm; this one proves it does its job.
+kcd_60x2_dejit_event.trace
+# 69 minutes of real streamed gameplay, desktop trimmed off both ends. Every other fixture
+# is minutes of map cycles or walking at 8-9% synth; this one is an hour of the content the
+# relay actually ships, at 0.6%, where blends are ISOLATED events rather than transition
+# bursts. It is the only fixture long enough to measure the isolated-blend rate at all
+# (75 removals, 73 of them single-frame events), and the only one carrying the once-per-
+# second NvFBC delivery hitch that produces half of them.
+gm_60x2_gameplay_hour.trace
+# The same content on the D3D11 flip-model present, and the only fixture carrying a phase
+# TRANSIENT: the source jumps its phase 6 to 7 ms for about 0.65 s and then puts it back,
+# four times in half an hour. That shape is what defeated the step re-seed rule on hardware
+# after 43 fixtures called it clean, so this file is the gate for any future rule that acts
+# on a phase step. Its field numbers were recorded under that rule and its bounds under the
+# policy without it; the fixture header explains why those two lines disagree.
+gm_60x2_gameplay_2026_09_17_0.trace
+# The same content and present path again, 90 minutes of it, captured AFTER that rule was
+# reverted: the only Get Medieval fixture running the policy the tree ships, so its field and
+# replay lines are comparable and agree (on the dejitter arm, which is how it ran, 8 long runs
+# each and worst 62 against 62). It is the
+# fidelity anchor for b:vsync gameplay and the widest sample of the residual blend-zone class,
+# which is why it earns its 12 MB. Its header explains both.
+gm_60x2_gameplay_2026_09_17_1.trace
+# The same content, policy and present path, 61 minutes streamed on 2026-09-22. It carries the
+# residual blend-zone class at the highest rate yet seen: 10 runs >= 50 in an hour against
+# 2026_09_17_1's 8 in 90 minutes, all after the lock released at a small source hitch and re-engaged
+# slowly. The lock released 44 times an hour against 16 on the 2026-09-16 stream while the game
+# hitched at the same rate (118 against 129 small hitches an hour), so a quarter of this
+# capture's hitches dropped the lock against 6% there. Replaying the logged error sequence
+# through the real lock reproduces the field lock state on 99.8% of presents, so the releases
+# follow from this capture timeline itself. Why this timeline releases so much more often is
+# still unexplained, which is the reason to gate on it.
+gm_60x2_gameplay_2026_09_22_0.trace
+# The same game and present path, two short local recordings from 2026-09-23 kept for the LOCK
+# WRAP: the pull is held in [0, comb) with a band either side, and a pull that wanders across a
+# band's edge wraps a whole comb, which re-presents one frame (wrapping up) or skips one
+# (wrapping down). On these captures the pull sat about 1 ms from the wrap point for minutes and,
+# with a band of comb/16 on both sides, wrapped back and forth, a repeat and a skip that cancel,
+# each proven in the recording at frame precision. Widening the band above the comb to comb/8
+# took their wraps from 3 and 6 to 1 and 4. max_pull_wraps pins the count, so a fix passes by
+# lowering it. The first carries wraps and nothing else; the second adds a game hitch that
+# releases the lock into a 118-present blend run.
+kcd_60x2_lockwrap_2026_09_23_0.trace
+kcd_60x2_lockwrap_hitch_2026_09_23_0.trace
+# The same game, present path and policy, 30 minutes of the 2026-09-24 stream with the capture
+# card on its standard 2560x1440 mode, which runs at 59.95 Hz, instead of the custom 60.000 Hz
+# one. A 60 fps source into a 59.95 Hz output gains a frame about every 20 s, so the pull drifts
+# steadily and has to wrap each time, a skip no band can prevent. This is not a setup to tune
+# for, since the custom mode fixes it, but the card fell back to it without anyone changing a
+# setting, so the fixture pins how the relay behaves there: one wrap per beat, no back and forth,
+# no long blend runs.
+gm_60x2_card5995_2026_09_24_0.trace
+# FROM HERE, WHOLE STREAMS. Each fixture above was added for one regime. The ones below are
+# captures added as they come, each cut to the span its video shows, so that a change to the
+# relay is replayed against as much real play as there is. Their bounds sit at what the replay
+# measured when they were added: a change that makes any of them worse fails, and their headers
+# say what is in each.
+# 44 minutes of the 2026-09-29 stream, the first capture on the phase-step lookahead, made before
+# late moves and the refusal: its field numbers come from that older rule and match the replay arm
+# that runs it, while its bounds measure the tree's policy. The calmest of these streams: 179
+# hitches an hour, no lock release, a worst blend run of 12.
+gm_60x2_gameplay_2026_09_29_0.trace
+# 64 minutes of the 2026-09-30 stream, on the policy the tree runs. Its dice game (about 291 s to
+# 519 s) holds the two longest blend runs, which late moves cut: without them the replay reads a
+# worst run of 62 and two runs of 50 or more, against 38 and none.
+gm_60x2_gameplay_2026_09_30_0.trace
+# 49 minutes of the 2026-10-01 stream, on the phase-step lookahead with late moves and the
+# refusal. Eight of its minutes are the dice game, where the game hitches
+# once every 4.31 s and the source phase steps at most of them: 48 of the capture's 66 lookahead
+# moves, all 5 lock releases and the worst blend run are there. The rest is dialog, fades and
+# walking, with the stalls and repeats that come with scene changes.
+gm_60x2_gameplay_2026_10_01_1.trace
+# THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
+# (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
+# presents per source frame, the comb lock structurally unable to engage, half the decisions
+# landing between teeth. These present on the SINK's own clock at 1:1, so the lock holds
+# engaged and the steady state is pure passthrough. A policy change that assumes the old
+# two-presents-per-tooth geometry passes every fixture above and fails here.
+#
+# Each configuration ships TWO fixtures, because one window cannot gate both regimes. The
+# _steady pair is a single benchmark test with no fade at either end, where the field decided
+# passthrough on EVERY present: any spurious blend fails it immediately, and the replay model
+# tracks it almost exactly. The _bench pair is all nine tests across three bench runs with
+# every inter-test fade kept, which is where the source drops to 60 Hz on a fade to black and
+# the relay blends across the hole. The model tracks a fade about half as well as it tracks
+# gameplay, so the _bench bounds are looser by construction and gate what the model can see;
+# that is why the _steady fixtures exist beside them rather than instead of them.
+avatar_60x2_vsync_steady.trace
+avatar_60x2_vsync_bench.trace
+# The same two windows recaptured 2026-09-16, on the capture loop that skips NvFBC's
+# grab-timeout re-deliveries and with the lock re-engage convergence window live. They sit
+# beside the pair above rather than replacing it, so the older build's behaviour on this
+# configuration stays gated. The regrab_copies difference between the two pairs is inert: the
+# older windows contain no arrival gap anywhere near the 100 ms timeout (0 in the 99-102 ms
+# band, 2 at or above 50 ms across the whole bench window), so the loader has nothing to drop
+# in them either way. What these add is field behaviour from the loop that ships: the steady
+# window passes every present through sharp, and the bench window's worst blend run of 40
+# presents is the lock refusing across one inter-test fade rather than a gameplay sweep.
+# The steady window opens 2.3 s after its fade ENDS rather than the 0.3 s the other fixtures
+# use, so it starts once the benchmark is fully running. That margin is the replay model's
+# requirement rather than the relay's: cut at 0.3 s the model's cold-start
+# convergence outlasts the 200-present warmup and reports a 47-present blend run on a window
+# where the field blended nothing, while the harness replaying the same window with the real
+# linked policy reports none. Shifting the start 2 s removes it and changes nothing else.
+avatar_60x2_vsync_steady_2026_09_16_0.trace
+avatar_60x2_vsync_bench_2026_09_16_0.trace
+# The same configuration with generated-frame substitution armed (-subgen, which implies the
+# driver change map). What it pins is a NEGATIVE: substitution fires 38 times in six minutes
+# and changes nothing. The cause was originally read as the tooth guard having already removed
+# the mid-tooth blends; measuring the change map on this log says otherwise. 99.5% of batches
+# report ZERO changed blocks between the real member and the generated member paired with it,
+# so the ring refuses the retracted slot as a duplicate and the policy never sees a candidate.
+# The 59x2 subgen pair further down shows the identical 99.6% at a ratio where the tooth guard
+# is not even armed, which is what separates the two explanations.
+# A change that makes -subgen active again at x2 breaks this pair and nothing else.
+avatar_60x2_subgen_steady.trace
+avatar_60x2_subgen_bench.trace
+# Frame generation OFF: arrivals, presents and source flips all 1:1:1, so keep-real has nothing
+# to collapse and every present has exactly one candidate frame. The FG-off fixture further up
+# covers 1-member batches on the D3D9 path, where the present clock is DWM's; these cover them
+# where the present is the sink's own. The degenerate geometry - no pairing, no collapse, no
+# side to choose - so anything that only works because a batch has two members, or because the
+# target can sit between teeth, has nowhere to hide.
+avatar_60x1_vsync_steady.trace
+avatar_60x1_vsync_bench.trace
+# The non-integer ratio. 59 fps into a 60 Hz sink: no comb can hold it, so the bracket phase
+# ramps through a full source period once per second and the compositor synthesizes whenever
+# the target sits more than a quarter period from a real frame - about half of every beat, and
+# 44% of all presents. Every other fixture here runs the blend path at 0-9%; these run it at
+# maximum duty, with weights piled in the 0.25-0.75 midrange rather than at the edges. The
+# passthrough threshold, the stickiness band and the tooth guard all decide something on nearly
+# every present, so a change to any of them shows up here first. Captured and replayed at
+# -src 59, the only fixture that is; the 59at60 pair below is the same source declared as 60.
+avatar_59x1_vsync_steady.trace
+avatar_59x1_vsync_bench.trace
+# The SAME 59 fps source and the same content, declared as -src 60. Nobody types -src 59; the
+# flag will always name a nominal target rate, so a source that misses it by a frame is the
+# realistic configuration and this pair is what it costs. Every derived period comes out 1.7%
+# short - lag 95833 vs 96186 us, passthrough threshold 4166 vs 4237, comb 16666 vs 16949 - and
+# the output is indistinguishable: 44.8% synth against 44.3%, blend runs of median 26 against
+# 25. What DOES move is the comb: an exact 1.000 ratio makes M=1 a true match rather than a
+# 1.67%-error one, the gate engages twice as often and holds half as long, and the pull tail
+# halves. Paired with avatar_59x1_vsync_* this isolates -src as a single variable.
+avatar_59at60_vsync_steady.trace
+avatar_59at60_vsync_bench.trace
+# 59 base with frame generation x2, declared -src 60. The pair that proves keep-real erases the
+# frame generator: arrivals come at 115/s in pairs, keep-real collapses each to its real member
+# at 59.04/s, and the policy then walks the identical 59:60 ramp the FG-off pair walks - 45.1%
+# synth against 44.8%, blend runs of the same length, the comb lock never engaging once. Same
+# beat, twice the arrival traffic. It also carries the only VRR source in the corpus: the panel
+# is G-SYNC and the individual flips wander 7.1 to 9.9 ms even while the per-second count holds
+# 118, so a policy that quietly assumes an evenly spaced source grid fails here and nowhere else.
+avatar_59x2_vsync_steady.trace
+avatar_59x2_vsync_bench.trace
+# The same 59x2 configuration with -subgen armed. What it pins is WHY substitution is inert,
+# which is not what the 60x2 subgen pair above was originally read to say. The blocker is not
+# the tooth guard and not the policy gate: it is the ring's duplicate refusal. The driver's
+# change map reports ZERO changed blocks between the real member and the generated member it
+# was paired with on 99.6% of batches, so the retracted slot is never marked generated, the
+# policy never sees a candidate, and 24 substitutions happen in six minutes against 8300
+# blends. Synth share is 45.1%, identical to the no-subgen pair.
+#
+# The cause is the FRAME GENERATOR, not the ratio and not the policy. Measured on the same
+# instrument, Smooth Motion duplicates only 7.5% of second members and hands the relay 114 of
+# 120 displayed frames per second; DLSS frame generation duplicates 99.3% and hands over 59 of
+# 118 - exactly the base rate, meaning its generated frames never enter the capture stream at
+# all. So these fixtures pin a property of the NvFBC capture path under DLSS-G. If that path is
+# ever replaced (DXGI duplication taps the scanout plane, where a generated frame holds a
+# display slot by construction), this pair moves and nothing else does.
+avatar_59x2_subgen_steady.trace
+avatar_59x2_subgen_bench.trace
+# The 2:1 case. 30 fps into a 60 Hz sink is the one ratio where the comb lock has real work
+# and can do it: M=2, modulus 16666 us, engaged on 98% of presents, and the steady state is a
+# strict alternation of one real frame and one midpoint blend at w=0.5 for the whole of a test
+# without a single break. Every other fixture here has the lock either idle (1:1, nothing to
+# pull) or refusing (59:60, nothing to hold); this is the only one where it is doing the thing
+# it was built for. The fades in the _bench pair are where it re-seeds: all 46 in-test breaks
+# across nine tests fall inside the first five seconds after a fade, and none after.
+avatar_30x1_vsync_steady.trace
+avatar_30x1_vsync_bench.trace
+# The 2:1 case recaptured 2026-09-16 on the same copy-free capture loop, with the re-engage
+# convergence window live. The alternation is unchanged where it matters: the steady window
+# blends every other present at w=0.5 with a worst blend run of one present and the lock
+# engaged throughout, and the nine tests hold 49.8% synth with a worst run of four. With the
+# 60x2 rows above, these four are the only fixtures in the corpus recorded by the capture loop
+# that ships; every other trace here predates the grab-timeout skip.
+avatar_30x1_vsync_steady_2026_09_16_0.trace
+avatar_30x1_vsync_bench_2026_09_16_0.trace
+# 30 base with frame generation x2, -src 30. The 2:1 alternation again, reached through
+# keep-real: arrivals come at 58/s in pairs 187 us apart, the generated member of each pair is
+# retracted, and the policy sees the same 30 real frames per second the FG-off pair sees. All
+# nine tests alternate one real frame and one w=0.5 blend without a single break, and the lock
+# holds on 100% of in-test presents. What this pair pins beyond the FG-off one is that the pair
+# collapse and the lock compose: a change that let a retracted member leak into the bracket
+# would shift the blend weights off 0.5 here first, because at 2:1 every blend is a midpoint.
+avatar_30x2_vsync_steady.trace
+avatar_30x2_vsync_bench.trace
+# 30x2 with -subgen armed: the sharpest supply test the corpus has. At 2:1 every blend sits at
+# w=0.5, which is exactly where the placement rule puts the generated member, and the 8333 us
+# threshold admits it on every one, so nothing but the ring's duplicate refusal stands between
+# substitution and nine thousand pass-gen presents. It fired 7 times in six minutes, none of
+# them inside a test, because the change map reported zero changed blocks on 6214 of 6216
+# second members. Under DLSS frame generation the generated pixels do not reach NvFBC, and
+# this pair is where that would first stop being true.
+avatar_30x2_subgen_steady.trace
+avatar_30x2_subgen_bench.trace
+# Frame generation x3, 180 fps displayed into the 60 Hz sink. The first x3 coverage on the
+# b:vsync present and the first under DLSS frame generation rather than Smooth Motion. The
+# delivery is not three members per batch: the relay sees two on 69% of batches and three on
+# 31%, at 120 to 165 arrivals per second against 181 displayed, with members up to 1.2 ms
+# apart (p95) under the 3 ms collapse threshold. keep-real reduces every shape to one real
+# frame at 60.05 per second, the lock holds at 1:1 and the nine tests pass 11634 of 11639
+# presents through sharp. A change to the batch threshold or to member ordering at x3 has
+# nowhere else in the corpus to be caught.
+avatar_60x3_vsync_steady.trace
+avatar_60x3_vsync_bench.trace
+# 60x3 with -subgen armed, and the row that changed what x3 under DLSS frame generation means.
+# The change map on the members says the later members are NOT all duplicates here: the
+# second of a two-member batch is a full-frame-distinct image on 16% of batches, the middle of
+# a three-member batch on 99.9%, and the distinct ones arrive later (1.5 ms against 0.6 ms for
+# the duplicates), which is the capture race landing after a 5.5 ms flip. keep-real keeps the
+# last member regardless, and the output video measured against the FG-off 60x1 run shows the
+# same content-step regularity to within noise, so whichever member it keeps sits on the real
+# frame's content grid. Substitution fired 38 times, none in a test: at 1:1 nothing blends, so
+# placement never asks. The rotation vote refused every batch and must keep refusing.
+avatar_60x3_subgen_steady.trace
+avatar_60x3_subgen_bench.trace
+# 90 fps into the 60 Hz sink, no frame generation: the 3:2 ratio, and the first source in the
+# corpus faster than the sink without being an integer multiple of it. The target alternates
+# between a real frame (w about 0.03) and the midpoint between the next two (w about 0.55), so
+# the ideal output is a strict real / half-blend alternation with every content step 1.5 source
+# periods. Captured on the relay that sizes the passthrough threshold at a quarter of the
+# source period (2777 us; policy::PassthroughThreshold, shared by production and this replay):
+# 99.8% of midpoint presents blend, content steps are 1.5 periods on 96% of presents, and the
+# per-test step deviation from the ideal is 0.8 to 1.8 ms rms. The capture this pair replaced
+# ran the present-period floor (4166 us, widened to 5166 by the hysteresis band against a
+# midpoint 5555 us from either neighbour) and passed 41% of midpoints through it, each pass a
+# 22 ms then 11 ms content step; it replayed at 29.1 and 26.7 percent synth against 49.8 and
+# 48.4 here (49.0 and 48.4 before these replays ran the capture's extra lag), with lock
+# engagement at 88% on both, so the difference is the gate alone. A
+# min_synth_pct floor on each fixture fails if midpoints start passing again.
+avatar_90x1_vsync_steady.trace
+avatar_90x1_vsync_bench.trace
+# 90 base with frame generation x2, 180 displayed. The first fixture whose source cannot hold its
+# declared rate: keep-real collapses the pairs to about 88 real frames a second with the batch
+# period wandering around the 11.1 ms it should be. The M=2 comb engages on 23 to 51 percent of
+# presents against 76 to 99 on the steady 90x1 source, and the phase wanders instead of
+# alternating. Captured on the quarter-source-period threshold: 98.8% of midpoint presents
+# blend anyway, because the blend band spans w in [0.31, 0.69] and a wandering phase still
+# lands in it; content steps are 1.5 periods on 82% of presents, the rest spread by the
+# source's own wobble rather than quantized to 1.0 / 2.0 pairs, step deviation 1.9 to 2.7 ms
+# rms per test. The capture this pair replaced, on the present-period floor, blended 39% of
+# midpoints and stepped 1.5 on 29%, at 42% lock engagement against 35% here (the source, not
+# the relay: 88.7 against 88.3 real frames a second). Two effects compounded on that capture,
+# the 1.5x threshold gap and a source the comb cannot follow; the first is closed and what
+# remains is the second.
+avatar_90x2_vsync_steady.trace
+avatar_90x2_vsync_bench.trace
+# 90x2 with -subgen armed, and the pair that measured what the driver change map COSTS. The
+# game's own benchmark ran 9% slower with the flag on (score 5028 to 4576, GPU time 11.27 to
+# 12.38 ms a frame, three runs each within six points of each other), because -subgen implies
+# -diffmap and the driver computes the 8160-block difference on the GPU the game is rendering
+# on. The relay therefore received 72 to 77 real frames a second declared as 90, the comb never
+# engaged, and the phase wandered. Substitution fired 990 times, 677 inside tests, the most of
+# any DLSS-G row: 13% of second members and 84% of three-member middles were distinct frames,
+# because the slower grab (868 us between members against 275 without the map) lands after the
+# next 5.5 ms flip more often. It did not move the smooth-step share (31% against 30% without),
+# on a source too different to compare. Read as a record of the observer effect, not as a
+# substitution result. Declared 90, the pair takes the shared threshold rule like every other
+# -src 90 row: the replay went from 26.6 and 24.6 to 52.7 and 51.1 percent synth with the comb
+# and the re-seed counts unchanged (54.6 and 52.7 once the replay ran the capture's extra lag).
+avatar_90x2_subgen_steady.trace
+avatar_90x2_subgen_bench.trace

@@ -1,0 +1,146 @@
+#pragma once
+
+#include "IFrameCaptureMode.h"
+#include "PresentScheduler.h"
+#include "CaptureRing.h"
+#include "TemporalPolicy.h"
+#include "EtwConsumer.h"
+
+// Defined in IPresentPath.h, which this header deliberately does not pull in: only the
+// implementation needs the concrete present paths.
+class IPresentPath;
+
+// Temporal capture mode: frame selection and composition for smooth fixed-rate capture of
+// a (possibly variable-rate) source.
+//
+// Composition of the shared pieces plus a trivial selection step:
+//   CaptureRing      - capture thread fills a ring with source frames stamped at arrival.
+//   Present timing   - two options (the <selection>:<present> framework's present axis):
+//                      timer  (t:60)    - PresentScheduler's absolute-QPC deadline drives it.
+//                      vsync  (t:dwm)   - the present path's own blocking wait drives it, and
+//                                         which clock that is belongs to the path: DWM's
+//                                         compose clock on the D3D9 swapchain (regime-
+//                                         dependent: the source display's rate on a composed
+//                                         desktop, card-locked 60 Hz under a fullscreen game),
+//                                         the SINK's vblank on the D3D11 flip-model swapchain.
+//   Present path     - everything from the bracket to the screen: the compositor (nearest
+//                      copies one real frame; blend lerps the pair; interp motion-compensates
+//                      the pair), the marker, the swapchain and its statistics. This loop
+//                      never asks which path it is driving.
+//   This mode        - each present: aim a content target lagged a fixed bracketing delay
+//                      behind, bracket it in the ring, hand the bracket to the present path,
+//                      log the line.
+
+// Which compositor the mode letter selected (t nearest, b blend, o interp).
+enum CompositorKind {
+    kCompositorNearest = 0,
+    kCompositorBlend = 1,
+    kCompositorInterp = 2,
+};
+
+class TemporalCaptureMode : public IFrameCaptureMode,
+                            private CaptureRing::IRotationOracle {
+private:
+    // CaptureRing::IRotationOracle, answered on the CAPTURE thread. Both take the flip
+    // history's lock for one bounded lookup each; the ring calls them once per batch.
+    virtual bool Grid(long long batchPeriodTicks, int* outStride, int* outFlipsPerSource,
+                      long long* outSpacingTicks) override;
+    virtual bool AnchorAndSteps(long long batchStartTs, long long prevAnchorTs,
+                                long long* outOffset, int* outSteps) override;
+
+    PresentScheduler m_scheduler;
+    CaptureRing m_ring;
+    LONGLONG m_bracketingDelayQpc;  // present-target lag; static: max(present period, 1.25 x assumed source period)
+    LONGLONG m_assumedSrcPeriodQpc; // declared/default source period the lag was sized for
+    policy::PolicyConfig m_policyCfg;    // stickiness band, comb spacing (0 = lock off), pull slew, passthrough gate
+    policy::PhaseLockState m_lockState;  // comb-lock pull/EMAs/gate (pure policy state)
+    policy::PhaseLookahead m_lookahead;  // a phase step seen in the ring, waiting for the target
+    policy::PresentHistory m_presentHist;  // recent present times, for the guard's resume exemption
+    // THE PRESENT PATH. Owned. Constructed with the mode, before any device exists, so main
+    // can ask whether the output window belongs to it before creating the D3D9 device; its
+    // device work happens in Setup, after the ring has started. The compositor lives behind
+    // it, so this class holds no compositor of its own.
+    IPresentPath* m_present;
+    int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
+    CompositorKind m_compositorKind;
+    bool m_lock;                    // the comb lock unless -nolock; -src or the assumed 60
+    bool m_mark;                    // -mark: burn the frame-counter marker (debug); default off
+    unsigned int m_markFrames;      // -mark N: burn only the first N presents; 0 = all (unset)
+    bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: the path's blocking present (t:dwm, b:vsync)
+    LARGE_INTEGER m_baseQpc;        // logging time origin
+    float m_targetFramerate;
+    float m_srcRateHint;            // declared source fps (-src); 0 = unset, assume >= 60
+    IDirect3DDevice9Ex* m_device;
+    bool m_etw;                     // read the driver's scanout times, unless -noetw
+    // -nojoin: keep the ETW session and its flip lines, skip the per-present grid lookup.
+    // The A/B control for the join itself: -etw off logs no flips, so it cannot answer
+    // whether the join affects the flip grid, and an older build differs by more than the
+    // join. This is the only arrangement where one binary in one session isolates it.
+    bool m_noJoin;
+    // -dejit: subtract each batch's measured delivery lateness from its stamps (stage 6,
+    // the phantom-blend fix). Requires -etw with the join on AND the comb lock configured
+    // (the calm gate reads lock state; without a lock it would be vacuously open, running
+    // corrections straight through the stall recoveries it exists to protect). Corrections
+    // live in the overlay, never in the slots; off, FindBracket takes the exact pre-stage-6
+    // read path.
+    bool m_dejitter;
+    bool m_fgPhase;                 // -fgphase: per-batch content-phase instrument (ring-side)
+    bool m_phaseKeep;               // -phasekeep: phase-aware keep-real (needs -etw with the join)
+    // -lag N: extra bracketing delay in ms, on top of the derived 1.25x source period. A HOLD
+    // is a bracket with no after-frame, and it re-presents the last output - a visible
+    // duplicate. Moving the target further into the past makes it likelier that a newer frame
+    // has already arrived, so this trades output latency for holds. Latency here is not felt
+    // by the player (the source display is direct) and only shifts the stream, which is
+    // already seconds behind. Replayed on a 55-minute capture: holds 1.23/s at +0,
+    // 0.29/s at +50 ms, 0.01/s at +75 ms; the frames those holds wanted DID arrive, just
+    // later than the target. The cost is that they become blends, not passthroughs.
+    unsigned int m_extraLagMs;
+    bool m_phaseKeepRequested;      // asked for, so an unmet prerequisite can say so once
+    char m_modeName[64];            // GetModeName: the compositor kind and the present path
+    policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
+    policy::StampOverlay m_overlay;      // present-thread-owned; FindBracket reads through it
+    long long m_nextBatch = 0;           // cursor into the ring's batch-start history
+    LONGLONG m_maxTargetQpc = 0;         // newest target consumed; the coherence-rule fence
+    long long m_noAfterRun = 0;          // consecutive presents with no after-frame; logged per run
+    // Session telemetry, all logged at exit: without the blocked counts, a live A/B cannot
+    // distinguish "no late deliveries" from "corrections measured and discarded".
+    long long m_dejitMeasured = 0;
+    long long m_dejitLate = 0;
+    long long m_dejitCorrected = 0;
+    long long m_dejitFenceBlocked = 0;
+    long long m_dejitLockDeclined = 0;
+    long long m_dejitSkipped = 0;        // batches lapped past while the walk was pinned
+    EtwFlipConsumer m_etwConsumer;  // inert unless m_etw; the join, -dejit, -phasekeep read it
+    // How far back PairBatchMember measures the flip grid's step, in QPC ticks. The
+    // confidence bound it accepts is derived from that measurement, so nothing here needs to
+    // know the frame-generation multiplier. 200 ms holds ~24 flips at 60x2 and ~36 at 60x3,
+    // which is a stable median without spanning a rate change.
+    LONGLONG m_flipCadenceWindowQpc = 0;
+
+    // The one lag-sizing rule: 1.25x the source period for bracketing headroom, floored at
+    // the present period. Setup sizes the operative lag with it; telemetry sizes suggestions.
+    LONGLONG LagForSourcePeriod(LONGLONG srcPeriodQpc) const;
+
+public:
+    // d3d11Present selects the D3D11 flip-model present path, which carries the blend
+    // compositor only; the parser pairs it with kCompositorBlend and nothing else.
+    TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
+                        bool lock = false, CompositorKind compositor = kCompositorNearest,
+                        bool mark = false, unsigned int markFrames = 0, bool tint = false,
+                        bool etw = false, bool noJoin = false, bool dejitter = false,
+                        bool fgPhase = false, bool phaseKeep = false,
+                        unsigned int extraLagMs = 0, bool d3d11Present = false);
+    virtual ~TemporalCaptureMode();
+
+    virtual UINT GetPresentationInterval() const override;
+
+    // The temporal modes rebind NvFBC to CaptureRing's private capture device, so the present
+    // device is free to live on the adapter that actually owns the output window.
+    virtual bool PresentsOnTargetAdapter() const override { return true; }
+    // A property of the chosen present path, not of the mode.
+    virtual bool PresentsViaD3D11() const override;
+    virtual MaybeFailure Setup(const RelayContext& ctx) override;
+    virtual MaybeFailure Run(RelayContext& ctx,
+                             NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) override;
+    virtual const char* GetModeName() const override;
+};
