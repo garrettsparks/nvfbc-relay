@@ -16,5 +16,8 @@ D3DPRESENT_PARAMETERS WindowedPresentParams(HWND window, int width, int height, 
                                             UINT presentationInterval);
 
 // Creates the present device on the given adapter for ctx->deviceWindow, sized ctx->width by
-// ctx->height, and fetches its back buffer into ctx->backBuffer.
-MaybeFailure CreatePresentDevice(RelayContext* ctx, UINT adapter, UINT presentationInterval);
+// ctx->height, and fetches its back buffer into ctx->backBuffer. multithreaded false leaves out
+// D3DCREATE_MULTITHREADED, as the original relay did; only a mode that calls the device from one
+// thread may ask for that.
+MaybeFailure CreatePresentDevice(RelayContext* ctx, UINT adapter, UINT presentationInterval,
+                                 bool multithreaded);

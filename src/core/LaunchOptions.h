@@ -35,6 +35,12 @@ struct Options {
     bool mark = false;              // -mark: burn the frame-counter marker
     unsigned int markFrames = 0;    // -mark N: first N presents only; 0 = every present
     unsigned int extraLagMs = 75;   // -lag N: extra bracketing delay, 0 to 200 ms
+    // The original relay's behaviour, one switch per way the timer mode differs from it, so a
+    // bench can put each difference back on its own. Development flags.
+    bool ogTimer = false;           // -ogtimer: a default-resolution relative timer, armed first
+    bool ogDevice = false;          // -ogdevice: a present device without the multithreaded flag
+    bool ogWindow = false;          // -ogwindow: an output window that is not topmost
+    bool ogFlags = false;           // -ogflags: PresentEx flags 0x80000000
 };
 
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths always
@@ -134,6 +140,14 @@ inline const std::vector<UsageRow>& OptionRows() {
          false, false},
         {"-phasekeep", "", "Phase-aware keep-real, the x3 rotation vote", false, false},
         {"-flipex", "", "D3D9Ex flip-ex swap effect on the D3D9 present path", false, false},
+        {"-ogtimer", "", "Timer mode: the original relay's timer, a default-resolution relative "
+                         "timer armed before each grab", false, false},
+        {"-ogdevice", "", "Timer mode: a present device without D3DCREATE_MULTITHREADED, as in "
+                          "the original relay", false, false},
+        {"-ogwindow", "", "An output window that is not topmost, as in the original relay",
+         false, false},
+        {"-ogflags", "", "Timer mode: PresentEx flags 0x80000000, as the original relay passed",
+         false, false},
         {"-source", "0", "Capture display index, for a launch without the prompts", false, true},
         {"-target", "1", "Output display index, for a launch without the prompts", false, true},
         {"-framerate", "b:vsync", "Capture mode, for a launch without the prompts", false, true},
@@ -263,6 +277,10 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
+    if (t == "-ogtimer")   { o->ogTimer = true;   return 1; }
+    if (t == "-ogdevice")  { o->ogDevice = true;  return 1; }
+    if (t == "-ogwindow")  { o->ogWindow = true;  return 1; }
+    if (t == "-ogflags")   { o->ogFlags = true;   return 1; }
     if (t == "-mark") {
         o->mark = true;
         // Optional frame count: consume the next token as N only if it is all digits, so a bare
@@ -419,6 +437,10 @@ inline std::string FormatOptions(const Options& o) {
     if (o.fgPhase) add("-fgphase");
     if (o.phaseKeep) add("-phasekeep");
     if (o.flipEx) add("-flipex");
+    if (o.ogTimer) add("-ogtimer");
+    if (o.ogDevice) add("-ogdevice");
+    if (o.ogWindow) add("-ogwindow");
+    if (o.ogFlags) add("-ogflags");
     return s;
 }
 

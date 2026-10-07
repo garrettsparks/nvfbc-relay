@@ -14,8 +14,9 @@ struct OutputWindows {
     HWND host = NULL;
 };
 
+// topmost false gives the output window the original relay's stacking: an ordinary window.
 MaybeFailure CreateOutputWindows(HINSTANCE instance, int showCommand, const DisplayInfo& target,
-                                 bool withHost, OutputWindows* out);
+                                 bool withHost, bool topmost, OutputWindows* out);
 
 // Destroys whichever of the windows still exist. The output window's destruction is what ends a
 // run, so this also discards the quit request it leaves behind: a pending quit dismisses the
