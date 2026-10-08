@@ -84,7 +84,7 @@ update its numbers.
 | `vsync` | Plain capture, present blocked on DWM's compose clock. No temporal selection. |
 | `t` or `t:dwm` | Temporal selection, present blocked on DWM's compose clock. |
 | `t:<fps>` | Temporal selection, present driven by a QPC timer at the given rate. |
-| `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the bracket pair otherwise), presented through a D3D11 flip-model swapchain on the capture card's own vblank. The default. |
+| `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the frame before it and the frame after it otherwise), presented through a D3D11 flip-model swapchain on the capture card's own vblank. The default. |
 | `b:dwm` | The same blend on the D3D9 swapchain, present blocked on DWM's compose clock. The path `t` runs on. |
 | `b:<fps>` | The same blend, present driven by a QPC timer at the given rate. |
 | `<fps>` | Plain timer capture at the given rate. No temporal selection. How the original relay ran. |
@@ -196,9 +196,9 @@ Measured in one session with a game rendering 60 FPS and in-game frame
 generation doubling it to 120, on the default settings plus `-mark`, during the
 game's benchmark tests:
 
-| | `b:dwm` (D3D9, DWM compose clock) | `b:vsync` (D3D11 flip model, sink vblank) |
+| | `b:dwm` (D3D9, DWM compose clock) | `b:vsync` (D3D11 flip model, capture card's vblank) |
 | --- | --- | --- |
-| presents/s on the 60Hz sink | 117 to 120 | 60.00 |
+| presents/s on the 60Hz capture card | 117 to 120 | 60.00 |
 | present spacing stdev | 575 to 2076 us | 20 to 97 us |
 | comb lock engaged | 0.0% | 100% |
 | hold-comb/s | 53 to 60 | 0 |
