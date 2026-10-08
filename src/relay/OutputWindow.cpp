@@ -22,7 +22,7 @@ LRESULT CALLBACK RelayWindowProc(HWND window, UINT message, WPARAM wParam, LPARA
 }  // namespace
 
 MaybeFailure CreateOutputWindows(HINSTANCE instance, int showCommand, const DisplayInfo& target,
-                                 bool withHost, bool topmost, OutputWindows* out) {
+                                 bool withHost, OutputWindows* out) {
     WNDCLASSEXA windowClass = {};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.style = CS_HREDRAW | CS_VREDRAW;
@@ -34,9 +34,7 @@ MaybeFailure CreateOutputWindows(HINSTANCE instance, int showCommand, const Disp
         return WindowFailed("window class", GetLastError());
     }
 
-    // The original relay passed WS_EX_TOPMOST in the style argument, where it is not a style,
-    // so its window was never topmost.
-    out->output = CreateWindowExA(topmost ? WS_EX_TOPMOST : 0, kWindowClass, "NvFBCR", WS_POPUP,
+    out->output = CreateWindowExA(WS_EX_TOPMOST, kWindowClass, "NvFBCR", WS_POPUP,
                                   target.rect.left, target.rect.top, target.Width(),
                                   target.Height(), NULL, NULL, instance, NULL);
     if (!out->output) {

@@ -4530,9 +4530,7 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.etw == b.etw && a.noJoin == b.noJoin && a.dejitter == b.dejitter &&
            a.dejitterRequested == b.dejitterRequested && a.fgPhase == b.fgPhase &&
            a.phaseKeep == b.phaseKeep && a.flipEx == b.flipEx && a.mark == b.mark &&
-           a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs &&
-           a.ogTimer == b.ogTimer && a.ogDevice == b.ogDevice && a.ogWindow == b.ogWindow &&
-           a.ogFlags == b.ogFlags;
+           a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
@@ -4738,39 +4736,6 @@ static void test_launch_option_parsing() {
     CHECK(launch::SplitTokens("a\tb").size() == 1, "a tab must not split a token");
 }
 
-static void test_launch_original_relay_switches() {
-    // The switches that put the original relay's behaviour back one difference at a time.
-    // Off by default, so a launch that names none of them runs exactly as before.
-    const launch::Options d;
-    CHECK(!d.ogTimer && !d.ogDevice && !d.ogWindow && !d.ogFlags,
-          "the original-relay switches must default off");
-
-    // Each one sets its own field and nothing else.
-    struct Switch { const char* flag; bool launch::Options::*field; };
-    const Switch switches[] = {
-        {"-ogtimer", &launch::Options::ogTimer},   {"-ogdevice", &launch::Options::ogDevice},
-        {"-ogwindow", &launch::Options::ogWindow}, {"-ogflags", &launch::Options::ogFlags},
-    };
-    for (const Switch& s : switches) {
-        launch::Options x;
-        const std::vector<std::string> t = {s.flag};
-        std::string w;
-        const size_t n = launch::ApplyOption(t, 0, &x, &w);
-        const bool set = x.*(s.field);
-        x.*(s.field) = false;
-        CHECK(n == 1 && set && w.empty() && SameOptions(x, launch::Options()),
-              "%s must set exactly its own switch and consume one token", s.flag);
-    }
-
-    // All four together, after a mode at the prompt, as a bench row types them.
-    const launch::PromptAnswer a =
-        launch::ParsePromptAnswer("60 -ogtimer -ogdevice -ogwindow -ogflags");
-    CHECK(a.problem.empty() && a.mode == "60" && a.options.ogTimer && a.options.ogDevice &&
-              a.options.ogWindow && a.options.ogFlags,
-          "a timer row with every original-relay switch must be accepted, got '%s'",
-          a.problem.c_str());
-}
-
 static void test_launch_mode_parsing() {
     using launch::Compositor;
     using launch::ModeKind;
@@ -4956,8 +4921,6 @@ static void test_launch_relaunch_round_trip() {
         "-mark",
         "-mark 7200 -tint -fgphase -phasekeep -flipex",
         "-lock -etw -dejit -src 90",
-        "-ogtimer -ogdevice -ogwindow -ogflags",
-        "-ogwindow -src 60",
     };
     for (const char* text : launches) {
         launch::Options typed = ParseOptionString(text, nullptr, nullptr);
@@ -5344,7 +5307,6 @@ int main(int argc, char** argv) {
     test_lock_reseed_stall_paired_cadence();
     test_launch_defaults();
     test_launch_option_parsing();
-    test_launch_original_relay_switches();
     test_launch_mode_parsing();
     test_launch_dependencies();
     test_launch_int_parse();

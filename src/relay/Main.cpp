@@ -53,7 +53,7 @@ IFrameCaptureMode* CreateCaptureMode(const std::string& modeText, const launch::
     case launch::ModeKind::Diag:
         return new DiagCaptureMode(spec.vsyncPresent);
     case launch::ModeKind::Timer:
-        return new TimerCaptureMode(spec.framerate, o.ogTimer, o.ogFlags);
+        return new TimerCaptureMode(spec.framerate);
     case launch::ModeKind::Invalid:
         return NULL;
     case launch::ModeKind::Temporal:
@@ -131,22 +131,6 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
             "rotates");
         options.flipEx = false;
     }
-    // The original relay's timer, device and present flags belong to the timer mode, the only
-    // one built like it. The other modes call the present device from two threads, so a device
-    // without the multithreaded flag is never theirs.
-    if (launch::ParseMode(r.choice.mode).kind != launch::ModeKind::Timer &&
-        (options.ogTimer || options.ogDevice || options.ogFlags)) {
-        LOG("-ogtimer, -ogdevice and -ogflags ignored: they apply to the timer mode only");
-        options.ogTimer = options.ogDevice = options.ogFlags = false;
-    }
-    if (options.ogTimer || options.ogDevice || options.ogWindow || options.ogFlags) {
-        LOG("Original relay's behaviour: timer %s, present device %s, output window %s, "
-            "PresentEx flags %s",
-            options.ogTimer ? "ORIGINAL (-ogtimer)" : "high-resolution absolute",
-            options.ogDevice ? "single-threaded (-ogdevice)" : "multithreaded",
-            options.ogWindow ? "NOT topmost (-ogwindow)" : "topmost",
-            options.ogFlags ? "0x80000000 (-ogflags)" : "0");
-    }
 
     LOG("Source display: [%u] %s (%s)", source.adapter, source.Name().c_str(),
         source.deviceName.c_str());
@@ -181,8 +165,7 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
     LOG("Buffer size: %dx%d", ctx.width, ctx.height);
 
     if (MaybeFailure f = CreateOutputWindows(instance, showCommand, target,
-                                             r.mode->PresentsViaD3D11(), !options.ogWindow,
-                                             &r.windows)) {
+                                             r.mode->PresentsViaD3D11(), &r.windows)) {
         return f;
     }
     ctx.outputWindow = r.windows.output;
@@ -198,8 +181,7 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
                  : "source - mode captures into its back buffer",
         source.adapter);
     if (MaybeFailure f = CreatePresentDevice(&ctx, presentAdapter,
-                                             r.mode->GetPresentationInterval(),
-                                             !options.ogDevice)) {
+                                             r.mode->GetPresentationInterval())) {
         return f;
     }
     if (MaybeFailure f = CreateStartupSession(&ctx, &r.grab, &r.grabInfo)) return f;

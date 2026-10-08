@@ -27,8 +27,7 @@ D3DPRESENT_PARAMETERS WindowedPresentParams(HWND window, int width, int height, 
     return params;
 }
 
-MaybeFailure CreatePresentDevice(RelayContext* ctx, UINT adapter, UINT presentationInterval,
-                                 bool multithreaded) {
+MaybeFailure CreatePresentDevice(RelayContext* ctx, UINT adapter, UINT presentationInterval) {
     // The bitblt swap effect converts a back buffer that does not match the display mode on
     // every present, so the relay keeps its 10-bit format there. Flip mode hands the buffers to
     // DWM with nowhere to convert, and the device is refused unless the format follows the mode.
@@ -59,8 +58,7 @@ MaybeFailure CreatePresentDevice(RelayContext* ctx, UINT adapter, UINT presentat
     // Multithreaded because the temporal modes call the device from the capture thread and the
     // present loop at once. Present statistics are only gathered when asked for at creation, and
     // without them the statistics read as zeroes, which looks like a sink that never missed.
-    DWORD behavior = D3DCREATE_HARDWARE_VERTEXPROCESSING;
-    if (multithreaded) behavior |= D3DCREATE_MULTITHREADED;
+    DWORD behavior = D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED;
     if (ctx->flipEx) behavior |= D3DCREATE_ENABLE_PRESENTSTATS;
 
     HRESULT hr = ctx->d3d->CreateDeviceEx(adapter, D3DDEVTYPE_HAL, ctx->deviceWindow, behavior,
