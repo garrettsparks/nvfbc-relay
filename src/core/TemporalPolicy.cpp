@@ -673,6 +673,54 @@ int RotationPositionAt(const RotationPhase& p, int64_t ts, int64_t spacingTicks)
     return (int)pos;
 }
 
+DeferLimits SizeDeferLimits(int64_t lagTicks, int64_t srcPeriodTicks, int64_t marginTicks,
+                            int64_t aboutTicks, int64_t leastTicks) {
+    DeferLimits d;
+    if (srcPeriodTicks <= 0) return d;
+    const int64_t needGap = srcPeriodTicks + srcPeriodTicks / 8;
+    for (int64_t periods = aboutTicks / srcPeriodTicks; periods >= 1; periods--) {
+        const int64_t wait = periods * srcPeriodTicks + srcPeriodTicks / 2;
+        if (wait < leastTicks) break;
+        const int64_t gap = DeferMaxGap(lagTicks, wait, marginTicks);
+        if (gap >= needGap) {
+            d.maxWaitTicks = wait;
+            d.maxGapTicks = gap;
+            break;
+        }
+    }
+    return d;
+}
+
+DeferDecision DecideDefer(DeferState& s, const BatchDecision& batch, int64_t maxGapTicks) {
+    DeferDecision d;
+    if (batch.member == 0) {
+        // A batch has just closed: fold its member count into the average. batchGap is zero
+        // only for the very first wake, where there is no batch before to count.
+        if (batch.batchGap > 0) {
+            const int64_t members = (int64_t)(s.prevLastMember + 1) << 8;
+            s.membersEmaQ8 = s.membersEmaQ8 ? (s.membersEmaQ8 * 7 + members) / 8 : members;
+        }
+        s.prevLastMember = 0;
+    } else {
+        s.prevLastMember = batch.member;
+    }
+    if (s.pending) {
+        d.hadPending = true;
+        d.copyPending = batch.member == 0;
+        s.pending = false;
+    }
+    d.deferThis = batch.member == 0 && s.membersEmaQ8 >= kDeferPairedQ8 &&
+                  batch.batchGap <= maxGapTicks;
+    s.pending = d.deferThis;
+    return d;
+}
+
+bool DeferOnTimeout(DeferState& s) {
+    const bool waiting = s.pending;
+    s.pending = false;
+    return waiting;
+}
+
 KeepDecision DecideKeep(const BatchDecision& batch, int realMember, int64_t spacingTicks,
                         bool havePrevSlot) {
     KeepDecision d;

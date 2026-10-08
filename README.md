@@ -122,8 +122,10 @@ Without `-src` the relay assumes 60.
 The relay's frame pacing features are all on by default. It locks onto the
 game's frame timing, adds the 75 ms of extra delay above, and reads frame timing
 from the graphics driver to correct frames that arrive late. None of them costs
-anything measurable (see Present paths). For troubleshooting, each can be
-turned off.
+anything measurable (see Present paths). When the game uses frame generation,
+frames reach the relay in pairs and it keeps one of each pair. It skips copying
+the one it drops, which lowers what the relay costs the game. For
+troubleshooting, each can be turned off.
 
 | Option | Turns off |
 | ------ | --------- |
@@ -131,6 +133,7 @@ turned off.
 | `-noetw` | Reading frame timing from the graphics driver, and with it the late-frame correction |
 | `-nodejit` | The late-frame correction only |
 | `-lag 0` | The extra delay |
+| `-nodefercopy` | Skipping the copy of the dropped frame of each pair |
 
 The older spellings `-lock`, `-etw` and `-dejit` still work and change nothing.
 If the relay can't read frame timing from the driver, it says so once and keeps

@@ -20,7 +20,8 @@ namespace launch {
 // with: a launch starts from a default-constructed Options, so a default is changed here and
 // nowhere else. The comb lock, the extra lag, flip timing and delivery-lateness
 // correction are on by default because the relay-cost ladder measured no cost for any of them;
-// -nolock, -lag 0, -noetw and -nodejit turn them off.
+// -nolock, -lag 0, -noetw and -nodejit turn them off. The deferred ring copy is on by default
+// because it lowers what the relay costs the game; -nodefercopy turns it off.
 struct Options {
     float srcRateHint = 0.0f;       // -src: declared BASE render rate; 0 = not declared
     bool lock = true;               // -lock / -nolock: the phase comb lock
@@ -35,6 +36,8 @@ struct Options {
     bool mark = false;              // -mark: burn the frame-counter marker
     unsigned int markFrames = 0;    // -mark N: first N presents only; 0 = every present
     unsigned int extraLagMs = 75;   // -lag N: extra bracketing delay, 0 to 200 ms
+    bool deferCopy = true;          // -defercopy / -nodefercopy: no ring copy for the frame of a
+                                    // frame-generated pair that keep-real drops
 };
 
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths always
@@ -127,6 +130,11 @@ inline const std::vector<UsageRow>& OptionRows() {
          false, false},
         {"-dejit", "", "Late-batch correction; on by default, and typed it refuses loudly when a "
                        "prerequisite is off", false, false},
+        {"-nodefercopy", "", "Copy every captured frame into the ring. By default, when frames "
+                             "arrive in pairs, the one that is dropped a moment later is not "
+                             "copied", false, false},
+        {"-defercopy", "", "Skipping that copy; on by default, accepted so a launch string that "
+                           "names it keeps working", false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -260,6 +268,8 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-nojoin")    { o->noJoin = true;    return 1; }
     if (t == "-dejit")     { o->dejitter = true;  o->dejitterRequested = true; return 1; }
     if (t == "-nodejit")   { o->dejitter = false; o->dejitterRequested = false; return 1; }
+    if (t == "-defercopy")   { o->deferCopy = true;  return 1; }
+    if (t == "-nodefercopy") { o->deferCopy = false; return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -316,6 +326,16 @@ inline std::string ResolveDependencies(Options* o) {
     if (!reason) return std::string();
     o->dejitter = false;
     return std::string("Delivery-lateness correction off: -dejit needs ") + reason;
+}
+
+// The deferred ring copy leaves the first frame of a frame-generated pair uncopied, and the
+// phase instrument and the rotation vote both read every captured frame's pixels. With either
+// of those on it steps aside, and this returns the line to log.
+inline std::string ResolveDeferCopy(Options* o) {
+    if (!o->deferCopy || (!o->fgPhase && !o->phaseKeep)) return std::string();
+    o->deferCopy = false;
+    return std::string("Deferred ring copy off: ") + (o->fgPhase ? "-fgphase" : "-phasekeep") +
+           " reads every captured frame";
 }
 
 // What a command line names besides the options: the display pair and the capture mode, for a
@@ -414,6 +434,7 @@ inline std::string FormatOptions(const Options& o) {
         add(o.dejitter ? "-dejit" : "-nodejit");
     }
     if (o.extraLagMs != d.extraLagMs) add("-lag " + std::to_string(o.extraLagMs));
+    if (o.deferCopy != d.deferCopy) add(o.deferCopy ? "-defercopy" : "-nodefercopy");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");

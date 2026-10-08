@@ -65,7 +65,7 @@ IFrameCaptureMode* CreateCaptureMode(const std::string& modeText, const launch::
     return new TemporalCaptureMode(spec.framerate, spec.vsyncPresent, o.srcRateHint, o.lock,
                                    compositor, o.mark, o.markFrames, o.tint, o.etw, o.noJoin,
                                    o.dejitter, o.fgPhase, o.phaseKeep, o.extraLagMs,
-                                   spec.d3d11Present);
+                                   spec.d3d11Present, o.deferCopy);
 }
 
 // Takes the named lock that keeps a second relay from starting. Two relays cannot share NvFBC,
@@ -115,6 +115,8 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
     launch::Options& options = r.choice.options;
     const std::string note = launch::ResolveDependencies(&options);
     if (!note.empty()) LOG("%s", note.c_str());
+    const std::string deferNote = launch::ResolveDeferCopy(&options);
+    if (!deferNote.empty()) LOG("%s", deferNote.c_str());
 
     const DisplayInfo& source = displays[r.choice.source];
     const DisplayInfo& target = displays[r.choice.target];

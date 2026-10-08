@@ -112,6 +112,15 @@ struct SimResult {
     long long fenceBlockedBatches = 0;
     long long lockDeclinedBatches = 0;
     long long anchoredBatches = 0;
+    // The deferred ring copy (SimParams::deferCopy): wakes left waiting, and what became of
+    // them.
+    long long deferredWakes = 0;
+    long long deferNeverCopied = 0;
+    long long deferCopiedLate = 0;      // copied when the next wake opened a new batch
+    long long deferCopiedAtLimit = 0;   // copied when the wait limit came first
+    // Presents whose nearest frame on either side had arrived and survived keep-real but was
+    // still waiting to be copied, so the bracket had to use an older or a newer one.
+    long long deferStarvedPresents = 0;
 };
 
 struct SimParams {
@@ -155,6 +164,12 @@ struct SimParams {
     // Batch-collapse window. Production sizes this at 3 ms; frame generation submits a
     // pair well inside it and no real content cadence produces gaps that short.
     int64_t batchThresholdQpc = 3000;
+    // The deferred ring copy as the relay runs it: a paired batch's first member waits
+    // uncopied, under the limits policy::SizeDeferLimits gives this simulation's lag with the
+    // sink period as the margin. A waiting frame is not visible to the bracket until the
+    // capture loop copies it, at the next wake when that opens a new batch or at the wait
+    // limit when nothing comes first. The lookahead reads its stamp from the moment it arrives.
+    bool deferCopy = false;
     // Stage 6: subtract each batch's measured DELIVERY LATENESS (batch start minus its
     // stride-anchored flip) from its slots' stamps, under the coherence rule. The timeline
     // stays on the arrival base - on-time batches are left alone entirely - so the lock
@@ -204,6 +219,21 @@ static bool EasedTarget(const SimResult& r, size_t i) {
     return i > 0 && i - 1 < r.ease.size() && r.ease[i - 1] != 0;
 }
 
+// The bracketing lag a simulation runs: sized from the source rate as production sizes it,
+// plus the extra lag, unless overridden.
+static int64_t BracketingLag(const SimParams& p) {
+    if (p.lagOverride > 0) return p.lagOverride;   // a mis-declared source rate, in effect
+    int64_t lag = p.srcPeriod + p.srcPeriod / 4;
+    if (lag < p.presentPeriod) lag = p.presentPeriod;
+    return lag + p.extraLag;
+}
+
+// The deferred ring copy's limits as the relay sizes them, in the simulator's microseconds.
+static policy::DeferLimits SizedDeferLimits(int64_t lag, int64_t srcPeriod, int64_t margin) {
+    return policy::SizeDeferLimits(lag, srcPeriod, margin, policy::kDeferWaitAboutMs * 1000,
+                                   policy::kDeferWaitLeastMs * 1000);
+}
+
 static SimResult Simulate(const SimParams& p) {
     SeedRng();   // each simulation owns its jitter stream; see kRngSeed
     PolicyConfig cfg;
@@ -231,10 +261,7 @@ static SimResult Simulate(const SimParams& p) {
     cfg.lookaheadNeedsLead = cfg.phaseLookahead && !p.noLookaheadLead;
     if (!p.noResumeGuardExemption) cfg.resumeGuardExemptPresents = policy::kResumeGuardExemptPresents;
 
-    int64_t lag = p.srcPeriod + p.srcPeriod / 4;
-    if (lag < p.presentPeriod) lag = p.presentPeriod;
-    lag += p.extraLag;
-    if (p.lagOverride > 0) lag = p.lagOverride;   // a mis-declared source rate, in effect
+    const int64_t lag = BracketingLag(p);
 
     // Pre-generate arrivals covering the whole run. Drops are filtered after
     // generation so the jitter stream (and every surviving arrival) is identical
@@ -325,6 +352,51 @@ static SimResult Simulate(const SimParams& p) {
     policy::PhaseLookahead lookahead;
     policy::CompositeState comp;
     SimResult r;
+    // When each slot's pixels are in the ring: at its own arrival, unless the capture loop
+    // left the frame waiting. Then it is when the loop copies it, which production's
+    // DecideDefer says is at the next wake if that opens a new batch, or at the wait limit if
+    // that comes first. A waiting frame whose batch gets a second member is never copied;
+    // keep-real has retracted it by then anyway. With no wait that fits the lag the deferral
+    // is off, as it is in the relay.
+    std::vector<int64_t> visibleAt(arrivals.begin(), arrivals.end());
+    const policy::DeferLimits deferLimits = SizedDeferLimits(lag, p.srcPeriod, p.sinkPeriod);
+    if (p.deferCopy && deferLimits.maxWaitTicks > 0) {
+        policy::BatchState bs;
+        policy::DeferState ds;
+        long long pendingIdx = -1;
+        const int64_t waitLimit = deferLimits.maxWaitTicks;
+        for (size_t i = 0; i < arrivals.size(); i++) {
+            if (pendingIdx >= 0 && arrivals[i] - arrivals[(size_t)pendingIdx] >= waitLimit) {
+                if (policy::DeferOnTimeout(ds)) {
+                    visibleAt[(size_t)pendingIdx] = arrivals[(size_t)pendingIdx] + waitLimit;
+                    r.deferCopiedAtLimit++;
+                }
+                pendingIdx = -1;
+            }
+            const policy::BatchDecision bd =
+                policy::UpdateBatch(bs, arrivals[i], p.batchThresholdQpc);
+            const policy::DeferDecision dd =
+                policy::DecideDefer(ds, bd, deferLimits.maxGapTicks);
+            if (dd.hadPending && pendingIdx >= 0) {
+                if (dd.copyPending) {
+                    visibleAt[(size_t)pendingIdx] = arrivals[i];
+                    r.deferCopiedLate++;
+                } else {
+                    visibleAt[(size_t)pendingIdx] = INT64_MAX;
+                    r.deferNeverCopied++;
+                }
+                pendingIdx = -1;
+            }
+            if (dd.deferThis) {
+                pendingIdx = (long long)i;
+                r.deferredWakes++;
+            }
+        }
+        // A frame still waiting when the capture ends would be copied at the wait limit.
+        if (pendingIdx >= 0) {
+            visibleAt[(size_t)pendingIdx] = arrivals[(size_t)pendingIdx] + waitLimit;
+        }
+    }
     size_t published = 0;
     int64_t prevPull = 0;
     policy::PresentHistory presentHist;
@@ -404,15 +476,31 @@ static SimResult Simulate(const SimParams& p) {
         // visible slot, the same result the production scan gives while the display
         // is pinned at the ring's tail.
         BracketInfo b;
+        bool hiddenBefore = false, hiddenAfter = false;
+        int64_t hiddenBeforeTs = 0, hiddenAfterTs = 0;
         for (size_t i = oldest; i < published; i++) {
             if (!valid[i]) continue;
             int64_t ts = stamps[i];
             if (flipDejitter) ts -= overlay.CorrectionFor(ts);
+            // A frame still waiting to be copied is not in the ring yet. Its stamp is kept
+            // aside to tell afterwards whether the bracket would have used it.
+            if (visibleAt[i] > deadline) {
+                if (ts <= target) {
+                    if (!hiddenBefore || ts > hiddenBeforeTs) { hiddenBefore = true; hiddenBeforeTs = ts; }
+                } else {
+                    if (!hiddenAfter || ts < hiddenAfterTs) { hiddenAfter = true; hiddenAfterTs = ts; }
+                }
+                continue;
+            }
             if (ts <= target) {
                 if (!b.hasBefore || ts > b.beforeTs) { b.hasBefore = true; b.beforeTs = ts; }
             } else {
                 if (!b.hasAfter || ts < b.afterTs) { b.hasAfter = true; b.afterTs = ts; }
             }
+        }
+        if ((hiddenBefore && (!b.hasBefore || hiddenBeforeTs > b.beforeTs)) ||
+            (hiddenAfter && (!b.hasAfter || hiddenAfterTs < b.afterTs))) {
+            r.deferStarvedPresents++;
         }
         if (b.hasBefore) b.beforeDiff = target - b.beforeTs;
         if (b.hasAfter) b.afterDiff = b.afterTs - target;
@@ -1162,6 +1250,157 @@ static void test_anchor_chain() {
 // find, and stay silent until it is sure? Built from the MEASURED signature (real-led
 // batches wake ~-50 us before their flip, generated-led ~+75 us after, with distributions
 // that overlap heavily), because the whole point is that no single batch is decisive.
+// The deferred ring copy's rule: which frame waits uncopied, what becomes of it, and the limits
+// that follow the lag.
+static void test_defer_decision() {
+    const int64_t kPeriod = 16667, kPairGap = 1500, kThreshold = 3000;
+
+    // Feeds a wake list through the batch fold and the deferral, counting what each waiting
+    // frame came to. wakesPerBatch[i] members open at batch i's time.
+    struct Tally { int deferred = 0, neverCopied = 0, copiedLate = 0, retractedWaiting = 0; };
+    int64_t maxGap = policy::kDeferAnyGap;
+    // Batch index after which every batch comes this much later (0: no pause).
+    size_t pauseAfter = 0;
+    int64_t pause = 0;
+    auto run = [&](const std::vector<int>& wakesPerBatch, policy::DeferState* stateOut) {
+        Tally t;
+        policy::BatchState bs;
+        policy::DeferState ds;
+        bool waiting = false;
+        for (size_t b = 0; b < wakesPerBatch.size(); b++) {
+            const int64_t open = (int64_t)b * kPeriod + (pause && b > pauseAfter ? pause : 0);
+            for (int m = 0; m < wakesPerBatch[b]; m++) {
+                const policy::BatchDecision bd =
+                    policy::UpdateBatch(bs, open + (int64_t)m * kPairGap, kThreshold);
+                const policy::DeferDecision dd = policy::DecideDefer(ds, bd, maxGap);
+                CHECK(dd.hadPending == waiting,
+                      "the deferral lost track of a waiting frame (batch %zu member %d)", b, m);
+                if (dd.hadPending) {
+                    if (dd.copyPending) t.copiedLate++;
+                    else t.neverCopied++;
+                    // A waiting frame is dropped only when keep-real retracts it anyway.
+                    if (!dd.copyPending && bd.retractPrevious) t.retractedWaiting++;
+                }
+                CHECK(!(dd.deferThis && bd.member != 0),
+                      "only a batch's first member may wait (member %d did)", bd.member);
+                waiting = dd.deferThis;
+                if (dd.deferThis) t.deferred++;
+            }
+        }
+        if (stateOut) *stateOut = ds;
+        return t;
+    };
+
+    // Steady pairs: once the average has seen them, every first member waits and none is
+    // copied, and each one dropped is one keep-real retracts.
+    {
+        const Tally t = run(std::vector<int>(200, 2), NULL);
+        CHECK(t.deferred >= 190, "steady pairs: %d of 200 first members waited", t.deferred);
+        CHECK(t.copiedLate == 0, "steady pairs: %d waiting frames were copied", t.copiedLate);
+        CHECK(t.neverCopied == t.retractedWaiting,
+              "steady pairs: %d waiting frames dropped but keep-real retracts only %d",
+              t.neverCopied, t.retractedWaiting);
+    }
+    // No frame generation: nothing ever waits.
+    {
+        const Tally t = run(std::vector<int>(200, 1), NULL);
+        CHECK(t.deferred == 0, "single-member batches: %d frames waited", t.deferred);
+    }
+    // A batch of one among pairs: its frame waits and is copied when the next batch opens.
+    {
+        std::vector<int> wakes(200, 2);
+        wakes[150] = 1;
+        policy::DeferState ds;
+        const Tally t = run(wakes, &ds);
+        CHECK(t.copiedLate == 1, "one single among pairs: %d frames copied late", t.copiedLate);
+        CHECK(t.neverCopied == t.retractedWaiting,
+              "one single among pairs: a waiting frame was dropped that keep-real keeps");
+    }
+    // Pairs that turn into singles: every single that waits is copied, none is dropped, and
+    // the waiting stops once the average has followed.
+    {
+        std::vector<int> wakes(100, 2);
+        wakes.insert(wakes.end(), 100, 1);
+        const Tally t = run(wakes, NULL);
+        CHECK(t.neverCopied == t.retractedWaiting,
+              "pairs to singles: a real frame was dropped while waiting");
+        CHECK(t.copiedLate >= 1 && t.copiedLate <= 10,
+              "pairs to singles: %d singles waited before the average followed (1 to 10 "
+              "expected)", t.copiedLate);
+    }
+    // The grab timeout takes a waiting frame once and only once.
+    {
+        policy::DeferState ds;
+        run(std::vector<int>(50, 2), &ds);
+        policy::BatchState bs;
+        policy::DeferState state = ds;
+        state.pending = true;
+        CHECK(policy::DeferOnTimeout(state), "a waiting frame must be copied at the timeout");
+        CHECK(!policy::DeferOnTimeout(state), "the timeout copied the same frame twice");
+        const policy::BatchDecision bd = policy::UpdateBatch(bs, 5000000, kThreshold);
+        CHECK(!policy::DecideDefer(state, bd, policy::kDeferAnyGap).hadPending,
+              "a frame copied at the timeout was still counted as waiting");
+    }
+    // The gap limit: a frame that ends a pause longer than the limit is copied at once, and
+    // the frames around it wait as before. Every batch after the 151st comes 60 ms later,
+    // which leaves one 76 ms gap among 16.7 ms ones.
+    {
+        maxGap = 40000;
+        pauseAfter = 150;
+        pause = 60000;
+        const Tally limited = run(std::vector<int>(200, 2), NULL);
+        maxGap = policy::kDeferAnyGap;
+        const Tally unlimited = run(std::vector<int>(200, 2), NULL);
+        pause = 0;
+        CHECK(unlimited.deferred - limited.deferred == 1,
+              "a 40 ms gap limit kept %d frames from waiting at one 76 ms gap (1 expected)",
+              unlimited.deferred - limited.deferred);
+    }
+    // A limit shorter than the source period lets nothing wait.
+    {
+        maxGap = kPeriod - 1;
+        const Tally t = run(std::vector<int>(200, 2), NULL);
+        maxGap = policy::kDeferAnyGap;
+        CHECK(t.deferred == 0, "a gap limit under the source period: %d frames waited",
+              t.deferred);
+    }
+    // The limit is the lag less the longest wait and the margin.
+    CHECK(policy::DeferMaxGap(95833, 50000, 4000) == 41833,
+          "DeferMaxGap(95833, 50000, 4000) is %lld, not 41833",
+          (long long)policy::DeferMaxGap(95833, 50000, 4000));
+    // The limits follow the lag. At 60 fps with a 16.7 ms margin and waits from about 55 ms
+    // down to 40: the default 95.8 ms lag takes 3.5 periods, a shorter lag 2.5, and a lag with
+    // no room for that switches the deferral off. Every wait ends on a half period.
+    {
+        struct Case { int64_t lag, period, wantWait, wantGap; };
+        const Case cases[] = {
+            { 95833, 16667, 58334, 20832 },    // -lag 75, the default
+            { 145833, 16667, 58334, 70832 },   // -lag 125: the wait does not grow past 55 ms
+            { 80833, 16667, 41667, 22499 },    // -lag 60
+            { 77833, 16667, 41667, 19499 },    // -lag 57, the shortest that still waits
+            { 76833, 16667, 0, -1 },           // -lag 56: off
+            { 70833, 16667, 0, -1 },           // -lag 50: off, a 25 ms wait is under the least
+            { 20833, 16667, 0, -1 },           // no extra lag: off
+            { 116666, 33333, 49999, 50000 },   // 30 fps at -lag 75
+            { 91667, 11111, 49999, 25001 },    // 90 fps at -lag 75
+            { 95833, 0, 0, -1 },               // no source period: off
+        };
+        for (const Case& c : cases) {
+            const policy::DeferLimits d =
+                policy::SizeDeferLimits(c.lag, c.period, 16667, 55000, 40000);
+            CHECK(d.maxWaitTicks == c.wantWait && d.maxGapTicks == c.wantGap,
+                  "SizeDeferLimits(lag %lld, period %lld) gives wait %lld and gap %lld, "
+                  "expected %lld and %lld",
+                  (long long)c.lag, (long long)c.period, (long long)d.maxWaitTicks,
+                  (long long)d.maxGapTicks, (long long)c.wantWait, (long long)c.wantGap);
+            CHECK(d.maxWaitTicks == 0 || d.maxWaitTicks % c.period == c.period / 2,
+                  "SizeDeferLimits(lag %lld, period %lld): a wait of %lld does not end on a "
+                  "half period",
+                  (long long)c.lag, (long long)c.period, (long long)d.maxWaitTicks);
+        }
+    }
+}
+
 // What one wake does to the ring. THE FIRST HALF IS AN EQUIVALENCE PROOF, not a behaviour
 // test: with no rotation guidance this must do exactly what the capture loop did before any
 // rotation code existed, and that is checked by exhausting every input combination rather
@@ -2916,6 +3155,47 @@ static void test_replay_capture_corpus() {
                       fx.description.c_str(), removed, fx.minBlendsRemoved);
             }
         }
+
+        // THE DEFERRED RING COPY: the same capture replayed with the deferral the relay runs
+        // by default. Both arms run the capture's production configuration (the dejitter
+        // correction where the fixture has flips) and differ only in when a waiting frame's
+        // slot can be seen. Every present must show what it shows without the deferral: a
+        // waiting frame that a present needed turns a blend into a repeat. On a fixture whose
+        // lag has no room for a wait the deferral is off and nothing waits. What this cannot
+        // show is the capture loop reaching its next grab sooner: these wake times were
+        // recorded by a loop that copied and waited on every wake.
+        {
+            SimParams pd = p;
+            if (!fx.flipDisplay.empty() && !fx.flipKnown.empty()) {
+                pd.flipDisplay = fx.flipDisplay;
+                pd.flipKnown = fx.flipKnown;
+                pd.flipDejitter = true;
+            }
+            const SimResult rb = Simulate(pd);
+            pd.deferCopy = true;
+            const SimResult rd = Simulate(pd);
+            int differs = 0;
+            for (size_t i = kWarmup; i < rb.outTs.size() && i < rd.outTs.size(); i++) {
+                if (rb.outTs[i] != rd.outTs[i]) differs++;
+            }
+            const policy::DeferLimits limits =
+                SizedDeferLimits(BracketingLag(pd), pd.srcPeriod, pd.sinkPeriod);
+            if (limits.maxWaitTicks > 0) {
+                std::printf("    deferred copy: wait at most %.1f ms, after a gap of at most "
+                            "%.1f ms;", limits.maxWaitTicks / 1000.0,
+                            limits.maxGapTicks / 1000.0);
+            } else {
+                std::printf("    deferred copy: off, the lag is too short;");
+            }
+            std::printf(" %lld waited: %lld never copied, %lld copied a wake late, %lld at the "
+                        "wait limit; content differs on %d presents\n",
+                        rd.deferredWakes, rd.deferNeverCopied, rd.deferCopiedLate,
+                        rd.deferCopiedAtLimit, differs);
+            CHECK(differs == 0 && rd.deferStarvedPresents == 0,
+                  "[%s] the deferred ring copy changed %d presents, and %lld needed a frame "
+                  "still waiting",
+                  fx.description.c_str(), differs, rd.deferStarvedPresents);
+        }
     }
 }
 
@@ -4522,7 +4802,7 @@ static launch::Options ParseOptionString(const char* text, std::vector<std::stri
 
 static int CountSwitchesOn(const launch::Options& o) {
     return (int)o.lock + (int)o.tint + (int)o.etw + (int)o.noJoin + (int)o.dejitter +
-           (int)o.fgPhase + (int)o.phaseKeep + (int)o.flipEx + (int)o.mark;
+           (int)o.fgPhase + (int)o.phaseKeep + (int)o.flipEx + (int)o.mark + (int)o.deferCopy;
 }
 
 static bool SameOptions(const launch::Options& a, const launch::Options& b) {
@@ -4530,14 +4810,15 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.etw == b.etw && a.noJoin == b.noJoin && a.dejitter == b.dejitter &&
            a.dejitterRequested == b.dejitterRequested && a.fgPhase == b.fgPhase &&
            a.phaseKeep == b.phaseKeep && a.flipEx == b.flipEx && a.mark == b.mark &&
-           a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs;
+           a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs &&
+           a.deferCopy == b.deferCopy;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
 static launch::Options SwitchesAt(bool on) {
     launch::Options o;
     o.lock = o.tint = o.etw = o.noJoin = o.dejitter = on;
-    o.fgPhase = o.phaseKeep = o.flipEx = o.mark = on;
+    o.fgPhase = o.phaseKeep = o.flipEx = o.mark = o.deferCopy = on;
     o.dejitterRequested = on;
     return o;
 }
@@ -4552,8 +4833,10 @@ static void test_launch_defaults() {
     CHECK(o.dejitter, "late-batch correction must default on");
     CHECK(!o.dejitterRequested, "a default -dejit must not read as typed");
     CHECK(o.extraLagMs == 75, "-lag must default to 75 ms, got %u", o.extraLagMs);
-    CHECK(CountSwitchesOn(o) == 3 && o.markFrames == 0,
-          "exactly the lock, flip timing and late-batch correction must default on, %d are on",
+    CHECK(o.deferCopy, "the deferred ring copy must default on");
+    CHECK(CountSwitchesOn(o) == 4 && o.markFrames == 0,
+          "exactly the lock, flip timing, late-batch correction and the deferred ring copy "
+          "must default on, %d are on",
           CountSwitchesOn(o));
 
     // A blank mode answer is the release path, and it is the same mode b:vsync spells.
@@ -4570,7 +4853,8 @@ static void test_launch_defaults() {
 
     // The bare launch needs no dependency settled: every default's prerequisite is a default.
     launch::Options bare = launch::Options();
-    CHECK(launch::ResolveDependencies(&bare).empty() && SameOptions(bare, launch::Options()),
+    CHECK(launch::ResolveDependencies(&bare).empty() && launch::ResolveDeferCopy(&bare).empty() &&
+              SameOptions(bare, launch::Options()),
           "a bare launch must resolve to the defaults unchanged");
 }
 
@@ -4590,8 +4874,9 @@ static void test_launch_option_parsing() {
     // The full opt-out: every default-on option off, and nothing reported.
     warnings.clear();
     unknown.clear();
-    o = ParseOptionString("-nolock -noetw -nodejit -lag 0", &warnings, &unknown);
-    CHECK(!o.lock && !o.etw && !o.dejitter && o.extraLagMs == 0 && CountSwitchesOn(o) == 0,
+    o = ParseOptionString("-nolock -noetw -nodejit -lag 0 -nodefercopy", &warnings, &unknown);
+    CHECK(!o.lock && !o.etw && !o.dejitter && o.extraLagMs == 0 && !o.deferCopy &&
+              CountSwitchesOn(o) == 0,
           "the opt-outs must turn every default off");
     CHECK(warnings.empty() && unknown.empty(), "the opt-outs must parse clean");
 
@@ -4603,7 +4888,7 @@ static void test_launch_option_parsing() {
         {"-etw", &launch::Options::etw},           {"-nojoin", &launch::Options::noJoin},
         {"-dejit", &launch::Options::dejitter},    {"-fgphase", &launch::Options::fgPhase},
         {"-phasekeep", &launch::Options::phaseKeep}, {"-flipex", &launch::Options::flipEx},
-        {"-mark", &launch::Options::mark},
+        {"-mark", &launch::Options::mark},         {"-defercopy", &launch::Options::deferCopy},
     };
     for (const Switch& s : switches) {
         launch::Options x = SwitchesAt(false);
@@ -4619,13 +4904,14 @@ static void test_launch_option_parsing() {
         {"-nolock", &launch::Options::lock},
         {"-noetw", &launch::Options::etw},
         {"-nodejit", &launch::Options::dejitter},
+        {"-nodefercopy", &launch::Options::deferCopy},
     };
     for (const Switch& s : optOuts) {
         launch::Options x = SwitchesAt(true);
         const std::vector<std::string> t = {s.flag};
         std::string w;
         const size_t n = launch::ApplyOption(t, 0, &x, &w);
-        CHECK(n == 1 && !(x.*(s.field)) && CountSwitchesOn(x) == 8 && w.empty(),
+        CHECK(n == 1 && !(x.*(s.field)) && CountSwitchesOn(x) == 9 && w.empty(),
               "%s must clear exactly its own switch and consume one token", s.flag);
     }
 
@@ -4637,7 +4923,7 @@ static void test_launch_option_parsing() {
         CHECK(!x.dejitter && !x.dejitterRequested, "-nodejit must take back a typed -dejit");
         x = ParseOptionString("-nodejit -dejit", nullptr, nullptr);
         CHECK(x.dejitter && x.dejitterRequested, "the last of -nodejit and -dejit must win");
-        x = ParseOptionString("-lock -etw", nullptr, nullptr);
+        x = ParseOptionString("-lock -etw -defercopy", nullptr, nullptr);
         CHECK(SameOptions(x, launch::Options()),
               "the positive spellings of the defaults must leave a default launch unchanged");
     }
@@ -4834,8 +5120,29 @@ static void test_launch_dependencies() {
     // Only -dejit is settled: an opt-out changes nothing else.
     launch::Options o = ParseOptionString("-noetw -src 90 -lag 50", nullptr, nullptr);
     launch::ResolveDependencies(&o);
-    CHECK(!o.etw && o.lock && o.srcRateHint == 90.0f && o.extraLagMs == 50,
+    CHECK(!o.etw && o.lock && o.srcRateHint == 90.0f && o.extraLagMs == 50 && o.deferCopy,
           "resolving must leave every other option as typed");
+
+    // The deferred ring copy steps aside for the two options that read every captured frame,
+    // names the one that was typed, and is silent when it was already off or neither is on.
+    struct DeferCase { const char* text; bool on; const char* line; };
+    const DeferCase deferCases[] = {
+        {"", true, ""},
+        {"-src 60 -lag 0", true, ""},
+        {"-fgphase", false, "Deferred ring copy off: -fgphase reads every captured frame"},
+        {"-phasekeep", false, "Deferred ring copy off: -phasekeep reads every captured frame"},
+        {"-phasekeep -fgphase", false,
+         "Deferred ring copy off: -fgphase reads every captured frame"},
+        {"-nodefercopy", false, ""},
+        {"-nodefercopy -fgphase", false, ""},
+    };
+    for (const DeferCase& c : deferCases) {
+        launch::Options x = ParseOptionString(c.text, nullptr, nullptr);
+        const std::string line = launch::ResolveDeferCopy(&x);
+        CHECK(x.deferCopy == c.on && line == c.line,
+              "'%s' must leave the deferred ring copy %s with '%s', got %d '%s'", c.text,
+              c.on ? "on" : "off", c.line, (int)x.deferCopy, line.c_str());
+    }
 }
 
 static void test_launch_int_parse() {
@@ -4921,18 +5228,27 @@ static void test_launch_relaunch_round_trip() {
         "-mark",
         "-mark 7200 -tint -fgphase -phasekeep -flipex",
         "-lock -etw -dejit -src 90",
+        "-nodefercopy",
+        "-nodefercopy -defercopy -lag 60",
+        "-fgphase",
     };
     for (const char* text : launches) {
         launch::Options typed = ParseOptionString(text, nullptr, nullptr);
         for (int resolved = 0; resolved < 2; resolved++) {
             launch::Options o = typed;
-            if (resolved) launch::ResolveDependencies(&o);
+            if (resolved) {
+                launch::ResolveDependencies(&o);
+                launch::ResolveDeferCopy(&o);
+            }
             const std::string written = launch::RelaunchArguments(0, 1, "", o);
             const std::vector<std::string> tokens = launch::SplitTokens(written);
             std::vector<std::string> warnings;
             launch::Options back;
             const launch::CommandLine c = launch::ParseCommandLine(tokens, &back, &warnings);
-            if (resolved) launch::ResolveDependencies(&back);
+            if (resolved) {
+                launch::ResolveDependencies(&back);
+                launch::ResolveDeferCopy(&back);
+            }
             CHECK(SameOptions(back, o) && warnings.empty() && c.sourceIndex == 0 &&
                       c.targetIndex == 1 && c.mode == "b:vsync" && c.relaunched &&
                       launch::IsRelaunch(tokens),
@@ -5298,6 +5614,7 @@ int main(int argc, char** argv) {
     test_flip_pairing();
     test_anchor_chain();
     test_keep_decision();
+    test_defer_decision();
     test_x3_phasekeep_field_failure();
     test_rotation_phase();
     test_dejit_removes_late_blends();

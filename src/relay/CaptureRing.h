@@ -70,6 +70,20 @@ public:
     // Before Setup only. Clamped to [kDefaultRingSlots, RING_SIZE].
     void SetSlotsInUse(int n);
 
+    // Before Start. Turns the deferred ring copy on: while frames arrive in frame-generated
+    // pairs, a pair's first frame, which keep-real drops a wake later, is not copied into the
+    // ring. It sizes its limits (policy::SizeDeferLimits) from the bracketing lag the present
+    // side runs, the source period that lag was sized for, and a margin of one refresh of the
+    // output, the time a ring copy can take on a saturated GPU. A frame waits uncopied only
+    // while the gap before it, the longest wait and the margin fit inside the lag, so with a
+    // lag too short nothing waits and every frame is copied as it arrives.
+    void EnableDeferCopy(LONGLONG bracketingLagQpc, LONGLONG srcPeriodQpc, LONGLONG marginQpc) {
+        m_deferRequested = true;
+        m_deferLagQpc = bracketingLagQpc;
+        m_deferSrcPeriodQpc = srcPeriodQpc;
+        m_deferMarginQpc = marginQpc;
+    }
+
     CaptureRing();
     ~CaptureRing();
 
@@ -222,6 +236,10 @@ private:
         LARGE_INTEGER batchStart;
         int member;                       // position inside its capture batch; 0 opens one
         bool valid;
+        // The deferred ring copy has left this frame waiting in its capture buffer. Its stamp
+        // is final and its pixels are not in the slot, so ReadRecentFrames counts it and
+        // FindBracket does not.
+        bool awaitingCopy;
     };
 
     void CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
@@ -284,7 +302,14 @@ private:
 
     Slot m_ring[RING_SIZE];
     int m_ringSlots = kDefaultRingSlots;
+    bool m_deferRequested = false;        // see EnableDeferCopy
+    LONGLONG m_deferLagQpc = 0;
+    LONGLONG m_deferSrcPeriodQpc = 0;
+    LONGLONG m_deferMarginQpc = 0;
     IDirect3DSurface9* m_captureTarget;   // on the capture device; NvFBC writes here
+    // The second NvFBC output buffer, which the deferred ring copy grabs into in turn with the
+    // first. NULL when the deferral is off or NvFBC refused two buffers.
+    IDirect3DSurface9* m_captureTargetB = NULL;
     IDirect3DDevice9Ex* m_presentDevice;
     IDirect3DDevice9Ex* m_capDevice;      // private capture device
     IDirect3DQuery9* m_capSync;           // event query: flush capture writes before publish

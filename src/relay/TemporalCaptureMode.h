@@ -95,6 +95,9 @@ private:
     // 0.29/s at +50 ms, 0.01/s at +75 ms; the frames those holds wanted DID arrive, just
     // later than the target. The cost is that they become blends, not passthroughs.
     unsigned int m_extraLagMs;
+    // The deferred ring copy (CaptureRing::EnableDeferCopy). Off with -fgphase or -phasekeep,
+    // which read every captured frame's pixels.
+    bool m_deferCopy;
     bool m_phaseKeepRequested;      // asked for, so an unmet prerequisite can say so once
     char m_modeName[64];            // GetModeName: the compositor kind and the present path
     policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
@@ -129,7 +132,8 @@ public:
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
                         bool etw = false, bool noJoin = false, bool dejitter = false,
                         bool fgPhase = false, bool phaseKeep = false,
-                        unsigned int extraLagMs = 0, bool d3d11Present = false);
+                        unsigned int extraLagMs = 0, bool d3d11Present = false,
+                        bool deferCopy = false);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

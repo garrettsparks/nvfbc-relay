@@ -15,7 +15,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
                                          bool tint, bool etw, bool noJoin, bool dejitter,
                                          bool fgPhase, bool phaseKeep, unsigned int extraLagMs,
-                                         bool d3d11Present)
+                                         bool d3d11Present, bool deferCopy)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_present(NULL)
@@ -34,6 +34,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_fgPhase(fgPhase)
     , m_phaseKeep(phaseKeep && etw && !noJoin)
     , m_extraLagMs(extraLagMs)
+    , m_deferCopy(deferCopy && !fgPhase && !phaseKeep)
     , m_phaseKeepRequested(phaseKeep)
 {
     m_baseQpc.QuadPart = 0;
@@ -159,6 +160,13 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
                                                     m_assumedSrcPeriodQpc,
                                                     CaptureRing::kDefaultRingSlots,
                                                     CaptureRing::RING_SIZE));
+    }
+    // The deferred ring copy sizes its limits from this lag, with one refresh of the output as
+    // the margin.
+    if (m_deferCopy) {
+        m_ring.EnableDeferCopy(m_bracketingDelayQpc, m_assumedSrcPeriodQpc,
+                               ctx.sinkRefreshHz > 0 ? m_scheduler.Freq() / ctx.sinkRefreshHz
+                                                     : m_scheduler.PeriodQpc());
     }
     m_flipCadenceWindowQpc = m_scheduler.Freq() / 5;    // 200 ms; see the header for why
     m_telemetryCountdown = kTelemetryPeriodPresents;

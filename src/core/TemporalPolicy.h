@@ -390,6 +390,79 @@ struct KeepDecision {
 KeepDecision DecideKeep(const BatchDecision& batch, int realMember, int64_t spacingTicks,
                         bool havePrevSlot);
 
+// Deferred copies. While batches come in pairs, a batch's first member is the frame keep-real
+// retracts one wake later, so copying it into the ring is wasted work. The capture loop can
+// leave that frame in its capture buffer instead and decide at the next wake: if the next wake
+// is the same batch's second member, the waiting frame is never copied; if it opens a new
+// batch, the waiting frame was a batch of one, a real frame, and is copied then. A waiting
+// frame's slot is not visible to the present side until it has been copied, so a batch of
+// one becomes visible one wake late, or after the wait limit below when nothing follows it.
+//
+// Nothing waits unless batches have been averaging at least 1.6 members, the same line the
+// rotation vote's pairing gate draws, so a source without frame generation is copied wake by
+// wake exactly as before.
+struct DeferState {
+    int64_t membersEmaQ8 = 0;   // members per batch, running average, in Q8
+    int prevLastMember = 0;     // index of the last member the batch before this one reached
+    bool pending = false;       // a frame is waiting uncopied
+};
+
+struct DeferDecision {
+    bool hadPending = false;    // a frame was waiting when this wake arrived
+    bool copyPending = false;   // ...and it is copied now: its batch had one member
+    bool deferThis = false;     // this wake's frame waits
+};
+
+// 1.6 members per batch, in Q8.
+constexpr int64_t kDeferPairedQ8 = 410;
+
+// No limit on the gap before a waiting frame.
+constexpr int64_t kDeferAnyGap = INT64_MAX;
+
+// The longest gap before a frame that still lets it wait. A present first needs a frame one
+// bracketing lag after the frame before it, and a waiting frame is in the ring at the latest
+// maxWaitTicks after its own arrival, so it is there in time while the gap between the two
+// plus the wait fits inside the lag. marginTicks covers what moves a target earlier than the
+// lag alone says: the pull below zero, a lookahead move, a dejitter correction.
+inline int64_t DeferMaxGap(int64_t lagTicks, int64_t maxWaitTicks, int64_t marginTicks) {
+    return lagTicks - maxWaitTicks - marginTicks;
+}
+
+// The range of waits SizeDeferLimits is asked for, in milliseconds. Past about 55 a longer wait
+// buys nothing: it only matters at a pause, and it takes room from the gap limit. Under 40 a
+// wait ends where ordinary small hitches put the next frame, and the capture loop loses the
+// frames that arrive in its last 5 ms (see below): replayed over 10.1 hours of streams, 7 wakes
+// came there with a 41.7 ms wait and 598 to 2,300 with a 25 ms one.
+constexpr int kDeferWaitAboutMs = 55;
+constexpr int kDeferWaitLeastMs = 40;
+
+// The deferral's two limits, sized from the bracketing lag so it follows -lag by itself.
+struct DeferLimits {
+    int64_t maxWaitTicks = 0;   // 0: the lag is too short and nothing may wait
+    int64_t maxGapTicks = -1;
+};
+
+// The longest wait, up to about aboutTicks, that still leaves the gap limit room for the
+// source's own cadence (a period and an eighth), and the gap limit that goes with it. A shorter
+// lag gets a shorter wait, and a lag with no room for a wait of leastTicks gets none.
+//
+// The wait is always a whole number of source periods and a half. The capture loop tells a grab
+// that timed out from one that brought a frame only by how long it blocked, so a frame that
+// arrives in the last milliseconds of a wait is taken for the timeout and lost. After a pause
+// the source resumes on its own cadence, a whole number of periods after the waiting frame, so
+// a wait that ends half a period from those has the fewest frames arrive at its edge.
+DeferLimits SizeDeferLimits(int64_t lagTicks, int64_t srcPeriodTicks, int64_t marginTicks,
+                            int64_t aboutTicks, int64_t leastTicks);
+
+// Fold one stored wake into the deferral. Call once per wake, after UpdateBatch. A frame that
+// opens a batch more than maxGapTicks after the batch before it does not wait: the longer the
+// picture has stood still, the sooner a present needs the frame that ends it.
+DeferDecision DecideDefer(DeferState& s, const BatchDecision& batch, int64_t maxGapTicks);
+
+// The grab timed out with nothing new. True when a frame was waiting, which the caller copies
+// now: it was the last frame before a pause.
+bool DeferOnTimeout(DeferState& s);
+
 // Stage-6 corrections as metadata BESIDE the ring, never as slot mutation. FindBracket
 // subtracts CorrectionFor(stamp) at read time, so the ring slots keep exactly one writer
 // (the capture thread) and a recycled slot can never inherit a stale correction - its
