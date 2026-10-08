@@ -16,5 +16,6 @@ D3DPRESENT_PARAMETERS WindowedPresentParams(HWND window, int width, int height, 
                                             UINT presentationInterval);
 
 // Creates the present device on the given adapter for ctx->deviceWindow, sized ctx->width by
-// ctx->height, and fetches its back buffer into ctx->backBuffer.
+// ctx->height, or 1x1 when the D3D11 swapchain owns the output window and this device never
+// presents, and fetches its back buffer into ctx->backBuffer.
 MaybeFailure CreatePresentDevice(RelayContext* ctx, UINT adapter, UINT presentationInterval);

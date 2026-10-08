@@ -117,8 +117,12 @@ bool CaptureRing::Start(RelayContext& ctx, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* gra
     // It joins the present device on the window every D3D9 device shares: the output window
     // when the D3D9 swapchain presents there, the hidden host when the output window belongs
     // to the D3D11 swapchain.
+    //
+    // This device never presents and nothing draws to its back buffer: NvFBC writes to the
+    // capture targets and the copies go to the ring slots. D3D9 cannot make a device without
+    // a back buffer, so it gets the smallest there is.
     D3DPRESENT_PARAMETERS params = WindowedPresentParams(
-        ctx.deviceWindow, m_width, m_height, D3DFMT_A2R10G10B10, 1, D3DSWAPEFFECT_DISCARD,
+        ctx.deviceWindow, 1, 1, D3DFMT_A2R10G10B10, 1, D3DSWAPEFFECT_DISCARD,
         D3DPRESENT_INTERVAL_IMMEDIATE);
     HRESULT hr = ctx.d3d->CreateDeviceEx(
         ctx.sourceAdapter, D3DDEVTYPE_HAL, ctx.deviceWindow,
