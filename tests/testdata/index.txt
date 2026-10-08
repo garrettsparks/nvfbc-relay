@@ -92,6 +92,16 @@ gm_60x2_gameplay_2026_09_30_0.trace
 # moves, all 5 lock releases and the worst blend run are there. The rest is dialog, fades and
 # walking, with the stalls and repeats that come with scene changes.
 gm_60x2_gameplay_2026_10_01_1.trace
+# 98 minutes of the 2026-10-06 stream, the longest of these, on the same policy as 2026-10-01.
+# Its 10 lock releases fall between 873 s and 2957 s, five of them with no hitch of 20 ms or more
+# in the 10 s before. Its dice game (5697 s to 5797 s) steps the source phase back and forth every
+# 3 to 4 s with almost no hitches: 22 of the 83 lookahead moves, 19 of them reversed by the next.
+gm_60x2_gameplay_2026_10_06_0.trace
+# 52 minutes of the 2026-10-07 stream, on the same policy: 172 hitches and 28 stalls an hour.
+# All 7 lock releases and 26 of its 33 lookahead moves fall in the first 28 minutes, with the
+# worst blend run (37) at a scene change into a trade screen, right after two releases 8 presents
+# apart. Its dice game hitches every 4.31 s in two short stretches, 13 hitches in all.
+gm_60x2_gameplay_2026_10_07_0.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions
