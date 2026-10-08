@@ -302,6 +302,9 @@ private:
 
     Slot m_ring[RING_SIZE];
     int m_ringSlots = kDefaultRingSlots;
+    // The grab asks NvFBC for the frame at its own size, with no scaling: set when the source
+    // display is the size of the ring, and cleared again if NvFBC refuses such a grab.
+    bool m_fullSizeGrab = false;
     bool m_deferRequested = false;        // see EnableDeferCopy
     LONGLONG m_deferLagQpc = 0;
     LONGLONG m_deferSrcPeriodQpc = 0;

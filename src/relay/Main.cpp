@@ -162,6 +162,8 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
     ctx.targetAdapter = target.adapter;
     ctx.width = target.Width();
     ctx.height = target.Height();
+    ctx.sourceWidth = source.Width();
+    ctx.sourceHeight = source.Height();
     ctx.sinkRefreshHz = target.refreshHz;
     ctx.flipEx = options.flipEx;
     LOG("Buffer size: %dx%d", ctx.width, ctx.height);

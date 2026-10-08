@@ -290,6 +290,21 @@ bool CaptureRing::Start(RelayContext& ctx, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* gra
     // Fully event-driven blocking grab — safe now that the lock it holds is private.
     grabParams->dwFlags = NVFBC_TODX9VID_WAIT_WITH_TIMEOUT;
     grabParams->dwWaitTime = kGrabWaitMs;
+    // When the source display is the size of the ring there is nothing to scale, so NvFBC is
+    // asked for the frame as it is. The scaled mode's target size has to be cleared with it:
+    // left set, NvFBC refuses every grab as an invalid parameter. Displays of different sizes
+    // keep the scaled grab.
+    m_fullSizeGrab = ctx.sourceWidth == m_width && ctx.sourceHeight == m_height;
+    if (m_fullSizeGrab) {
+        grabParams->eGMode = NVFBC_TODX9VID_SOURCEMODE_FULL;
+        grabParams->dwTargetWidth = 0;
+        grabParams->dwTargetHeight = 0;
+        LOG("CaptureRing: source and output are both %dx%d: full-size grab, no scaling",
+            m_width, m_height);
+    } else {
+        LOG("CaptureRing: source is %dx%d and output %dx%d: scaled grab", ctx.sourceWidth,
+            ctx.sourceHeight, m_width, m_height);
+    }
     LOG("CaptureRing: a grab that waits out its %u ms timeout stores nothing (NvFBC re-delivers the previous picture); blocked %u ms or more counts as one",
         kGrabWaitMs, kGrabTimeoutFloorMs);
 
@@ -372,7 +387,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     long long pendingCount = -1;
     IDirect3DSurface9* pendingSource = NULL;
     long long wakesStored = 0, deferredWakes = 0, neverCopied = 0, copiedLate = 0;
-    long long copiedAtTimeout = 0;
+    long long copiedAtTimeout = 0, grabFailures = 0;
     // NvFBC takes its wait in whole milliseconds; rounding down keeps it inside the limit.
     const NvU32 deferWaitMs = deferCopy
         ? (NvU32)(deferLimits.maxWaitTicks * 1000 / m_freqQuad) : kGrabWaitMs;
@@ -408,7 +423,22 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             break;
         }
         if (res != NVFBC_SUCCESS) {
-            // Nothing was grabbed: loop and re-check stop.
+            // Nothing was grabbed: loop and re-check stop. A full-size grab NvFBC refuses
+            // before any frame has come goes back to the scaled grab. A grab that keeps
+            // failing returns at once, so the first failure and every 100,000th are logged,
+            // not each one.
+            grabFailures++;
+            if (m_fullSizeGrab && wakesStored == 0) {
+                LOGERR("CaptureRing: NvFBC refused the full-size grab (result %d); using the "
+                       "scaled grab", (int)res);
+                m_fullSizeGrab = false;
+                grabParams->eGMode = NVFBC_TODX9VID_SOURCEMODE_SCALE;
+                grabParams->dwTargetWidth = (NvU32)m_width;
+                grabParams->dwTargetHeight = (NvU32)m_height;
+            } else if (grabFailures == 1 || (grabFailures % 100000) == 0) {
+                LOGERR("CaptureRing: grab failed with NvFBC result %d (%lld failed so far, "
+                       "%lld wakes stored)", (int)res, grabFailures, wakesStored);
+            }
             continue;
         }
 
@@ -699,6 +729,10 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         }
     }
 
+    if (grabFailures) {
+        LOGERR("CaptureRing: %lld grabs failed over the run, %lld wakes stored", grabFailures,
+               wakesStored);
+    }
     if (deferCopy) {
         LOG("Deferred ring copy summary: %lld wakes stored, %lld left waiting (%.1f%%); of "
             "those %lld never copied, %lld copied a wake late, %lld copied after a grab timeout",
