@@ -1,7 +1,9 @@
 # Performance candidates for `b:vsync`
 
-Ranked ideas for lowering what the default mode, `b:vsync`, costs the game. Nothing here is built
-or measured yet. The decision logic (comb lock, lookahead, late moves, refusal) stays as it is; the
+What the default mode, `b:vsync`, costs the game, where that cost goes, and what each idea for
+lowering it was measured to be worth. Sections 1 to 4 were rewritten on 2026-10-08 from the bench
+runs of 2026-10-07 and the replay work of 2026-10-08. Section 9 is still ideas nobody has
+measured. The decision logic (comb lock, lookahead, late moves, refusal) stays as it is; the
 candidates change how frames are captured, copied and drawn.
 
 The goal (user, 2026-10-03): beat OBS's fullscreen projector on both game cost and picture
@@ -9,45 +11,43 @@ quality.
 
 ## 1. Where things stand
 
-All rows are the Avatar benchmark at 2560x1440 with DLSS frame generation x2, uncapped and
-GPU-bound, three runs per row. Files are in the analysis folder.
+Every number is the Avatar benchmark at 2560x1440 with DLSS frame generation 2X. Uncapped it
+keeps the GPU fully loaded, so anything the relay costs shows up as a lower score. A point is one
+point of that score. The score with no relay is about 5,380, so 54 points is 1%.
 
-Session 1 (2026-10-03, 18:37 to 19:24):
+The game's level differs between launches by tens of points (no-relay rows on fresh launches read
+5,345 to 5,394 in one afternoon), while runs inside one launch agree within about 6. Since
+2026-10-07 rows are therefore compared inside one launch: the game stays running, the relay is
+swapped between rows, a reference row and a no-relay row run at both ends, and the first run
+after the launch is thrown away. A sitting is one such batch of rows, a row is one configuration,
+and a run is one pass of the benchmark. The level still rises inside a launch, steeply for the
+first two or three rows and then by 17 to 35 points over an hour, which the rows at both ends
+correct for.
 
-| row | scores | mean | cost |
-|---|---|---|---|
-| no relay | 5349, 5361, 5358 | 5356 | |
-| original relay (`4e138c6`) at 60 | 5198, 5206, 5215 | 5206 | 2.79% |
-| `60` | 5086, 5092, 5094 | 5091 | 4.95% |
-| OBS projector | 5084, 5102, 5102 | 5096 | 4.85% |
-| `b:vsync -src 60`, defaults | 5004, 5016, 5022 | 5014 | 6.39% |
+| row | cost | measured |
+|---|---|---|
+| `b:vsync -src 60` | 332 points, 6.2% | one-launch sitting, 2026-10-07 |
+| `60` | 4.69% | one-launch sitting, 2026-10-07 |
+| `60` with the original relay's timer (32.3 loops a second) | 3.05% | the same sitting |
+| OBS projector | 4.85% | by hand on 2026-10-03, separate launches |
+| `b:vsync -src 60`, game capped at 60 with 2X | no frame rate, about 0.4 points of GPU % | 2026-10-07 |
 
-Session 2 (2026-10-03, 19:53 to 20:10):
+`b:vsync` is about 1.3 points above the projector's hand figure. The projector has not been
+measured inside one launch, so that gap is not established in either direction.
 
-| row | scores | mean | cost |
-|---|---|---|---|
-| no relay | 5378, 5385, 5382 | 5382 | |
-| `b:vsync -src 60`, today's build (`5996f29`) | 5040, 5054, 5070 | 5055 | 6.08% |
-| `b:vsync -src 60 -lock -lag 75 -etw -dejit`, the 09-18 build (`f953554`, rebuilt from source) | 5038, 5053, 5058 | 5050 | 6.17% |
+The 6% exists only when the GPU has nothing to spare. Capped, the relay takes no frame rate.
 
-What these say:
+On quality `b:vsync` is ahead. In motion it shows 1.5 repeated frames a second where the
+projector shows 3.7 (`mgdupes.py` over ten 30 s windows of each 2026-10-03 recording, no marker,
+so what the chain and the game add is not split out). The repeat count does not see blends or
+skips.
 
-- Today's build costs the same as the 09-18 build. The rise from the 5.6% measured on 09-18 came
-  from outside the relay.
-- The same build scored 41 points higher in session 2 than in session 1, and the no-relay
-  baseline 26 points higher. Compare only rows from one session, against that session's
-  baseline. Within a session, three runs resolve about 32 points (0.6%).
-- `b:vsync` costs about 6.1 to 6.4%, the projector about 4.85%. The gap is about 1.2 to 1.6
-  points.
-- On quality, `b:vsync` already leads: in motion, 1.5 repeated frames a second against the
-  projector's 3.7 (`mgdupes.py` over ten 30 s windows of each session-1 recording, no marker, so
-  the floor of what the chain and the game add is not split out). The repeat count does not see
-  blends or skips.
+The zig cross-build used for experiments costs the same as the MSVC build as far as two launches
+each can tell (4 points apart), and logging costs nothing measurable.
 
-`docs/relay-cost-results.md` (2026-09-18) found capture to be the larger part of the cost:
-roughly 4.2 points of the 5.6% for capture at 151 grabs a second, roughly 1.3 for the 60 presents.
-It also found that under DLSS frame generation the extra wakes deliver a duplicate of the real
-picture, so about 40% of the capture work copies a frame the ring already holds.
+The hand sessions of 2026-10-03 (`b:vsync` 6.1 to 6.4%, `60` 4.95%, the original relay 2.79%)
+and `docs/relay-cost-results.md` (2026-09-18) compared rows from separate launches. Where a
+one-launch row exists it replaces them.
 
 ## 2. What `b:vsync` does each second
 
@@ -68,23 +68,48 @@ present device with a 2560x1440 back buffer, and 32 ring slot aliases on it, exi
 but do no per-frame work (`D3D9Setup.cpp:55-65`, `CaptureRing.cpp:166-177`).
 
 The original relay does one grab straight into a D3D9 back buffer and one present per loop, with
-no ring, no copy and no flush. Its video shows about 41 new pictures a second (inferred from 19.2
-repeated frames a second in motion; its loop rate was never logged).
+no ring, no copy and no flush. Its loop runs 32.3 times a second (section 4).
 
-## 3. Ranked candidates
+Where the 332 points go was priced in two sittings on 2026-10-07 with switches that each leave
+one piece of work out. Some of them show a wrong picture and exist only to price that work.
 
-Ranked by how likely each is to work times how much it could save. Gains are estimates from the
-09-18 split and the operation counts above, not measurements.
+| part | points | how it was priced |
+|---|---|---|
+| presenting, 60 a second | about 75 | half the presents saved 38; a row that captured nothing cost 77 |
+| the ring copy and the wait after it | about 80 | no copies at all +81; a pair's first copy skipped and no wait +77 to +89 |
+| NvFBC delivering each frame | about 175 | what is left; no switch moved it |
 
-| rank | candidate | removes per second | possible gain | plausibility | effort |
-|---|---|---|---|---|---|
-| 1 | Copy only the kept member (`-defercopy`) | about 60 copies and 60 flushes | 0.3 to 1 point | medium | medium |
-| 2 | Skip the extra wake (`-grabphase`) | about 60 grabs, copies and flushes | up to about 1.7 points | low | high |
-| 3 | 8-bit ring and plain-copy passthrough (`-8bit`) | a format conversion per grab; the draw on most presents | small, unknown | medium | low to medium |
-| 4 | Full-resolution grab mode (`-grabfull`) | a scaling pass per grab, if NvFBC does one at 1:1 | unknown | low | low |
-| 5 | GPU priority (`-gpuprio`) | nothing; changes who waits | none expected for cost | n/a | low |
+The grab of a frame generation duplicate is cheap and the grab of a new frame is dear. Pausing
+8 ms before each grab removed 43% of the wakes, the pairs' extra members, and saved 75 points,
+about what skipping only those members' copies saved (64). Inside the present's 75 points the
+draw is small: presenting with no draw at all saved 9 to 31. A ring copy completes in about
+0.1 ms when the game is capped (p95 0.14 ms) and takes 10 ms at p95 when the GPU is saturated.
 
-Before any of them, one calibration row costs no code (section 4).
+## 3. Candidates
+
+Gains are in points over the reference row of the same sitting with the drift removed. Rows are
+two runs each and repeat within about 6 points; the early rows of the second sitting are good to
+about 15.
+
+| candidate | measured | status |
+|---|---|---|
+| Copy only the kept member (the deferred ring copy) | priced at +64; built, about +44 (2026-10-08) | on by default; `-nodefercopy` turns it off (3.1) |
+| Stop waiting for the remaining copies (`-nowaitcopy`) | priced at +13 to +25 on top of the row above; built, about +11 on top of it (2026-10-08) | built on a local experiment branch (3.2) |
+| Skip the extra wake (`-grabphase`) | 8 ms before each grab: +75 for 43% fewer wakes | helps only when the game outruns the card (3.3) |
+| NvFBC's own grab | about 175 points, by subtraction | open; one profiled look planned (section 8) |
+| Presenting | about 75 points for 60 presents | no cheap lever found |
+| Plain copy in place of the shader draw, on an 8-bit ring | +4 to +22 alone; added to the copy-side pair, less than the pair alone | dropped (3.4) |
+| A grab without scaling, full-size or crop | +8 to +22, and -14 to +11 | re-test full-size mode, for displays of the same resolution (3.4) |
+| Low GPU priority for capture | -7 starved capture to 18 frames a second; -2 did nothing | dropped for a GPU-bound game; untested capped (3.4) |
+| 8-bit capture and ring alone | +4 | dropped |
+| 1x1 back buffers on the idle D3D9 devices | +5 | re-test; carry it either way as a tidy-up (about 29 MB of video memory) |
+
+The first two rows are the copy side, about 80 points in all when it was priced. As built they
+take `b:vsync` from about 6.1% to about 4.9% (2026-10-08).
+
+The rows marked "re-test" gained too little to tell from zero in rows that were good to about
+15 points. They are kept as candidates because small gains add up (user, 2026-10-08), and will
+be re-measured together in one row, in a settled part of a sitting, before any is dropped.
 
 ### 3.1 Copy only the kept member (`-defercopy`)
 
@@ -93,49 +118,138 @@ relay keeps the second. Today both wakes are copied and flushed, and the first i
 later. Deferring the copy until the next wake shows which member a frame is removes the wasted
 copy and flush.
 
-How: register two NvFBC output buffers (`dwNumBuffers = 2` at `CaptureRing.cpp:220-237`) and
-alternate `dwBufferIdx` per grab, so a frame waits in its buffer while the next grab writes the
-other. At each wake, the policy's batch decision (`policy::UpdateBatch`) already says whether this
-wake is intra-batch. If it is, the waiting frame is the generated member and is dropped uncopied;
-the new wake is the real member and is copied at once. If it is not, the waiting frame was a lone
-real frame and is copied now.
+As built: two NvFBC output buffers are taken in turn (`dwBufferIdx`; SetUp accepts two on driver
+610.88, and eight crashed inside NvFBC in July, `8eb5e70`). While batches average 1.6 members or
+more, a batch's first member is not copied and waits in its buffer. If the next wake is the same
+batch's second member, the waiting frame is never copied. If the next wake opens a new batch, or
+the grab times out, it was a batch of one and is copied then. Its slot is published with `valid`
+off and turned on when the pixels are there. The decision is in the policy layer
+(`policy::DecideDefer`), so the replay tests run it on recorded captures. Without frame
+generation nothing waits. `-fgphase` and `-phasekeep` need every member's pixels and switch it
+off, and generated-frame substitution would too if it returns. NVOFA interpolation works from
+real frame pairs and is unaffected.
 
-It is the keep-real rule (`policy::DecideKeep`) applied before the copy instead of after: the
-ring gets exactly the frames and stamps it gets today. Without frame generation every wake is a
-real frame, nothing is skipped and nothing is saved; a lone frame is only published one wake
-later. To leave runs without frame generation exactly as today, defer only while recent batches
-have had a second member.
+The first version saved about 30 points on single profiled runs on 2026-10-07 (5,074 where the
+references read 5,040 and 5,050, and PresentMon's game frame time agrees). 35 to 39% of stored
+frames are never copied and 2 to 5% are copied a wake late.
 
-No extra thread: the second NvFBC buffer is what lets the capture thread hold one picture while
-the next grab writes the other. Grabs alternate A, B, A; each copy is flushed before the grab that
-would overwrite its buffer, so the coherence argument is unchanged.
+In the benchmark that version's pacing matched the reference rows, uncapped and capped: no
+repeats, no holds, no present gap over 25 ms, and capped the shown-content steps were identical.
+The blends at the benchmark's two scene changes range from 30 to 96 a run in the capped
+reference rows alone, and its capped rows fell inside that range.
 
-It conflicts with anything that needs the generated member's pixels: `-phasekeep` and `-fgphase`
-today, and generated-frame substitution (`-subgen`, removed on this branch; Smooth Motion only,
-since DLSS's generated frames never reach NvFBC) if it returns. Those refuse `-defercopy`, or it
-keeps a generated member when they ask for it. NVOFA interpolation works from real frame pairs and
-is unaffected.
+The benchmark never pauses, and streams do. Replayed over the 39 streams captured at the 75 ms
+extra lag (10.1 hours, 2,165,858 presents), that first version shows 204 more repeats, nearly all
+of them where the relay would have blended, and a blend is always better than a repeat. The
+cause, worked out on 2026-10-08: a present first needs a frame one bracketing lag after the
+frame before it arrived. A frame that follows a pause is needed sooner the longer the pause was,
+and at once when the pause was longer than the lag, while the first version could leave it
+waiting for the next wake or for the whole 100 ms grab timeout.
 
-What can go wrong:
+A shorter wait alone does not fix that, and more lag alone does not either:
 
-- **Two buffers may not pass SetUp.** Eight crashed inside NvFBC (`8eb5e70`, July; the commit
-  records only that); the triage results were never written down. The user recalls (2026-10-04)
-  that two worked and it failed beyond three. Whether the cap depends on the GPU is unknown; the
-  crash is a stack buffer overrun inside NvFBC's user-mode DLL during SetUp. The first test is only whether SetUp with two
-  buffers succeeds on driver 610.88. If it crashes, this candidate falls back to one buffer and a
-  short second grab (wait 3 ms; a return means the waiting frame was generated), which is fragile:
-  the relay never raises the timer resolution, a 3 ms wait can fire much later, and what NvFBC
-  does to the buffer on a timeout is not known.
-- **A lone frame is published one wake later**, up to one source period, inside the 75 ms of
-  extra lag. At a stall the next wake can be up to the 100 ms grab timeout away, so the waiting
-  frame must be copied on the timeout return as well.
-- `-phasekeep` and `-fgphase` (development flags) need every member's content and must refuse it.
-- Field logs need a field for when a slot was published, so the replay can model it.
+| change, alone | repeats added in 10.1 hours |
+|---|---|
+| first version (a wait of up to 100 ms, 75 ms extra lag) | 204 |
+| a waiting frame copied after at most 60 ms | 145 |
+| after at most 20 ms | 78 |
+| after at most 4 ms | 26 |
+| 100 ms extra lag | 177 |
+| 125 ms extra lag | 145 |
+| 150 ms extra lag | 123 |
 
-Test: one bench row against the same session's `b:vsync -src 60`, plus a capped 60x2 gameplay
-stream for pacing (one change per stream).
+Three rules together remove all of them:
 
-### 3.2 Skip the extra wake (`-grabphase`)
+1. A frame waits only when the gap before it, the longest it can wait and a margin fit inside
+   the bracketing lag (`policy::DeferMaxGap`). The margin is one refresh of the output, the time
+   a ring copy can take on a saturated GPU.
+2. While a frame is waiting the grab waits a shorter time than its usual 100 ms, sized from the
+   lag (`policy::SizeDeferLimits`): the longest wait from about 55 ms down to 40 that still
+   leaves rule 1 room for the source's own cadence. At 60 fps that is 58.3 ms (3.5 source
+   periods) from `-lag 75` up, where a frame may wait after a gap of up to 20.8 ms, and 41.7 ms
+   from `-lag 57` to `-lag 74`. Below `-lag 57` no wait fits, and the relay runs without the
+   deferral and says so in the log.
+3. The lookahead reads a waiting frame's timestamp, which is known when the frame arrives,
+   before its pixels are copied. Without this the lookahead plans its moves a wake late, which
+   adds 41 blends and makes 1,893 presents pass the other neighbouring frame through.
+
+With all three the replay shows the same content on every present of every fixture as it does
+without the deferral, at every extra lag tried from 25 to 125 ms. Of the 1,934,639 copies the
+first version skipped, 1,931,685 are still skipped at the default 75 ms and 1,885,287 at 57 ms.
+On the fixtures captured without extra lag nothing waits. The suite fails if any present
+differs.
+
+So the switch follows `-lag` by itself, which is what it needs to become a default (user,
+2026-10-08: "it should default to on, scale with lag, and if lag is too low, disable
+automatically").
+
+The shorter wait has one cost, and it is why the wait stops at 40 ms. The capture loop tells a
+grab that timed out from one that brought a frame only by how long it blocked, so a frame that
+arrives in the last 5 ms of the wait is taken for the timeout and lost. After a pause the source
+resumes a whole number of its periods after the waiting frame, so the wait always ends on a half
+period. In the corpus 2 wakes in 10.1 hours fall in that window with a 58.3 ms wait and 7 with
+41.7 ms. With 25 ms it is 598 to 2,300, because an ordinary small hitch puts the next frame 20
+to 26 ms after the last.
+
+It is on by default in every temporal mode, and `-nodefercopy` turns it off. `-fgphase` and
+`-phasekeep` turn it off too, and so does a GPU or driver that refuses two NvFBC buffers: the
+relay then sets up again with one buffer and copies every frame as it arrives.
+
+It was benched on 2026-10-08 as a switch, `-defercopy`, on the experiment branch's build. In a
+one-launch sitting (three reference rows and two `-defercopy` rows alternating, two runs each,
+a no-relay row at both ends) it gained 43.5 and 44.25 points over the reference rows on either
+side, which takes `b:vsync` from 6.2% to about 5.4%. Inside the benchmark's test segments the
+`-defercopy` rows showed no repeats, no holds and no present gap over 25 ms, like the reference
+rows. They stored 4% more wakes and blended less (about 7% of presents where the reference rows
+blended 8.5 to 9.0%); why the blends fall is not established. 36% of stored frames were never
+copied and 5% were copied a wake late.
+
+Before it ships it still needs a capped sitting and one stream with `-defercopy` alone: the
+benchmark's frame generation is DLSS, whose extra wake is a duplicate, while Smooth Motion's
+generated frames do reach NvFBC.
+
+The replay cannot show the capture loop reaching its next grab sooner, because every fixture's
+wake times were recorded by a loop that copied and waited on every wake. Replayed from their own
+logs, two benchmark captures made with `-defercopy` give the same number of waiting frames as
+the relay counted (9,732 and 7,188) and split them the same way to within 7 and 9 frames.
+
+### 3.2 The copies still waited for
+
+The rest of the copy side needs the remaining copies not waited for at all. The wait is there for two reasons that stay true. The present side reads ring slots from
+another device, and D3D9 shared surfaces have no lock or fence, so a slot may be published only
+once its copy has run on the GPU. And NvFBC writes the next frame into the same capture buffer.
+The design keeps both: hand the copy to the GPU with one flush, go on, turn the slot on when a
+later wake finds the event query done, and block only when that buffer is about to be grabbed
+into again. With two buffers a copy has one source period to finish.
+
+A politer wait (one flush, then reads of the query without the flush flag) saved nothing, so
+waiting at all is the cost. Not waiting saved 47 to 62 points.
+
+In the replay, with every copy's slot turned on a wake late, which is the worst case, and the
+three rules of 3.1, no present past the replay's cold start shows different content on any
+fixture, with 2,055,731 copies not waited for. Without the gap rule the same model adds 1,885
+repeats at the 75 ms lag, and without the lookahead reading timestamps 12,922 presents differ.
+
+Built on the experiment branch as `-nowaitcopy` and benched on 2026-10-08 in one launch
+(reference, both switches, `-defercopy`, both switches, reference, a no-relay row at both ends,
+two runs a row). It adds about 11 points to `-defercopy`: the reference cost 6.07%, `-defercopy`
+5.12% and both switches 4.91%. Pacing inside the benchmark's test segments matched the other
+rows (no repeats, no holds, no present gap over 25 ms).
+
+That is less than first expected, for two reasons. Priced properly, not waiting was only ever
+worth 13 to 25 points on top of the skipped copies, and `-defercopy` alone now gets 44 to 52. And
+on a saturated GPU a copy takes 10 ms at p95 of a 12 ms source period, so about a tenth of the
+copies are still waited for before their buffer is grabbed into again (the longest 11.6 ms), and
+nearly every slot is turned on one wake late. A third NvFBC buffer, which would give a copy more
+time, is not available. The copy side as built gives 60 to 65 of its 80 points.
+
+### 3.3 Skip the extra wake (`-grabphase`)
+
+Not built. A stand-in was measured on 2026-10-07: pausing 8 ms before each grab removed 43% of
+the wakes and saved 75 points, about what `-defercopy` was priced at for skipping the copies of
+those same wakes (64). So the grab of a duplicate costs little, and skipping the wake adds
+little to skipping its copy. It would save more when the game outruns the card and whole frames
+go unshown. The idea as first written:
 
 The only candidate that also cuts NvFBC's own grabs. The capture loop already sees NvFBC return
 the newest frame in a single wake when the thread was busy through the generated flip (the
@@ -154,49 +268,59 @@ have to cover; oversleeping into the next generated flip loses a real frame; an 
 that wanders makes the wake time imprecise. Capped 60x2 gameplay, with its steady 16.7 ms between
 real frames, is the easier case.
 
-### 3.3 8-bit ring and plain-copy passthrough (`-8bit`)
+### 3.4 Dropped
 
-The capture card reports 8 bits per colour and the swapchain is B8G8R8A8 (10-01 log), so the
-10-bit ring buys nothing on this card. NvFBC is asked for ARGB10 with HDR (`CaptureRing.cpp:235-237`)
-from an 8-bit desktop, which may cost it a conversion, and every present converts back to 8 bits
-in the draw.
+**A plain copy in place of the shader draw, on an 8-bit ring.** The capture card reports 8 bits
+per colour and the swapchain is B8G8R8A8, so with NvFBC capturing 8-bit ARGB the ring matches the
+swapchain, and a present that shows one frame unchanged can be a `CopyResource` from the slot to
+the back buffer. Built as a switch and measured: 13,117 of 14,403 presents were plain copies and
+the row gained 4 to 22 points. Added to the copy-side pair it gave less (63 to 65) than the pair
+alone (77 to 89). Presenting with no draw at all saved only 9 to 31, so the present itself is
+most of the 75 points and no replacement for the draw can save much. The 8-bit capture and ring
+alone gained 4.
 
-With NvFBC capturing 8-bit ARGB (`NVFBC_TODX9VID_ARGB = 0` in the SDK header at
-`v0.0.16:inc/NvFBC/nvFBCToDx9Vid.h:79`; the vendored `src/common/NvFBCApi.h:90-93` keeps only the
-10-bit value), the ring matches the swapchain format, and a passthrough or hold can be a
-`CopyResource` from the slot to the back buffer instead of the full-screen draw. A plain copy
-moves the same bytes as the draw, so the saving is uncertain: it helps if NVIDIA runs it on the
-copy engine alongside the game's rendering, and does nothing if it runs on the 3D engine like the
-draw. Blends keep the draw.
+**A grab without scaling.** The grab asks NvFBC to scale to 2560x1440 (`SOURCEMODE_SCALE`) even
+when the game display already is 2560x1440. Full-size mode gained 8 to 22 points and crop mode
+-14 to +11, both inside those rows' uncertainty. The first attempt at full-size mode left the
+scaled mode's target size set, every grab failed with result -2, and the row scored 255 points
+better while capturing nothing. A row's log has to show frames stored.
 
-Keep the 10-bit path when the output reports 10 bits or more.
+**Low GPU priority for capture.** `IDirect3DDevice9Ex::SetGPUThreadPriority` on the capture
+device. At -7 in the GPU-bound benchmark the copy waited 10 to 276 ms and capture fell to 18
+frames a second, which is where its 192 points came from. At -2 nothing changed. Whether a mild
+level helps a capped game, where capture has the whole lag as slack, is untested. Raising the
+present device's priority is still the roadmap's idea for the present that waits 33 or 50 ms at
+a game's resume, which is a quality question.
 
-### 3.4 Full-resolution grab mode (`-grabfull`)
+**1x1 back buffers on the idle D3D9 devices.** 5 points.
 
-The grab asks NvFBC to scale to 2560x1440 (`SOURCEMODE_SCALE`, `NvFBCSession.cpp:104-110`).
-When the game display is already 2560x1440, `SOURCEMODE_FULL` (0 in the SDK header) may skip a
-scaling pass. Whether NvFBC scales at 1:1 at all is unknown. Cheap to try; only valid when the
-two displays have the same resolution.
+## 4. The original relay
 
-### 3.5 GPU priority (`-gpuprio`)
+The original relay cost 2.79% by hand on 2026-10-03 where `60` cost 4.95%. `60` is the original
+loop with the high-resolution absolute timer the user added in `fb0e6e3` (2026-06-08), plus
+`D3DCREATE_MULTITHREADED`, a window that is really topmost, and PresentEx flags 0. Four switches
+that each put one of those back the way the original had it were benched in one launch on
+2026-10-07, three runs a row with runs 2 and 3 counted:
 
-`IDirect3DDevice9Ex::SetGPUThreadPriority` on the capture device and
-`IDXGIDevice::SetGPUThreadPriority` on the D3D11 device, -7 to 7. Lowering it cannot reduce the
-relay's GPU work; it makes the relay wait longer behind the game, and presents would miss
-refreshes. Raising it is the roadmap's idea for the known issue at a game's resume (the present
-waiting 33 or 50 ms). A quality lever, listed so it isn't mistaken for a cost one.
+| switches on, after `60` | cost | loops a second |
+|---|---|---|
+| all four | 3.05% | 32.31 |
+| all but the timer | 4.68% | 59.99 |
+| all but the device flag | 2.96% | 32.33 |
+| all but the window | 2.86% | 32.33 |
+| all but the present flags | 3.07% | 32.34 |
+| none (plain `60`) | 4.69% | 59.99 |
 
-## 4. Calibration: does cost follow operations per second?
+The timer accounts for all of it. Each relative 16.7 ms wait on a default-resolution timer ends
+on the second 15.6 ms tick, so the original loops 32.3 times a second and repeats a frame about
+every other refresh. The other three switches moved the score by -5, -10 and +1 points, inside
+the drift of that sitting. Nothing in the original is worth copying, and the switches were
+removed again; the `timer:` line that logs the loop rate stays. The original exe itself read
+about 24 points better than the all-four row in hand rows on separate launches, which may be
+nothing.
 
-The original relay costs 2.79% and today's `60` 4.95%. `60` is the original loop with the
-high-resolution absolute timer the user added in `fb0e6e3` (2026-06-08), plus
-`D3DCREATE_MULTITHREADED`, a window that is really topmost, and PresentEx flags 0. The original
-presents only about 41 times a second; `60` presents 60.
-
-One row settles how much of that gap is the rate: today's `60` mode typed as `41`. If it costs
-about 2.8%, cost follows grabs and presents per second, the other differences don't matter, and
-the ranking above (which counts operations) holds. If it stays near 5%, the other differences
-carry the cost and are worth a row each.
+Cost does not simply follow presents a second: `40` cost 0.86 of what `60` cost on 2026-10-06,
+where the rate alone predicts 0.67.
 
 ## 5. CPU-only cleanups
 
@@ -209,13 +333,17 @@ by the CPU.
   name the current back buffer (from the Fable review's reading of the DXGI docs, not checked
   here). Check on the rig that a cached view still draws to the screen.
 - Yield in the flush wait. The spin at `CaptureRing.cpp:340-342` holds a core for the whole wait
-  (p95 about 10 ms in GPU-bound rows). With `-defercopy`, the check can move to the next wake.
+  (p95 about 10 ms in GPU-bound rows). A wait that flushes once and then only reads the query
+  was measured on 2026-10-07 and did not move the score, as expected on a GPU-bound game. Section
+  3.2 would remove the wait.
 - Shrink the idle D3D9 back buffers to 1x1 in `b:vsync` (the present device's and the capture
-  device's own, about 29 MB of video memory).
+  device's own, about 29 MB of video memory). Measured at 5 points, so it is only a memory
+  saving.
 - Drop `D3DCREATE_MULTITHREADED` where one thread uses the device.
 
 ## 6. Ruled out
 
+- The candidates section 3.4 lists as dropped, which were measured.
 - NvFBC writing straight into ring slots: crashes at SetUp beyond about 2 buffers (`8eb5e70`).
 - Replacing the flush with a fence or keyed mutex: D3D9Ex has neither for these shared surfaces,
   so the event drain stays the only guarantee that a published slot is complete.
@@ -225,7 +353,8 @@ by the CPU.
 
 ## 7. Open question: what the game's GPU % shows
 
-The game's GPU % falls from 95.7 with no relay to 87.5 to 91 with one. Its definition is unknown:
+The game's GPU % falls from about 96 with no relay to 87 to 91 with one, and reads about 63 when
+the game is capped at 60 with 2X, with or without the relay. Its definition is unknown:
 the CSV's "GPU time" equals the frame time in every row, so it is not the game's busy time.
 Neither "the game's own share" nor "the whole GPU's busy time" fits every row. PresentMon's
 per-frame GPU busy for the game, plus `nvidia-smi --query-gpu=timestamp,utilization.gpu
@@ -234,10 +363,15 @@ relay adds work to a busy GPU or leaves it idle between the game's frames.
 
 ## 8. Measuring where the GPU time goes
 
-Every ranking above is inferred from operation counts. A GPU timing trace of one benchmark run
-would show how long each piece of the relay's GPU work takes (NvFBC's grab, the ring copy, the
-flush, the draw, the present) and how often the relay's work interrupts the game's. It decides
-which candidate, and which option in section 9, is worth building.
+The copy and the present were priced by leaving them out (section 2). NvFBC's grab was not: its
+175 points are what is left after the other two, and worked back from PresentMon that is about
+0.4 ms of GPU time per captured frame, about one full-frame copy on a saturated GPU. PresentMon's
+GPU busy figure for the relay is no measure of it. It overlaps the game's own work and read 0.6
+to 5.6 ms between identical runs.
+
+A GPU timing trace of one benchmark run would show which engine the grab runs on, how long each
+packet takes and whether it preempts the game. That decides whether anything about the grab can
+be moved, and which option in section 9 is worth building.
 
 - On the rig: `wpr -start GPU -filemode`, run the benchmark with `b:vsync -src 60`, `wpr -stop
   relay.etl`, then open it in GPUView or Windows Performance Analyzer. A second trace with no relay
@@ -307,11 +441,8 @@ rate change a grab can come early (the previous frame again), late (the generate
 next real one), or miss a frame, leaving a gap the bracket covers with a wider blend. Steady capped
 content suits it; an uncapped, wandering rate does not. This is the cleaner form of `-grabphase`.
 
-**Low GPU priority for the capture device.** Section 3.5 treats priority as quality only. For the
-capture device it may also be a cost lever: capture has the whole 75 ms lag as slack, so at low
-priority its grab and copy could wait for gaps in the game's GPU work instead of preempting it. If
-preemption is a real part of the cost (section 8 would show it), this lowers it. The present device
-stays at normal priority so it still makes each refresh. One line of code and one bench row.
+**Low GPU priority for the capture device.** Measured and dropped for a GPU-bound game (section
+3.4): a saturated GPU leaves no gaps for a low-priority copy to wait for, so capture starves.
 
 **NV12 ring.** The D3D9 interface can output NV12 (`NVFBC_TODX9VID_NV12`,
 `v0.0.16:inc/NvFBC/nvFBCToDx9Vid.h:80`): 1.5 bytes a pixel where the ring holds 4, about 60% less
@@ -345,20 +476,23 @@ problems before it finds a number.
 0. ON HOLD (user, 2026-10-04): sizing NVOFA with `o` against `b:dwm`. "I think we'll want to hold
    on anything with o mode for now. We'll need to rebuild it in the future I think. comparing cuda
    vs dx11 mechanisms." Measure NVOFA's cost on the rebuilt mode.
-1. The `41` calibration row (section 4, no code), first (user, 2026-10-04: "starting with 41 mode is
-   a good place to start to classify how much of a performance improvement we get").
-2. The GPU timing trace (section 8), with and without the relay.
-3. Low GPU priority for the capture device, and `-defercopy` (first the two-buffer SetUp check),
-   one bench row each.
-4. The `-grabphase` instrument (grab blocking times), then decide between it and "grab only at
-   real flips".
-5. `-8bit` and `-grabfull`, one row each.
+1. DONE 2026-10-07: the calibration (section 4), the split of the cost (section 2), and a row
+   each for capture priority, the 8-bit ring, the plain-copy present and the grab without
+   scaling (section 3.4).
+2. `-defercopy` with its three rules (section 3.1): a sitting on the rig for cost and pacing,
+   then one stream with it alone before it ships.
+3. The copies still waited for (section 3.2): build it, then a sitting with a reference row,
+   `-defercopy` and the new switch in one launch.
+4. One profiled look at NvFBC's grab (section 8), then decide whether anything about it can be
+   moved.
+5. OBS's projector as a row in a one-launch sitting, so the comparison in section 1 stands on
+   one method.
 6. One architectural prototype, chosen with the trace: WGC with the pool as the ring (also the
    app's default capture path) or NvFBC's CUDA interface (NvFBC-native), each with the composition
    swapchain as a later step.
 7. The CPU-only cleanups, together, checked by the suite and one stream.
 
-Every row against the same session's no-relay baseline and `b:vsync -src 60`.
+Every row is compared inside one launch with a no-relay row and `b:vsync -src 60` at both ends.
 
 Sources for section 9: Microsoft Learn,
 [Direct3D11CaptureFramePool.Create](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.direct3d11captureframepool.create),
