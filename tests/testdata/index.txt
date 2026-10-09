@@ -102,6 +102,12 @@ gm_60x2_gameplay_2026_10_06_0.trace
 # worst blend run (37) at a scene change into a trade screen, right after two releases 8 presents
 # apart. Its dice game hitches every 4.31 s in two short stretches, 13 hitches in all.
 gm_60x2_gameplay_2026_10_07_0.trace
+# 136 minutes of the 2026-10-08 stream, the longest of these, on the same policy and the first
+# on the build that grabs at full size: 131 hitches and 23 stalls an hour. 35 of its 72
+# lookahead moves fall in the first 16 minutes, 21 of them in a dice game that hitches every
+# 4.3 s. All 7 lock releases come 0.2 to 0.3 s after a hitch of about 30 ms, and the worst blend
+# run (35) runs through the first. A second dice game, 10 minutes long, has no hitch at all.
+gm_60x2_gameplay_2026_10_08_0.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions

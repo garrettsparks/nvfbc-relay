@@ -2,12 +2,15 @@
 
 What the default mode, `b:vsync`, costs the game, where that cost goes, and what each idea for
 lowering it was measured to be worth. Sections 1 to 4 were rewritten on 2026-10-08 from the bench
-runs of 2026-10-07 and the replay work of 2026-10-08. Section 9 is still ideas nobody has
-measured. The decision logic (comb lock, lookahead, late moves, refusal) stays as it is; the
+runs of 2026-10-07 and the replay work of 2026-10-08. Section 9 is ideas nobody has measured,
+except NvFBC's CUDA interface, which was built and measured on 2026-10-08 and 2026-10-09 and
+dropped (3.4). The decision logic (comb lock, lookahead, late moves, refusal) stays as it is; the
 candidates change how frames are captured, copied and drawn.
 
 The goal (user, 2026-10-03): beat OBS's fullscreen projector on both game cost and picture
-quality.
+quality. The cost to beat is the projector's with game capture, 3.76% (user, 2026-10-09). NvFBC
+captures the whole display and may not get there, so that may have to wait for a test of WGC or
+Desktop Duplication capture (9.1).
 
 ## 1. Where things stand
 
@@ -37,9 +40,12 @@ correct for.
 
 Compared with OBS's fullscreen projector showing the same 2560x1440 picture, `b:vsync` costs
 about 1 point less than OBS with display capture and about 1.4 points more than OBS with game
-capture. How the picture is captured decides it: game capture takes the game's own frames from inside the
-game's process, where display capture and NvFBC take the finished desktop. Only cost was
-measured for OBS on 2026-10-08, not its pacing or picture.
+capture. How the picture is captured decides it: game capture takes the game's own frames from
+inside the game's process, where display capture and NvFBC take the finished desktop. OBS's logs
+of those two rows show the methods. Its display capture used DXGI Desktop Duplication (`method:
+DXGI`). Its game capture loaded a hook into the game and shared the game's back buffer (`d3d12
+shared texture capture successful`). Only cost was measured for OBS on 2026-10-08; its pacing
+and picture were not.
 
 The 6% exists only when the GPU has nothing to spare. Capped, the relay takes no frame rate.
 
@@ -104,6 +110,7 @@ about 15.
 | Stop waiting for the remaining copies (`-nowaitcopy`) | priced at +13 to +25 on top of the row above; built, about +11 on top of it (2026-10-08) | built on a local experiment branch (3.2) |
 | Skip the extra wake (`-grabphase`) | 8 ms before each grab: +75 for 43% fewer wakes | helps only when the game outruns the card (3.3) |
 | NvFBC's own grab | about 175 points, by subtraction | open; one profiled look planned (section 8) |
+| NvFBC's CUDA interface in place of the D3D9 one | with nothing copied, 223 points dearer than the D3D9 grab with nothing copied, in 10-bit and in 8-bit (2026-10-09) | dropped (3.4) |
 | Presenting | about 75 points for 60 presents | no cheap lever found |
 | Plain copy in place of the shader draw, on an 8-bit ring | +4 to +22 alone; added to the copy-side pair, less than the pair alone | dropped (3.4) |
 | A grab without scaling, full-size or crop | +8 to +22, and -14 to +11; full-size again on 2026-10-08, about +4 | full-size committed on 2026-10-08 as the more correct request, used when both displays are the same size (3.4) |
@@ -215,6 +222,32 @@ Before it ships it still needs a capped sitting and one stream with `-defercopy`
 benchmark's frame generation is DLSS, whose extra wake is a duplicate, while Smooth Motion's
 generated frames do reach NvFBC.
 
+The capped sitting ran on 2026-10-08 (`cap3`): the benchmark capped at 60 with frame generation
+2X, one launch, the zig build of `f046ae2`, three rows with `-nodefercopy` and three with the
+default in turn, one run a row. Every run scored 3400 at 120 fps. Inside the benchmark's test
+segments (84 s and about 5,000 presents a row) no row had a repeat, a hold or a present gap over
+25 ms (the longest was 19 ms), and every row presented 60.01 times a second. The rows with the
+deferral blended 39, 64 and 37 times and the rows without it 31, 45 and 78. With the deferral
+40.6 to 40.8% of stored wakes waited: 38.9 to 39.3% were never copied, 1.3 to 1.9% were copied a
+wake late and none after a grab timeout. Over each whole log 1 or 2 refreshes showed no new
+frame, with the deferral and without it.
+
+The stream ran the same night: 136 minutes of Get Medieval with Smooth Motion x2 on the CI build
+of `b043b35`, the deferral on by default. That build also has the full-size grab and the 1x1 back
+buffers, so it was not the deferral alone. Of 971,591 stored wakes, 492,591 waited (50.7%):
+476,493 were never copied, 16,098 were copied a wake late, and none were copied after a grab
+timeout. Smooth Motion skips more copies than the benchmark's DLSS did (49% never copied, where
+the benchmark had 36%) and copies fewer late (1.7%, where it had 5%). Replayed from the capture
+(`gm_60x2_gameplay_2026_10_08_0.trace`, cut to the 136.4 minutes its video shows), the deferral
+waits on 489,413, never copies 473,413 and copies 16,000 late; the log's totals also cover the
+68 seconds outside the cut, where 7,107 more wakes were stored. Nothing downstream got worse.
+Compared with the four streams before it (2026-09-30 to 2026-10-07, all without the deferral),
+it had the lowest blend share (0.32%; the others 0.39 to 0.77%), the fewest presents blocked over
+25 ms per source gap over 25 ms (0.22; 0.26 to 0.32), the fewest refreshes with no new frame
+(0.009 a second; 0.015 to 0.031) and the fewest late dejitter batches (0.35%; 0.41 to 0.45%).
+Holds ran 192 an hour, inside the earlier streams' 168 to 494. The game's content moves all of
+these, so the stream says only that nothing regressed.
+
 The replay cannot show the capture loop reaching its next grab sooner, because every fixture's
 wake times were recorded by a loop that copied and waited on every wake. Replayed from their own
 logs, two benchmark captures made with `-defercopy` give the same number of waiting frames as
@@ -307,6 +340,23 @@ a game's resume, which is a quality question.
 all the same, since nothing draws to those back buffers and they hold about 29 MB of video
 memory.
 
+**NvFBC's CUDA interface.** The CUDA interface takes its output buffer on every grab, so a grab
+could write straight into a ring slot with no ring copy (9.1). It was built for real on
+2026-10-08 behind a switch and never committed: the ring slots were Direct3D 11 buffers
+registered with CUDA, each grab mapped the next slot and NvFBC wrote the frame into it, and the
+present shader read the slot by address. On the desktop it worked and the picture matched the
+D3D9 path's. Under game load the driver reset a GPU engine twice (`nvlddmkm` event 153), each
+time within a minute of the relay starting. With the hand-off to Direct3D 11 taken out (the grab
+writing into one buffer of CUDA's own, nothing copied) it ran without errors, and that form was
+priced on 2026-10-09 in one launch beside the D3D9 grab also copying nothing. The D3D9 grab cost
+about 260 points (263 and 258) and the CUDA grab about 483 (485 and 482 in 10-bit, 484 in 8-bit).
+So the CUDA grab is about 223 points dearer before any hand-off, and the whole ring copy and its
+wait are worth about 80, which no way of sharing the buffer can make up. In those rows the game's
+own passes took the same time (9.9 to 10.0 ms) while its frame time rose from 11.0 to 11.5 ms;
+why is not established. A CUDA session writes nothing, while every grab reports success, when it
+is created on one thread and grabbed on another. The 10-bit CUDA session delivers one frame and
+then nothing for about 4 seconds after it starts.
+
 ## 4. The original relay
 
 The original relay cost 2.79% by hand on 2026-10-03 where `60` cost 4.95%. `60` is the original
@@ -395,8 +445,8 @@ be moved, and which option in section 9 is worth building.
 
 ## 9. Architectural options
 
-Bigger changes than section 3, each removing work the current design cannot avoid. None is
-prototyped.
+Bigger changes than section 3, each removing work the current design cannot avoid. Only NvFBC's
+CUDA interface has been built, and it was dropped.
 
 ### 9.1 Keeping frames without copying them
 
@@ -410,9 +460,9 @@ buffers, not textures (point sampling at 1:1 needs no filtering). CUDA comes fro
 on the experiment branch) showed the interface works on driver 610.88: a session creates and
 sets up with a CUDA context current, and grabs deliver the 2560x1440 picture into device memory
 the caller allocated. A context synchronize after each grab took about 0.2 ms on an idle GPU,
-which suggests the write is still in flight when the grab returns. Still unknown: what such a
-grab costs the game, and what handing a buffer between CUDA and D3D11 costs per frame (map and
-unmap, or shared memory with an external semaphore).
+which suggests the write is still in flight when the grab returns. Measured on 2026-10-09 and
+dropped: with nothing copied, the CUDA grab costs the game about 223 points more than the D3D9
+grab does (3.4).
 
 **Windows.Graphics.Capture (WGC).** A different API from DXGI Desktop Duplication (the one usually
 called "DXGI capture"). Desktop Duplication hands over one frame at a time: asking for the next one
@@ -430,6 +480,13 @@ flip (that timestamp is the compositor's, which suggests composition) and what t
 game; whether it sees Smooth Motion's generated frames; how long a pool frame stays valid while
 held; and the cost of holding about 30.
 
+**What each API can capture.** Desktop Duplication captures a whole display. WGC captures a
+whole display or one window, and gets a window's picture from the compositor; OBS's window
+capture can use it. OBS's game capture, the 3.76% row, uses neither. It loads a hook into the
+game and shares the game's back buffer when the game presents. OBS's display capture row (6.23%)
+used Desktop Duplication, which makes it the only price there is for either Windows API, and
+that price includes OBS's own drawing. WGC has no price yet.
+
 **Presenting a ring slot by reference (composition swapchain).** Windows 11's composition
 swapchain registers up to 31 textures with a presentation manager and presents any of them, in any
 order, with no copy; each present can carry a target time on the QPC clock (Microsoft's composition
@@ -437,7 +494,7 @@ swapchain programming guide). Passthrough and hold presents would need no draw, 
 draw into a spare registered buffer. Target-time presents match how the relay already chooses
 frames. Requirements: Windows 11 build 22000.194 or later with WDDM 2.0; independent flip and
 direct scanout need WDDM 3.0 and textures created as displayable, which the D3D9-made ring slots
-are not. So this pairs with the CUDA or WGC option, whose slots are created on the D3D11 side.
+are not. So this pairs with the WGC option, whose frames are created on the D3D11 side.
 
 ### 9.2 Doing less work
 
@@ -478,7 +535,9 @@ motherboard output that drives 2560x1440 at 60 Hz, and a cross-adapter copy path
 
 The user's order (2026-10-04): release first, then this pass on its own branch. Why performance
 comes before NVOFA (user, 2026-10-04): "I'm worried nvofa interp frames are going to be expensive
-to generate, so we need more performance headroom before we even enable that."
+to generate, so we need more performance headroom before we even enable that." The deferred copy
+alone does not make a release (user, 2026-10-09: "deferred copy is good, but it's not worthy of a
+full release I don't think").
 
 NVOFA's cost has never been measured. The interp compositor runs flow and warp only on presents
 that synthesize (`SynthCompositorBase::RenderSynthesis`, `src/relay/FrameCompositors.h:58`), so its
@@ -496,17 +555,18 @@ problems before it finds a number.
 1. DONE 2026-10-07: the calibration (section 4), the split of the cost (section 2), and a row
    each for capture priority, the 8-bit ring, the plain-copy present and the grab without
    scaling (section 3.4).
-2. `-defercopy` with its three rules (section 3.1): a sitting on the rig for cost and pacing,
-   then one stream with it alone before it ships.
+2. DONE 2026-10-08: `-defercopy` with its three rules (section 3.1): a sitting on the rig for
+   cost and pacing, a capped sitting, and one stream (with the full-size grab and the 1x1 back
+   buffers too). It is on by default.
 3. The copies still waited for (section 3.2): build it, then a sitting with a reference row,
    `-defercopy` and the new switch in one launch.
 4. One profiled look at NvFBC's grab (section 8), then decide whether anything about it can be
    moved.
 5. DONE 2026-10-08: OBS's projector as two rows in a one-launch sitting (section 1). Its pacing
    and picture with each capture method are still to be measured the way the relay's are.
-6. One architectural prototype, chosen with the trace: WGC with the pool as the ring (also the
-   app's default capture path) or NvFBC's CUDA interface (NvFBC-native), each with the composition
-   swapchain as a later step.
+6. One architectural prototype: WGC with the pool as the ring (also the app's default capture
+   path), or Desktop Duplication, with the composition swapchain as a later step. NvFBC's CUDA
+   interface was the other choice; it was built, measured and dropped on 2026-10-09 (3.4).
 7. The CPU-only cleanups, together, checked by the suite and one stream.
 
 Every row is compared inside one launch with a no-relay row and `b:vsync -src 60` at both ends.
