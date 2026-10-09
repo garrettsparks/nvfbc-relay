@@ -29,17 +29,24 @@ correct for.
 | `b:vsync -src 60` | 332 points, 6.2% | one-launch sitting, 2026-10-07 |
 | `60` | 4.69% | one-launch sitting, 2026-10-07 |
 | `60` with the original relay's timer (32.3 loops a second) | 3.05% | the same sitting |
-| OBS projector | 4.85% | by hand on 2026-10-03, separate launches |
+| `b:vsync -src 60` with the deferred ring copy (the default since 2026-10-08) | 5.1 to 5.4% | three one-launch sittings, 2026-10-08 |
+| OBS projector, game capture, 2560x1440 canvas | 3.76% | one-launch sitting, 2026-10-08 |
+| OBS projector, display capture, 2560x1440 canvas | 6.23% | the same sitting |
+| OBS projector, game capture, 1920x1080 canvas | 4.85% | by hand on 2026-10-03, separate launches |
 | `b:vsync -src 60`, game capped at 60 with 2X | no frame rate, about 0.4 points of GPU % | 2026-10-07 |
 
-`b:vsync` is about 1.3 points above the projector's hand figure. The projector has not been
-measured inside one launch, so that gap is not established in either direction.
+Compared with OBS's fullscreen projector showing the same 2560x1440 picture, `b:vsync` costs
+about 1 point less than OBS with display capture and about 1.4 points more than OBS with game
+capture. How the picture is captured decides it: game capture takes the game's own frames from inside the
+game's process, where display capture and NvFBC take the finished desktop. Only cost was
+measured for OBS on 2026-10-08, not its pacing or picture.
 
 The 6% exists only when the GPU has nothing to spare. Capped, the relay takes no frame rate.
 
-On quality `b:vsync` is ahead. In motion it shows 1.5 repeated frames a second where the
-projector shows 3.7 (`mgdupes.py` over ten 30 s windows of each 2026-10-03 recording, no marker,
-so what the chain and the game add is not split out). The repeat count does not see blends or
+On quality `b:vsync` was ahead on 2026-10-03, when the projector ran game capture on a 1080p
+canvas. In motion the relay showed 1.5 repeated frames a second where the projector showed 3.7
+(`mgdupes.py` over ten 30 s windows of each recording, no marker, so what the chain and the
+game add is not split out). The repeat count does not see blends or
 skips.
 
 The zig cross-build used for experiments costs the same as the MSVC build as far as two launches
@@ -99,17 +106,17 @@ about 15.
 | NvFBC's own grab | about 175 points, by subtraction | open; one profiled look planned (section 8) |
 | Presenting | about 75 points for 60 presents | no cheap lever found |
 | Plain copy in place of the shader draw, on an 8-bit ring | +4 to +22 alone; added to the copy-side pair, less than the pair alone | dropped (3.4) |
-| A grab without scaling, full-size or crop | +8 to +22, and -14 to +11 | re-test full-size mode, for displays of the same resolution (3.4) |
+| A grab without scaling, full-size or crop | +8 to +22, and -14 to +11; full-size again on 2026-10-08, about +4 | full-size committed on 2026-10-08 as the more correct request, used when both displays are the same size (3.4) |
 | Low GPU priority for capture | -7 starved capture to 18 frames a second; -2 did nothing | dropped for a GPU-bound game; untested capped (3.4) |
 | 8-bit capture and ring alone | +4 | dropped |
-| 1x1 back buffers on the idle D3D9 devices | +5 | re-test; carry it either way as a tidy-up (about 29 MB of video memory) |
+| 1x1 back buffers on the idle D3D9 devices | +5 | committed on 2026-10-08 as a tidy-up (about 29 MB of video memory) |
 
 The first two rows are the copy side, about 80 points in all when it was priced. As built they
 take `b:vsync` from about 6.1% to about 4.9% (2026-10-08).
 
-The rows marked "re-test" gained too little to tell from zero in rows that were good to about
-15 points. They are kept as candidates because small gains add up (user, 2026-10-08), and will
-be re-measured together in one row, in a settled part of a sitting, before any is dropped.
+The full-size grab and the 1x1 back buffers gained too little to tell from zero in rows that
+were good to about 15 points. Small gains add up (user, 2026-10-08), and both cost nothing, so
+both went in.
 
 ### 3.1 Copy only the kept member (`-defercopy`)
 
@@ -281,8 +288,12 @@ alone gained 4.
 
 **A grab without scaling.** The grab asks NvFBC to scale to 2560x1440 (`SOURCEMODE_SCALE`) even
 when the game display already is 2560x1440. Full-size mode gained 8 to 22 points and crop mode
--14 to +11, both inside those rows' uncertainty. The first attempt at full-size mode left the
-scaled mode's target size set, every grab failed with result -2, and the row scored 255 points
+-14 to +11 on 2026-10-07, both inside those rows' uncertainty. Measured again on 2026-10-08 in
+settled rows, alternating the same build with and without it, full-size mode gained about 4
+points (7.8 and 0.4), which is still inside the noise. It costs nothing and its pacing
+matches, so it was committed on 2026-10-08 as the more correct request; it falls back to the
+scaled grab if NvFBC refuses it. The first attempt at full-size mode left the scaled mode's
+target size set, every grab failed with result -2, and the row scored 255 points
 better while capturing nothing. A row's log has to show frames stored.
 
 **Low GPU priority for capture.** `IDirect3DDevice9Ex::SetGPUThreadPriority` on the capture
@@ -292,7 +303,9 @@ level helps a capped game, where capture has the whole lag as slack, is untested
 present device's priority is still the roadmap's idea for the present that waits 33 or 50 ms at
 a game's resume, which is a quality question.
 
-**1x1 back buffers on the idle D3D9 devices.** 5 points.
+**1x1 back buffers on the idle D3D9 devices.** 5 points on 2026-10-07. Committed on 2026-10-08
+all the same, since nothing draws to those back buffers and they hold about 29 MB of video
+memory.
 
 ## 4. The original relay
 
@@ -336,9 +349,9 @@ by the CPU.
   (p95 about 10 ms in GPU-bound rows). A wait that flushes once and then only reads the query
   was measured on 2026-10-07 and did not move the score, as expected on a GPU-bound game. Section
   3.2 would remove the wait.
-- Shrink the idle D3D9 back buffers to 1x1 in `b:vsync` (the present device's and the capture
-  device's own, about 29 MB of video memory). Measured at 5 points, so it is only a memory
-  saving.
+- DONE 2026-10-08: the idle D3D9 back buffers at 1x1 in `b:vsync` (the present device's and
+  the capture device's own, about 29 MB of video memory). Measured at 5 points, so it is only a
+  memory saving.
 - Drop `D3DCREATE_MULTITHREADED` where one thread uses the device.
 
 ## 6. Ruled out
@@ -393,9 +406,13 @@ is where direct write crashed. The CUDA interface takes its output buffer on eve
 and ARGB10 only, `:59-60`). Each grab could write straight into its ring slot, removing the ring
 copy and its flush. CUDA hands out linear device memory, so the D3D11 side would read the slots as
 buffers, not textures (point sampling at 1:1 needs no filtering). CUDA comes from the driver's
-`nvcuda.dll` through the driver API, so nothing new ships. Unknown: whether the CUDA interface still
-works on Windows with driver 610.88, and what handing a buffer between CUDA and D3D11 costs per
-frame (map and unmap, or shared memory with an external semaphore).
+`nvcuda.dll` through the driver API, so nothing new ships. A probe on 2026-10-08 (`CudaProbe`,
+on the experiment branch) showed the interface works on driver 610.88: a session creates and
+sets up with a CUDA context current, and grabs deliver the 2560x1440 picture into device memory
+the caller allocated. A context synchronize after each grab took about 0.2 ms on an idle GPU,
+which suggests the write is still in flight when the grab returns. Still unknown: what such a
+grab costs the game, and what handing a buffer between CUDA and D3D11 costs per frame (map and
+unmap, or shared memory with an external semaphore).
 
 **Windows.Graphics.Capture (WGC).** A different API from DXGI Desktop Duplication (the one usually
 called "DXGI capture"). Desktop Duplication hands over one frame at a time: asking for the next one
@@ -485,8 +502,8 @@ problems before it finds a number.
    `-defercopy` and the new switch in one launch.
 4. One profiled look at NvFBC's grab (section 8), then decide whether anything about it can be
    moved.
-5. OBS's projector as a row in a one-launch sitting, so the comparison in section 1 stands on
-   one method.
+5. DONE 2026-10-08: OBS's projector as two rows in a one-launch sitting (section 1). Its pacing
+   and picture with each capture method are still to be measured the way the relay's are.
 6. One architectural prototype, chosen with the trace: WGC with the pool as the ring (also the
    app's default capture path) or NvFBC's CUDA interface (NvFBC-native), each with the composition
    swapchain as a later step.
