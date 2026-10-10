@@ -146,6 +146,7 @@ D3D11PresentBackend::~D3D11PresentBackend() {
         if (m_ringSrv[i]) m_ringSrv[i]->Release();
         if (m_ringAlias[i]) m_ringAlias[i]->Release();
     }
+    for (const auto& entry : m_poolSrvs) entry.second->Release();
     if (m_sampler) m_sampler->Release();
     if (m_cb) m_cb->Release();
     if (m_markerPs) m_markerPs->Release();
@@ -170,6 +171,7 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
     m_height = height;
     m_cfg = cfg;
     if (m_tintRequested) LOG("-tint ignored: the D3D11 present path has no tint pass");
+    m_wgc = ring->WgcRequested();
     if (!CreateDeviceAndSwapChain(hwnd, width, height)) return false;
     if (!OpenRingAliases(ring)) return false;
     if (!CreatePipeline()) return false;
@@ -178,6 +180,11 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
         m_markerRect = FrameMarker::StripRect(width, height);
         m_mark = true;
     }
+    if (m_wgc) {
+        // From here the capture thread may move to a WGC frame pool on this device.
+        m_ring = ring;
+        ring->OfferWgcDevice(m_dev);
+    }
     m_enabled = true;
     return true;
 }
@@ -185,8 +192,10 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
 bool D3D11PresentBackend::CreateDeviceAndSwapChain(HWND hwnd, int width, int height) {
     // Default adapter, matching InterpSidecar. Correct while the relay is single-GPU; a
     // multi-adapter box would want the adapter driving the TARGET output, which is a
-    // different (and currently hypothetical) selection problem.
-    HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
+    // different (and currently hypothetical) selection problem. WGC makes its frame pool only
+    // on a device with BGRA support.
+    const UINT flags = m_wgc ? (UINT)D3D11_CREATE_DEVICE_BGRA_SUPPORT : 0;
+    HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags, NULL, 0,
                                    D3D11_SDK_VERSION, &m_dev, NULL, &m_ctx);
     if (FAILED(hr)) {
         LOGERR("D3D11Present: D3D11CreateDevice failed (0x%08x)", hr);
@@ -409,6 +418,25 @@ bool D3D11PresentBackend::AcquireBackBuffer() {
     return true;
 }
 
+// A slot with no pool texture holds its own picture, as every slot stored before WGC took over
+// does.
+ID3D11ShaderResourceView* D3D11PresentBackend::SourceFor(int slot) {
+    ID3D11Texture2D* texture = m_ring ? m_ring->WgcTexture(slot) : NULL;
+    if (!texture) return m_ringSrv[slot];
+    for (const auto& entry : m_poolSrvs) {
+        if (entry.first == texture) return entry.second;
+    }
+    ID3D11ShaderResourceView* view = NULL;
+    const HRESULT hr = m_dev->CreateShaderResourceView(texture, NULL, &view);
+    if (FAILED(hr)) {
+        LOGERR("D3D11Present: no view for a capture pool texture (0x%08x)", (unsigned)hr);
+        return m_ringSrv[slot];
+    }
+    m_poolSrvs.push_back(std::make_pair(texture, view));
+    LOG("D3D11Present: sampling capture pool texture %zu directly", m_poolSrvs.size());
+    return view;
+}
+
 bool D3D11PresentBackend::Draw(int slotA, int slotB, float w) {
     if (slotA < 0 || slotA >= m_ringSlots || slotB < 0 || slotB >= m_ringSlots) return false;
     if (!m_rtv) return false;
@@ -425,7 +453,7 @@ bool D3D11PresentBackend::Draw(int slotA, int slotB, float w) {
     vp.Width = (float)m_width; vp.Height = (float)m_height;
     vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
 
-    ID3D11ShaderResourceView* srvs[2] = { m_ringSrv[slotA], m_ringSrv[slotB] };
+    ID3D11ShaderResourceView* srvs[2] = { SourceFor(slotA), SourceFor(slotB) };
     m_ctx->OMSetRenderTargets(1, &m_rtv, NULL);
     m_ctx->RSSetViewports(1, &vp);
     m_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

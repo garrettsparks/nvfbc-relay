@@ -1,6 +1,7 @@
 #include "CaptureRing.h"
 #include "D3D9Setup.h"
 #include "ICaptureSource.h"
+#include "WgcCaptureSource.h"
 #include <NvFBCLoader.h>
 #include <SimpleLogger.h>
 #include <limits.h>
@@ -47,6 +48,7 @@ CaptureRing::CaptureRing()
         m_ring[i].timestamp.QuadPart = 0;
         m_ring[i].batchStart.QuadPart = 0;
         m_ring[i].member = 0;
+        m_wgcTexture[i].store(NULL);
     }
     m_baseQpc.QuadPart = 0;
 }
@@ -310,6 +312,7 @@ bool CaptureRing::Start(RelayContext& ctx, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* gra
         kGrabWaitMs, kGrabTimeoutFloorMs);
 
     LOG("CaptureRing initialized - %dx%d, %d shared slots, private capture device", m_width, m_height, m_ringSlots);
+    if (m_wgcRequested) m_sourceMonitor = ctx.d3d->GetAdapterMonitor(ctx.sourceAdapter);
 
     m_published.store(0);
     m_writeCount = 0;
@@ -492,6 +495,16 @@ public:
         if (m_deferCopy) m_bufferIdx ^= 1;
     }
 
+    // A frame still waiting in its buffer is copied into its slot before NvFBC is let go.
+    void Finish() override {
+        if (m_pendingSlot < 0) return;
+        CopyAndWait(m_pendingSource, m_pendingSlot);
+        r.m_ring[m_pendingSlot].valid = true;
+        r.m_ring[m_pendingSlot].awaitingCopy = false;
+        LOG("defer: capture #%lld copied as capture left NvFBC", m_pendingCount);
+        m_pendingSlot = -1;
+    }
+
     void LogSummary(long long wakesStored) override {
         if (m_grabFailures) {
             LOGERR("CaptureRing: %lld grabs failed over the run, %lld wakes stored",
@@ -546,11 +559,14 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     const double usPerTick = 1000000.0 / (double)m_freqQuad;
     long long collapsed = 0;
 
-    // The frames come from one capture source, which owns how a frame is waited for and how
-    // its picture reaches its slot (ICaptureSource). Everything below is the same whichever
-    // source delivers them.
+    // The frames come from one capture source at a time, which owns how a frame is waited for
+    // and how its picture reaches its slot (ICaptureSource). Everything below is the same
+    // whichever source delivers them. Capture starts on NvFBC, and with -wgc moves to WGC once
+    // the D3D11 present has offered its device, which it does just after the ring starts.
     NvfbcCaptureSource nvfbcSource(*this, grabParams);
-    ICaptureSource& source = nvfbcSource;
+    WgcCaptureSource wgcSource(*this);
+    ICaptureSource* source = &nvfbcSource;
+    bool wgcPending = m_wgcRequested;
 
     // Batch-collapse threshold. Under NVIDIA Smooth Motion (driver-level frame gen; in-game
     // DLSS-FG untested) the grab wakes ~2x per BASE frame, members arriving <2 ms apart
@@ -564,16 +580,43 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     // inside the ~ε window still shows the gen frame). Keep-real won the definitive A/B:
     // keep-first ghosted throughout, keep-real crisp throughout (Round 10). How close two wakes
     // have to be is the source's to say.
-    const LONGLONG batchThresholdQpc = source.BatchWindowQpc();
+    LONGLONG batchThresholdQpc = source->BatchWindowQpc();
     policy::BatchState batchState;
     LOG("CaptureRing: batch-collapse keep-real (intra-batch wake <%lldms = real member; "
         "previous slot retracted)", (long long)(batchThresholdQpc * 1000 / m_freqQuad));
-    source.LogStart();
-    long long wakesStored = 0;
+    source->LogStart();
+    long long wakesStored = 0;   // by the source capturing now
 
     while (!m_stop.load()) {
+        // WGC opens while NvFBC is still capturing, and NvFBC is let go only once WGC is.
+        if (wgcPending) {
+            if (ID3D11Device* device = m_wgcDevice.load(std::memory_order_acquire)) {
+                wgcPending = false;
+                if (const char* failed = wgcSource.Open(device)) {
+                    LOGERR("CaptureRing: -wgc: %s; capture stays on NvFBC", failed);
+                } else {
+                    nvfbcSource.Finish();
+                    nvfbcSource.LogSummary(wakesStored);
+                    m_nvfbc->NvFBCToDx9VidRelease();
+                    m_nvfbc = NULL;
+                    LOG("CaptureRing: capture moved from NvFBC to Windows.Graphics.Capture "
+                        "after %lld wakes", wakesStored);
+                    source = &wgcSource;
+                    wakesStored = 0;
+                    batchThresholdQpc = source->BatchWindowQpc();
+                    source->LogStart();
+                    // The instrument reads each wake's picture from the slot NvFBC's frame was
+                    // copied into, and WGC copies nothing there.
+                    if (m_fgPhaseActive) {
+                        m_fgPhaseActive = false;
+                        LOG("fgphase instrument off: it reads frames NvFBC put in the ring");
+                    }
+                }
+            }
+        }
+
         LARGE_INTEGER now;
-        const ICaptureSource::Wake wake = source.Wait(&now);
+        const ICaptureSource::Wake wake = source->Wait(&now);
         if (wake == ICaptureSource::Wake::Lost) {
             m_stop.store(true);
             break;
@@ -594,7 +637,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             policy::UpdateBatch(batchState, now.QuadPart, batchThresholdQpc);
 
         // The source says whether this frame's picture goes into its slot now or waits.
-        const ICaptureSource::Placement placement = source.Place(batch);
+        const ICaptureSource::Placement placement = source->Place(batch);
         // Source-period estimate (gaps over 125 ms are stalls, not cadence). A static source
         // adds nothing, so the estimate holds its last value while nothing new is drawn. EMA
         // alpha 1/8: stable within ~8 source frames of a regime change, jitter-immune in
@@ -610,7 +653,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         wakesStored++;
         // The picture has to be where the present can read it before the slot is published. A
         // frame the source leaves waiting is not stored now.
-        if (!placement.waits) source.Store(slot);
+        if (!placement.waits) source->Store(slot);
 
         // Measure how long the flush blocked: this is the fix's cost. It should be small and
         // CONSISTENT (a near-constant pipeline offset, off the present path). Spikes here would
@@ -795,7 +838,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         m_writeCount = count + 1;
         m_published.store(count + 1);  // a slot whose pixels are not there yet has valid off
         if (placement.replacedSlot >= 0) m_ring[placement.replacedSlot].awaitingCopy = false;
-        source.Published(slot, count, placement, keep.keepThis);
+        source->Published(slot, count, placement, keep.keepThis);
 
         if (keep.retractPrev && count >= 1) {
             // Retract the previous member (the generated frame): hide it from future brackets.
@@ -822,7 +865,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         }
     }
 
-    source.LogSummary(wakesStored);
+    source->LogSummary(wakesStored);
 }
 
 // Downscale a ring surface on the GPU, read it back, convert to blurred luma. The blur

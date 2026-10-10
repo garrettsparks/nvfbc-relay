@@ -38,6 +38,7 @@ struct Options {
     unsigned int extraLagMs = 75;   // -lag N: extra bracketing delay, 0 to 200 ms
     bool deferCopy = true;          // -defercopy / -nodefercopy: no ring copy for the frame of a
                                     // frame-generated pair that keep-real drops
+    bool wgc = false;               // -wgc: capture through Windows.Graphics.Capture (b:vsync)
 };
 
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths always
@@ -135,6 +136,8 @@ inline const std::vector<UsageRow>& OptionRows() {
                              "copied", false, false},
         {"-defercopy", "", "Skipping that copy; on by default, accepted so a launch string that "
                            "names it keeps working", false, false},
+        {"-wgc", "", "Capture through Windows (Windows.Graphics.Capture) in place of NvFBC, with "
+                     "b:vsync only; NvFBC stays when it cannot start", false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -270,6 +273,7 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-nodejit")   { o->dejitter = false; o->dejitterRequested = false; return 1; }
     if (t == "-defercopy")   { o->deferCopy = true;  return 1; }
     if (t == "-nodefercopy") { o->deferCopy = false; return 1; }
+    if (t == "-wgc")       { o->wgc = true;       return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -435,6 +439,7 @@ inline std::string FormatOptions(const Options& o) {
     }
     if (o.extraLagMs != d.extraLagMs) add("-lag " + std::to_string(o.extraLagMs));
     if (o.deferCopy != d.deferCopy) add(o.deferCopy ? "-defercopy" : "-nodefercopy");
+    if (o.wgc) add("-wgc");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");

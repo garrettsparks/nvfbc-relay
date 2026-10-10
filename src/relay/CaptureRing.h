@@ -9,6 +9,9 @@
 #include "RelayContext.h"
 #include "TemporalPolicy.h"
 
+struct ID3D11Device;
+struct ID3D11Texture2D;
+
 // Result of a bracketing query: the captured frames immediately before and after a target
 // time, plus the interpolation weight a blending consumer would use. The timestamp/diff
 // half lives in the embedded policy::BracketInfo so the policy layer consumes it without
@@ -148,6 +151,27 @@ public:
     // Shared handle of slot i, for opening the same texture on another API's device.
     HANDLE SlotSharedHandle(int i) const { return m_ring[i].sharedHandle; }
 
+    // Before Start. Asks for Windows.Graphics.Capture (-wgc) in place of NvFBC. The ring starts
+    // on NvFBC as it always does. Once the D3D11 present has offered its device, the capture
+    // thread opens a WGC session with its frame pool on that device, and only when WGC is
+    // capturing is NvFBC let go. If WGC cannot open, capture stays on NvFBC and the log says
+    // why. srcPeriodQpc is the source period the pair window is sized from.
+    void EnableWgc(LONGLONG srcPeriodQpc) {
+        m_wgcRequested = true;
+        m_wgcSrcPeriodQpc = srcPeriodQpc;
+    }
+    bool WgcRequested() const { return m_wgcRequested; }
+    // The D3D11 present's device, offered once it is set up. The capture thread makes the frame
+    // pool on it and makes no call on its context.
+    void OfferWgcDevice(ID3D11Device* device) {
+        m_wgcDevice.store(device, std::memory_order_release);
+    }
+    // The frame pool texture slot i's picture is in, or NULL when the slot holds a frame NvFBC
+    // delivered, which is in the slot itself.
+    ID3D11Texture2D* WgcTexture(int slot) const {
+        return m_wgcTexture[slot].load(std::memory_order_acquire);
+    }
+
     // What the ring needs from the flip grid to read the batch-composition rotation, kept
     // to two questions so the ring never learns about ETW. Both are answered on the CAPTURE
     // thread at batch open, so both must be cheap and must not block: the implementation
@@ -222,6 +246,7 @@ public:
 private:
     // The capture sources fill the ring's slots, so they work on its devices and slots.
     friend class NvfbcCaptureSource;
+    friend class WgcCaptureSource;
 
     struct Slot {
         IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
@@ -334,4 +359,11 @@ private:
     long long m_grabTimeoutsSkipped = 0;  // capture-thread-local; see GrabTimeoutsSkipped
     LONGLONG m_batchStarts[kBatchHistory] = {};   // written by capture thread at batch open
     std::atomic<long long> m_batchOpens{0};
+
+    // -wgc; see EnableWgc.
+    bool m_wgcRequested = false;
+    LONGLONG m_wgcSrcPeriodQpc = 0;
+    HMONITOR m_sourceMonitor = NULL;                       // the display WGC captures
+    std::atomic<ID3D11Device*> m_wgcDevice{NULL};          // offered once by the present
+    std::atomic<ID3D11Texture2D*> m_wgcTexture[RING_SIZE];   // written by the capture thread
 };

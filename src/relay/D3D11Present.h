@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_3.h>
+#include <utility>
+#include <vector>
 
 #include "IPresentPath.h"
 #include "FrameMarker.h"
@@ -116,6 +118,9 @@ private:
     // inputs with w = 0, so there is ONE code path and the swapchain format is free to differ
     // from the ring's (a CopyResource would demand they match exactly).
     bool Draw(int slotA, int slotB, float w);
+    // The view to sample for a ring slot. Under -wgc a slot may name a texture of WGC's frame
+    // pool on this device; one view is made per pool texture the first time it is seen.
+    ID3D11ShaderResourceView* SourceFor(int slot);
     bool DrawMarker(const bool cells[FrameMarker::kCells]);
     void SampleStats();
     void SamplePresentationPath();
@@ -154,6 +159,12 @@ private:
 
     ID3D11Texture2D* m_ringAlias[CaptureRing::RING_SIZE];
     ID3D11ShaderResourceView* m_ringSrv[CaptureRing::RING_SIZE];
+
+    // -wgc: the ring was asked for WGC, so this device is offered to it, and once it has been
+    // m_ring is set and slots are looked up there first (SourceFor).
+    bool m_wgc = false;
+    CaptureRing* m_ring = NULL;
+    std::vector<std::pair<ID3D11Texture2D*, ID3D11ShaderResourceView*>> m_poolSrvs;
 
     ID3D11VertexShader* m_vs;
     ID3D11PixelShader* m_ps;

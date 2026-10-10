@@ -49,6 +49,11 @@ public:
     // the keep decision dropped at once.
     virtual void Published(int slot, long long count, const Placement& placement, bool kept) = 0;
 
-    // Logged once when capture ends.
+    // Called once when the ring moves to another source and will not ask this one again. A
+    // frame Place left waiting has to reach its slot now.
+    virtual void Finish() {}
+
+    // Logged once when capture ends, or when the ring moves to another source. wakesStored
+    // counts the wakes this source delivered.
     virtual void LogSummary(long long wakesStored) = 0;
 };

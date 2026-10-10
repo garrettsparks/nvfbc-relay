@@ -65,7 +65,7 @@ IFrameCaptureMode* CreateCaptureMode(const std::string& modeText, const launch::
     return new TemporalCaptureMode(spec.framerate, spec.vsyncPresent, o.srcRateHint, o.lock,
                                    compositor, o.mark, o.markFrames, o.tint, o.etw, o.noJoin,
                                    o.dejitter, o.fgPhase, o.phaseKeep, o.extraLagMs,
-                                   spec.d3d11Present, o.deferCopy);
+                                   spec.d3d11Present, o.deferCopy, o.wgc);
 }
 
 // Takes the named lock that keeps a second relay from starting. Two relays cannot share NvFBC,
@@ -132,6 +132,12 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
         LOG("-flipex ignored: this mode grabs into a back buffer fetched once, which flip mode "
             "rotates");
         options.flipEx = false;
+    }
+    // WGC's frame pool lives on the D3D11 present's device, which only b:vsync has.
+    if (options.wgc && !r.mode->PresentsViaD3D11()) {
+        LOG("-wgc ignored: capture through Windows.Graphics.Capture needs b:vsync; capturing "
+            "with NvFBC");
+        options.wgc = false;
     }
 
     LOG("Source display: [%u] %s (%s)", source.adapter, source.Name().c_str(),
