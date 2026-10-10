@@ -45,7 +45,9 @@ inside the game's process, where display capture and NvFBC take the finished des
 of those two rows show the methods. Its display capture used DXGI Desktop Duplication (`method:
 DXGI`). Its game capture loaded a hook into the game and shared the game's back buffer (`d3d12
 shared texture capture successful`). Only cost was measured for OBS on 2026-10-08; its pacing
-and picture were not.
+and picture were not. A second sitting on 2026-10-09 ran OBS with each of its capture methods
+beside the relay in one launch (9.1): game capture 4.0%, the relay 5.3%, window capture by WGC
+5.4%, display capture by WGC 5.5% and display capture by Desktop Duplication 6.8%.
 
 The 6% exists only when the GPU has nothing to spare. Capped, the relay takes no frame rate.
 
@@ -280,8 +282,9 @@ That is less than first expected, for two reasons. Priced properly, not waiting 
 worth 13 to 25 points on top of the skipped copies, and `-defercopy` alone now gets 44 to 52. And
 on a saturated GPU a copy takes 10 ms at p95 of a 12 ms source period, so about a tenth of the
 copies are still waited for before their buffer is grabbed into again (the longest 11.6 ms), and
-nearly every slot is turned on one wake late. A third NvFBC buffer, which would give a copy more
-time, is not available. The copy side as built gives 60 to 65 of its 80 points.
+nearly every slot is turned on one wake late. A third NvFBC buffer would give a copy more time.
+It was thought unavailable when this was built; a probe on 2026-10-09 showed NvFBC accepts three
+(section 6), and `-nowaitcopy` has not been tried with three. The copy side as built gives 60 to 65 of its 80 points.
 
 ### 3.3 Skip the extra wake (`-grabphase`)
 
@@ -407,7 +410,10 @@ by the CPU.
 ## 6. Ruled out
 
 - The candidates section 3.4 lists as dropped, which were measured.
-- NvFBC writing straight into ring slots: crashes at SetUp beyond about 2 buffers (`8eb5e70`).
+- NvFBC writing straight into ring slots: NvFBC registers at most 3 output buffers, and a ring
+  needs about 34. Probed on driver 610.88 on 2026-10-09: 2 and 3 are accepted and grabbed into,
+  4 and 5 are refused (result -5), 8 and 34 crash inside `NvFBC64_.dll` (`0xc0000409`), as 8 did
+  in July (`8eb5e70`).
 - Replacing the flush with a fence or keyed mutex: D3D9Ex has neither for these shared surfaces,
   so the event drain stays the only guarantee that a published slot is complete.
 - Doing the capture copy on the D3D11 side: the copy still has to happen before the next grab
@@ -483,9 +489,68 @@ held; and the cost of holding about 30.
 **What each API can capture.** Desktop Duplication captures a whole display. WGC captures a
 whole display or one window, and gets a window's picture from the compositor; OBS's window
 capture can use it. OBS's game capture, the 3.76% row, uses neither. It loads a hook into the
-game and shares the game's back buffer when the game presents. OBS's display capture row (6.23%)
-used Desktop Duplication, which makes it the only price there is for either Windows API, and
-that price includes OBS's own drawing. WGC has no price yet.
+game and shares the game's back buffer when the game presents.
+
+**What each method costs inside OBS.** A sitting on 2026-10-09 (`wg1`) ran OBS's projector with
+each capture method in one launch, two runs a row, with the relay beside them and a no-relay row
+at both ends. Every OBS row shares OBS's own drawing, so the differences between them belong to
+the capture methods. OBS's log of each row names the method that ran, and a screenshot of both
+displays during each row's first run shows the game on the card display in every row.
+
+| row | cost |
+|---|---|
+| OBS, game capture (the hook) | 216 points, 4.0% |
+| OBS, display capture by Desktop Duplication | 365 points, 6.8% |
+| OBS, display capture by WGC | 295 points, 5.5% |
+| OBS, window capture by WGC | 291 points, 5.4% |
+| `b:vsync -src 60`, the CI build of `b043b35` | 287 points, 5.3% |
+
+WGC costs about 70 points less than Desktop Duplication. Capturing the game's window costs the
+same as capturing the whole display. OBS with WGC costs what the relay costs with NvFBC, and the
+hook is about 75 points cheaper than either. So neither Windows API, as OBS uses it, reaches game
+capture's cost. A relay on WGC differs from OBS's WGC rows in one way that matters: OBS copies
+every frame out of WGC's pool into a texture of its own (`libobs-winrt/winrt-capture.cpp`,
+`on_frame_arrived`), and a relay that keeps frames in the pool does not.
+
+**WGC in the relay (2026-10-09, on a local experiment branch, not in this tree).** Built as
+`-wgc`: the D3D11 present hands its device to the capture ring, the capture thread opens a WGC
+frame pool on that device with a buffer for every ring slot, each stored frame stays in the pool
+for as long as its slot names it, and the present samples the pool's texture with the shader it
+already has. No frame is copied and nothing is waited for. On the desktop the card display
+matches the game display exactly. Two things had to be learned first. As Windows has it, WGC
+delivers a 185 fps game at about 53 frames a second: its least time between frames
+(`MinUpdateInterval`, Windows 11 24H2 and later) is 16 ms, and the relay sets it to 1 ms. And a
+row that only priced the capture, with a wrong picture, read 59 points cheaper than the real
+path, so only the real one is quoted here. One launch, two runs a row, a no-relay row at both
+ends, rates inside the benchmark:
+
+| row | cost | frames stored a second | repeats | holds | blends |
+|---|---|---|---|---|---|
+| `b:vsync -src 60` (NvFBC, the deferred copy) | 288 points, 5.3% | 160.6, in 90.4 batches | 0 | 0 | 7.7% |
+| `b:vsync -src 60 -wgc`, 1 ms | 241 points, 4.5% | 93.1, in 92.0 batches | 0 | 0 | 6.6% |
+| `b:vsync -src 60 -wgc`, Windows' 16 ms | 189 points, 3.5% | 52.8 | 0 | 0 | 53.6% |
+
+At 1 ms WGC stores one frame for each of the game's real frames and paces like NvFBC: 60.01
+presents a second, no present gap over 25 ms, and the same spread of shown-content steps. It is
+47 points cheaper. At Windows' own 16 ms it is cheaper than OBS's game capture, and more than
+half of its presents are blends, which is a worse picture. WGC does not deliver DLSS frame
+generation's second wake; NvFBC's second wake there is a duplicate.
+
+Under Smooth Motion (a 60 fps game at x2, about 20 seconds a run, standing and walking) WGC
+delivers all 120 frames a second, as NvFBC does, and they still come as a pair every 16.7 ms.
+The two members arrive 1 to 4 ms apart, where NvFBC's two wakes come 0.4 ms apart, so the
+relay's 3 ms pair window caught only 29% of them. With a 6 ms window under `-wgc` every wake is
+in a pair (60.1 batches a second), and the shown content steps exactly one 60 Hz period on
+every present, with no repeat and no blend, as it does with NvFBC in the same spot. The second
+member of a WGC pair is the real frame, as it is with NvFBC: reading back the centre of every
+frame for 27 seconds of standing, walking and strafing, the 3,103 frames were 3,101 different
+pictures, and in 1,484 of 1,490 pairs the first frame had the softer edges (77 to 92% of the
+second's edge energy while moving, 99.3 to 99.5% while standing), which is what an interpolated
+frame looks like. The relay keeps the second. ETW flip pairing works on WGC's arrival times
+(1,414 batches paired in one run, none late). WGC's own per-frame timestamp is the compositor's
+and is no use as a clock: under Smooth Motion it ticked with the capture card display's refresh.
+Still untested: a whole stream, the pair window at other rates and multipliers, and HDR sources
+(the pool is 8-bit).
 
 **Presenting a ring slot by reference (composition swapchain).** Windows 11's composition
 swapchain registers up to 31 textures with a presentation manager and presents any of them, in any
@@ -562,8 +627,9 @@ problems before it finds a number.
    `-defercopy` and the new switch in one launch.
 4. One profiled look at NvFBC's grab (section 8), then decide whether anything about it can be
    moved.
-5. DONE 2026-10-08: OBS's projector as two rows in a one-launch sitting (section 1). Its pacing
-   and picture with each capture method are still to be measured the way the relay's are.
+5. DONE 2026-10-08: OBS's projector as two rows in a one-launch sitting (section 1), and on
+   2026-10-09 as four rows, one for each capture method (9.1). Its pacing and picture with each
+   capture method are still to be measured the way the relay's are.
 6. One architectural prototype: WGC with the pool as the ring (also the app's default capture
    path), or Desktop Duplication, with the composition swapchain as a later step. NvFBC's CUDA
    interface was the other choice; it was built, measured and dropped on 2026-10-09 (3.4).

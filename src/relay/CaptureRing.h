@@ -220,6 +220,9 @@ public:
     void EnableFgPhase() { m_fgPhaseRequested = true; }
 
 private:
+    // The capture sources fill the ring's slots, so they work on its devices and slots.
+    friend class NvfbcCaptureSource;
+
     struct Slot {
         IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
         IDirect3DSurface9* capSurface;

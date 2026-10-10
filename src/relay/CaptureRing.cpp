@@ -1,5 +1,6 @@
 #include "CaptureRing.h"
 #include "D3D9Setup.h"
+#include "ICaptureSource.h"
 #include <NvFBCLoader.h>
 #include <SimpleLogger.h>
 #include <limits.h>
@@ -330,10 +331,226 @@ void CaptureRing::Stop() {
     }
 }
 
+// NvFBC as the ring's capture source. NvFBC writes each grabbed frame into one of the output
+// buffers it was given at setup, and the next grab into that buffer overwrites it, so a frame
+// the ring keeps is copied into its slot, a shared surface the present reads from another
+// device, and the copy is waited for before the slot is published.
+class NvfbcCaptureSource : public ICaptureSource {
+public:
+    NvfbcCaptureSource(CaptureRing& ring, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams)
+        : r(ring)
+        , m_grabParams(grabParams)
+        , m_usPerTick(1000000.0 / (double)ring.m_freqQuad)
+        , m_timeoutFloorQpc((ring.m_freqQuad * kGrabTimeoutFloorMs) / 1000)
+        // The deferred ring copy. While batches come in pairs, a batch's first member is the
+        // frame keep-real retracts one wake later, so its copy is wasted work. With two NvFBC
+        // buffers taken in turn, that frame can wait in its buffer while the next grab writes
+        // the other: if the next wake is the same batch's second member, the waiting frame is
+        // never copied, and if not, it was a batch of one and is copied then, a wake late. Its
+        // slot is published at once with valid off and awaitingCopy on, and turned on when the
+        // pixels are there.
+        //
+        // Its limits are sized from the lag. While a frame waits the grab waits only
+        // m_deferWaitMs, so the frame is copied that long after it arrived at the latest, and
+        // a frame waits only when the gap before it leaves room for that wait inside the lag.
+        // A lag with no room for any wait leaves the deferral off. All of it is the policy
+        // layer's rule, which the replay tests run on every recorded capture.
+        , m_deferLimits(policy::SizeDeferLimits(
+              ring.m_deferLagQpc, ring.m_deferSrcPeriodQpc, ring.m_deferMarginQpc,
+              (ring.m_freqQuad * policy::kDeferWaitAboutMs) / 1000,
+              (ring.m_freqQuad * policy::kDeferWaitLeastMs) / 1000))
+        , m_deferCopy(ring.m_captureTargetB != NULL && m_deferLimits.maxWaitTicks > 0)
+        // NvFBC takes its wait in whole milliseconds; rounding down keeps it inside the limit.
+        , m_deferWaitMs(m_deferCopy
+              ? (NvU32)(m_deferLimits.maxWaitTicks * 1000 / ring.m_freqQuad) : kGrabWaitMs)
+        , m_deferWaitFloorQpc(
+              (ring.m_freqQuad * (m_deferWaitMs - (kGrabWaitMs - kGrabTimeoutFloorMs))) / 1000)
+        , m_deferMaxGapQpc(m_deferLimits.maxGapTicks)
+    {
+        m_srcRect.left = 0;
+        m_srcRect.top = 0;
+        m_srcRect.right = (LONG)ring.m_width;
+        m_srcRect.bottom = (LONG)ring.m_height;
+    }
+
+    void LogStart() override {
+        if (m_deferCopy) {
+            LOG("Deferred ring copy on: a frame waits at most %u ms, and only after a gap of at "
+                "most %lld us (lag %lld us, margin %lld us)",
+                m_deferWaitMs, (long long)(m_deferMaxGapQpc * m_usPerTick),
+                (long long)(r.m_deferLagQpc * m_usPerTick),
+                (long long)(r.m_deferMarginQpc * m_usPerTick));
+        } else if (r.m_captureTargetB) {
+            LOG("Deferred ring copy off: the lag (%lld us) is too short for a frame to wait at "
+                "this source rate; every frame is copied as it arrives",
+                (long long)(r.m_deferLagQpc * m_usPerTick));
+        } else {
+            LOG("Deferred ring copy off: every frame is copied as it arrives");
+        }
+    }
+
+    // NvFBC's two wakes for a frame-generation pair come under 2 ms apart, and no real content
+    // cadence produces a gap under 3 ms (that would take a 333 fps source).
+    LONGLONG BatchWindowQpc() const override { return (r.m_freqQuad * 3) / 1000; }
+
+    Wake Wait(LARGE_INTEGER* arrived) override {
+        if (m_deferCopy) m_grabParams->dwBufferIdx = m_bufferIdx;
+        // A frame waiting uncopied bounds the grab's wait: the timeout is what gets it into the
+        // ring when no frame follows.
+        const bool frameWaiting = m_pendingSlot >= 0;
+        m_grabParams->dwWaitTime = frameWaiting ? m_deferWaitMs : kGrabWaitMs;
+        LARGE_INTEGER grabStart;
+        QueryPerformanceCounter(&grabStart);
+        NVFBCRESULT res = r.m_nvfbc->NvFBCToDx9VidGrabFrame(m_grabParams);
+
+        if (res == NVFBC_ERROR_INVALIDATED_SESSION) {
+            LOGERR("CaptureRing: NvFBC session invalidated - stopping capture");
+            return Wake::Lost;
+        }
+        if (res != NVFBC_SUCCESS) {
+            // Nothing was grabbed. A full-size grab NvFBC refuses before any frame has come
+            // goes back to the scaled grab. A grab that keeps failing returns at once, so the
+            // first failure and every 100,000th are logged, not each one.
+            m_grabFailures++;
+            if (r.m_fullSizeGrab && m_frames == 0) {
+                LOGERR("CaptureRing: NvFBC refused the full-size grab (result %d); using the "
+                       "scaled grab", (int)res);
+                r.m_fullSizeGrab = false;
+                m_grabParams->eGMode = NVFBC_TODX9VID_SOURCEMODE_SCALE;
+                m_grabParams->dwTargetWidth = (NvU32)r.m_width;
+                m_grabParams->dwTargetHeight = (NvU32)r.m_height;
+            } else if (m_grabFailures == 1 || (m_grabFailures % 100000) == 0) {
+                LOGERR("CaptureRing: grab failed with NvFBC result %d (%lld failed so far, "
+                       "%lld wakes stored)", (int)res, m_grabFailures, m_frames);
+            }
+            return Wake::Failed;
+        }
+
+        QueryPerformanceCounter(arrived);
+
+        // The timeout's re-delivery of the picture already in the ring (see
+        // kGrabTimeoutFloorMs): NvFBC reports success and hands the old picture over again.
+        if (arrived->QuadPart - grabStart.QuadPart >=
+            (frameWaiting ? m_deferWaitFloorQpc : m_timeoutFloorQpc)) {
+            // Nothing new came, so a frame still waiting was the last before a pause: it is
+            // copied now. The timed-out grab wrote the other buffer, and the next grab uses
+            // that one again.
+            if (m_deferCopy && policy::DeferOnTimeout(m_deferState) && m_pendingSlot >= 0) {
+                CopyAndWait(m_pendingSource, m_pendingSlot);
+                r.m_ring[m_pendingSlot].valid = true;
+                r.m_ring[m_pendingSlot].awaitingCopy = false;
+                m_copiedAtTimeout++;
+                LOG("defer: capture #%lld copied after a grab timeout", m_pendingCount);
+                m_pendingSlot = -1;
+            }
+            return Wake::Timeout;
+        }
+        m_frames++;
+        return Wake::Frame;
+    }
+
+    Placement Place(const policy::BatchDecision& batch) override {
+        m_source = (m_deferCopy && m_bufferIdx == 1) ? r.m_captureTargetB : r.m_captureTarget;
+        // Which frame waits and which waiting frame is copied is the policy layer's decision,
+        // so the replay tests run the same rule on recorded captures.
+        policy::DeferDecision defer;
+        if (m_deferCopy) defer = policy::DecideDefer(m_deferState, batch, m_deferMaxGapQpc);
+        // A waiting frame this wake's member replaces. Its slot stops counting for the
+        // lookahead once this wake's slot, which carries the same stamp, is published.
+        Placement placement;
+        if (defer.hadPending && m_pendingSlot >= 0) {
+            if (defer.copyPending) {
+                CopyAndWait(m_pendingSource, m_pendingSlot);
+                r.m_ring[m_pendingSlot].valid = true;
+                r.m_ring[m_pendingSlot].awaitingCopy = false;
+                m_copiedLate++;
+                LOG("defer: capture #%lld copied a wake late, its batch had one member",
+                    m_pendingCount);
+            } else {
+                placement.replacedSlot = m_pendingSlot;
+                m_neverCopied++;
+            }
+            m_pendingSlot = -1;
+        }
+        placement.waits = defer.deferThis;
+        return placement;
+    }
+
+    // The copy has to be complete on the capture GPU before the slot is published, so the
+    // present device never reads a shared slot that is not yet coherent.
+    void Store(int slot) override { CopyAndWait(m_source, slot); }
+
+    void Published(int slot, long long count, const Placement& placement, bool kept) override {
+        if (placement.waits) {
+            if (kept) {
+                m_pendingSlot = slot;
+                m_pendingCount = count;
+                m_pendingSource = m_source;
+            }
+            m_deferredWakes++;
+        }
+        if (m_deferCopy) m_bufferIdx ^= 1;
+    }
+
+    void LogSummary(long long wakesStored) override {
+        if (m_grabFailures) {
+            LOGERR("CaptureRing: %lld grabs failed over the run, %lld wakes stored",
+                   m_grabFailures, wakesStored);
+        }
+        if (m_deferCopy) {
+            LOG("Deferred ring copy summary: %lld wakes stored, %lld left waiting (%.1f%%); of "
+                "those %lld never copied, %lld copied a wake late, %lld copied after a grab "
+                "timeout",
+                wakesStored, m_deferredWakes,
+                wakesStored ? 100.0 * (double)m_deferredWakes / (double)wakesStored : 0.0,
+                m_neverCopied, m_copiedLate, m_copiedAtTimeout);
+        }
+    }
+
+private:
+    // Copies a grabbed frame into its ring slot and returns once the GPU has done it, so the
+    // slot is complete before it is published and before NvFBC writes that buffer again.
+    // D3DGETDATA_FLUSH kicks the command buffer; GetData returns S_FALSE until the GPU signals
+    // the event.
+    void CopyAndWait(IDirect3DSurface9* source, int toSlot) {
+        r.m_capDevice->StretchRect(source, &m_srcRect, r.m_ring[toSlot].capSurface, &m_srcRect,
+                                   D3DTEXF_NONE);
+        r.m_capSync->Issue(D3DISSUE_END);
+        while (r.m_capSync->GetData(NULL, 0, D3DGETDATA_FLUSH) == S_FALSE) {
+            if (r.m_stop.load()) break;
+        }
+    }
+
+    CaptureRing& r;
+    NVFBC_TODX9VID_GRAB_FRAME_PARAMS* m_grabParams;
+    RECT m_srcRect;
+    const double m_usPerTick;
+    const LONGLONG m_timeoutFloorQpc;
+    const policy::DeferLimits m_deferLimits;
+    const bool m_deferCopy;
+    const NvU32 m_deferWaitMs;
+    const LONGLONG m_deferWaitFloorQpc;
+    const LONGLONG m_deferMaxGapQpc;
+    policy::DeferState m_deferState;
+    unsigned int m_bufferIdx = 0;
+    IDirect3DSurface9* m_source = NULL;          // the buffer the frame in hand was grabbed into
+    int m_pendingSlot = -1;
+    long long m_pendingCount = -1;
+    IDirect3DSurface9* m_pendingSource = NULL;
+    long long m_frames = 0;                      // wakes that brought a new frame
+    long long m_deferredWakes = 0, m_neverCopied = 0, m_copiedLate = 0, m_copiedAtTimeout = 0;
+    long long m_grabFailures = 0;
+};
+
 void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
-    RECT srcRect = { 0, 0, (LONG)m_width, (LONG)m_height };
     const double usPerTick = 1000000.0 / (double)m_freqQuad;
     long long collapsed = 0;
+
+    // The frames come from one capture source, which owns how a frame is waited for and how
+    // its picture reaches its slot (ICaptureSource). Everything below is the same whichever
+    // source delivers them.
+    NvfbcCaptureSource nvfbcSource(*this, grabParams);
+    ICaptureSource& source = nvfbcSource;
 
     // Batch-collapse threshold. Under NVIDIA Smooth Motion (driver-level frame gen; in-game
     // DLSS-FG untested) the grab wakes ~2x per BASE frame, members arriving <2 ms apart
@@ -345,123 +562,30 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     // Retraction never overwrites a published slot, so a concurrent present read is safe
     // (content untouched; the flag only hides it from future brackets — worst case one present
     // inside the ~ε window still shows the gen frame). Keep-real won the definitive A/B:
-    // keep-first ghosted throughout, keep-real crisp throughout (Round 10).
-    const LONGLONG batchThresholdQpc = (m_freqQuad * 3) / 1000;
+    // keep-first ghosted throughout, keep-real crisp throughout (Round 10). How close two wakes
+    // have to be is the source's to say.
+    const LONGLONG batchThresholdQpc = source.BatchWindowQpc();
     policy::BatchState batchState;
-    LOG("CaptureRing: batch-collapse keep-real (intra-batch wake <3ms = real member; previous slot retracted)");
-    const LONGLONG timeoutFloorQpc = (m_freqQuad * kGrabTimeoutFloorMs) / 1000;
-
-    // Copies a grabbed frame into its ring slot and returns once the GPU has done it, so the
-    // slot is complete before it is published and before NvFBC writes that buffer again.
-    // D3DGETDATA_FLUSH kicks the command buffer; GetData returns S_FALSE until the GPU signals
-    // the event.
-    auto copyAndWait = [&](IDirect3DSurface9* source, int toSlot) {
-        m_capDevice->StretchRect(source, &srcRect, m_ring[toSlot].capSurface, &srcRect,
-                                 D3DTEXF_NONE);
-        m_capSync->Issue(D3DISSUE_END);
-        while (m_capSync->GetData(NULL, 0, D3DGETDATA_FLUSH) == S_FALSE) {
-            if (m_stop.load()) break;
-        }
-    };
-
-    // The deferred ring copy. While batches come in pairs, a batch's first member is the frame
-    // keep-real retracts one wake later, so its copy is wasted work. With two NvFBC buffers
-    // taken in turn, that frame can wait in its buffer while the next grab writes the other: if
-    // the next wake is the same batch's second member, the waiting frame is never copied, and
-    // if not, it was a batch of one and is copied then, a wake late. Its slot is published at
-    // once with valid off and awaitingCopy on, and turned on when the pixels are there.
-    //
-    // Its limits are sized from the lag. While a frame waits the grab waits only deferWaitMs,
-    // so the frame is copied that long after it arrived at the latest, and a frame waits only
-    // when the gap before it leaves room for that wait inside the lag. A lag with no room for
-    // any wait leaves the deferral off. All of it is the policy layer's rule, which the replay
-    // tests run on every recorded capture.
-    const policy::DeferLimits deferLimits = policy::SizeDeferLimits(
-        m_deferLagQpc, m_deferSrcPeriodQpc, m_deferMarginQpc,
-        (m_freqQuad * policy::kDeferWaitAboutMs) / 1000,
-        (m_freqQuad * policy::kDeferWaitLeastMs) / 1000);
-    const bool deferCopy = m_captureTargetB != NULL && deferLimits.maxWaitTicks > 0;
-    policy::DeferState deferState;
-    unsigned int bufferIdx = 0;
-    int pendingSlot = -1;
-    long long pendingCount = -1;
-    IDirect3DSurface9* pendingSource = NULL;
-    long long wakesStored = 0, deferredWakes = 0, neverCopied = 0, copiedLate = 0;
-    long long copiedAtTimeout = 0, grabFailures = 0;
-    // NvFBC takes its wait in whole milliseconds; rounding down keeps it inside the limit.
-    const NvU32 deferWaitMs = deferCopy
-        ? (NvU32)(deferLimits.maxWaitTicks * 1000 / m_freqQuad) : kGrabWaitMs;
-    const LONGLONG deferWaitFloorQpc =
-        (m_freqQuad * (deferWaitMs - (kGrabWaitMs - kGrabTimeoutFloorMs))) / 1000;
-    const LONGLONG deferMaxGapQpc = deferLimits.maxGapTicks;
-    if (deferCopy) {
-        LOG("Deferred ring copy on: a frame waits at most %u ms, and only after a gap of at "
-            "most %lld us (lag %lld us, margin %lld us)",
-            deferWaitMs, (long long)(deferMaxGapQpc * usPerTick),
-            (long long)(m_deferLagQpc * usPerTick), (long long)(m_deferMarginQpc * usPerTick));
-    } else if (m_captureTargetB) {
-        LOG("Deferred ring copy off: the lag (%lld us) is too short for a frame to wait at "
-            "this source rate; every frame is copied as it arrives",
-            (long long)(m_deferLagQpc * usPerTick));
-    } else {
-        LOG("Deferred ring copy off: every frame is copied as it arrives");
-    }
+    LOG("CaptureRing: batch-collapse keep-real (intra-batch wake <%lldms = real member; "
+        "previous slot retracted)", (long long)(batchThresholdQpc * 1000 / m_freqQuad));
+    source.LogStart();
+    long long wakesStored = 0;
 
     while (!m_stop.load()) {
-        if (deferCopy) grabParams->dwBufferIdx = bufferIdx;
-        // A frame waiting uncopied bounds the grab's wait: the timeout is what gets it into the
-        // ring when no frame follows.
-        const bool frameWaiting = pendingSlot >= 0;
-        grabParams->dwWaitTime = frameWaiting ? deferWaitMs : kGrabWaitMs;
-        LARGE_INTEGER grabStart;
-        QueryPerformanceCounter(&grabStart);
-        NVFBCRESULT res = m_nvfbc->NvFBCToDx9VidGrabFrame(grabParams);
-
-        if (res == NVFBC_ERROR_INVALIDATED_SESSION) {
-            LOGERR("CaptureRing: NvFBC session invalidated - stopping capture");
+        LARGE_INTEGER now;
+        const ICaptureSource::Wake wake = source.Wait(&now);
+        if (wake == ICaptureSource::Wake::Lost) {
             m_stop.store(true);
             break;
         }
-        if (res != NVFBC_SUCCESS) {
-            // Nothing was grabbed: loop and re-check stop. A full-size grab NvFBC refuses
-            // before any frame has come goes back to the scaled grab. A grab that keeps
-            // failing returns at once, so the first failure and every 100,000th are logged,
-            // not each one.
-            grabFailures++;
-            if (m_fullSizeGrab && wakesStored == 0) {
-                LOGERR("CaptureRing: NvFBC refused the full-size grab (result %d); using the "
-                       "scaled grab", (int)res);
-                m_fullSizeGrab = false;
-                grabParams->eGMode = NVFBC_TODX9VID_SOURCEMODE_SCALE;
-                grabParams->dwTargetWidth = (NvU32)m_width;
-                grabParams->dwTargetHeight = (NvU32)m_height;
-            } else if (grabFailures == 1 || (grabFailures % 100000) == 0) {
-                LOGERR("CaptureRing: grab failed with NvFBC result %d (%lld failed so far, "
-                       "%lld wakes stored)", (int)res, grabFailures, wakesStored);
-            }
-            continue;
-        }
+        // A wait that failed is tried again, re-checking stop.
+        if (wake == ICaptureSource::Wake::Failed) continue;
 
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-
-        // The timeout's re-delivery of the picture already in the ring (see
-        // kGrabTimeoutFloorMs). It enters nothing: no slot, no batch, no period estimate, no
-        // vote, so the next real frame arrives against the last one that was actually new.
-        if (now.QuadPart - grabStart.QuadPart >=
-            (frameWaiting ? deferWaitFloorQpc : timeoutFloorQpc)) {
+        // A wait that ran out with nothing new enters nothing: no slot, no batch, no period
+        // estimate, no vote, so the next real frame arrives against the last one that was
+        // actually new.
+        if (wake == ICaptureSource::Wake::Timeout) {
             m_grabTimeoutsSkipped++;
-            // Nothing new came, so a frame still waiting was the last before a pause: it is
-            // copied now. The timed-out grab wrote the other buffer, and the next grab uses
-            // that one again.
-            if (deferCopy && policy::DeferOnTimeout(deferState) && pendingSlot >= 0) {
-                copyAndWait(pendingSource, pendingSlot);
-                m_ring[pendingSlot].valid = true;
-                m_ring[pendingSlot].awaitingCopy = false;
-                copiedAtTimeout++;
-                LOG("defer: capture #%lld copied after a grab timeout", pendingCount);
-                pendingSlot = -1;
-            }
             continue;
         }
 
@@ -469,30 +593,8 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         const policy::BatchDecision batch =
             policy::UpdateBatch(batchState, now.QuadPart, batchThresholdQpc);
 
-        IDirect3DSurface9* source =
-            (deferCopy && bufferIdx == 1) ? m_captureTargetB : m_captureTarget;
-        // Which frame waits and which waiting frame is copied is the policy layer's decision,
-        // so the replay tests run the same rule on recorded captures.
-        policy::DeferDecision defer;
-        if (deferCopy) defer = policy::DecideDefer(deferState, batch, deferMaxGapQpc);
-        // A waiting frame this wake's member replaces. Its slot stops counting for the
-        // lookahead once this wake's slot, which carries the same stamp, is published.
-        int replacedSlot = -1;
-        if (defer.hadPending && pendingSlot >= 0) {
-            if (defer.copyPending) {
-                copyAndWait(pendingSource, pendingSlot);
-                m_ring[pendingSlot].valid = true;
-                m_ring[pendingSlot].awaitingCopy = false;
-                copiedLate++;
-                LOG("defer: capture #%lld copied a wake late, its batch had one member",
-                    pendingCount);
-            } else {
-                replacedSlot = pendingSlot;
-                neverCopied++;
-            }
-            pendingSlot = -1;
-        }
-        const bool deferThis = defer.deferThis;
+        // The source says whether this frame's picture goes into its slot now or waits.
+        const ICaptureSource::Placement placement = source.Place(batch);
         // Source-period estimate (gaps over 125 ms are stalls, not cadence). A static source
         // adds nothing, so the estimate holds its last value while nothing new is drawn. EMA
         // alpha 1/8: stable within ~8 source frames of a regime change, jitter-immune in
@@ -506,10 +608,9 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         long long count = m_writeCount;
         int slot = (int)(count % m_ringSlots);
         wakesStored++;
-        // The copy has to be complete on the capture GPU before the slot is published, so the
-        // present device never reads a shared slot that is not yet coherent. A frame the
-        // deferral leaves waiting is not copied now.
-        if (!deferThis) copyAndWait(source, slot);
+        // The picture has to be where the present can read it before the slot is published. A
+        // frame the source leaves waiting is not stored now.
+        if (!placement.waits) source.Store(slot);
 
         // Measure how long the flush blocked: this is the fix's cost. It should be small and
         // CONSISTENT (a near-constant pipeline offset, off the present path). Spikes here would
@@ -689,20 +790,12 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
 
         m_ring[slot].timestamp.QuadPart = keep.stampTs;
         m_ring[slot].batchStart.QuadPart = batch.stampTs;
-        m_ring[slot].valid = keep.keepThis && !deferThis;
-        m_ring[slot].awaitingCopy = keep.keepThis && deferThis;
+        m_ring[slot].valid = keep.keepThis && !placement.waits;
+        m_ring[slot].awaitingCopy = keep.keepThis && placement.waits;
         m_writeCount = count + 1;
         m_published.store(count + 1);  // a slot whose pixels are not there yet has valid off
-        if (replacedSlot >= 0) m_ring[replacedSlot].awaitingCopy = false;
-        if (deferThis) {
-            if (keep.keepThis) {
-                pendingSlot = slot;
-                pendingCount = count;
-                pendingSource = source;
-            }
-            deferredWakes++;
-        }
-        if (deferCopy) bufferIdx ^= 1;
+        if (placement.replacedSlot >= 0) m_ring[placement.replacedSlot].awaitingCopy = false;
+        source.Published(slot, count, placement, keep.keepThis);
 
         if (keep.retractPrev && count >= 1) {
             // Retract the previous member (the generated frame): hide it from future brackets.
@@ -729,17 +822,7 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         }
     }
 
-    if (grabFailures) {
-        LOGERR("CaptureRing: %lld grabs failed over the run, %lld wakes stored", grabFailures,
-               wakesStored);
-    }
-    if (deferCopy) {
-        LOG("Deferred ring copy summary: %lld wakes stored, %lld left waiting (%.1f%%); of "
-            "those %lld never copied, %lld copied a wake late, %lld copied after a grab timeout",
-            wakesStored, deferredWakes,
-            wakesStored ? 100.0 * (double)deferredWakes / (double)wakesStored : 0.0, neverCopied,
-            copiedLate, copiedAtTimeout);
-    }
+    source.LogSummary(wakesStored);
 }
 
 // Downscale a ring surface on the GPU, read it back, convert to blurred luma. The blur
