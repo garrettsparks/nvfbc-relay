@@ -155,11 +155,8 @@ public:
     // on NvFBC as it always does. Once the D3D11 present has offered its device, the capture
     // thread opens a WGC session with its frame pool on that device, and only when WGC is
     // capturing is NvFBC let go. If WGC cannot open, capture stays on NvFBC and the log says
-    // why. srcPeriodQpc is the source period the pair window is sized from.
-    void EnableWgc(LONGLONG srcPeriodQpc) {
-        m_wgcRequested = true;
-        m_wgcSrcPeriodQpc = srcPeriodQpc;
-    }
+    // why.
+    void EnableWgc() { m_wgcRequested = true; }
     bool WgcRequested() const { return m_wgcRequested; }
     // The D3D11 present's device, offered once it is set up. The capture thread makes the frame
     // pool on it and makes no call on its context.
@@ -362,7 +359,6 @@ private:
 
     // -wgc; see EnableWgc.
     bool m_wgcRequested = false;
-    LONGLONG m_wgcSrcPeriodQpc = 0;
     HMONITOR m_sourceMonitor = NULL;                       // the display WGC captures
     std::atomic<ID3D11Device*> m_wgcDevice{NULL};          // offered once by the present
     std::atomic<ID3D11Texture2D*> m_wgcTexture[RING_SIZE];   // written by the capture thread

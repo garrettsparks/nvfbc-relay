@@ -180,10 +180,15 @@ public:
     // Starts a session on the source display with its frame pool on device, the D3D11
     // present's. Returns NULL once it is capturing, or what stopped it, with nothing left open.
     // It also stops short where it would deliver fewer frames than NvFBC, or a picture of
-    // another size: Windows' least time between frames has to come down to 1 ms (16 ms as
-    // found on Windows 11 build 26100, which delivered a 185 fps game at about 53 frames a
-    // second), and the source display has to be the size of the output, since the present
-    // samples the pool's textures with point sampling and no scaling of its own.
+    // another size: Windows' least time between frames has to come down to 0.001 ms, and the
+    // source display has to be the size of the output, since the present samples the pool's
+    // textures with point sampling and no scaling of its own.
+    //
+    // The least time between frames is 16 ms as found on Windows 11 build 26100, which
+    // delivered a 185 fps game at about 53 frames a second. It has to be far under a
+    // millisecond: under Smooth Motion the real frame arrives 0.27 ms behind the generated one
+    // (0.066 ms at the closest), and with 1 ms set Windows held the real frame back for its
+    // compositor's next tick and, whenever that tick met the next pair, never delivered it.
     const char* Open(ID3D11Device* device) {
         HMODULE combase = LoadLibraryW(L"combase.dll");
         HMODULE d3d11 = LoadLibraryW(L"d3d11.dll");
@@ -284,7 +289,7 @@ public:
             return Refuse("this Windows has no setting for the least time between frames");
         }
         wgc::TimeSpan found = {}, now = {};
-        const wgc::TimeSpan wanted = {10000};   // 1 ms
+        const wgc::TimeSpan wanted = {10};   // 0.001 ms
         session5->get_MinUpdateInterval(&found);
         m_result = session5->put_MinUpdateInterval(wanted);
         session5->get_MinUpdateInterval(&now);
@@ -313,15 +318,10 @@ public:
             (long long)(BatchWindowQpc() * 1000000 / r.m_freqQuad));
     }
 
-    // Under Smooth Motion at 60 x2, WGC hands over a pair's two frames up to 5.14 ms apart
-    // (median 4.15) and the next pair at least 11.34 ms later, where NvFBC's two wakes come
-    // within half a millisecond. The window is half the source's frame period less a
-    // millisecond, 7.3 ms at 60, which falls between the two. Only 60 x2 has been measured. A
-    // source over 500 fps leaves no window, and every wake is a batch of its own.
-    LONGLONG BatchWindowQpc() const override {
-        const LONGLONG window = r.m_wgcSrcPeriodQpc / 2 - r.m_freqQuad / 1000;
-        return window > 0 ? window : 0;
-    }
+    // The same window as NvFBC's. With the least time between frames at 0.001 ms, WGC hands
+    // over a frame-generation pair as NvFBC does: generated then real, 0.27 ms apart (1.04 ms
+    // at the most) under Smooth Motion at 60 x2, the next pair at least 15.5 ms later.
+    LONGLONG BatchWindowQpc() const override { return (r.m_freqQuad * 3) / 1000; }
 
     // Blocks until a frame is in the pool or the wait has run out in full. A frame already
     // queued is taken at once.

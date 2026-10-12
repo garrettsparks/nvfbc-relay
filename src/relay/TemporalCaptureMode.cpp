@@ -169,9 +169,8 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
                                ctx.sinkRefreshHz > 0 ? m_scheduler.Freq() / ctx.sinkRefreshHz
                                                      : m_scheduler.PeriodQpc());
     }
-    // WGC sizes its pair window from the same source period.
     if (m_wgc) {
-        m_ring.EnableWgc(m_assumedSrcPeriodQpc);
+        m_ring.EnableWgc();
         LOG("Capture through Windows.Graphics.Capture asked (-wgc): it takes over from NvFBC "
             "once the D3D11 present is up, and NvFBC stays if it cannot start");
     }
