@@ -3,14 +3,16 @@
 What the default mode, `b:vsync`, costs the game, where that cost goes, and what each idea for
 lowering it was measured to be worth. Sections 1 to 4 were rewritten on 2026-10-08 from the bench
 runs of 2026-10-07 and the replay work of 2026-10-08. Section 9 is ideas nobody has measured,
-except NvFBC's CUDA interface, which was built and measured on 2026-10-08 and 2026-10-09 and
-dropped (3.4). The decision logic (comb lock, lookahead, late moves, refusal) stays as it is; the
-candidates change how frames are captured, copied and drawn.
+with two exceptions. NvFBC's CUDA interface was built and measured on 2026-10-08 and 2026-10-09
+and dropped (3.4). Capture through Windows (WGC) was built and measured from 2026-10-09 to
+2026-10-11 and is in the relay behind `-wgc` (9.1). The decision logic (comb lock, lookahead,
+late moves, refusal) stays as it is; the candidates change how frames are captured, copied and
+drawn.
 
 The goal (user, 2026-10-03): beat OBS's fullscreen projector on both game cost and picture
 quality. The cost to beat is the projector's with game capture, 3.76% (user, 2026-10-09). NvFBC
-captures the whole display and may not get there, so that may have to wait for a test of WGC or
-Desktop Duplication capture (9.1).
+captures the whole display and costs about 5.5%. Capture through Windows (WGC, `-wgc`) costs
+about 4.6% (9.1).
 
 ## 1. Where things stand
 
@@ -33,6 +35,7 @@ correct for.
 | `60` | 4.69% | one-launch sitting, 2026-10-07 |
 | `60` with the original relay's timer (32.3 loops a second) | 3.05% | the same sitting |
 | `b:vsync -src 60` with the deferred ring copy (the default since 2026-10-08) | 5.1 to 5.4% | three one-launch sittings, 2026-10-08 |
+| `b:vsync -src 60 -wgc`, capture through Windows, off by default (9.1) | 4.6% | one-launch sitting, 2026-10-11 |
 | OBS projector, game capture, 2560x1440 canvas | 3.76% | one-launch sitting, 2026-10-08 |
 | OBS projector, display capture, 2560x1440 canvas | 6.23% | the same sitting |
 | OBS projector, game capture, 1920x1080 canvas | 4.85% | by hand on 2026-10-03, separate launches |
@@ -451,8 +454,8 @@ be moved, and which option in section 9 is worth building.
 
 ## 9. Architectural options
 
-Bigger changes than section 3, each removing work the current design cannot avoid. Only NvFBC's
-CUDA interface has been built, and it was dropped.
+Bigger changes than section 3, each removing work the current design cannot avoid. Two have
+been built. NvFBC's CUDA interface was dropped, and WGC capture is in the relay behind `-wgc`.
 
 ### 9.1 Keeping frames without copying them
 
@@ -484,7 +487,8 @@ default. An earlier experiment exists: the remote branch `dxgi-native-pipeline-p
 or Desktop Duplication prototype. Unknown: whether WGC pulls a fullscreen game out of independent
 flip (that timestamp is the compositor's, which suggests composition) and what that costs the
 game; whether it sees Smooth Motion's generated frames; how long a pool frame stays valid while
-held; and the cost of holding about 30.
+held; and the cost of holding about 30. Building it answered the last three ("WGC in the relay"
+below).
 
 **What each API can capture.** Desktop Duplication captures a whole display. WGC captures a
 whole display or one window, and gets a window's picture from the compositor; OBS's window
@@ -512,45 +516,79 @@ capture's cost. A relay on WGC differs from OBS's WGC rows in one way that matte
 every frame out of WGC's pool into a texture of its own (`libobs-winrt/winrt-capture.cpp`,
 `on_frame_arrived`), and a relay that keeps frames in the pool does not.
 
-**WGC in the relay (2026-10-09, on a local experiment branch, not in this tree).** Built as
-`-wgc`: the D3D11 present hands its device to the capture ring, the capture thread opens a WGC
-frame pool on that device with a buffer for every ring slot, each stored frame stays in the pool
-for as long as its slot names it, and the present samples the pool's texture with the shader it
-already has. No frame is copied and nothing is waited for. On the desktop the card display
-matches the game display exactly. Two things had to be learned first. As Windows has it, WGC
-delivers a 185 fps game at about 53 frames a second: its least time between frames
-(`MinUpdateInterval`, Windows 11 24H2 and later) is 16 ms, and the relay sets it to 1 ms. And a
-row that only priced the capture, with a wrong picture, read 59 points cheaper than the real
-path, so only the real one is quoted here. One launch, two runs a row, a no-relay row at both
-ends, rates inside the benchmark:
+**WGC in the relay (built 2026-10-09 and 2026-10-11).** It is the switch `-wgc`. It is off by
+default, it runs only with `b:vsync`, and the help text does not list it. The relay starts on
+NvFBC as it always does. Once the D3D11 present has its device, the capture thread opens a WGC
+session on the game display. The session's frame pool is made on the present's device, with a
+buffer for every ring slot and two more. Each stored frame stays in the pool for as long as its
+slot names it, and the present samples the pool's texture with the shader it already has. No
+frame is copied and nothing is waited for. NvFBC is let go only once WGC is capturing. The relay
+stays on NvFBC, and says so in the log, when WGC cannot open, when Windows will not take the
+frame interval described next, or when the two displays differ in size. On the desktop the card
+display matches the game display exactly.
+
+Windows limits how often WGC delivers a frame (`MinUpdateInterval`, Windows 11 24H2 and later).
+As found it is 16 ms, and with that a 185 fps game arrived at about 53 frames a second. The
+relay sets it to 0.001 ms. It was first set to 1 ms, and that was wrong for frame generation.
+Under Smooth Motion the real frame arrives 0.27 ms after the generated one, and 0.066 ms at the
+closest, which is sooner than 1 ms allows. With 1 ms set, Windows delivered the generated frame
+when it flipped on the game display and delivered the real frame later, in step with the capture
+card display's refresh. The time between the two moved through the whole 16.7 ms cycle, by 0.03
+to 0.17 ms a second, with jumps at hitches. The relay keeps the second frame of a pair, so it
+kept the real frame only while that frame happened to come a few milliseconds after the
+generated one. In a two-minute run with the user playing, that build showed a generated frame on
+70 to 97% of presents for 48 seconds. When the two arrivals came within about 1 ms of each other
+Windows delivered only the generated frame. In a 13-minute run, about 70 seconds of a cycle of
+about 490 seconds had real frames missing. The runs of 2026-10-09 lasted 20 seconds and caught
+one point of that cycle, with the frames 1 to 4 ms apart, and this section first described that
+as how WGC delivers a pair.
+
+With 0.001 ms both frames arrive together after one flip, generated then real, as NvFBC's do.
+In the user's game at 60 fps with Smooth Motion x2, over 175 seconds, all 10,514 batches were
+pairs. The gap inside a pair was 0.27 ms at the median and 1.46 ms at the most, and the next
+pair came at least 15.0 ms later. The shown content stepped exactly one 60 Hz period on all
+10,512 presents, with no repeat and no blend. So WGC uses the same 3 ms pair window as NvFBC.
+Which frame of a pair is the generated one was checked two ways. The centre of every frame was
+read back, and the first frame of a pair had the softer edges in about 800 pairs to 20 in each
+15 seconds, which is what an interpolated frame looks like. The user was also shown one run that
+kept the first frame and one that kept the second, without being told which was which, and
+called the keep-first run generated. Windows accepted 0.1 and 0.01 ms as well. 0.001 ms leaves
+the most room under the closest pair seen.
+
+A row that only priced the capture, with a wrong picture, read 59 points cheaper than the real
+path on 2026-10-09, so only real rows are quoted. The rows below are one launch on 2026-10-11
+with one run a row. The no-relay rows at its two ends scored 5405 and 5438, and each row's cost
+takes the level as rising evenly between them. The rates are inside the benchmark.
 
 | row | cost | frames stored a second | repeats | holds | blends |
 |---|---|---|---|---|---|
-| `b:vsync -src 60` (NvFBC, the deferred copy) | 288 points, 5.3% | 160.6, in 90.4 batches | 0 | 0 | 7.7% |
-| `b:vsync -src 60 -wgc`, 1 ms | 241 points, 4.5% | 93.1, in 92.0 batches | 0 | 0 | 6.6% |
-| `b:vsync -src 60 -wgc`, Windows' 16 ms | 189 points, 3.5% | 52.8 | 0 | 0 | 53.6% |
+| `b:vsync -src 60` (NvFBC), two rows | 293 and 302 points, 5.5% | 161.3 and 162.2, in 91 batches | 0 | 0 | 7.3 and 6.5% |
+| `b:vsync -src 60 -wgc`, 0.001 ms, three rows | 249, 249 and 252 points, 4.6% | 92.4 | 0 | 0 | 5.5 to 6.2% |
+| the same at 0.01 ms, two rows | 240 and 250 points | 92.4 | 0 | 0 | 5.9 and 6.2% |
+| the same at 1 ms, two rows | 238 and 243 points | 92.4 | 0 | 0 | 5.9 and 6.1% |
+| the same at Windows' 16 ms (2026-10-09, another launch) | 189 points, 3.5% | 52.8 | 0 | 0 | 53.6% |
 
-At 1 ms WGC stores one frame for each of the game's real frames and paces like NvFBC: 60.01
-presents a second, no present gap over 25 ms, and the same spread of shown-content steps. It is
-47 points cheaper. At Windows' own 16 ms it is cheaper than OBS's game capture, and more than
-half of its presents are blends, which is a worse picture. WGC does not deliver DLSS frame
-generation's second wake; NvFBC's second wake there is a duplicate.
+WGC is about 47 points cheaper than NvFBC, as it was on 2026-10-09 (241 and 288 points). This
+sitting cannot tell the three short intervals apart. They are 4 to 11 points apart on single
+runs, two rows of one setting differ by 3 to 18, and each block ran them in the same order while
+the game's level was rising. A cost of up to about 10 points for 0.001 ms is not ruled out. Every
+WGC row presented 60.01 times a second with no present gap over 25 ms and the same spread of
+shown-content steps as NvFBC, and a screenshot taken during each row shows the game on the card
+display. At Windows' own 16 ms WGC is cheaper than OBS's game capture, and more than half of its
+presents are blends, which is a worse picture. Under DLSS frame generation WGC delivers one
+frame for each real frame at every interval, where NvFBC wakes twice and its second wake is a
+duplicate. At 0.01 and 0.001 ms about 1.3% of WGC's frames in the benchmark arrive as a pair,
+and 0.2% do at 1 ms. What those pairs are has not been looked at.
 
-Under Smooth Motion (a 60 fps game at x2, about 20 seconds a run, standing and walking) WGC
-delivers all 120 frames a second, as NvFBC does, and they still come as a pair every 16.7 ms.
-The two members arrive 1 to 4 ms apart, where NvFBC's two wakes come 0.4 ms apart, so the
-relay's 3 ms pair window caught only 29% of them. With a 6 ms window under `-wgc` every wake is
-in a pair (60.1 batches a second), and the shown content steps exactly one 60 Hz period on
-every present, with no repeat and no blend, as it does with NvFBC in the same spot. The second
-member of a WGC pair is the real frame, as it is with NvFBC: reading back the centre of every
-frame for 27 seconds of standing, walking and strafing, the 3,103 frames were 3,101 different
-pictures, and in 1,484 of 1,490 pairs the first frame had the softer edges (77 to 92% of the
-second's edge energy while moving, 99.3 to 99.5% while standing), which is what an interpolated
-frame looks like. The relay keeps the second. ETW flip pairing works on WGC's arrival times
-(1,414 batches paired in one run, none late). WGC's own per-frame timestamp is the compositor's
-and is no use as a clock: under Smooth Motion it ticked with the capture card display's refresh.
-Still untested: a whole stream, the pair window at other rates and multipliers, and HDR sources
-(the pool is 8-bit).
+WGC keeps each frame in its own pool buffer until the relay takes it, so a capture thread that
+is busy loses none. In the 13-minute read-back run the thread spent 1.5 to 2.5 ms on every
+frame and all 92,470 frames arrived. What Windows drops when the relay stalls for longer than
+the pool's two spare buffers last has not been seen. WGC's own per-frame timestamp is the
+compositor's and is no use as a clock. WGC does not scale: a pool's buffers keep the size they
+were made with, and a larger picture is clipped (Microsoft's screen capture page). The present
+samples without filtering, so with displays of different sizes the relay stays on NvFBC, which
+scales in the grab. Still untested: a whole stream, Smooth Motion x3 and other source rates, HDR
+sources (the pool is 8-bit), and capturing the game's window in place of the display.
 
 **Presenting a ring slot by reference (composition swapchain).** Windows 11's composition
 swapchain registers up to 31 textures with a presentation manager and presents any of them, in any
@@ -628,11 +666,12 @@ problems before it finds a number.
 4. One profiled look at NvFBC's grab (section 8), then decide whether anything about it can be
    moved.
 5. DONE 2026-10-08: OBS's projector as two rows in a one-launch sitting (section 1), and on
-   2026-10-09 as four rows, one for each capture method (9.1). Its pacing and picture with each
-   capture method are still to be measured the way the relay's are.
-6. One architectural prototype: WGC with the pool as the ring (also the app's default capture
-   path), or Desktop Duplication, with the composition swapchain as a later step. NvFBC's CUDA
-   interface was the other choice; it was built, measured and dropped on 2026-10-09 (3.4).
+   2026-10-09 as four rows, one for each capture method (9.1). Its pacing and picture were not
+   measured, and the user does not need them (2026-10-09).
+6. DONE 2026-10-11: one architectural prototype, WGC with the pool as the ring, in the relay
+   behind `-wgc` (9.1). Next for it are a whole stream and capturing the game's window. The
+   composition swapchain is a later step. NvFBC's CUDA interface was the other choice. It was
+   built, measured and dropped on 2026-10-09 (3.4).
 7. The CPU-only cleanups, together, checked by the suite and one stream.
 
 Every row is compared inside one launch with a no-relay row and `b:vsync -src 60` at both ends.

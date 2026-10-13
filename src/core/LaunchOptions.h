@@ -21,7 +21,9 @@ namespace launch {
 // nowhere else. The comb lock, the extra lag, flip timing and delivery-lateness
 // correction are on by default because the relay-cost ladder measured no cost for any of them;
 // -nolock, -lag 0, -noetw and -nodejit turn them off. The deferred ring copy is on by default
-// because it lowers what the relay costs the game; -nodefercopy turns it off.
+// because it lowers what the relay costs the game; -nodefercopy turns it off. With -wgc, the
+// frames Windows sends for a move of the mouse pointer alone are left out by default, because
+// each is a copy of the frame before it; -nowgcdrop keeps them.
 struct Options {
     float srcRateHint = 0.0f;       // -src: declared BASE render rate; 0 = not declared
     bool lock = true;               // -lock / -nolock: the phase comb lock
@@ -39,6 +41,8 @@ struct Options {
     bool deferCopy = true;          // -defercopy / -nodefercopy: no ring copy for the frame of a
                                     // frame-generated pair that keep-real drops
     bool wgc = false;               // -wgc: capture through Windows.Graphics.Capture (b:vsync)
+    bool wgcDrop = true;            // -wgcdrop / -nowgcdrop: with -wgc, leave out the frames
+                                    // that only a move of the mouse pointer brought
 };
 
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths always
@@ -138,6 +142,11 @@ inline const std::vector<UsageRow>& OptionRows() {
                            "names it keeps working", false, false},
         {"-wgc", "", "Capture through Windows (Windows.Graphics.Capture) in place of NvFBC, with "
                      "b:vsync only; NvFBC stays when it cannot start", false, false},
+        {"-nowgcdrop", "", "With -wgc, keep the frames Windows sends when only the mouse pointer "
+                           "moved. By default they are left out, since each is a copy of the "
+                           "frame before it", false, false},
+        {"-wgcdrop", "", "Leaving those frames out; on by default, accepted so a launch string "
+                         "that names it keeps working", false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -274,6 +283,8 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-defercopy")   { o->deferCopy = true;  return 1; }
     if (t == "-nodefercopy") { o->deferCopy = false; return 1; }
     if (t == "-wgc")       { o->wgc = true;       return 1; }
+    if (t == "-wgcdrop")   { o->wgcDrop = true;   return 1; }
+    if (t == "-nowgcdrop") { o->wgcDrop = false;  return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -440,6 +451,7 @@ inline std::string FormatOptions(const Options& o) {
     if (o.extraLagMs != d.extraLagMs) add("-lag " + std::to_string(o.extraLagMs));
     if (o.deferCopy != d.deferCopy) add(o.deferCopy ? "-defercopy" : "-nodefercopy");
     if (o.wgc) add("-wgc");
+    if (o.wgcDrop != d.wgcDrop) add(o.wgcDrop ? "-wgcdrop" : "-nowgcdrop");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");

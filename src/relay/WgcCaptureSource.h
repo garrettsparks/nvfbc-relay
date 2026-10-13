@@ -39,6 +39,8 @@ static const GUID kIidSession3 =
     {0xf2cdd966, 0x22ae, 0x5ea1, {0x95, 0x96, 0x3a, 0x28, 0x93, 0x44, 0xc3, 0xbe}};
 static const GUID kIidSession5 =
     {0x67c0ea62, 0x1f85, 0x5061, {0x92, 0x5a, 0x23, 0x9b, 0xe0, 0xac, 0x09, 0xcb}};
+static const GUID kIidFrame2 =
+    {0x37869cfa, 0x2b48, 0x5ebf, {0x9a, 0xfb, 0xdf, 0xfd, 0x80, 0x5d, 0xef, 0xdb}};
 static const GUID kIidClosable =
     {0x30d5a829, 0x7fa4, 0x4026, {0x83, 0xbb, 0xd7, 0x5b, 0xae, 0x4e, 0xa9, 0x9e}};
 static const GUID kIidDxgiAccess =
@@ -63,6 +65,21 @@ struct Frame : IInspectable {
     virtual HRESULT STDMETHODCALLTYPE get_Surface(IInspectable** surface) = 0;
     virtual HRESULT STDMETHODCALLTYPE get_SystemRelativeTime(TimeSpan* time) = 0;
     virtual HRESULT STDMETHODCALLTYPE get_ContentSize(SizeInt32* size) = 0;
+};
+struct RectInt32 { INT32 X; INT32 Y; INT32 Width; INT32 Height; };
+// IVectorView<RectInt32>
+struct RectView : IInspectable {
+    virtual HRESULT STDMETHODCALLTYPE GetAt(UINT32 index, RectInt32* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Size(UINT32* size) = 0;
+    virtual HRESULT STDMETHODCALLTYPE IndexOf(RectInt32 value, UINT32* index,
+                                              unsigned char* found) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetMany(UINT32 start, UINT32 capacity, RectInt32* values,
+                                              UINT32* actual) = 0;
+};
+// What Windows reports as changed in a frame since the frame before it.
+struct Frame2 : IInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_DirtyRegions(RectView** regions) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_DirtyRegionMode(int* mode) = 0;
 };
 struct Session : IInspectable {
     virtual HRESULT STDMETHODCALLTYPE StartCapture() = 0;
@@ -316,6 +333,13 @@ public:
             (int)m_size.Width, (int)m_size.Height, (int)m_buffers, m_cursorOff ? "off" : "ON",
             m_borderOff ? "off" : "ON",
             (long long)(BatchWindowQpc() * 1000000 / r.m_freqQuad));
+        if (r.m_wgcDropPointerFrames) {
+            LOG("WGC: a frame that changed only a small area, as a move of the mouse pointer "
+                "makes, is left out while frames that change the whole picture are arriving "
+                "(-nowgcdrop keeps them)");
+        } else {
+            LOG("WGC: frames that changed only a small area are kept (-nowgcdrop)");
+        }
     }
 
     // The same window as NvFBC's. With the least time between frames at 0.001 ms, WGC hands
@@ -324,13 +348,20 @@ public:
     LONGLONG BatchWindowQpc() const override { return (r.m_freqQuad * 3) / 1000; }
 
     // Blocks until a frame is in the pool or the wait has run out in full. A frame already
-    // queued is taken at once.
+    // queued is taken at once. A frame that only a move of the mouse pointer brought goes
+    // straight back to the pool and the wait goes on, so the ring is never told of it.
     Wake Wait(LARGE_INTEGER* arrived) override {
         LARGE_INTEGER freq, start, now;
         QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&start);
         for (;;) {
             m_pool->TryGetNextFrame(&m_frame);
+            if (m_frame && r.m_wgcDropPointerFrames && PointerOnly(m_frame)) {
+                wgc::Dispose(m_frame);
+                m_frame = NULL;
+                m_pointerFrames++;
+                continue;
+            }
             if (m_frame) break;
             QueryPerformanceCounter(&now);
             const LONGLONG waitedMs = (now.QuadPart - start.QuadPart) * 1000 / freq.QuadPart;
@@ -378,11 +409,59 @@ public:
     void Published(int, long long, const Placement&, bool) override {}
 
     void LogSummary(long long wakesStored) override {
-        LOG("WGC summary: %lld wakes stored, %lld frames came with no texture and were dropped",
-            wakesStored, m_noTexture);
+        LOG("WGC summary: %lld wakes stored, %lld frames came with no texture and were dropped, "
+            "%lld frames that changed only a small area were left out",
+            wakesStored, m_noTexture, m_pointerFrames);
     }
 
 private:
+    // True for a frame Windows reports as changed only in a small area, under a hundredth of
+    // the picture, while frames that change the whole picture are still arriving. A move of
+    // the mouse pointer makes one while WGC is capturing: Windows delivers a frame whose
+    // picture is a copy of the frame before it and marks the pointer's rectangle as all that
+    // changed, where a frame the game presented is marked as the whole picture. Left in, such
+    // a frame reaches the ring as a wake between the pairs of a frame-generated source, or as
+    // a third member of one.
+    //
+    // A frame with no list of changed areas, or an empty one, is never this. Neither is a
+    // small change when nothing has changed the whole picture in the last half second, so a
+    // still screen keeps the small updates that are all it has.
+    bool PointerOnly(wgc::Frame* frame) {
+        long long area = -1;
+        wgc::Frame2* frame2 = NULL;
+        wgc::RectView* regions = NULL;
+        if (SUCCEEDED(frame->QueryInterface(wgc::kIidFrame2, (void**)&frame2)) && frame2) {
+            if (SUCCEEDED(frame2->get_DirtyRegions(&regions)) && regions) {
+                UINT32 count = 0;
+                regions->get_Size(&count);
+                area = 0;
+                for (UINT32 i = 0; i < count; i++) {
+                    wgc::RectInt32 rect = {};
+                    if (FAILED(regions->GetAt(i, &rect))) {
+                        area = -1;
+                        break;
+                    }
+                    area += (long long)rect.Width * rect.Height;
+                }
+                regions->Release();
+            }
+            frame2->Release();
+        }
+        if (area < 0 && !m_noAreasLogged) {
+            m_noAreasLogged = true;
+            LOG("WGC: a frame came with no list of changed areas, and such a frame is never "
+                "left out");
+        }
+        const long long whole = (long long)m_size.Width * m_size.Height;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (area <= 0 || area * 100 >= whole) {
+            if (area >= whole) m_lastWholeQpc = now.QuadPart;
+            return false;
+        }
+        return m_lastWholeQpc != 0 && (now.QuadPart - m_lastWholeQpc) * 2 < r.m_freqQuad;
+    }
+
     // How long a wait lasts with no frame, as long as NvFBC's grab waits: it bounds how
     // quickly the capture thread sees a stop request.
     static const DWORD kWaitMs = 100;
@@ -449,4 +528,7 @@ private:
     ID3D11Texture2D* m_texture = NULL;                // its texture
     wgc::Frame* m_slotFrame[CaptureRing::RING_SIZE];  // the frame each slot names
     long long m_noTexture = 0;
+    long long m_pointerFrames = 0;      // left out by PointerOnly
+    LONGLONG m_lastWholeQpc = 0;        // when a frame last changed the whole picture
+    bool m_noAreasLogged = false;
 };

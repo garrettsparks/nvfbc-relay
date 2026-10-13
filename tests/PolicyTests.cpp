@@ -4803,7 +4803,7 @@ static launch::Options ParseOptionString(const char* text, std::vector<std::stri
 static int CountSwitchesOn(const launch::Options& o) {
     return (int)o.lock + (int)o.tint + (int)o.etw + (int)o.noJoin + (int)o.dejitter +
            (int)o.fgPhase + (int)o.phaseKeep + (int)o.flipEx + (int)o.mark + (int)o.deferCopy +
-           (int)o.wgc;
+           (int)o.wgc + (int)o.wgcDrop;
 }
 
 static bool SameOptions(const launch::Options& a, const launch::Options& b) {
@@ -4812,14 +4812,14 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.dejitterRequested == b.dejitterRequested && a.fgPhase == b.fgPhase &&
            a.phaseKeep == b.phaseKeep && a.flipEx == b.flipEx && a.mark == b.mark &&
            a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs &&
-           a.deferCopy == b.deferCopy && a.wgc == b.wgc;
+           a.deferCopy == b.deferCopy && a.wgc == b.wgc && a.wgcDrop == b.wgcDrop;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
 static launch::Options SwitchesAt(bool on) {
     launch::Options o;
     o.lock = o.tint = o.etw = o.noJoin = o.dejitter = on;
-    o.fgPhase = o.phaseKeep = o.flipEx = o.mark = o.deferCopy = o.wgc = on;
+    o.fgPhase = o.phaseKeep = o.flipEx = o.mark = o.deferCopy = o.wgc = o.wgcDrop = on;
     o.dejitterRequested = on;
     return o;
 }
@@ -4835,9 +4835,10 @@ static void test_launch_defaults() {
     CHECK(!o.dejitterRequested, "a default -dejit must not read as typed");
     CHECK(o.extraLagMs == 75, "-lag must default to 75 ms, got %u", o.extraLagMs);
     CHECK(o.deferCopy, "the deferred ring copy must default on");
-    CHECK(CountSwitchesOn(o) == 4 && o.markFrames == 0,
-          "exactly the lock, flip timing, late-batch correction and the deferred ring copy "
-          "must default on, %d are on",
+    CHECK(o.wgcDrop, "leaving out the frames a mouse pointer move brings must default on");
+    CHECK(CountSwitchesOn(o) == 5 && o.markFrames == 0,
+          "exactly the lock, flip timing, late-batch correction, the deferred ring copy and "
+          "leaving out pointer frames must default on, %d are on",
           CountSwitchesOn(o));
 
     // A blank mode answer is the release path, and it is the same mode b:vsync spells.
@@ -4875,9 +4876,10 @@ static void test_launch_option_parsing() {
     // The full opt-out: every default-on option off, and nothing reported.
     warnings.clear();
     unknown.clear();
-    o = ParseOptionString("-nolock -noetw -nodejit -lag 0 -nodefercopy", &warnings, &unknown);
+    o = ParseOptionString("-nolock -noetw -nodejit -lag 0 -nodefercopy -nowgcdrop", &warnings,
+                          &unknown);
     CHECK(!o.lock && !o.etw && !o.dejitter && o.extraLagMs == 0 && !o.deferCopy &&
-              CountSwitchesOn(o) == 0,
+              !o.wgcDrop && CountSwitchesOn(o) == 0,
           "the opt-outs must turn every default off");
     CHECK(warnings.empty() && unknown.empty(), "the opt-outs must parse clean");
 
@@ -4890,7 +4892,7 @@ static void test_launch_option_parsing() {
         {"-dejit", &launch::Options::dejitter},    {"-fgphase", &launch::Options::fgPhase},
         {"-phasekeep", &launch::Options::phaseKeep}, {"-flipex", &launch::Options::flipEx},
         {"-mark", &launch::Options::mark},         {"-defercopy", &launch::Options::deferCopy},
-        {"-wgc", &launch::Options::wgc},
+        {"-wgc", &launch::Options::wgc},           {"-wgcdrop", &launch::Options::wgcDrop},
     };
     for (const Switch& s : switches) {
         launch::Options x = SwitchesAt(false);
@@ -4907,13 +4909,14 @@ static void test_launch_option_parsing() {
         {"-noetw", &launch::Options::etw},
         {"-nodejit", &launch::Options::dejitter},
         {"-nodefercopy", &launch::Options::deferCopy},
+        {"-nowgcdrop", &launch::Options::wgcDrop},
     };
     for (const Switch& s : optOuts) {
         launch::Options x = SwitchesAt(true);
         const std::vector<std::string> t = {s.flag};
         std::string w;
         const size_t n = launch::ApplyOption(t, 0, &x, &w);
-        CHECK(n == 1 && !(x.*(s.field)) && CountSwitchesOn(x) == 10 && w.empty(),
+        CHECK(n == 1 && !(x.*(s.field)) && CountSwitchesOn(x) == 11 && w.empty(),
               "%s must clear exactly its own switch and consume one token", s.flag);
     }
 
@@ -4925,7 +4928,7 @@ static void test_launch_option_parsing() {
         CHECK(!x.dejitter && !x.dejitterRequested, "-nodejit must take back a typed -dejit");
         x = ParseOptionString("-nodejit -dejit", nullptr, nullptr);
         CHECK(x.dejitter && x.dejitterRequested, "the last of -nodejit and -dejit must win");
-        x = ParseOptionString("-lock -etw -defercopy", nullptr, nullptr);
+        x = ParseOptionString("-lock -etw -defercopy -wgcdrop", nullptr, nullptr);
         CHECK(SameOptions(x, launch::Options()),
               "the positive spellings of the defaults must leave a default launch unchanged");
     }
@@ -5235,6 +5238,8 @@ static void test_launch_relaunch_round_trip() {
         "-fgphase",
         "-wgc",
         "-wgc -src 60 -nodefercopy",
+        "-wgc -nowgcdrop",
+        "-nowgcdrop -wgcdrop -lag 60",
     };
     for (const char* text : launches) {
         launch::Options typed = ParseOptionString(text, nullptr, nullptr);

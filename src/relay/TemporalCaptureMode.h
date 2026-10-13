@@ -101,6 +101,9 @@ private:
     // -wgc: capture through Windows.Graphics.Capture (CaptureRing::EnableWgc). Only on the
     // D3D11 present, whose device the frame pool lives on.
     bool m_wgc;
+    // -nowgcdrop clears it: with -wgc, the frames a move of the mouse pointer alone brings are
+    // left out of the ring.
+    bool m_wgcDrop;
     bool m_phaseKeepRequested;      // asked for, so an unmet prerequisite can say so once
     char m_modeName[64];            // GetModeName: the compositor kind and the present path
     policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
@@ -136,7 +139,7 @@ public:
                         bool etw = false, bool noJoin = false, bool dejitter = false,
                         bool fgPhase = false, bool phaseKeep = false,
                         unsigned int extraLagMs = 0, bool d3d11Present = false,
-                        bool deferCopy = false, bool wgc = false);
+                        bool deferCopy = false, bool wgc = false, bool wgcDrop = true);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;
