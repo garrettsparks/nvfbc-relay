@@ -12,10 +12,11 @@ and the first stream on it kept its menus in the 60 fps regime with one lock rel
 minutes (5.10). Two benchmark sittings on 2026-10-13 found no cost for leaving those frames out,
 no cost for the mouse pointer in the picture and no difference between 0.001, 0.01 and 0.1 ms
 for the least time between frames (5.11). Since then the pointer is in the picture by default
-(`-nowgccursor` leaves it out); no stream has run with it yet. The rule that picks
-those frames is to be sized from the game's own frames in place of a hundredth of the picture,
-so that it works with other games' pointers and at other resolutions (section 8; agreed
-2026-10-13, not built). Last updated 2026-10-13.
+(`-nowgccursor` leaves it out); no stream has run with it yet. The rule that picks those
+frames now draws its line at a twentieth of the picture, where it was a hundredth, to cover
+larger pointers and lower resolutions (section 2). Sizing it from the game's own frames, so
+that it also works for a game in a window, was agreed and is not built (section 8). Last
+updated 2026-10-13.
 
 This file is the reference for WGC capture: what is built, what has been measured, what is not
 known and what to test next. How it got here stays where it was written. The costs, the sittings
@@ -91,8 +92,9 @@ capturing, Windows delivers a frame for each move of a visible mouse pointer: a 
 frame before it, reported as changed only in the pointer's rectangle (5.9). `Wait` gives such a
 frame straight back to the pool and goes on waiting, so the ring is never told of it and none
 of the ring's, the lock's or the policy's code is involved. The rule
-(`WgcCaptureSource::PointerOnly`): the frame's changed areas sum to under a hundredth of the
-picture, and a frame that changed the whole picture arrived in the last half second. A frame
+(`WgcCaptureSource::PointerOnly`): the frame's changed areas sum to under a twentieth of the
+picture (a hundredth up to `c448312`), and a frame that changed the whole picture arrived in
+the last half second. A frame
 with no list of changed areas, or an empty one, is kept, and so is a small change on a screen
 where nothing has redrawn the whole picture for half a second. Both numbers are defaults the
 user owns. The log says which way it is set, and the closing line counts them:
@@ -116,15 +118,26 @@ night (5.10). Its benchmark rows are in 5.11: leaving the frames out costs the g
 measurable.
 
 Windows gives no flag that says a frame came from the pointer. The rule reads the size of the
-changed area, and the hundredth of the picture is a line drawn between what was measured: the
-largest pointer frame in any log is 2,048 pixels (two 32x32 rectangles, when the pointer jumped
-far), 0.056% of 2560x1440, and a game frame is the whole of it. The user, 2026-10-12: "different
-games have different pointers", "we need to consider scaling it by resolution or something. but
-for now we leave it". A pointer keeps its pixel size when the resolution drops, so its share of
-the picture grows on a smaller screen. The hundredth covers a pointer about 190 pixels square at
-2560x1440 and about 96 at 1280x720, and about 135 and 68 when the pointer jumps and Windows
-reports two rectangles. Section 8 has the rule that is to replace it, sized from the game's own
-frames.
+changed area, and the line is drawn between what was measured: the largest pointer frame in any
+log is 2,048 pixels (two 32x32 rectangles, when the pointer jumped far), 0.056% of 2560x1440,
+and a game frame is the whole of it. The user, 2026-10-12: "different games have different
+pointers", "we need to consider scaling it by resolution or something. but for now we leave
+it". A pointer keeps its pixel size when the resolution drops, so its share of the picture
+grows on a smaller screen.
+
+The line was a hundredth of the picture up to `c448312` and is a twentieth since. The user,
+2026-10-13, after agreeing the rule of section 8: "can we make it like 2% or 5% to give us a
+little more wiggle room for now without requiring a ton more testing?", then "go ahead and do
+the 5% change". The twentieth covers a pointer about 429 pixels square at 2560x1440, 321 at
+1920x1080 and 214 at 1280x720, and about 303, 228 and 152 when the pointer jumps and Windows
+reports two rectangles. So it leaves out every pointer size Windows offers at 2560x1440 (the
+largest, 256 pixels, is 3.6% of the picture when it jumps), all but the largest jumping at
+1920x1080 (6.3%), and up to a 128-pixel pointer jumping at 1280x720 (3.6%). On everything read
+so far the hundredth and the twentieth give the same result, since nothing between 0.06% of the
+picture and the whole of it has been seen; the benchmark's frames were all the whole picture,
+and the work a frame does is the same, so no benchmark row was run for it. Checked: a zig build
+(`drop5pct1`). The suite does not compile this code. Section 8 has the rule that is to replace
+it, sized from the game's own frames.
 
 **Lines that mean trouble.** `WGC: frames are now WxH, and the pool's buffers WxH` (the content
 changed size), `WGC: a frame came with no texture and was dropped`, and `WGC: a frame came with
@@ -699,15 +712,18 @@ Each is the user's.
   remembers the largest changed area any frame was reported with, and forgets it when half a
   second passes with no frame at least that large. A frame is left out when its changed area is
   under a tenth of the remembered one. A frame with no list of changed areas, or an empty one,
-  is kept as now, and `-nowgcdrop` keeps every frame as now.
+  is kept as now, and `-nowgcdrop` keeps every frame as now. The user, later that day: "I
+  think we keep it at 10% for now. we'll adjust later if we need to", and then asked for 2% or
+  5% of the picture "without requiring a ton more testing". So the rule as built moved from a
+  hundredth to a twentieth of the picture (section 2), and this rule stays agreed and unbuilt.
 
-  | case | the rule as built | the rule sized from the game's frames |
+  | case | the rule as built (a twentieth of the picture) | the rule sized from the game's frames |
   |---|---|---|
   | a game that fills the display, a pointer of the size measured | left out | left out |
-  | the same, a pointer over a hundredth of the picture | kept | left out, up to a tenth of the picture |
+  | the same, a pointer over a twentieth of the picture | kept | left out, up to a tenth of the picture |
   | a still screen where only the pointer moves | kept after the first half second | the same |
   | a game in a window smaller than the display (not seen) | kept, since no frame is the whole picture | left out |
-  | a notification or overlay that updates between game frames (not seen) | kept unless under a hundredth of the picture | left out when under a tenth of a game frame |
+  | a notification or overlay that updates between game frames (not seen) | kept unless under a twentieth of the picture | left out when under a tenth of a game frame |
 
   The reasons. A game frame was reported as the whole picture in both games read so far (the
   user's game in 5.9, and Avatar in 5.11: 7,689 of 7,689 frames and 7,706 of 7,706), while a
@@ -728,7 +744,7 @@ Each is the user's.
   the pointers allow because the two mistakes cost differently. A pointer frame that is kept gives the menu behaviour of section 5. A frame of
   real content that is left out is a picture that does not change: an application that redraws
   only parts of its picture would have every update under the line left out for half a second
-  after each whole redraw. The rule as built does that already for updates under a hundredth.
+  after each whole redraw. The rule as built does that already for updates under a twentieth.
   On everything measured so far a tenth and a quarter give the same result, so the number is a
   judgement about cases not yet seen. The user accepted the tenth on 2026-10-13, and of the
   largest pointer on a 1280x720 display said "this seems unlikely".
@@ -744,9 +760,9 @@ Each is the user's.
   The rule would lose frames in a game whose own frames are reported with areas more than ten
   times apart inside half a second. No game read so far does that.
 
-  For a game that fills the display, a tenth of the picture in place of the hundredth in
-  `PointerOnly` gives the same result with one number changed. The remembered area is what
-  makes the rule work for a game in a window.
+  For a game that fills the display, a fixed share of the picture in `PointerOnly` gives the
+  same result with one number, which is what was done (a twentieth). The remembered area is
+  what makes the rule work for a game in a window.
 - **Whether the pointer goes back in the stream's picture.** The user, 2026-10-12: "it's not a
   huge deal, although I would like to turn mouse back on at some point". On WGC that is cursor
   capture on, and 5.9 shows no cost in extra frames beyond what a moving pointer brings anyway.

@@ -421,7 +421,7 @@ public:
     }
 
 private:
-    // True for a frame Windows reports as changed only in a small area, under a hundredth of
+    // True for a frame Windows reports as changed only in a small area, under a twentieth of
     // the picture, while frames that change the whole picture are still arriving. A move of
     // the mouse pointer makes one while WGC is capturing: Windows delivers a frame whose
     // picture is a copy of the frame before it and marks the pointer's rectangle as all that
@@ -461,7 +461,7 @@ private:
         const long long whole = (long long)m_size.Width * m_size.Height;
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
-        if (area <= 0 || area * 100 >= whole) {
+        if (area <= 0 || area * 20 >= whole) {
             if (area >= whole) m_lastWholeQpc = now.QuadPart;
             return false;
         }
