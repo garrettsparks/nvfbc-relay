@@ -10,8 +10,9 @@ a copy of the frame before it, reported by Windows as changed only in a pointer-
 rectangle. Since `407caaf` those frames are left out before the ring by default (section 2),
 and the first stream on it kept its menus in the 60 fps regime with one lock release in 31
 minutes (5.10). Two benchmark sittings on 2026-10-13 found no cost for leaving those frames out,
-no cost for the mouse pointer in the picture (`-wgccursor`, off by default) and no difference
-between 0.001, 0.01 and 0.1 ms for the least time between frames (5.11). The rule that picks
+no cost for the mouse pointer in the picture and no difference between 0.001, 0.01 and 0.1 ms
+for the least time between frames (5.11). Since then the pointer is in the picture by default
+(`-nowgccursor` leaves it out); no stream has run with it yet. The rule that picks
 those frames is to be sized from the game's own frames in place of a hundredth of the picture,
 so that it works with other games' pointers and at other resolutions (section 8; agreed
 2026-10-13, not built). Last updated 2026-10-13.
@@ -47,7 +48,7 @@ moves to it. NvFBC is let go only once WGC is capturing. The log says each step:
     Capture through Windows.Graphics.Capture asked (-wgc): it takes over from NvFBC once the D3D11 present is up, and NvFBC stays if it cannot start
     WGC: least time between frames 16.000 ms as found, 0.001 ms after asking for 0.001 ms
     CaptureRing: capture moved from NvFBC to Windows.Graphics.Capture after 22 wakes
-    WGC: capturing the 2560x1440 source display into a pool of 34 buffers on the D3D11 present's device; a ring slot names the pool texture its frame is in, and no frame is copied; cursor off, border off; wakes under 3000 us apart are one batch
+    WGC: capturing the 2560x1440 source display into a pool of 34 buffers on the D3D11 present's device; a ring slot names the pool texture its frame is in, and no frame is copied; cursor on (-nowgccursor leaves it out), border off; wakes under 3000 us apart are one batch
 
 **When it stays on NvFBC.** Each of these leaves the relay on NvFBC with the reason in the log:
 
@@ -74,7 +75,7 @@ in as it is.
 | setting | interface | the relay sets | state |
 |---|---|---|---|
 | least time between frames (`MinUpdateInterval`) | `Session5` | 0.001 ms, and refuses WGC without it | settled (section 3) |
-| cursor in the picture (`IsCursorCaptureEnabled`) | `Session2` | off, to match NvFBC's grab; on with `-wgccursor` | set; a moving pointer brings the same extra frames either way (5.9), and on costs nothing with no pointer on screen (5.11) |
+| cursor in the picture (`IsCursorCaptureEnabled`) | `Session2` | on; off with `-nowgccursor`, to match NvFBC's grab | set; a moving pointer brings the same extra frames either way (5.9), and on costs nothing with no pointer on screen (5.11) |
 | yellow border (`IsBorderRequired`) | `Session3` | off | set |
 | a frame's changed areas (`DirtyRegions`) | `IDirect3D11CaptureFrame2` | nothing; it reads the list of every frame | used to leave out the mouse pointer's frames (below) |
 | how changed areas are handled (`DirtyRegionMode`) | not declared | nothing; it is report-only as found | not needed |
@@ -629,9 +630,10 @@ window that moves, resizes or closes.
   does not turn the hardware cursor off on the display. T7's own note says `= 1` was never
   tested in a game; the user, 2026-10-12: "I'm not convinced it does anymore with a game in
   fullscreen mode".
-- **WGC.** `put_IsCursorCaptureEnabled(0)`, logged as "cursor off". It leaves the pointer out of
-  the captured picture. `-wgccursor` (off by default) sets it to 1, logged as "cursor on
-  (-wgccursor)", and the pointer is then in the picture. A moving pointer brings its extra
+- **WGC.** `put_IsCursorCaptureEnabled(1)` by default, logged as "cursor on (-nowgccursor leaves
+  it out)", and the pointer is in the captured picture. `-nowgccursor` sets it to 0, logged as
+  "cursor off (-nowgccursor)", and leaves the pointer out as NvFBC's grab does. `-wgccursor` is
+  accepted. Up to `f530b08` the pointer was left out unless `-wgccursor` was typed. A moving pointer brings its extra
   frames with the setting on or off (5.9), and they are left out the same (5.9, the run with
   cursor capture on). In the benchmark, which shows no pointer, the setting costs nothing
   (5.11).
@@ -752,8 +754,10 @@ Each is the user's.
   170 wakes a second with nothing to tell them from frames (5.9). The user, 2026-10-13: "part of
   this benchmark should also be with the cursor re-enabled just for wgc mode? Since that's what
   we really want ideally". The switch `-wgccursor` is built and its benchmark rows cost nothing
-  (5.11). Whether it becomes the default with `-wgc` is open, and a stream with it on has not
-  run.
+  (5.11). DECIDED 2026-10-13: "let's make wgccursor the default now. I'll use that build to
+  stream tonight." The pointer is in the picture by default with `-wgc`, and `-nowgccursor`
+  leaves it out. The default's rows are the `-wgccursor` rows of 5.11, so no new row is owed.
+  Not yet seen on a build of the user's branch: the pointer on the card, and a stream.
 - **Which member the ring keeps from a batch of three.** Today it is the last, which is the
   extra about half the time. Neither "the last" nor "the second" is right for both orders, so
   the ring would have to tell the extra from the pair. W4 says how much it matters.

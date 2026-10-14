@@ -289,8 +289,8 @@ public:
         m_handlerAdded = true;
         m_result = m_pool->CreateCaptureSession(m_item, &m_session);
         if (FAILED(m_result)) return Fail("CreateCaptureSession");
-        // No cursor unless -wgccursor asks for it, as NvFBC grabs without its hardware cursor,
-        // and no yellow border around the captured display.
+        // The mouse pointer is in the picture unless -nowgccursor leaves it out, as NvFBC's
+        // grab does. No yellow border around the captured display.
         wgc::Session2* session2 = NULL;
         if (SUCCEEDED(m_session->QueryInterface(wgc::kIidSession2, (void**)&session2))) {
             const HRESULT set = session2->put_IsCursorCaptureEnabled(r.m_wgcCursor ? 1 : 0);
@@ -328,10 +328,11 @@ public:
     }
 
     void LogStart() override {
-        // "ON" in capitals is a pointer nobody asked for: Windows did not take the setting.
+        // "ON" in capitals is a pointer -nowgccursor asked to leave out: Windows did not take
+        // the setting.
         const char* cursor = "ON";
-        if (m_cursorOff) cursor = "off";
-        else if (r.m_wgcCursor) cursor = "on (-wgccursor)";
+        if (m_cursorOff) cursor = "off (-nowgccursor)";
+        else if (r.m_wgcCursor) cursor = "on (-nowgccursor leaves it out)";
         LOG("WGC: capturing the %dx%d source display into a pool of %d buffers on the D3D11 "
             "present's device; a ring slot names the pool texture its frame is in, and no frame "
             "is copied; cursor %s, border %s; wakes under %lld us apart are one batch",

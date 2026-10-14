@@ -104,7 +104,7 @@ private:
     // -nowgcdrop clears it: with -wgc, the frames a move of the mouse pointer alone brings are
     // left out of the ring.
     bool m_wgcDrop;
-    // -wgccursor: with -wgc, the mouse pointer is in the captured picture.
+    // -nowgccursor clears it: with -wgc, the mouse pointer is in the captured picture.
     bool m_wgcCursor;
     bool m_phaseKeepRequested;      // asked for, so an unmet prerequisite can say so once
     char m_modeName[64];            // GetModeName: the compositor kind and the present path
@@ -142,7 +142,7 @@ public:
                         bool fgPhase = false, bool phaseKeep = false,
                         unsigned int extraLagMs = 0, bool d3d11Present = false,
                         bool deferCopy = false, bool wgc = false, bool wgcDrop = true,
-                        bool wgcCursor = false);
+                        bool wgcCursor = true);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

@@ -366,7 +366,7 @@ private:
     // -wgc; see EnableWgc.
     bool m_wgcRequested = false;
     bool m_wgcDropPointerFrames = true;
-    bool m_wgcCursor = false;
+    bool m_wgcCursor = true;
     HMONITOR m_sourceMonitor = NULL;                       // the display WGC captures
     std::atomic<ID3D11Device*> m_wgcDevice{NULL};          // offered once by the present
     std::atomic<ID3D11Texture2D*> m_wgcTexture[RING_SIZE];   // written by the capture thread

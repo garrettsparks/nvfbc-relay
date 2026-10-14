@@ -4838,9 +4838,11 @@ static void test_launch_defaults() {
     CHECK(o.extraLagMs == 75, "-lag must default to 75 ms, got %u", o.extraLagMs);
     CHECK(o.deferCopy, "the deferred ring copy must default on");
     CHECK(o.wgcDrop, "leaving out the frames a mouse pointer move brings must default on");
-    CHECK(CountSwitchesOn(o) == 5 && o.markFrames == 0,
-          "exactly the lock, flip timing, late-batch correction, the deferred ring copy and "
-          "leaving out pointer frames must default on, %d are on",
+    CHECK(o.wgcCursor, "the mouse pointer in the WGC picture must default on");
+    CHECK(CountSwitchesOn(o) == 6 && o.markFrames == 0,
+          "exactly the lock, flip timing, late-batch correction, the deferred ring copy, "
+          "leaving out pointer frames and the pointer in the WGC picture must default on, %d "
+          "are on",
           CountSwitchesOn(o));
 
     // A blank mode answer is the release path, and it is the same mode b:vsync spells.
@@ -4878,10 +4880,10 @@ static void test_launch_option_parsing() {
     // The full opt-out: every default-on option off, and nothing reported.
     warnings.clear();
     unknown.clear();
-    o = ParseOptionString("-nolock -noetw -nodejit -lag 0 -nodefercopy -nowgcdrop", &warnings,
-                          &unknown);
+    o = ParseOptionString("-nolock -noetw -nodejit -lag 0 -nodefercopy -nowgcdrop -nowgccursor",
+                          &warnings, &unknown);
     CHECK(!o.lock && !o.etw && !o.dejitter && o.extraLagMs == 0 && !o.deferCopy &&
-              !o.wgcDrop && CountSwitchesOn(o) == 0,
+              !o.wgcDrop && !o.wgcCursor && CountSwitchesOn(o) == 0,
           "the opt-outs must turn every default off");
     CHECK(warnings.empty() && unknown.empty(), "the opt-outs must parse clean");
 
@@ -4913,6 +4915,7 @@ static void test_launch_option_parsing() {
         {"-nodejit", &launch::Options::dejitter},
         {"-nodefercopy", &launch::Options::deferCopy},
         {"-nowgcdrop", &launch::Options::wgcDrop},
+        {"-nowgccursor", &launch::Options::wgcCursor},
     };
     for (const Switch& s : optOuts) {
         launch::Options x = SwitchesAt(true);
@@ -4931,7 +4934,7 @@ static void test_launch_option_parsing() {
         CHECK(!x.dejitter && !x.dejitterRequested, "-nodejit must take back a typed -dejit");
         x = ParseOptionString("-nodejit -dejit", nullptr, nullptr);
         CHECK(x.dejitter && x.dejitterRequested, "the last of -nodejit and -dejit must win");
-        x = ParseOptionString("-lock -etw -defercopy -wgcdrop", nullptr, nullptr);
+        x = ParseOptionString("-lock -etw -defercopy -wgcdrop -wgccursor", nullptr, nullptr);
         CHECK(SameOptions(x, launch::Options()),
               "the positive spellings of the defaults must leave a default launch unchanged");
     }
@@ -5244,6 +5247,8 @@ static void test_launch_relaunch_round_trip() {
         "-wgc -nowgcdrop",
         "-nowgcdrop -wgcdrop -lag 60",
         "-wgc -wgccursor",
+        "-wgc -nowgccursor",
+        "-nowgccursor -wgccursor -lag 60",
     };
     for (const char* text : launches) {
         launch::Options typed = ParseOptionString(text, nullptr, nullptr);

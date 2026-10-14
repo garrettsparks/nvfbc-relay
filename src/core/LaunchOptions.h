@@ -23,7 +23,9 @@ namespace launch {
 // -nolock, -lag 0, -noetw and -nodejit turn them off. The deferred ring copy is on by default
 // because it lowers what the relay costs the game; -nodefercopy turns it off. With -wgc, the
 // frames Windows sends for a move of the mouse pointer alone are left out by default, because
-// each is a copy of the frame before it; -nowgcdrop keeps them.
+// each is a copy of the frame before it; -nowgcdrop keeps them. With -wgc the mouse pointer is
+// in the captured picture by default, because the benchmark measured no cost for it;
+// -nowgccursor leaves it out.
 struct Options {
     float srcRateHint = 0.0f;       // -src: declared BASE render rate; 0 = not declared
     bool lock = true;               // -lock / -nolock: the phase comb lock
@@ -43,7 +45,8 @@ struct Options {
     bool wgc = false;               // -wgc: capture through Windows.Graphics.Capture (b:vsync)
     bool wgcDrop = true;            // -wgcdrop / -nowgcdrop: with -wgc, leave out the frames
                                     // that only a move of the mouse pointer brought
-    bool wgcCursor = false;         // -wgccursor: with -wgc, the mouse pointer is in the picture
+    bool wgcCursor = true;          // -wgccursor / -nowgccursor: with -wgc, the mouse pointer
+                                    // is in the picture
 };
 
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths always
@@ -148,8 +151,10 @@ inline const std::vector<UsageRow>& OptionRows() {
                            "frame before it", false, false},
         {"-wgcdrop", "", "Leaving those frames out; on by default, accepted so a launch string "
                          "that names it keeps working", false, false},
-        {"-wgccursor", "", "With -wgc, show the mouse pointer in the captured picture. By "
-                           "default it is left out, as it is with NvFBC", false, false},
+        {"-nowgccursor", "", "With -wgc, leave the mouse pointer out of the captured picture, "
+                             "as NvFBC does. By default it is in the picture", false, false},
+        {"-wgccursor", "", "The mouse pointer in the picture; on by default, accepted so a "
+                           "launch string that names it keeps working", false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -288,7 +293,8 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-wgc")       { o->wgc = true;       return 1; }
     if (t == "-wgcdrop")   { o->wgcDrop = true;   return 1; }
     if (t == "-nowgcdrop") { o->wgcDrop = false;  return 1; }
-    if (t == "-wgccursor") { o->wgcCursor = true; return 1; }
+    if (t == "-wgccursor")   { o->wgcCursor = true;  return 1; }
+    if (t == "-nowgccursor") { o->wgcCursor = false; return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -456,7 +462,7 @@ inline std::string FormatOptions(const Options& o) {
     if (o.deferCopy != d.deferCopy) add(o.deferCopy ? "-defercopy" : "-nodefercopy");
     if (o.wgc) add("-wgc");
     if (o.wgcDrop != d.wgcDrop) add(o.wgcDrop ? "-wgcdrop" : "-nowgcdrop");
-    if (o.wgcCursor) add("-wgccursor");
+    if (o.wgcCursor != d.wgcCursor) add(o.wgcCursor ? "-wgccursor" : "-nowgccursor");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");
