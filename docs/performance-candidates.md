@@ -35,7 +35,7 @@ correct for.
 | `60` | 4.69% | one-launch sitting, 2026-10-07 |
 | `60` with the original relay's timer (32.3 loops a second) | 3.05% | the same sitting |
 | `b:vsync -src 60` with the deferred ring copy (the default since 2026-10-08) | 5.1 to 5.4% | three one-launch sittings, 2026-10-08 |
-| `b:vsync -src 60 -wgc`, capture through Windows, off by default (9.1) | 4.6% | one-launch sitting, 2026-10-11 |
+| `b:vsync -src 60 -wgc`, capture through Windows, off by default (9.1) | 4.6%, and 4.5% | one-launch sitting, 2026-10-11, and two on 2026-10-13 |
 | OBS projector, game capture, 2560x1440 canvas | 3.76% | one-launch sitting, 2026-10-08 |
 | OBS projector, display capture, 2560x1440 canvas | 6.23% | the same sitting |
 | OBS projector, game capture, 1920x1080 canvas | 4.85% | by hand on 2026-10-03, separate launches |
@@ -578,7 +578,33 @@ display. At Windows' own 16 ms WGC is cheaper than OBS's game capture, and more 
 presents are blends, which is a worse picture. Under DLSS frame generation WGC delivers one
 frame for each real frame at every interval, where NvFBC wakes twice and its second wake is a
 duplicate. At 0.01 and 0.001 ms about 1.3% of WGC's frames in the benchmark arrive as a pair,
-and 0.2% do at 1 ms. What those pairs are has not been looked at.
+and 0.2% do at 1 ms.
+
+Two more sittings on 2026-10-13 settled the interval and priced two settings added since. Each
+ran five settings four times in mirrored cycles, one run a row, with no-relay rows at the
+start, the middle and the end. A difference is from a fit of the 40 rows with a drift curve
+for each sitting; the fit puts the noise at 5.0 points a row.
+
+| row | rows | mean cost | difference from the first row |
+|---|---|---|---|
+| `b:vsync -src 60 -wgc`, 0.001 ms, as it ships | 8 | 243.7 points | |
+| the same at 0.01 ms | 8 | 242.1 | -1.2 +- 2.6 |
+| the same at 0.1 ms | 8 | 243.4 | +0.6 +- 2.6 |
+| `b:vsync -src 60 -wgc -nowgcdrop` | 8 | 242.2 | -1.1 +- 2.6 |
+| `b:vsync -src 60 -wgc -wgccursor` | 8 | 242.6 | -1.1 +- 2.7 |
+| `b:vsync -src 60 -wgc`, the CI build of `407caaf` | 4 | 247.6 | |
+| `b:vsync -src 60` (NvFBC), the CI build of `407caaf` | 4 | 289.8 | |
+
+The three intervals cost the same, so the cost of up to 10 points for 0.001 ms is ruled out for
+0.01 and 0.1 ms, and the relay keeps 0.001 ms. Leaving out the mouse pointer's frames costs
+nothing these rows can see, and neither does the pointer in the picture while no pointer is on
+screen. WGC is about 46 points cheaper than NvFBC, as before. Every WGC row stored 92 to 93
+frames a second and presented 60.00 to 60.01 times a second with no hold, and the card showed
+the game in every screenshot. A third sitting the same day captured the game's window in place
+of the display on the experiment build: 248 points where display capture read 252 and 242,
+and the same 92.8 frames a second. A readback of every frame's picture read the pairs as a
+generated frame followed by its real frame, about two a second of the 90 the game generates.
+`wgc-capture-spec.md` section 5.11 has the rows.
 
 WGC keeps each frame in its own pool buffer until the relay takes it, so a capture thread that
 is busy loses none. In the 13-minute read-back run the thread spent 1.5 to 2.5 ms on every
@@ -587,8 +613,9 @@ the pool's two spare buffers last has not been seen. WGC's own per-frame timesta
 compositor's and is no use as a clock. WGC does not scale: a pool's buffers keep the size they
 were made with, and a larger picture is clipped (Microsoft's screen capture page). The present
 samples without filtering, so with displays of different sizes the relay stays on NvFBC, which
-scales in the grab. Still untested: a whole stream, Smooth Motion x3 and other source rates, HDR
-sources (the pool is 8-bit), and capturing the game's window in place of the display.
+scales in the grab. Still untested: Smooth Motion x3 and other source rates, HDR sources (the
+pool is 8-bit), and capturing the game's window under Smooth Motion. Two streams have run on
+it (`wgc-capture-spec.md` sections 4 and 5.10).
 
 **Presenting a ring slot by reference (composition swapchain).** Windows 11's composition
 swapchain registers up to 31 textures with a presentation manager and presents any of them, in any

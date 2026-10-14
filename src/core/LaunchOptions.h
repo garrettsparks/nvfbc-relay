@@ -43,6 +43,7 @@ struct Options {
     bool wgc = false;               // -wgc: capture through Windows.Graphics.Capture (b:vsync)
     bool wgcDrop = true;            // -wgcdrop / -nowgcdrop: with -wgc, leave out the frames
                                     // that only a move of the mouse pointer brought
+    bool wgcCursor = false;         // -wgccursor: with -wgc, the mouse pointer is in the picture
 };
 
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths always
@@ -147,6 +148,8 @@ inline const std::vector<UsageRow>& OptionRows() {
                            "frame before it", false, false},
         {"-wgcdrop", "", "Leaving those frames out; on by default, accepted so a launch string "
                          "that names it keeps working", false, false},
+        {"-wgccursor", "", "With -wgc, show the mouse pointer in the captured picture. By "
+                           "default it is left out, as it is with NvFBC", false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -285,6 +288,7 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-wgc")       { o->wgc = true;       return 1; }
     if (t == "-wgcdrop")   { o->wgcDrop = true;   return 1; }
     if (t == "-nowgcdrop") { o->wgcDrop = false;  return 1; }
+    if (t == "-wgccursor") { o->wgcCursor = true; return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -452,6 +456,7 @@ inline std::string FormatOptions(const Options& o) {
     if (o.deferCopy != d.deferCopy) add(o.deferCopy ? "-defercopy" : "-nodefercopy");
     if (o.wgc) add("-wgc");
     if (o.wgcDrop != d.wgcDrop) add(o.wgcDrop ? "-wgcdrop" : "-nowgcdrop");
+    if (o.wgcCursor) add("-wgccursor");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");

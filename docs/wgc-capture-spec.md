@@ -7,8 +7,14 @@ them it is a single and the lock releases; inside a pair's window it makes a bat
 the ring can keep it in place of the real frame (section 5). A sitting on 2026-10-12 found what
 it is (5.9): a frame Windows delivers for each move of the mouse pointer while WGC is capturing,
 a copy of the frame before it, reported by Windows as changed only in a pointer-sized
-rectangle. What the ring does about it is the user's decision (section 8). Last updated
-2026-10-12.
+rectangle. Since `407caaf` those frames are left out before the ring by default (section 2),
+and the first stream on it kept its menus in the 60 fps regime with one lock release in 31
+minutes (5.10). Two benchmark sittings on 2026-10-13 found no cost for leaving those frames out,
+no cost for the mouse pointer in the picture (`-wgccursor`, off by default) and no difference
+between 0.001, 0.01 and 0.1 ms for the least time between frames (5.11). The rule that picks
+those frames is to be sized from the game's own frames in place of a hundredth of the picture,
+so that it works with other games' pointers and at other resolutions (section 8; agreed
+2026-10-13, not built). Last updated 2026-10-13.
 
 This file is the reference for WGC capture: what is built, what has been measured, what is not
 known and what to test next. How it got here stays where it was written. The costs, the sittings
@@ -68,7 +74,7 @@ in as it is.
 | setting | interface | the relay sets | state |
 |---|---|---|---|
 | least time between frames (`MinUpdateInterval`) | `Session5` | 0.001 ms, and refuses WGC without it | settled (section 3) |
-| cursor in the picture (`IsCursorCaptureEnabled`) | `Session2` | off, to match NvFBC's grab | set; what it does to frame delivery is untested (section 6) |
+| cursor in the picture (`IsCursorCaptureEnabled`) | `Session2` | off, to match NvFBC's grab; on with `-wgccursor` | set; a moving pointer brings the same extra frames either way (5.9), and on costs nothing with no pointer on screen (5.11) |
 | yellow border (`IsBorderRequired`) | `Session3` | off | set |
 | a frame's changed areas (`DirtyRegions`) | `IDirect3D11CaptureFrame2` | nothing; it reads the list of every frame | used to leave out the mouse pointer's frames (below) |
 | how changed areas are handled (`DirtyRegionMode`) | not declared | nothing; it is report-only as found | not needed |
@@ -78,8 +84,8 @@ The header declares `Session2`, `Session3` and `Session5` by hand. The dirty-reg
 secondary-window interfaces and their IDs have to be taken from mingw-w64's
 `windows.graphics.capture.h` or Microsoft's windows-rs bindings, as the others were.
 
-**The mouse pointer's frames are left out** (in the user's working tree on 2026-10-12, after
-`e79a362`; on by default, `-nowgcdrop` keeps them, `-wgcdrop` is accepted). While WGC is
+**The mouse pointer's frames are left out** (`407caaf`, 2026-10-12; on by default, `-nowgcdrop`
+keeps them, `-wgcdrop` is accepted). While WGC is
 capturing, Windows delivers a frame for each move of a visible mouse pointer: a copy of the
 frame before it, reported as changed only in the pointer's rectangle (5.9). `Wait` gives such a
 frame straight back to the pool and goes on waiting, so the ring is never told of it and none
@@ -103,7 +109,21 @@ log `mouse5.run.log`): by default every stretch reads 120 wakes in 60 batches a 
 batch of one or of three, the inventory scrolling, the map zooming and the map dragged
 included, and 1,432 frames were left out; with `-nowgcdrop` the same stretches read 178 to 180
 wakes, with 59 batches of one a second in the inventory and 58 to 60 batches of three in the
-map, and none were left out. Not yet: a CI build, a stream, a benchmark row.
+map, and none were left out. CI 38351906834 built `407caaf` with 0 warnings, the same imports
+as `e79a362` and the suite's 652 lines unchanged, and the user streamed on that build the same
+night (5.10). Its benchmark rows are in 5.11: leaving the frames out costs the game nothing
+measurable.
+
+Windows gives no flag that says a frame came from the pointer. The rule reads the size of the
+changed area, and the hundredth of the picture is a line drawn between what was measured: the
+largest pointer frame in any log is 2,048 pixels (two 32x32 rectangles, when the pointer jumped
+far), 0.056% of 2560x1440, and a game frame is the whole of it. The user, 2026-10-12: "different
+games have different pointers", "we need to consider scaling it by resolution or something. but
+for now we leave it". A pointer keeps its pixel size when the resolution drops, so its share of
+the picture grows on a smaller screen. The hundredth covers a pointer about 190 pixels square at
+2560x1440 and about 96 at 1280x720, and about 135 and 68 when the pointer jumps and Windows
+reports two rectangles. Section 8 has the rule that is to replace it, sized from the game's own
+frames.
 
 **Lines that mean trouble.** `WGC: frames are now WxH, and the pool's buffers WxH` (the content
 changed size), `WGC: a frame came with no texture and was dropped`, and `WGC: a frame came with
@@ -131,9 +151,17 @@ section 9.1 and in `session-kickoff-performance-pass-7.md`.
 - **`SystemRelativeTime` is no use as a clock.** Which clock it follows changes with how the
   game's frames reach the compositor. Dropped; the ETW flips are the clock.
 - **WGC does not scale.** A pool's buffers keep their size and bigger content is clipped.
-- **Cost.** About 249 points against NvFBC's 297 in one launch. The 1 ms, 0.01 ms and 0.001 ms
-  rows could not be told apart; up to about 10 points for 0.001 ms is not ruled out.
-- **Under DLSS frame generation** WGC delivers one frame for each real frame.
+- **Cost.** About 249 points where NvFBC costs 297, in one launch on 2026-10-11, and 244 and 290
+  over two launches on 2026-10-13 (5.11).
+- **0.001 ms costs the game no more than 0.01 or 0.1 ms.** Eight rows of each on 2026-10-13:
+  0.01 ms read 1.2 points cheaper than 0.001 and 0.1 ms read 0.6 dearer, each good to 2.6 (5.11).
+  So the setting stays at 0.001 ms, which leaves the most room under the closest pair seen in
+  the user's game (0.037 ms on the 2026-10-12 stream, where 5.9% of pairs came under 0.1 ms
+  apart and none under 0.01).
+- **Under DLSS frame generation** WGC delivers one frame for each real frame. About two a
+  second also bring a second frame 1.9 ms before them: a different picture, the softer of the
+  two in 168 of 179, which is what a generated frame followed by its real frame would read as
+  (5.11). Capturing the game's window in place of the display gives the same frames.
 
 **Retracted (2026-10-09 readings):** "under Smooth Motion WGC's pairs arrive 1 to 4 ms apart", "a
 6 ms pair window pairs every wake". They were one point of a drift that the 1 ms setting made.
@@ -472,6 +500,127 @@ reports far more often than the runner's 63 moves a second (whether it stays at 
 each present is the question); which frame the extra copies when it falls between a pair's two
 members; what label a notification or an overlay drawn over the game gets; any other game.
 
+### 5.10 The first stream with the pointer's frames left out (2026-10-12)
+
+Get Medieval, 31 minutes, the CI build of `407caaf`, typed at the prompt with the frame marker on
+for the first 5400 presents and `-wgc`. The log is `Get Medieval 2026-10-12 0.log` in the
+analysis root. The video pairs with it at log time = video time + 45.155 s, from 2,716 marked
+frames within 0.45 ms (p90), and everything below is on the stretch the video shows, relay time
+45.2 to 1926.6 s, read with `wgcsingles.py` and the stream's streamcheck report.
+
+| | 2026-10-08, NvFBC | 2026-10-09, NvFBC | 2026-10-11, WGC | 2026-10-12, WGC, pointer frames left out |
+|---|---|---|---|---|
+| length | 2h16m | 32m | 2h34m | 31m |
+| seconds with 70 or more batches | 0 | 0 | 449 | 0 |
+| runs of more than 2 s out of the 60 fps regime | 0 | 0 | 74 | 0 |
+| lock releases, and an hour | 7, 3.1 | 2, 3.7 | 303, 118 | 1, 1.9 |
+| batches of dejitter skipped | 0 | 0 | 148 | 0 |
+| blends, share of presents | 0.32% | 0.66% | 0.79% | 0.56% |
+| shown frame steps one period, ordinary seconds | 99.73% | 99.43% | 99.41% | 99.31% |
+| source gaps over 25 ms, an hour | 128 | 302 | 278 | 231 |
+| content repeats an hour | 193 | 322 | 468 | 806 |
+| presents blocked over 25 ms, an hour | 29 | 73 | 76 | 80 |
+| video freezes a second of motion | 0.73 | 0.46 | 0.51 | 0.37 |
+| upstream freezes that could be the relay's, at most | 9 of 1,237 | 2 of 175 | 51 of 1,418 | 9 of 324 |
+
+- **The menus are back in the regime.** 4,338 frames were left out over the run. The game
+  display had 140 or more flip requests in 98 seconds, which is the pointer moving in a menu,
+  and in none of them did the ring see more than its 60 batches. 111,869 of the ordinary
+  seconds' batches were pairs (99.9%), 0.27 ms apart at the median, with 64 batches of one and
+  7 of three among them.
+- **No game frame was lost to the rule.** Second by second, the wakes stored were never 4 or
+  more short of the flip requests the driver logged for the game's pairs (224,199 wakes against
+  222,486 such requests over the stretch).
+- **The repeats are the game's stalls.** Content repeats an hour are the highest of the four
+  streams. The holds all fall in 12 of the 32 minutes, the ones where the game's own request
+  rate dipped, and the game stalled for 100 ms or more 68 times an hour here against 23 on
+  2026-10-08. The marked opening had 2 freezes in motion, both the game's.
+- **It joined the replay corpus** as `gm_60x2_gameplay_2026_10_12_0.trace`, cut at 1908.0 s where
+  the video's last 16 s show a menu: no run out of the regime, and the replay matches the field
+  (synth 0.5% against 0.5%, worst run 20 against 20 at the same present, pull wraps 29 against
+  29, the one lock release at the same present).
+
+Not shown by one stream of 31 minutes: a rate for lock releases worth comparing with the longer
+streams, and anything about another game's pointer (section 8).
+
+### 5.11 The benchmark sittings of 2026-10-13
+
+Three sittings in the Avatar benchmark, one launch each, one run a row. The user asked for the
+drop's row, the mouse pointer in the picture, and the least time between frames again with
+more data. The files are `wgcset1`, `wgcset2` and `ww1` under `rigbench/sittings` in the
+analysis folder.
+
+**The five settings.** Every row is `-source 0 -target 1 -framerate b:vsync -src 60 -wgc` and
+the flags shown, on zig builds of the tree with `-wgccursor` in it. The 0.01 and 0.1 ms rows
+are builds of the same tree with that one number changed. Each sitting ran the five settings
+in four cycles, each cycle the mirror of the one before, with no-relay rows at the start, the
+middle and the end. A cost is points under the no-relay level at the row's time. A difference
+is from a fit of all 40 rows with a drift curve for each sitting, and its spread is one
+standard error. The fit puts the noise at 5.0 points a row.
+
+| setting | flags | rows | mean cost | difference from the first row |
+|---|---|---|---|---|
+| as it ships: 0.001 ms, pointer frames left out, cursor off | none | 8 | 243.7 | |
+| 0.01 ms | none | 8 | 242.1 | -1.2 +- 2.6 |
+| 0.1 ms | none | 8 | 243.4 | +0.6 +- 2.6 |
+| pointer frames kept | `-nowgcdrop` | 8 | 242.2 | -1.1 +- 2.6 |
+| mouse pointer in the picture | `-wgccursor` | 8 | 242.6 | -1.1 +- 2.7 |
+| the CI build of `407caaf` | none | 4 | 247.6 | |
+| NvFBC, the CI build of `407caaf`, without `-wgc` | none | 4 | 289.8 | |
+
+No setting differs from the first row by more than half of its standard error. The first
+launch's no-relay rows read 5357, 5391 and 5379 and the second's 5337, 5350 and 5354, so WGC
+costs about 4.5% and NvFBC about 5.4%.
+
+- **The least time between frames.** 0.001, 0.01 and 0.1 ms cost the same. A saving of 10
+  points from a longer one is more than three standard errors away for both. 1 ms was not run
+  again.
+- **Leaving out the pointer's frames.** Reading each frame's changed areas costs nothing these
+  sittings can see; `-nowgcdrop` does not read them. A row with the drop on left out no frame or
+  one. A readback row (below) found that one: a 32x48 rectangle at the centre of the screen,
+  0.36 s after capture started and before the run, a copy of the frame before it. Inside the
+  run every one of 7,689 frames was reported as the whole picture.
+- **The mouse pointer in the picture.** `-wgccursor` logs `cursor on (-wgccursor)`, stores the
+  same frames and costs the same. The benchmark shows no pointer, so these rows price the
+  setting with nothing to draw. What a moving pointer costs the game in a menu is not measured.
+- **What every relay row captured and showed.** WGC stored 92.1 to 93.3 frames a second, 3.1 to
+  5.6% of them in pairs, and NvFBC 155 to 161 in 90 batches. Every row presented 60.00 to 60.01
+  times a second with no hold and 6.1 to 7.8% blends, and the card showed the game in every
+  screenshot. Three rows early in the first sitting had one present gap over 25 ms each (29 to
+  33 ms); the second sitting had none.
+- **Heat.** The first launch's no-relay level rose 34 points in 27 minutes and fell 12 in the
+  next 27, and the second launch, started with the card warm, sat 20 to 40 points lower. Heat
+  and the ordinary difference between launches are not told apart by this. Seven readings taken
+  33 to 38 minutes into the first sitting gave 62 to 64 C under load, 24 to 26 C short of the
+  card's limit, with no thermal slowdown.
+
+**Window capture (`ww1`).** The experiment branch has `-xwgcwindow` (`3d6c8cb`, zig build
+`wgcwindow-1`): the session is made with `CreateForWindow` on the window at the centre of the
+source display. It captured `Avatar: Frontiers of Pandora` (class `AFOPClass`), 2560x1440 at
+0,0. Every row is `-source 0 -target 1 -framerate b:vsync -src 60` and the flags shown.
+
+| row | flags | cost | frames stored a second | what it showed |
+|---|---|---|---|---|
+| display, two rows | `-wgc -xwgcinterval 1` | 251.6 and 241.9 | 92.6 | the game on the card |
+| window, two rows | `-wgc -xwgcinterval 1 -xwgcwindow` | 248.4 and 248.1 | 92.8 | the game on the card |
+| display, readback | `-xwgc 32 -xwgcmeasure -xwgcdirty -xwgcinterval 1` | not a cost row | 92.4 | picture not valid |
+| window, readback | the same and `-xwgcwindow` | not a cost row | 92.6 | picture not valid |
+
+Capturing the window gives the frames display capture gives, at the same cost as far as two
+rows each can tell. It does not bring DLSS frame generation's generated frames: the game
+showed about 181 frames a second and both captures stored 92 to 93. The readback rows hash the
+centre of every frame. Inside the benchmark's three tests every frame was a new picture; the
+676 and 688 copies all sit in the two breaks between tests. 179 frames of the display row and
+185 of the window row came under 3 ms after the frame before them (1.9 ms at the median). The
+two frames of such a pair are different pictures in 177 of 179 and 185 of 185, and the first
+has the lower edge energy in 168 and 181, 0.87 of the second's at the median. That is what a
+generated frame followed by its real frame reads as under Smooth Motion; the edge test has not
+been checked by eye under DLSS. So about two generated frames a second reach WGC under DLSS
+frame generation, of about 90.
+
+Not tested: window capture under Smooth Motion, a window that does not fill the display, and a
+window that moves, resizes or closes.
+
 ## 6. The cursor under each source
 
 - **NvFBC.** The ring's grab session sets `bWithHWCursor = 0` (`CaptureRing.cpp`). That is T7 of
@@ -481,8 +630,11 @@ members; what label a notification or an overlay drawn over the game gets; any o
   tested in a game; the user, 2026-10-12: "I'm not convinced it does anymore with a game in
   fullscreen mode".
 - **WGC.** `put_IsCursorCaptureEnabled(0)`, logged as "cursor off". It leaves the pointer out of
-  the captured picture. Whether a moving pointer still produces a frame, or a flip request, with
-  it off has not been tested. T7's mouse test was never run on WGC.
+  the captured picture. `-wgccursor` (off by default) sets it to 1, logged as "cursor on
+  (-wgccursor)", and the pointer is then in the picture. A moving pointer brings its extra
+  frames with the setting on or off (5.9), and they are left out the same (5.9, the run with
+  cursor capture on). In the benchmark, which shows no pointer, the setting costs nothing
+  (5.11).
 - **In the stream's picture.** One inventory frame of the 2026-10-11 video (2:24:32) shows no
   pointer. The game's menu pointer is the system's pointer with the game's own shape (5.9: it
   appears on the card with cursor capture on and not with it off), so it has been missing from
@@ -504,8 +656,8 @@ so as not to be taken for the T rules of `dual-device-capture-present-spec.md`.
 | W6 | A local recording with `-mark` on for the whole run and `-wgc`, a minute in a menu and a minute walking, three times | streamcheck's count of each freeze by marker counter in the menu minutes | whether the extras cost shown frames, and whose the menu freezes are |
 | W7 | A benchmark row for whatever W3 or W5 would turn on by default | the sitting, beside a `-wgc` row | its cost. The user on reading dirty regions every frame: "sounds costly from a performance perspective". It should be one property read a frame, and it has not been measured |
 
-**W1 to W5 ran on 2026-10-12; the results are in 5.9.** W6 and W7 have not run. As it was
-prepared:
+**W1 to W5 ran on 2026-10-12; the results are in 5.9. W7 ran on 2026-10-13 (5.11): the drop
+and the cursor setting cost nothing measurable.** W6 has not run. As W1 to W5 were prepared:
 
 W1 to W5 are prepared as one job, `rigbench/checks-1012/mouse1.json` in the analysis folder: a
 menu open (the inventory, if its centre moves, so that W4's hash can tell a copy), and for each
@@ -540,10 +692,68 @@ Each is the user's.
   and none of their code changes. It passes a frame whenever Windows gives no list, whenever
   the changed area is anything but tiny, and whenever no whole-screen frame has come lately (a
   still screen where the pointer is the only thing moving).
+- **How the drop is sized (agreed 2026-10-13, not built).** The user asked what the size should
+  be and called this answer reasonable. A frame is measured by the game's own frames. The relay
+  remembers the largest changed area any frame was reported with, and forgets it when half a
+  second passes with no frame at least that large. A frame is left out when its changed area is
+  under a tenth of the remembered one. A frame with no list of changed areas, or an empty one,
+  is kept as now, and `-nowgcdrop` keeps every frame as now.
+
+  | case | the rule as built | the rule sized from the game's frames |
+  |---|---|---|
+  | a game that fills the display, a pointer of the size measured | left out | left out |
+  | the same, a pointer over a hundredth of the picture | kept | left out, up to a tenth of the picture |
+  | a still screen where only the pointer moves | kept after the first half second | the same |
+  | a game in a window smaller than the display (not seen) | kept, since no frame is the whole picture | left out |
+  | a notification or overlay that updates between game frames (not seen) | kept unless under a hundredth of the picture | left out when under a tenth of a game frame |
+
+  The reasons. A game frame was reported as the whole picture in both games read so far (the
+  user's game in 5.9, and Avatar in 5.11: 7,689 of 7,689 frames and 7,706 of 7,706), while a
+  pointer's size changes with the game, with Windows' scaling and with the resolution. The
+  largest pointer frame seen is 0.06% of the picture and no frame between that and the whole
+  picture has been seen, so the line can sit far from both. A WGC frame is a complete picture,
+  since the changed areas are a report and the session's mode is left at report-only. So a
+  frame that is left out loses nothing for good: what changed in it is in the next frame the
+  relay keeps, at most one game frame later while the game is drawing.
+
+  The tenth. The first write-up said a quarter, and the user asked whether that was too much.
+  It was more than the pointers need. The largest pointer in Windows' own settings is 256
+  pixels square at 100% display scaling (size 15 of 15; read from forum posts and a Microsoft
+  Q&A answer, not checked on the rig), where the default is 32. When it jumps, its two
+  rectangles are 6.3% of 1920x1080 and 3.6% of 2560x1440, and a notification of about 400 by
+  150 pixels is 3% of 1920x1080, so a tenth covers them and is ten times smaller than a game
+  frame. At 1280x720 that pointer's jump is 14% and would be kept. The number is kept as low as
+  the pointers allow because the two mistakes cost differently. A pointer frame that is kept gives the menu behaviour of section 5. A frame of
+  real content that is left out is a picture that does not change: an application that redraws
+  only parts of its picture would have every update under the line left out for half a second
+  after each whole redraw. The rule as built does that already for updates under a hundredth.
+  On everything measured so far a tenth and a quarter give the same result, so the number is a
+  judgement about cases not yet seen. The user accepted the tenth on 2026-10-13, and of the
+  largest pointer on a 1280x720 display said "this seems unlikely".
+
+  The changed area is Windows' own report, the `DirtyRegions` list each frame carries. The
+  relay reads no pixels for it. The readbacks of 5.9 and 5.11 are the check that the report
+  matched the pictures: every frame reported as a small change was a copy of the frame before
+  it, and every frame inside the benchmark's tests was reported as the whole picture and was a
+  new picture.
+
+  Not seen, and to be read with `-xwgcdirty` on the experiment build before or beside building
+  it: a third game's frames, a notification or overlay over the game, and a game in a window.
+  The rule would lose frames in a game whose own frames are reported with areas more than ten
+  times apart inside half a second. No game read so far does that.
+
+  For a game that fills the display, a tenth of the picture in place of the hundredth in
+  `PointerOnly` gives the same result with one number changed. The remembered area is what
+  makes the rule work for a game in a window.
 - **Whether the pointer goes back in the stream's picture.** The user, 2026-10-12: "it's not a
   huge deal, although I would like to turn mouse back on at some point". On WGC that is cursor
   capture on, and 5.9 shows no cost in extra frames beyond what a moving pointer brings anyway.
-  On NvFBC it is the hardware cursor setting of section 6, untested in a game.
+  On NvFBC it is the hardware cursor setting of section 6, which in the game's menus brought
+  170 wakes a second with nothing to tell them from frames (5.9). The user, 2026-10-13: "part of
+  this benchmark should also be with the cursor re-enabled just for wgc mode? Since that's what
+  we really want ideally". The switch `-wgccursor` is built and its benchmark rows cost nothing
+  (5.11). Whether it becomes the default with `-wgc` is open, and a stream with it on has not
+  run.
 - **Which member the ring keeps from a batch of three.** Today it is the last, which is the
   extra about half the time. Neither "the last" nor "the second" is right for both orders, so
   the ring would have to tell the extra from the pair. W4 says how much it matters.
@@ -557,17 +767,22 @@ Each is the user's.
 Carried from `performance-candidates.md` section 9.1 and `session-kickoff-performance-pass-7.md`.
 "A whole stream" is done (section 4).
 
-- Capturing the game's window in place of the display (`CreateForWindow`), cost included.
-  Unknown going in: whether window capture delivers Smooth Motion's generated frames at all.
+- Capturing the game's window in place of the display (`CreateForWindow`). Run in the benchmark
+  on 2026-10-13 (5.11): the same frames and the same cost as display capture under DLSS frame
+  generation. Still unknown: whether window capture delivers Smooth Motion's generated frames,
+  and everything a window can do that a display cannot (move, resize, minimise, close).
 - Smooth Motion x3 and other source rates. `-fgphase` and `-phasekeep` on WGC.
 - HDR sources. The pool is 8-bit.
 - What WGC drops when a stall outlasts the pool's two spare buffers. The stream's log has not
   been read for it.
-- The pairs under DLSS frame generation at 0.001 ms, 1.1 to 1.4% of wakes: what they are.
+- The pairs under DLSS frame generation, 1.1 to 1.4% of wakes on 2026-10-11 and 3 to 6% on
+  2026-10-13 at 0.001, 0.01 and 0.1 ms alike. The readback of 5.11 reads them as a generated
+  frame followed by its real frame. Why only about two a second come through is not known.
 - Displays of different sizes: WGC refuses, and a scaler would be needed.
 - Any GPU but the rig's. On a Windows before build 26100 WGC stays off, since the setting it
   needs is not there.
-- The up-to-10-point cost of 0.001 ms against 1 ms.
+- 0.001 ms compared with 1 ms. 0.001, 0.01 and 0.1 ms cost the same (5.11); 1 ms was not run
+  again, and it is not a setting the relay can use (section 3).
 
 ## 10. Where things are
 

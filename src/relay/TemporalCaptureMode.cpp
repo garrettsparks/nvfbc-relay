@@ -16,7 +16,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
                                          bool tint, bool etw, bool noJoin, bool dejitter,
                                          bool fgPhase, bool phaseKeep, unsigned int extraLagMs,
                                          bool d3d11Present, bool deferCopy, bool wgc,
-                                         bool wgcDrop)
+                                         bool wgcDrop, bool wgcCursor)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_present(NULL)
@@ -38,6 +38,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_deferCopy(deferCopy && !fgPhase && !phaseKeep)
     , m_wgc(wgc && d3d11Present)
     , m_wgcDrop(wgcDrop)
+    , m_wgcCursor(wgcCursor)
     , m_phaseKeepRequested(phaseKeep)
 {
     m_baseQpc.QuadPart = 0;
@@ -172,7 +173,7 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
                                                      : m_scheduler.PeriodQpc());
     }
     if (m_wgc) {
-        m_ring.EnableWgc(m_wgcDrop);
+        m_ring.EnableWgc(m_wgcDrop, m_wgcCursor);
         LOG("Capture through Windows.Graphics.Capture asked (-wgc): it takes over from NvFBC "
             "once the D3D11 present is up, and NvFBC stays if it cannot start");
     }

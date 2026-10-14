@@ -289,11 +289,12 @@ public:
         m_handlerAdded = true;
         m_result = m_pool->CreateCaptureSession(m_item, &m_session);
         if (FAILED(m_result)) return Fail("CreateCaptureSession");
-        // No cursor, as NvFBC grabs without its hardware cursor, and no yellow border around
-        // the captured display.
+        // No cursor unless -wgccursor asks for it, as NvFBC grabs without its hardware cursor,
+        // and no yellow border around the captured display.
         wgc::Session2* session2 = NULL;
         if (SUCCEEDED(m_session->QueryInterface(wgc::kIidSession2, (void**)&session2))) {
-            m_cursorOff = SUCCEEDED(session2->put_IsCursorCaptureEnabled(0));
+            const HRESULT set = session2->put_IsCursorCaptureEnabled(r.m_wgcCursor ? 1 : 0);
+            m_cursorOff = SUCCEEDED(set) && !r.m_wgcCursor;
             session2->Release();
         }
         wgc::Session3* session3 = NULL;
@@ -327,10 +328,14 @@ public:
     }
 
     void LogStart() override {
+        // "ON" in capitals is a pointer nobody asked for: Windows did not take the setting.
+        const char* cursor = "ON";
+        if (m_cursorOff) cursor = "off";
+        else if (r.m_wgcCursor) cursor = "on (-wgccursor)";
         LOG("WGC: capturing the %dx%d source display into a pool of %d buffers on the D3D11 "
             "present's device; a ring slot names the pool texture its frame is in, and no frame "
             "is copied; cursor %s, border %s; wakes under %lld us apart are one batch",
-            (int)m_size.Width, (int)m_size.Height, (int)m_buffers, m_cursorOff ? "off" : "ON",
+            (int)m_size.Width, (int)m_size.Height, (int)m_buffers, cursor,
             m_borderOff ? "off" : "ON",
             (long long)(BatchWindowQpc() * 1000000 / r.m_freqQuad));
         if (r.m_wgcDropPointerFrames) {

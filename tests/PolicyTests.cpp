@@ -4803,7 +4803,7 @@ static launch::Options ParseOptionString(const char* text, std::vector<std::stri
 static int CountSwitchesOn(const launch::Options& o) {
     return (int)o.lock + (int)o.tint + (int)o.etw + (int)o.noJoin + (int)o.dejitter +
            (int)o.fgPhase + (int)o.phaseKeep + (int)o.flipEx + (int)o.mark + (int)o.deferCopy +
-           (int)o.wgc + (int)o.wgcDrop;
+           (int)o.wgc + (int)o.wgcDrop + (int)o.wgcCursor;
 }
 
 static bool SameOptions(const launch::Options& a, const launch::Options& b) {
@@ -4812,7 +4812,8 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.dejitterRequested == b.dejitterRequested && a.fgPhase == b.fgPhase &&
            a.phaseKeep == b.phaseKeep && a.flipEx == b.flipEx && a.mark == b.mark &&
            a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs &&
-           a.deferCopy == b.deferCopy && a.wgc == b.wgc && a.wgcDrop == b.wgcDrop;
+           a.deferCopy == b.deferCopy && a.wgc == b.wgc && a.wgcDrop == b.wgcDrop &&
+           a.wgcCursor == b.wgcCursor;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
@@ -4820,6 +4821,7 @@ static launch::Options SwitchesAt(bool on) {
     launch::Options o;
     o.lock = o.tint = o.etw = o.noJoin = o.dejitter = on;
     o.fgPhase = o.phaseKeep = o.flipEx = o.mark = o.deferCopy = o.wgc = o.wgcDrop = on;
+    o.wgcCursor = on;
     o.dejitterRequested = on;
     return o;
 }
@@ -4893,6 +4895,7 @@ static void test_launch_option_parsing() {
         {"-phasekeep", &launch::Options::phaseKeep}, {"-flipex", &launch::Options::flipEx},
         {"-mark", &launch::Options::mark},         {"-defercopy", &launch::Options::deferCopy},
         {"-wgc", &launch::Options::wgc},           {"-wgcdrop", &launch::Options::wgcDrop},
+        {"-wgccursor", &launch::Options::wgcCursor},
     };
     for (const Switch& s : switches) {
         launch::Options x = SwitchesAt(false);
@@ -4916,7 +4919,7 @@ static void test_launch_option_parsing() {
         const std::vector<std::string> t = {s.flag};
         std::string w;
         const size_t n = launch::ApplyOption(t, 0, &x, &w);
-        CHECK(n == 1 && !(x.*(s.field)) && CountSwitchesOn(x) == 11 && w.empty(),
+        CHECK(n == 1 && !(x.*(s.field)) && CountSwitchesOn(x) == 12 && w.empty(),
               "%s must clear exactly its own switch and consume one token", s.flag);
     }
 
@@ -5240,6 +5243,7 @@ static void test_launch_relaunch_round_trip() {
         "-wgc -src 60 -nodefercopy",
         "-wgc -nowgcdrop",
         "-nowgcdrop -wgcdrop -lag 60",
+        "-wgc -wgccursor",
     };
     for (const char* text : launches) {
         launch::Options typed = ParseOptionString(text, nullptr, nullptr);

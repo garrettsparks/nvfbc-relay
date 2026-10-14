@@ -108,6 +108,12 @@ gm_60x2_gameplay_2026_10_07_0.trace
 # 4.3 s. All 7 lock releases come 0.2 to 0.3 s after a hitch of about 30 ms, and the worst blend
 # run (35) runs through the first. A second dice game, 10 minutes long, has no hitch at all.
 gm_60x2_gameplay_2026_10_08_0.trace
+# 31 minutes of the 2026-10-12 stream, the first captured through Windows.Graphics.Capture, with
+# the frames a moving mouse pointer brings left out before the ring: 178 hitches and 68 stalls an
+# hour. Eight times a burst with two stalls of 337 to 440 ms is followed 7 to 21 s later by one
+# stall of 190 to 280 ms. One lock release, at 735 s right after two pull wraps 0.25 s apart.
+# The worst blend run (20) starts as a burst of 7 hitches and 3 stalls ends.
+gm_60x2_gameplay_2026_10_12_0.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions
