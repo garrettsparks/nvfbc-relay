@@ -12,7 +12,8 @@ and the first stream on it kept its menus in the 60 fps regime with one lock rel
 minutes (5.10). Two benchmark sittings on 2026-10-13 found no cost for leaving those frames out,
 no cost for the mouse pointer in the picture and no difference between 0.001, 0.01 and 0.1 ms
 for the least time between frames (5.11). Since then the pointer is in the picture by default
-(`-nowgccursor` leaves it out); no stream has run with it yet. The rule that picks those
+(`-nowgccursor` leaves it out), and two streams on it showed the pointer in menus with the
+menus held (5.12). The rule that picks those
 frames now draws its line at a twentieth of the picture, where it was a hundredth, to cover
 larger pointers and lower resolutions (section 2). Sizing it from the game's own frames, so
 that it also works for a game in a window, was agreed and is not built (section 8). Last
@@ -635,6 +636,59 @@ frame generation, of about 90.
 Not tested: window capture under Smooth Motion, a window that does not fill the display, and a
 window that moves, resizes or closes.
 
+### 5.12 The first streams with the pointer in the picture (2026-10-13)
+
+Two streams back to back from one relay launch, the CI build of `700bb9d` (the pointer in the
+picture by default, the drop's line at a twentieth of the picture), typed at the prompt as
+`-wgc -mark 5400`. The log is `Get Medieval 2026-10-13 0.log` in the analysis root; the start
+line reads `cursor on (-nowgccursor leaves it out)`. Stream 0 runs 69.7 minutes and pairs with
+the log at log time = video time + 51.200 s, from 2,355 marked frames within 0.40 ms (p90), relay
+time 51.2 to 4235.2 s. Stream 1 runs 60.0 minutes with no marker, and streamcheck's game-stall
+match was not decisive (ratio 2.5). It is placed from the OBS log's stream start times at log
+time = video time + 4247.6 s, good to a few tenths of a second: the held-present check put its
+best match 13 frames away, with its thirds disagreeing. So its counts below are per second and
+nothing about it is frame-exact. The wake, request and release counts are from `wgcsingles.py`,
+`wgclost.py` and a count of `lk=1` to `lk=0` on the temporal lines, over each stream's stretch.
+
+| | 2026-10-12, `407caaf` | 2026-10-13 stream 0 | 2026-10-13 stream 1 |
+|---|---|---|---|
+| length | 31m | 69.7m | 60.0m |
+| seconds with 70 or more batches | 0 | 0 | 0 |
+| seconds with 140 or more game-display requests (a pointer moving in a menu) | 98 | 188 | 24 |
+| batches in the 60 fps seconds that are pairs | 99.9% | 99.9% | 99.9% |
+| seconds where the ring got 4 or more fewer wakes than the game's pair requests | 0 | 0 | 0 |
+| singles alone on the cadence, where a pair should be | 10 (19 an hour) | 22 (19 an hour) | 0 |
+| lock releases, and an hour | 1, 1.9 | 24, 20.7 | 21, 21.0 |
+| video freezes a second of motion | 0.37 | 0.22 | 0.20 |
+| frames left out by the drop | 4,338 | 9,986 over both streams | |
+
+- **The pointer is in the stream's picture.** The game's yellow arrow shows on the map at 3:55
+  and 4:05 of stream 0 and on a loot screen at 21:42.
+- **Menus held their 60 pairs a second** with the pointer drawn, through 212 seconds of a
+  pointer moving in a menu over the two streams.
+- **No game frame was lost**, and lone singles came at the 2026-10-12 rate.
+- **The lock released 45 times, all in 60 fps seconds, and the replay puts them there too.**
+  Stream 0 joined the corpus as `gm_60x2_gameplay_2026_10_13_0.trace` (cut at 4213.0 s), and its
+  replay releases the lock 24 times at the same moments as the field. So the releases come
+  from the frames' arrival times and the policy's answer to them. 27 of the 45 come 0.2 to
+  0.4 s after a capture gap of 25 to 50 ms; 3 fall in or beside a menu. Across streams, gaps of
+  25 to 50 ms an hour and the share of them a release follows within 0.5 s:
+
+  | stream | gaps of 25 to 50 ms an hour | followed by a release |
+  |---|---|---|
+  | 2026-10-13 stream 0, WGC | 213 | 5.3% |
+  | 2026-10-13 stream 1, WGC | 222 | 6.3% |
+  | 2026-10-12, WGC | 124 | 0% |
+  | 2026-10-11, WGC | 162 | 6.3% |
+  | 2026-10-09, NvFBC | 184 | 2.0% |
+  | 2026-10-08, NvFBC | 77 | 4.0% |
+
+  The game had more small gaps on 2026-10-13 than on any stream read before. Whether WGC
+  releases on a small gap more often than NvFBC is not settled by four short-gap counts this
+  far apart; the 2026-10-08 fixture's index note says its 7 releases follow hitches of about
+  30 ms, so the pattern is not new to WGC.
+- Stream 1 did not join the corpus: it has no alignment the fixture check accepts.
+
 ## 6. The cursor under each source
 
 - **NvFBC.** The ring's grab session sets `bWithHWCursor = 0` (`CaptureRing.cpp`). That is T7 of
@@ -773,7 +827,7 @@ Each is the user's.
   (5.11). DECIDED 2026-10-13: "let's make wgccursor the default now. I'll use that build to
   stream tonight." The pointer is in the picture by default with `-wgc`, and `-nowgccursor`
   leaves it out. The default's rows are the `-wgccursor` rows of 5.11, so no new row is owed.
-  Not yet seen on a build of the user's branch: the pointer on the card, and a stream.
+  Streamed the same night (5.12): the pointer shows in the menus and the menus held.
 - **Which member the ring keeps from a batch of three.** Today it is the last, which is the
   extra about half the time. Neither "the last" nor "the second" is right for both orders, so
   the ring would have to tell the extra from the pair. W4 says how much it matters.
