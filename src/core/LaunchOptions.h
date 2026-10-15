@@ -47,6 +47,8 @@ struct Options {
                                     // that only a move of the mouse pointer brought
     bool wgcCursor = true;          // -wgccursor / -nowgccursor: with -wgc, the mouse pointer
                                     // is in the picture
+    bool wgcOpen = false;           // -wgcopen: with -wgc, the frame pool on a device of its
+                                    // own, its textures opened by the present
 };
 
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths always
@@ -155,6 +157,8 @@ inline const std::vector<UsageRow>& OptionRows() {
                              "as NvFBC does. By default it is in the picture", false, false},
         {"-wgccursor", "", "The mouse pointer in the picture; on by default, accepted so a "
                            "launch string that names it keeps working", false, false},
+        {"-wgcopen", "", "With -wgc, keep Windows' frame pool on a device of its own and show "
+                         "its frames from there, which costs the game less", false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -295,6 +299,7 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-nowgcdrop") { o->wgcDrop = false;  return 1; }
     if (t == "-wgccursor")   { o->wgcCursor = true;  return 1; }
     if (t == "-nowgccursor") { o->wgcCursor = false; return 1; }
+    if (t == "-wgcopen")     { o->wgcOpen = true;    return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -463,6 +468,7 @@ inline std::string FormatOptions(const Options& o) {
     if (o.wgc) add("-wgc");
     if (o.wgcDrop != d.wgcDrop) add(o.wgcDrop ? "-wgcdrop" : "-nowgcdrop");
     if (o.wgcCursor != d.wgcCursor) add(o.wgcCursor ? "-wgccursor" : "-nowgccursor");
+    if (o.wgcOpen) add("-wgcopen");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");

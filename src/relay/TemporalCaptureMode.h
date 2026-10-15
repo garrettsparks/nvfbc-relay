@@ -106,6 +106,9 @@ private:
     bool m_wgcDrop;
     // -nowgccursor clears it: with -wgc, the mouse pointer is in the captured picture.
     bool m_wgcCursor;
+    // -wgcopen: with -wgc, the frame pool on a device of its own, its textures opened by the
+    // present.
+    bool m_wgcOpen;
     bool m_phaseKeepRequested;      // asked for, so an unmet prerequisite can say so once
     char m_modeName[64];            // GetModeName: the compositor kind and the present path
     policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
@@ -142,7 +145,7 @@ public:
                         bool fgPhase = false, bool phaseKeep = false,
                         unsigned int extraLagMs = 0, bool d3d11Present = false,
                         bool deferCopy = false, bool wgc = false, bool wgcDrop = true,
-                        bool wgcCursor = true);
+                        bool wgcCursor = true, bool wgcOpen = false);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

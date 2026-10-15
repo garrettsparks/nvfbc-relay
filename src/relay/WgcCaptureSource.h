@@ -4,7 +4,8 @@
 // WGC session delivers the source display's frames into a frame pool made on the D3D11
 // present's device, and every frame the ring stores stays in the pool for as long as its slot
 // names it. The present samples the pool's texture, so no frame is copied and nothing is waited
-// for.
+// for. With -wgcopen the pool is on a device of its own and the present opens its textures
+// through shared handles.
 //
 // The WGC interfaces are declared here by hand, in the order and with the interface IDs of
 // mingw-w64's windows.graphics.capture.h and Microsoft's windows-rs bindings, because the zig
@@ -13,10 +14,14 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 #include <inspectable.h>
 #include <SimpleLogger.h>
 #include <stdio.h>
+#include <utility>
+#include <vector>
 
 #include "CaptureRing.h"
 #include "ICaptureSource.h"
@@ -195,7 +200,8 @@ public:
     WgcCaptureSource& operator=(const WgcCaptureSource&) = delete;
 
     // Starts a session on the source display with its frame pool on device, the D3D11
-    // present's. Returns NULL once it is capturing, or what stopped it, with nothing left open.
+    // present's, or with -wgcopen on a device of its own. Returns NULL once it is capturing, or
+    // what stopped it, with nothing left open.
     // It also stops short where it would deliver fewer frames than NvFBC, or a picture of
     // another size: Windows' least time between frames has to come down to 0.001 ms, and the
     // source display has to be the size of the output, since the present samples the pool's
@@ -233,8 +239,32 @@ public:
         m_result = roInitialize(1);
         if (FAILED(m_result) && m_result != (HRESULT)0x80010106) return Fail("RoInitialize");
 
-        m_device = device;
-        m_device->AddRef();
+        // -wgcopen: the pool on a device of its own. With the pool on the present's device the
+        // game lost about 58 more points in the benchmark (2026-10-14). Windows makes the pool's
+        // textures shareable, so the present's device opens each one through a shared handle
+        // (OpenOnPresent) and samples it there; that opening is the only use of the present's
+        // device, and its context is never touched.
+        if (r.m_wgcOwnDevice) {
+            typedef HRESULT(WINAPI * CreateDeviceFn)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
+                                                     const D3D_FEATURE_LEVEL*, UINT, UINT,
+                                                     ID3D11Device**, D3D_FEATURE_LEVEL*,
+                                                     ID3D11DeviceContext**);
+            CreateDeviceFn createDevice =
+                reinterpret_cast<CreateDeviceFn>(::GetProcAddress(d3d11, "D3D11CreateDevice"));
+            if (!createDevice) return Refuse("D3D11CreateDevice was not found");
+            m_result = device->QueryInterface(__uuidof(ID3D11Device1), (void**)&m_presentDevice);
+            if (FAILED(m_result)) return Fail("the present's device as ID3D11Device1");
+            m_result = createDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                    D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION,
+                                    &m_device, NULL, NULL);
+            if (FAILED(m_result)) {
+                m_device = NULL;
+                return Fail("D3D11CreateDevice for the frame pool");
+            }
+        } else {
+            m_device = device;
+            m_device->AddRef();
+        }
         IDXGIDevice* dxgiDevice = NULL;
         m_result = m_device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
         if (FAILED(m_result)) return Fail("IDXGIDevice");
@@ -333,11 +363,14 @@ public:
         const char* cursor = "ON";
         if (m_cursorOff) cursor = "off (-nowgccursor)";
         else if (r.m_wgcCursor) cursor = "on (-nowgccursor leaves it out)";
-        LOG("WGC: capturing the %dx%d source display into a pool of %d buffers on the D3D11 "
-            "present's device; a ring slot names the pool texture its frame is in, and no frame "
-            "is copied; cursor %s, border %s; wakes under %lld us apart are one batch",
-            (int)m_size.Width, (int)m_size.Height, (int)m_buffers, cursor,
-            m_borderOff ? "off" : "ON",
+        LOG("WGC: capturing the %dx%d source display into a pool of %d buffers on %s; a ring "
+            "slot names the pool texture its frame is in, and no frame is copied; cursor %s, "
+            "border %s; wakes under %lld us apart are one batch",
+            (int)m_size.Width, (int)m_size.Height, (int)m_buffers,
+            m_presentDevice ? "a device of its own, each texture opened on the D3D11 present's "
+                              "device through a shared handle (-wgcopen)"
+                            : "the D3D11 present's device",
+            cursor, m_borderOff ? "off" : "ON",
             (long long)(BatchWindowQpc() * 1000000 / r.m_freqQuad));
         if (r.m_wgcDropPointerFrames) {
             LOG("WGC: a frame that changed only a small area, as a move of the mouse pointer "
@@ -404,7 +437,8 @@ public:
     // every texture it made for as long as it lives, so a texture the present has just read
     // from a slot is never one that no longer exists.
     void Store(int slot) override {
-        r.m_wgcTexture[slot].store(m_texture, std::memory_order_release);
+        ID3D11Texture2D* named = m_presentDevice ? OpenOnPresent(m_texture) : m_texture;
+        r.m_wgcTexture[slot].store(named, std::memory_order_release);
         m_texture->Release();
         m_texture = NULL;
         wgc::Dispose(m_slotFrame[slot]);
@@ -418,9 +452,45 @@ public:
         LOG("WGC summary: %lld wakes stored, %lld frames came with no texture and were dropped, "
             "%lld frames that changed only a small area were left out",
             wakesStored, m_noTexture, m_pointerFrames);
+        if (m_presentDevice) {
+            LOG("WGC summary: -wgcopen opened %zu pool textures on the present's device, %lld "
+                "could not be opened", m_opened.size(), m_openFailures);
+        }
     }
 
 private:
+    // -wgcopen: the pool texture as the present's device sees it, opened the first time it
+    // comes and kept for as long as the session lasts. A texture that cannot be opened leaves
+    // its slots naming nothing, so the present shows the ring's own surface for them and the
+    // summary counts it.
+    ID3D11Texture2D* OpenOnPresent(ID3D11Texture2D* pool) {
+        for (size_t i = 0; i < m_opened.size(); i++) {
+            if (m_opened[i].first == pool) return m_opened[i].second;
+        }
+        ID3D11Texture2D* opened = NULL;
+        IDXGIResource1* resource = NULL;
+        HRESULT result = pool->QueryInterface(__uuidof(IDXGIResource1), (void**)&resource);
+        if (SUCCEEDED(result)) {
+            HANDLE handle = NULL;
+            result = resource->CreateSharedHandle(NULL, DXGI_SHARED_RESOURCE_READ, NULL, &handle);
+            if (SUCCEEDED(result)) {
+                result = m_presentDevice->OpenSharedResource1(handle, __uuidof(ID3D11Texture2D),
+                                                              (void**)&opened);
+                CloseHandle(handle);
+            }
+            resource->Release();
+        }
+        if (!opened) {
+            m_openFailures++;
+            if (m_openFailures == 1) {
+                LOGERR("WGC: a pool texture could not be opened on the present's device "
+                       "(0x%08lx); its slots show the ring's own surface", (unsigned long)result);
+            }
+        }
+        m_opened.push_back(std::make_pair(pool, opened));   // the pool keeps its texture alive
+        return opened;
+    }
+
     // True for a frame Windows reports as changed only in a small area, under a twentieth of
     // the picture, while frames that change the whole picture are still arriving. A move of
     // the mouse pointer makes one while WGC is capturing: Windows delivers a frame whose
@@ -499,6 +569,12 @@ private:
         m_frame = NULL;
         wgc::Dispose(m_session);
         m_session = NULL;
+        for (size_t i = 0; i < m_opened.size(); i++) {
+            if (m_opened[i].second) m_opened[i].second->Release();
+        }
+        m_opened.clear();
+        if (m_presentDevice) m_presentDevice->Release();
+        m_presentDevice = NULL;
         wgc::Dispose(m_pool);
         m_pool = NULL;
         if (m_item) m_item->Release();
@@ -522,6 +598,9 @@ private:
     bool m_cursorOff = false;
     bool m_borderOff = false;
     ID3D11Device* m_device = NULL;
+    ID3D11Device1* m_presentDevice = NULL;   // -wgcopen only: opens the pool's textures
+    std::vector<std::pair<ID3D11Texture2D*, ID3D11Texture2D*>> m_opened;   // pool, on present
+    long long m_openFailures = 0;
     IInspectable* m_winrtDevice = NULL;
     wgc::Item* m_item = NULL;
     wgc::Pool* m_pool = NULL;
