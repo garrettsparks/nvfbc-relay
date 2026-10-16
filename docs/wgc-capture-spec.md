@@ -1,23 +1,23 @@
 # WGC Capture Spec (Windows.Graphics.Capture as the ring's capture source)
 
-Status: **built, behind `-wgc`, off by default.** On `performance-optimization` at `e79a362`. One
-stream has run on it (2026-10-11, 2h34m). In steady play it behaves as NvFBC does. One finding
-from that stream is open: while a menu is open, an extra frame arrives beside the pairs. Between
-them it is a single and the lock releases; inside a pair's window it makes a batch of three, and
-the ring can keep it in place of the real frame (section 5). A sitting on 2026-10-12 found what
-it is (5.9): a frame Windows delivers for each move of the mouse pointer while WGC is capturing,
-a copy of the frame before it, reported by Windows as changed only in a pointer-sized
-rectangle. Since `407caaf` those frames are left out before the ring by default (section 2),
-and the first stream on it kept its menus in the 60 fps regime with one lock release in 31
-minutes (5.10). Two benchmark sittings on 2026-10-13 found no cost for leaving those frames out,
-no cost for the mouse pointer in the picture and no difference between 0.001, 0.01 and 0.1 ms
-for the least time between frames (5.11). Since then the pointer is in the picture by default
-(`-nowgccursor` leaves it out), and two streams on it showed the pointer in menus with the
-menus held (5.12). The rule that picks those
-frames now draws its line at a twentieth of the picture, where it was a hundredth, to cover
-larger pointers and lower resolutions (section 2). Sizing it from the game's own frames, so
-that it also works for a game in a window, was agreed and is not built (section 8). Last
-updated 2026-10-13.
+Status: **built, behind `-wgc`, off by default** (the user's decision of 2026-10-14, section 8).
+Six streams have run on it, from 2026-10-11 to 2026-10-14, and in steady play it behaves as
+NvFBC does. While a menu was open on the first one, an extra frame arrived beside the pairs
+(section 5): a frame Windows delivers for each move of the mouse pointer while WGC is capturing,
+a copy of the frame before it, reported as changed only in a pointer-sized rectangle (5.9).
+Since `407caaf` those frames are left out before the ring by default, since `c448312` the
+pointer is in the picture by default, and since `700bb9d` the line that picks those frames sits
+at a twentieth of the picture (section 2). The streams on them held their menus at 60 pairs a
+second (5.10, 5.12). The sittings of 2026-10-14 (5.13) found that a moving pointer costs the game
+about 145 points while WGC captures, which is Windows' compositor drawing the pointer and was
+accepted, and that about 58 of WGC's points were its frame pool sharing the present's device.
+With the pool on a device of its own and its textures opened by the present, WGC cost about 192
+points where it cost 251 in the same launch, under OBS's game capture as measured in other
+launches (202 to 216). That is the default inside `-wgc` since 2026-10-15, with `-nowgcopen` to
+keep the pool on the present's device and a fall-back to it where a device of its own does not
+work (section 2). Two streams with the pool on its own device found no torn or stale picture
+(5.14). Sizing the drop from the game's own frames, so that it also works for a game in a
+window, was agreed and is not built (section 8). Last updated 2026-10-15.
 
 This file is the reference for WGC capture: what is built, what has been measured, what is not
 known and what to test next. How it got here stays where it was written. The costs, the sittings
@@ -28,10 +28,13 @@ disagree, the measurement wins and this file gets corrected.
 ## 1. What it is
 
 A second way for the capture ring to get the game display's frames, beside NvFBC. Windows
-delivers each frame into a pool of textures made on the D3D11 present's device, the ring's slots
-name those textures, and the present samples them where they are. No frame is copied and nothing
-is waited for. In the benchmark it costs the game about 47 points less than NvFBC (4.6% against
-5.5%, sitting `iv1`, 2026-10-11). It needs nothing from NVIDIA, and it is the path the roadmap
+delivers each frame into a pool of textures, the ring's slots name those textures, and the
+present samples them where they are: the pool is on a device of its own and the present opens
+each texture through a shared handle, or with `-nowgcopen` the pool is on the present's own
+device. No frame is copied and nothing is waited for. In the benchmark it cost the game about 47
+points less than NvFBC with the pool on the present's device (4.6% against 5.5%, sitting `iv1`,
+2026-10-11), and about 192 points, 3.6%, with the pool on its own device (5.13), where NvFBC
+cost 287 to 297 in other launches. It needs nothing from NVIDIA, and it is the path the roadmap
 wants the app to capture through by default.
 
 The ring still owns time and decisions: the arrival stamp of every wake, which wakes make a
@@ -39,7 +42,7 @@ batch, which member of a batch is kept, and the slot a frame goes in (`ICaptureS
 changes only where the pixels come from. The policy, the lock, the ETW flip pairing and the
 present are the same code for both sources.
 
-## 2. As built (`e79a362`)
+## 2. As built
 
 **Switch.** `-wgc`, with `b:vsync` only. The help text does not list it.
 
@@ -50,7 +53,7 @@ moves to it. NvFBC is let go only once WGC is capturing. The log says each step:
     Capture through Windows.Graphics.Capture asked (-wgc): it takes over from NvFBC once the D3D11 present is up, and NvFBC stays if it cannot start
     WGC: least time between frames 16.000 ms as found, 0.001 ms after asking for 0.001 ms
     CaptureRing: capture moved from NvFBC to Windows.Graphics.Capture after 22 wakes
-    WGC: capturing the 2560x1440 source display into a pool of 34 buffers on the D3D11 present's device; a ring slot names the pool texture its frame is in, and no frame is copied; cursor on (-nowgccursor leaves it out), border off; wakes under 3000 us apart are one batch
+    WGC: capturing the 2560x1440 source display into a pool of 34 buffers on a device of its own, each texture opened on the D3D11 present's device through a shared handle (-nowgcopen keeps it on the present's device); a ring slot names the pool texture its frame is in, and no frame is copied; cursor on (-nowgccursor leaves it out), border off; wakes under 3000 us apart are one batch
 
 **When it stays on NvFBC.** Each of these leaves the relay on NvFBC with the reason in the log:
 
@@ -63,6 +66,40 @@ moves to it. NvFBC is let go only once WGC is capturing. The log says each step:
 **Pool.** `CreateFreeThreaded`, BGRA 8-bit, the source display's size, one buffer for every ring
 slot and two more (34 on the rig). A frame stays out of the pool for as long as its slot names
 it and goes back when the slot is used again.
+
+**Where the pool lives** (on by default since 2026-10-15; `-nowgcopen` keeps the pool on the
+present's device, `-wgcopen` is accepted). The pool is made on a D3D11 device of its own,
+created on the adapter the present's device is on, and the present's device opens each pool
+texture once through an NT shared handle (`CreateSharedHandle`, `OpenSharedResource1`) and
+samples it there. Opening is the only use of the present's device; its context is never
+touched from the capture thread. Windows makes the pool's textures shareable (bind flags 0x28,
+misc flags 0x802, SHARED and SHARED_NTHANDLE, read on the rig on 2026-10-14) but does not
+promise it. So before NvFBC is let go, the relay takes WGC's first frame (it comes about 10 ms
+after capture starts on the rig's desktop) and opens its texture on the present's device. A
+pool makes every texture alike, so the first answers for all of them. If the device of its own
+cannot be made, the session does not start on it, the first frame's texture does not open, or
+no frame comes within half a second, the log says which and the session starts again with the
+pool on the present's device, the way it ran up to `ab1772e`:
+
+    WGC: with the frame pool on a device of its own, <why>; the pool goes on the D3D11 present's device instead
+
+Nothing is ever named in a slot from a pool the present cannot read. A retry would not help,
+since both causes known (Windows making the textures without the sharing flags, two devices on
+different graphics cards) are fixed facts of the machine, and the second is ruled out by making
+the device on the present's adapter. A later texture that cannot be opened is not expected; it
+would leave its slots naming nothing (the present would show the ring's own surface for them)
+and is logged once and counted in the closing line:
+
+    WGC summary: 34 pool textures opened on the present's device, 0 could not be opened
+
+Nothing orders Windows' write into a pool texture with the present's read on the other device
+(the textures carry no keyed mutex). The present reads a frame about 96 ms after it arrives, and
+two streams found no torn or stale picture (5.14). Why the pool's device costs the game 58
+points is not known; a device of its own goes around it (5.13). Checked on this code: the suite
+(C++20 and C++17 alike), controls that fail it without the `-nowgcopen` parse line or with the
+old default, and zig builds. The first version, `-wgcopen` off by default at `ab1772e` with the
+pool's device on the first adapter and no fall-back, streamed twice (5.14). The adapter choice
+and the fall-back have not run on the rig, and the fall-back has never been needed.
 
 **Waiting.** The pool's `FrameArrived` sets an event. The capture thread takes frames with
 `TryGetNextFrame` and waits up to 100 ms for one. A frame's arrival stamp is the moment that
@@ -177,6 +214,16 @@ section 9.1 and in `session-kickoff-performance-pass-7.md`.
   second also bring a second frame 1.9 ms before them: a different picture, the softer of the
   two in 168 of 179, which is what a generated frame followed by its real frame would read as
   (5.11). Capturing the game's window in place of the display gives the same frames.
+- **A moving mouse pointer costs the game about 145 points while WGC captures, and it is
+  Windows'.** Five sittings on 2026-10-14 (5.13). With a WGC session open and the pointer moving,
+  the compositor (`dwm.exe`) presents about 160 times a second where it presents none otherwise;
+  OBS's display capture by WGC pays the same, and no WGC setting tried removes it. The user
+  accepted it: the pointer is hidden in their game's play.
+- **WGC's points split as presenting about 78 (the draw 21, the present itself 57) and about
+  58 for the frame pool sharing the present's device** (5.13). A device of its own for the pool
+  takes the 58 back: 58.5 +- 4.0 points in one launch, WGC about 192 against 251 (5.13).
+- **A copy off the present's device costs more than the device does** (105 points, 5.13), so
+  the pool's frames are opened on the present's device and never copied.
 
 **Retracted (2026-10-09 readings):** "under Smooth Motion WGC's pairs arrive 1 to 4 ms apart", "a
 6 ms pair window pairs every wake". They were one point of a drift that the 1 ms setting made.
@@ -596,8 +643,11 @@ costs about 4.5% and NvFBC about 5.4%.
   0.36 s after capture started and before the run, a copy of the frame before it. Inside the
   run every one of 7,689 frames was reported as the whole picture.
 - **The mouse pointer in the picture.** `-wgccursor` logs `cursor on (-wgccursor)`, stores the
-  same frames and costs the same. The benchmark shows no pointer, so these rows price the
-  setting with nothing to draw. What a moving pointer costs the game in a menu is not measured.
+  same frames and costs the same. Corrected 2026-10-14: this said the benchmark shows no
+  pointer. The pointer sits at the centre of the card's picture in all 8 `-wgccursor` rows (the
+  runner's screenshot is 5120x2880 from 0,-1440, the card the top-right quarter and the game
+  display the bottom-left, where a desktop copy never shows the pointer). So these rows price a
+  still pointer drawn into the picture. A moving one is priced in 5.13.
 - **What every relay row captured and showed.** WGC stored 92.1 to 93.3 frames a second, 3.1 to
   5.6% of them in pairs, and NvFBC 155 to 161 in 90 batches. Every row presented 60.00 to 60.01
   times a second with no hold and 6.1 to 7.8% blends, and the card showed the game in every
@@ -689,6 +739,147 @@ nothing about it is frame-exact. The wake, request and release counts are from `
   30 ms, so the pattern is not new to WGC.
 - Stream 1 did not join the corpus: it has no alignment the fixture check accepts.
 
+### 5.13 The sittings of 2026-10-14: the moving pointer, where WGC's points go, the pool's device
+
+Avatar benchmark sittings in one launch each, one run a row, no-relay rows through each, files
+under `rigbench/sittings` in the analysis folder. The experiment branch's flags are named as
+they were run (`-xwgcinterval 1`, `-xwgcdrop` and `-xwgccursor` there match the user's branch's
+defaults).
+
+**A moving pointer** (`ptrset1`, `ptrwhy2`, `rnd1`, `nvc1`, `wnd1`, `ivm1`, `pmptr1`, `pmptr2`;
+the runner moving the pointer about 63 times a second through each run):
+
+| capture, pointer moving against still | cost of the moving pointer, points |
+|---|---|
+| no relay | +0.7 +- 1.4 |
+| relay `-wgc` (display) | +142.5 to +158 (five sittings) |
+| relay `-wgc -nowgccursor` / `-wgc -nowgcdrop` | +145.5 / +144.5 |
+| relay window capture (`-xwgcwindow`) | +158, the same pointer frames |
+| WGC's changed-area mode set to ReportAndRender (`-xwgcrender`) | about 12 less |
+| least time between frames 4 ms / 16 ms | the same / 75 less, but 16 ms stores 53 frames a second and blends 51% of presents |
+| relay on NvFBC, hardware cursor off as shipped | none |
+| relay on NvFBC with the hardware cursor (`-xnvcursor`) | +68 (and +25 with the pointer still) |
+| OBS display capture by WGC / by Desktop Duplication | +158 / +3.5 |
+| OBS game capture | none |
+
+PresentMon (`pmptr2`): `dwm.exe` presents 0 times a second with no relay and the pointer moving,
+0 with WGC and the pointer still, 0 with NvFBC's hardware cursor and the pointer moving, and
+about 160 with WGC and the pointer moving (101.5 Hardware: Legacy Flip with a median 1.24 ms of
+GPU each, 59.4 Composed: Flip). The game stays in Hardware: Independent Flip throughout. While a
+WGC session is open Windows draws the pointer in the compositor in place of the hardware cursor
+plane, which Desktop Duplication does not do. The user, 2026-10-14: the cost is fine "as long as
+the performance actually in game is still good" ("it might matter for like an RTS game"). In the
+user's game the pointer is hidden in play and the 2026-10-12 sitting saw no pointer frames
+there. Nothing to build.
+
+**Where WGC's points go** (`split1`, 22 rows, four a setting, pointer still; every row
+`-source 0 -target 1 -framerate b:vsync -src 60` and the flags shown; paired against wgc):
+
+| setting | flags | mean score | against wgc |
+|---|---|---|---|
+| no relay | | 5383 | +250.3 +- 5.3 |
+| wgc | `-wgc -xwgcinterval 1 -xwgcdrop -xwgccursor` | 5132.5 | |
+| nodraw | the same and `-xnodraw` | 5153 | +20.8 +- 2.3 |
+| div2 | the same and `-xpresentdiv 2` | 5171.5 | +39.0 +- 3.2 |
+| stand | `-xwgc 32 -xwgcinterval 1` | 5201 | +68.5 +- 3.3 |
+
+Presenting is about 78 points (twice what presenting half as often saved), as on NvFBC (75,
+2026-10-07): drawing WGC's frame about 21, the present itself about 57. The stand-in (WGC
+delivers into a pool on a device of its own and nothing reads it; the present draws ring slots
+nothing wrote) presents and blends like the real path.
+
+**The pool's device** (`place1`, 10 rows): no relay 5384 and 5397; wgc 5116 and 5138; the
+stand-in 5202 and 5201; the stand-in with its pool on the present's device (`-xwgcpresentdev`)
+5141 and 5145. Moving the pool onto the present's device with nothing else changed costs 58.5
+points. A copy off it (`copy1`, 10 rows): the stand-in 5184 and 5193, the same copying every
+frame on the pool's own device (`-xwgccopy`) 5079 and 5087, so a copy costs about 105 points,
+more than the device. A probe read the pool's textures as shareable (usage 0, bind flags 0x28,
+misc flags 0x802; `GetSharedHandle` refused, `CreateSharedHandle` worked).
+
+**A device of its own, opened by the present** (`open1`, 14 rows, experiment build `wgcopen-1`,
+`-xwgcopen`): no relay 5372, 5397, 5386 and 5390; wgc 5123, 5142, 5134 and 5147; with the pool
+on its own device 5188, 5185, 5200 and 5207. It is 58.5 +- 4.0 points cheaper paired (58.7 +-
+4.6 fitted): WGC about 192 points against 251. What the rows captured and showed: 94.2 to 94.9
+frames stored a second (wgc 92.8 to 93.4), 60.01 presents a second, no holds, no present gap
+over 25 ms, blends 4.6 to 5.7% (wgc 6.3 to 7.3%, not read why), all 34 pool textures opened, and
+the card showing the game in every screenshot (card against game 6.5 to 6.9 where the control
+reads about 9.6, as the wgc rows). OBS's game capture cost 216 (`wg1`, 2026-10-09), 207.6
+(`ptrwhy2`, 2026-10-14) and about 202 (`dl3`, 2026-10-08) in other launches; no sitting has had
+both in one launch. Why the pool's device costs 58 points is not known.
+
+**The user's decisions that day.** WGC stays off by default: "let's actually keep it not
+default for now". Window capture costs what display capture costs and pays the same for a
+moving pointer; its use would be leaving notifications, other windows and the desktop out. The
+relay drawing the pointer itself on NvFBC "does seem like it might be useful for a pointer with
+nvfbc if someone really wants to use nvfbc" (not built). A hook of the relay's own: "a whole
+future project probably. not part of the optimization work". On 2026-10-15, after the streams of
+5.14, the pool on its own device became the default inside `-wgc` with the fall-back of section
+2.
+
+Under NvFBC the busy core seen on a still desktop is NVIDIA's (`checks-1014/tcpu1`,
+`-xthreadcpu`): one thread starting in `nvd3dumx.dll` holds 93 to 95% of a core and the relay's
+own threads stay under 1%; on WGC the whole process uses under 1%.
+
+### 5.14 The first streams with the pool on its own device (2026-10-14)
+
+Two streams, each from a relay launch of its own, the CI build of `ab1772e` typed at the prompt
+as `-wgc -wgcopen -mark 5400`. The logs are `Get Medieval 2026-10-14 0.log` and `1.log` in the
+analysis root. Each log's start line names the pool on a device of its own and its summary reads
+`opened 34 pool textures on the present's device, 0 could not be opened`; no present reported a
+problem, no draw failed and no frame wait timed out. Stream 0's video stops at 26.4 minutes,
+where OBS lost its connection to Twitch (OBS ran 33.4 minutes); stream 1's runs 39.8 minutes.
+Both videos have no holes and pair with their logs through the marker (log = video + 45.655 s,
+2,691 frames, p90 0.38 ms; log = video + 52.101 s, 2,300 frames, p90 0.41 ms). The counts are
+over the stretch each video shows.
+
+| | 2026-10-13 stream 0 | 2026-10-13 stream 1 | 2026-10-14 stream 0 | 2026-10-14 stream 1 |
+|---|---|---|---|---|
+| pool | present's device | present's device | its own | its own |
+| length | 69.7m | 60.0m | 26.4m | 39.8m |
+| wakes a second in steady play | 120 in 60 pairs | the same | the same | the same |
+| batches in the 60 fps seconds that are pairs | 99.9% | 99.9% | 99.9% | 99.9% |
+| seconds where the ring got 4 or more fewer wakes than the game's pair requests | 0 | 0 | 0 | 0 |
+| singles alone on the cadence | 22 | 0 | 0 | 0 |
+| lock releases an hour | 20.7 | 21.0 | 4.5 | 9.0 |
+| video freezes a second of motion | 0.22 | 0.20 | 0.36 | 0.96 |
+| at most the relay's, after the marked opening | 8 of 358 | | 8 of 299 | 2 of 818 |
+
+- **The pairs held** under Smooth Motion with the pool on its own device, with no game frame
+  lost.
+- **The freezes are the game's scenes.** Stream 1's worst 30 s stretches are the dice game (six
+  of eight), a loot screen and a trader's inventory; stream 0's are inventory and loot screens.
+  Those are the scenes where the game drew the same picture twice most often on the fully
+  marked recording of 2026-10-01. 229 of stream 1's 890 freezes run into the next frame (48 of
+  299 on stream 0, 25 of 384 on 2026-10-13 stream 0), pictures held three frames or more, in the
+  dice game. That points to the game; it does not rule out the pool's device for freezes.
+- **No torn or stale picture.** A picture the present read before Windows finished writing it
+  would most likely show an older frame, whole or in part, between two frames that match each
+  other. Every frame whose differences to both neighbours are large against the motion either
+  side was listed from streamcheck's cache (`tools-1015/oddframes.py`, factor 2), and each was
+  decoded with its neighbours (`oddcheck.py`): it reads apart when the frames before and after are
+  closer to each other than either is to it. Controls, planted in 6 s of stream 0's fastest
+  steady motion: a picture 17 frames old reads 0.32, half the picture 17 frames old 0.76, every
+  other 32-pixel tile 17 frames old 0.54, an untouched frame 1.70, and real menu-cadence frames
+  1.36 and 1.74; the clean clip lists none, and at factor 4 the scan missed the half and the
+  tiles. Results:
+
+  | | candidates | apart | what they are |
+  |---|---|---|---|
+  | 2026-10-13, pool on the present's device, 129.7 min | 150 | 4 | a list scroll step, a one-frame shot in a dialogue camera cut, the hand on a polearm for one frame (66:42.15), a dark band across a tent for one frame (66:56.05) |
+  | 2026-10-14, pool on its own device, 66.2 min | 93 | 5 | a one-frame black blink of the loading screen (0:58.433 of stream 0), four list scroll steps |
+
+  At each one-frame picture the relay showed one new capture a present in arrival order. On
+  2026-10-13 the pool shared the present's device, where Windows orders its write before the
+  present's read, so the game draws such frames by itself. At the loading-screen blink the
+  painting had been on screen unchanged for over 2 s, so every pool texture held it and a stale
+  texture would have shown the painting. Not caught by the scan: a picture only a frame or two
+  old (it reads as a freeze or a small jerk), and anything in still footage.
+- **Lock releases fell** from about 21 an hour to 4.5 and 9.0. Stream 1's six follow capture
+  gaps of 29 to 41 ms by 0.2 to 1.3 s. Not read further; the content differs from 2026-10-13's.
+- **Both joined the corpus** as `gm_60x2_gameplay_2026_10_14_0.trace` (25.4 min, log 105.0 to
+  1628.4 s) and `gm_60x2_gameplay_2026_10_14_1.trace` (39.1 min, 91.0 to 2439.6 s), each cut to
+  gameplay; their replays release the lock at the same moments as the field.
+
 ## 6. The cursor under each source
 
 - **NvFBC.** The ring's grab session sets `bWithHWCursor = 0` (`CaptureRing.cpp`). That is T7 of
@@ -702,8 +893,8 @@ nothing about it is frame-exact. The wake, request and release counts are from `
   "cursor off (-nowgccursor)", and leaves the pointer out as NvFBC's grab does. `-wgccursor` is
   accepted. Up to `f530b08` the pointer was left out unless `-wgccursor` was typed. A moving pointer brings its extra
   frames with the setting on or off (5.9), and they are left out the same (5.9, the run with
-  cursor capture on). In the benchmark, which shows no pointer, the setting costs nothing
-  (5.11).
+  cursor capture on). In the benchmark a still pointer drawn into the picture costs nothing
+  (5.11), and a moving one costs about 145 points with the setting on or off (5.13).
 - **In the stream's picture.** One inventory frame of the 2026-10-11 video (2:24:32) shows no
   pointer. The game's menu pointer is the system's pointer with the game's own shape (5.9: it
   appears on the card with cursor capture on and not with it off), so it has been missing from
@@ -834,7 +1025,19 @@ Each is the user's.
 - **How a WGC stream joins the replay corpus.** As the regime check stands, every WGC stream
   with menu time fails it. Either the check learns what a menu looks like under WGC, or the
   singles stop reaching the ring.
-- **Whether `-wgc` becomes the default.** Not before the first decision.
+- **Whether `-wgc` becomes the default.** DECIDED 2026-10-14, not for now. The user first said
+  "seems fine to make wgc default first", then "let's actually keep it not default for now".
+- **Where the frame pool lives.** DECIDED 2026-10-15: on a device of its own by default inside
+  `-wgc`, with `-nowgcopen` to keep it on the present's device, after the 58 points of 5.13 and
+  the streams of 5.14. The user asked for the device made on the present's adapter ("let's do
+  the clean thing") and for the fall-back to the present's device where opening fails ("falling
+  back to the previous behavior makes sense to me in this case"); a retry was asked about and
+  is no use, since nothing about it is a race (section 2). Its benchmark on the user's branch is
+  owed: the 58.5 points were measured on the experiment build. The torn or stale frame question
+  has two further answers if the scan of 5.14 is not enough: an exact check inside the relay (a
+  few tiles' checksum on the pool's device at arrival against the present's device before
+  drawing, logged with its time) or a fence (a shared fence the present waits on before
+  sampling). Neither is built.
 
 ## 9. Untested elsewhere
 
@@ -843,8 +1046,13 @@ Carried from `performance-candidates.md` section 9.1 and `session-kickoff-perfor
 
 - Capturing the game's window in place of the display (`CreateForWindow`). Run in the benchmark
   on 2026-10-13 (5.11): the same frames and the same cost as display capture under DLSS frame
-  generation. Still unknown: whether window capture delivers Smooth Motion's generated frames,
-  and everything a window can do that a display cannot (move, resize, minimise, close).
+  generation, and on 2026-10-14 the same cost for a moving pointer (5.13). Still unknown:
+  whether window capture delivers Smooth Motion's generated frames, and everything a window can
+  do that a display cannot (move, resize, minimise, close).
+- The pool on a device of its own with the two displays on different graphics cards. The
+  pool's device is made on the present's adapter, so the present opens its textures on one
+  card; whether the session delivers there as it does on one card is not known.
+- The fall-back to the present's device (section 2) has not run on any machine.
 - Smooth Motion x3 and other source rates. `-fgphase` and `-phasekeep` on WGC.
 - HDR sources. The pool is 8-bit.
 - What WGC drops when a stall outlasts the pool's two spare buffers. The stream's log has not
@@ -860,12 +1068,15 @@ Carried from `performance-candidates.md` section 9.1 and `session-kickoff-perfor
 
 ## 10. Where things are
 
-- **Code.** `src/relay/WgcCaptureSource.h` (the session, the pool, the settings),
+- **Code.** `src/relay/WgcCaptureSource.h` (the session, the pool, the settings, the pool's
+  device and its fall-back),
   `src/relay/ICaptureSource.h` (what the ring asks of a source), `src/relay/CaptureRing.cpp` (the
   move from NvFBC, and NvFBC's cursor setting), `src/relay/FlipDecode.h` (what a flip line is).
-- **Logs.** The stream's is `Get Medieval 2026-10-11 0.log` in the analysis root, with the
-  NvFBC streams it is compared to beside it. The short runs of section 3 are named in
-  `session-kickoff-performance-pass-7.md`.
+- **Logs.** The streams' are `Get Medieval 2026-10-11 0.log`, `2026-10-12 0.log`,
+  `2026-10-13 0.log` (both streams of that night) and `2026-10-14 0.log` and `1.log` in the
+  analysis root, with the NvFBC streams they are compared to beside them. The short runs of
+  section 3 are named in `session-kickoff-performance-pass-7.md`, and the sittings of 5.11 and
+  5.13 are under `rigbench/sittings`.
 - **Tools.** `wgcsingles.py <log> <from_s> <to_s>`, in the analysis folder, prints the capture,
   flip, lock and step counts of sections 4 and 5: batch sizes and gaps inside a pair, singles
   and batches of three and where the odd member sits, flip requests a second on the game
@@ -874,4 +1085,8 @@ Carried from `performance-candidates.md` section 9.1 and `session-kickoff-perfor
   stretch of extras. The rows an hour in section 4 are from each stream's streamcheck
   report, and what was on screen (5.1) was read by eye from the video. In the analysis root,
   `regimegaps.py` lists the seconds out of the gameplay rate, and `tools-1010/kfstats.py` and
-  `kfshown.py` are the short-run tools of Part B.
+  `kfshown.py` are the short-run tools of Part B. `wgclost.py <log> <from_s> <to_s>` compares
+  wakes with the game display's pair requests second by second. For a video's frames,
+  `tools-1015/oddframes.py <video>.streamcheck-mad --ratio 2` lists frames apart from both
+  neighbours, `tools-1015/oddcheck.py <video> <frame> ...` decodes each with its neighbours, and
+  `tools-1015/freezemap.py` maps where freezes fall (5.14).

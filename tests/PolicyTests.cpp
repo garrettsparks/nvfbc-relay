@@ -4839,10 +4839,11 @@ static void test_launch_defaults() {
     CHECK(o.deferCopy, "the deferred ring copy must default on");
     CHECK(o.wgcDrop, "leaving out the frames a mouse pointer move brings must default on");
     CHECK(o.wgcCursor, "the mouse pointer in the WGC picture must default on");
-    CHECK(CountSwitchesOn(o) == 6 && o.markFrames == 0,
+    CHECK(o.wgcOpen, "the WGC frame pool on a device of its own must default on");
+    CHECK(CountSwitchesOn(o) == 7 && o.markFrames == 0,
           "exactly the lock, flip timing, late-batch correction, the deferred ring copy, "
-          "leaving out pointer frames and the pointer in the WGC picture must default on, %d "
-          "are on",
+          "leaving out pointer frames, the pointer in the WGC picture and the WGC frame pool on "
+          "a device of its own must default on, %d are on",
           CountSwitchesOn(o));
 
     // A blank mode answer is the release path, and it is the same mode b:vsync spells.
@@ -4880,10 +4881,11 @@ static void test_launch_option_parsing() {
     // The full opt-out: every default-on option off, and nothing reported.
     warnings.clear();
     unknown.clear();
-    o = ParseOptionString("-nolock -noetw -nodejit -lag 0 -nodefercopy -nowgcdrop -nowgccursor",
-                          &warnings, &unknown);
+    o = ParseOptionString(
+        "-nolock -noetw -nodejit -lag 0 -nodefercopy -nowgcdrop -nowgccursor -nowgcopen",
+        &warnings, &unknown);
     CHECK(!o.lock && !o.etw && !o.dejitter && o.extraLagMs == 0 && !o.deferCopy &&
-              !o.wgcDrop && !o.wgcCursor && CountSwitchesOn(o) == 0,
+              !o.wgcDrop && !o.wgcCursor && !o.wgcOpen && CountSwitchesOn(o) == 0,
           "the opt-outs must turn every default off");
     CHECK(warnings.empty() && unknown.empty(), "the opt-outs must parse clean");
 
@@ -4916,6 +4918,7 @@ static void test_launch_option_parsing() {
         {"-nodefercopy", &launch::Options::deferCopy},
         {"-nowgcdrop", &launch::Options::wgcDrop},
         {"-nowgccursor", &launch::Options::wgcCursor},
+        {"-nowgcopen", &launch::Options::wgcOpen},
     };
     for (const Switch& s : optOuts) {
         launch::Options x = SwitchesAt(true);
@@ -5251,6 +5254,8 @@ static void test_launch_relaunch_round_trip() {
         "-nowgccursor -wgccursor -lag 60",
         "-wgc -wgcopen",
         "-wgc -wgcopen -nowgccursor -src 60",
+        "-wgc -nowgcopen",
+        "-nowgcopen -wgcopen -lag 60",
     };
     for (const char* text : launches) {
         launch::Options typed = ParseOptionString(text, nullptr, nullptr);

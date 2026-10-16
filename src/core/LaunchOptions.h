@@ -25,7 +25,9 @@ namespace launch {
 // frames Windows sends for a move of the mouse pointer alone are left out by default, because
 // each is a copy of the frame before it; -nowgcdrop keeps them. With -wgc the mouse pointer is
 // in the captured picture by default, because the benchmark measured no cost for it;
-// -nowgccursor leaves it out.
+// -nowgccursor leaves it out. With -wgc the frame pool is on a device of its own by default,
+// because the benchmark measured it about 58 points cheaper for the game than the pool on the
+// present's device; -nowgcopen keeps it on the present's device.
 struct Options {
     float srcRateHint = 0.0f;       // -src: declared BASE render rate; 0 = not declared
     bool lock = true;               // -lock / -nolock: the phase comb lock
@@ -47,8 +49,8 @@ struct Options {
                                     // that only a move of the mouse pointer brought
     bool wgcCursor = true;          // -wgccursor / -nowgccursor: with -wgc, the mouse pointer
                                     // is in the picture
-    bool wgcOpen = false;           // -wgcopen: with -wgc, the frame pool on a device of its
-                                    // own, its textures opened by the present
+    bool wgcOpen = true;            // -wgcopen / -nowgcopen: with -wgc, the frame pool on a
+                                    // device of its own, its textures opened by the present
 };
 
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths always
@@ -157,8 +159,11 @@ inline const std::vector<UsageRow>& OptionRows() {
                              "as NvFBC does. By default it is in the picture", false, false},
         {"-wgccursor", "", "The mouse pointer in the picture; on by default, accepted so a "
                            "launch string that names it keeps working", false, false},
-        {"-wgcopen", "", "With -wgc, keep Windows' frame pool on a device of its own and show "
-                         "its frames from there, which costs the game less", false, false},
+        {"-nowgcopen", "", "With -wgc, keep Windows' frame pool on the device the relay shows "
+                           "its frames with. By default it is on a device of its own, which "
+                           "costs the game less", false, false},
+        {"-wgcopen", "", "The frame pool on a device of its own; on by default, accepted so a "
+                         "launch string that names it keeps working", false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -300,6 +305,7 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-wgccursor")   { o->wgcCursor = true;  return 1; }
     if (t == "-nowgccursor") { o->wgcCursor = false; return 1; }
     if (t == "-wgcopen")     { o->wgcOpen = true;    return 1; }
+    if (t == "-nowgcopen")   { o->wgcOpen = false;   return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -468,7 +474,7 @@ inline std::string FormatOptions(const Options& o) {
     if (o.wgc) add("-wgc");
     if (o.wgcDrop != d.wgcDrop) add(o.wgcDrop ? "-wgcdrop" : "-nowgcdrop");
     if (o.wgcCursor != d.wgcCursor) add(o.wgcCursor ? "-wgccursor" : "-nowgccursor");
-    if (o.wgcOpen) add("-wgcopen");
+    if (o.wgcOpen != d.wgcOpen) add(o.wgcOpen ? "-wgcopen" : "-nowgcopen");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");

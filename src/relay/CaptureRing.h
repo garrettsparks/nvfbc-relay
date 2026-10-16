@@ -157,9 +157,10 @@ public:
     // capturing is NvFBC let go. If WGC cannot open, capture stays on NvFBC and the log says
     // why. dropPointerFrames leaves out the frames WGC delivers for a move of the mouse pointer
     // alone (WgcCaptureSource::PointerOnly). cursor has Windows draw the mouse pointer into the
-    // captured picture. ownDevice (-wgcopen) puts the frame pool on a device of its own in place
-    // of the present's, and the present opens each of the pool's textures through a shared
-    // handle.
+    // captured picture. ownDevice (on unless -nowgcopen) puts the frame pool on a device of its
+    // own in place of the present's, and the present opens each of the pool's textures through
+    // a shared handle; where that does not work, the pool goes on the present's device
+    // (WgcCaptureSource::Open).
     void EnableWgc(bool dropPointerFrames, bool cursor, bool ownDevice) {
         m_wgcRequested = true;
         m_wgcDropPointerFrames = dropPointerFrames;
@@ -370,7 +371,7 @@ private:
     bool m_wgcRequested = false;
     bool m_wgcDropPointerFrames = true;
     bool m_wgcCursor = true;
-    bool m_wgcOwnDevice = false;
+    bool m_wgcOwnDevice = true;
     HMONITOR m_sourceMonitor = NULL;                       // the display WGC captures
     std::atomic<ID3D11Device*> m_wgcDevice{NULL};          // offered once by the present
     std::atomic<ID3D11Texture2D*> m_wgcTexture[RING_SIZE];   // written by the capture thread

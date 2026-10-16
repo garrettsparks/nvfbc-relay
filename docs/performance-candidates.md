@@ -11,8 +11,9 @@ drawn.
 
 The goal (user, 2026-10-03): beat OBS's fullscreen projector on both game cost and picture
 quality. The cost to beat is the projector's with game capture, 3.76% (user, 2026-10-09). NvFBC
-captures the whole display and costs about 5.5%. Capture through Windows (WGC, `-wgc`) costs
-about 4.6% (9.1).
+captures the whole display and costs about 5.5%. Capture through Windows (WGC, `-wgc`) cost
+about 4.6% with its frame pool on the present's device, and about 3.6% with the pool on a device
+of its own (9.1), which is the default inside `-wgc` since 2026-10-15.
 
 ## 1. Where things stand
 
@@ -35,8 +36,10 @@ correct for.
 | `60` | 4.69% | one-launch sitting, 2026-10-07 |
 | `60` with the original relay's timer (32.3 loops a second) | 3.05% | the same sitting |
 | `b:vsync -src 60` with the deferred ring copy (the default since 2026-10-08) | 5.1 to 5.4% | three one-launch sittings, 2026-10-08 |
-| `b:vsync -src 60 -wgc`, capture through Windows, off by default (9.1) | 4.6%, and 4.5% | one-launch sitting, 2026-10-11, and two on 2026-10-13 |
+| `b:vsync -src 60 -wgc`, capture through Windows, off by default, pool on the present's device (9.1) | 4.6%, and 4.5% | one-launch sitting, 2026-10-11, and two on 2026-10-13 |
+| the same with the pool on a device of its own (the experiment's `-xwgcopen`, 9.1) | about 192 points, 3.6%, against 251 for the row above | one-launch sitting, 2026-10-14 |
 | OBS projector, game capture, 2560x1440 canvas | 3.76% | one-launch sitting, 2026-10-08 |
+| the same | 216 points, 4.0%, and 207.6 | one-launch sittings, 2026-10-09 and 2026-10-14 |
 | OBS projector, display capture, 2560x1440 canvas | 6.23% | the same sitting |
 | OBS projector, game capture, 1920x1080 canvas | 4.85% | by hand on 2026-10-03, separate launches |
 | `b:vsync -src 60`, game capped at 60 with 2X | no frame rate, about 0.4 points of GPU % | 2026-10-07 |
@@ -50,7 +53,10 @@ DXGI`). Its game capture loaded a hook into the game and shared the game's back 
 shared texture capture successful`). Only cost was measured for OBS on 2026-10-08; its pacing
 and picture were not. A second sitting on 2026-10-09 ran OBS with each of its capture methods
 beside the relay in one launch (9.1): game capture 4.0%, the relay 5.3%, window capture by WGC
-5.4%, display capture by WGC 5.5% and display capture by Desktop Duplication 6.8%.
+5.4%, display capture by WGC 5.5% and display capture by Desktop Duplication 6.8%. On
+2026-10-14 the relay on WGC with its frame pool on a device of its own cost about 192 points,
+under game capture's 202 to 216 from those other launches; no sitting has had the two in one
+launch.
 
 The 6% exists only when the GPU has nothing to spare. Capped, the relay takes no frame rate.
 
@@ -102,6 +108,22 @@ The grab of a frame generation duplicate is cheap and the grab of a new frame is
 about what skipping only those members' copies saved (64). Inside the present's 75 points the
 draw is small: presenting with no draw at all saved 9 to 31. A ring copy completes in about
 0.1 ms when the game is capped (p95 0.14 ms) and takes 10 ms at p95 when the GPU is saturated.
+
+Under NvFBC one thread starting in NVIDIA's D3D9 driver (`nvd3dumx.dll`) holds 93 to 95% of a
+CPU core on a still desktop while the relay's own threads stay under 1%; on WGC the whole
+process uses under 1% (2026-10-14, `-xthreadcpu` on the experiment branch). The GPU-bound
+benchmark does not see it. A game held back by its CPU would.
+
+The same split on WGC (2026-10-14, sitting `split1`, 22 rows, with the pool on the present's
+device as it ran then; 9.1 has the rows):
+
+| part | points | how it was priced |
+|---|---|---|
+| presenting, 60 a second | about 78 | presenting half as often saved 39 |
+| of which drawing the frame | about 21 | presenting with no draw saved 20.8 |
+| of which the present itself | about 57 | the rest of the 78 |
+| the frame pool on the present's device | about 58 | moving the stand-in's pool there cost 58.5; a device of its own takes it back (9.1) |
+| Windows capturing and delivering the frames | about 114 | what is left of 250 |
 
 ## 3. Candidates
 
@@ -519,9 +541,11 @@ every frame out of WGC's pool into a texture of its own (`libobs-winrt/winrt-cap
 **WGC in the relay (built 2026-10-09 and 2026-10-11).** It is the switch `-wgc`. It is off by
 default, it runs only with `b:vsync`, and the help text does not list it. The relay starts on
 NvFBC as it always does. Once the D3D11 present has its device, the capture thread opens a WGC
-session on the game display. The session's frame pool is made on the present's device, with a
-buffer for every ring slot and two more. Each stored frame stays in the pool for as long as its
-slot names it, and the present samples the pool's texture with the shader it already has. No
+session on the game display. The session's frame pool has a buffer for every ring slot and two
+more. It was made on the present's device up to 2026-10-15; since then it is made on a device
+of its own and the present opens its textures through shared handles (below). Each stored frame
+stays in the pool for as long as its slot names it, and the present samples the pool's texture
+with the shader it already has. No
 frame is copied and nothing is waited for. NvFBC is let go only once WGC is capturing. The relay
 stays on NvFBC, and says so in the log, when WGC cannot open, when Windows will not take the
 frame interval described next, or when the two displays differ in size. On the desktop the card
@@ -606,6 +630,29 @@ and the same 92.8 frames a second. A readback of every frame's picture read the 
 generated frame followed by its real frame, about two a second of the 90 the game generates.
 `wgc-capture-spec.md` section 5.11 has the rows.
 
+The sittings of 2026-10-14 (`wgc-capture-spec.md` section 5.13 has every row) priced the parts
+of WGC's 250 points (section 2) and found the lever. With nothing else changed, moving the
+stand-in's pool onto the present's device cost 58.5 points (`place1`). Copying every frame off
+the pool's own device cost about 105 (`copy1`), more than the device, so a copy is no way round
+it. The pool's textures are made shareable (misc flags SHARED and SHARED_NTHANDLE), so the
+present's device can open each one through a shared handle with no copy. On the experiment
+branch (`-xwgcopen`, sitting `open1`, 14 rows) that was 58.5 +- 4.0 points cheaper than the
+pool on the present's device in the same launch: WGC about 192 points, 3.6%, against 251. The
+rows stored 94 to 95 frames a second, presented 60.01 times a second with no hold and no
+present gap over 25 ms, blended 4.6 to 5.7% of presents (the pool on the present's device 6.3 to
+7.3%), opened all 34 pool textures and showed the game on the card. Why the device costs 58
+points is not known. It went to the user's branch as `-wgcopen` (`ab1772e`, off by default),
+streamed twice that night with no game frame lost and no torn or stale picture found
+(`wgc-capture-spec.md` 5.14), and since 2026-10-15 is the default inside `-wgc`, made on the
+present's adapter and falling back to the present's device where opening fails, with
+`-nowgcopen` to turn it off. Its benchmark on the user's branch is owed.
+
+The same sittings priced a moving mouse pointer: about 145 points while WGC captures, with or
+without the pointer drawn, and nothing with no relay, on NvFBC as shipped, or under OBS's game
+capture. With a WGC session open the compositor draws the pointer itself, about 160 presents a
+second. OBS's display capture by WGC pays the same, and no WGC setting removes it. The user
+accepted it, since the pointer is hidden in their game's play.
+
 WGC keeps each frame in its own pool buffer until the relay takes it, so a capture thread that
 is busy loses none. In the 13-minute read-back run the thread spent 1.5 to 2.5 ms on every
 frame and all 92,470 frames arrived. What Windows drops when the relay stalls for longer than
@@ -614,8 +661,8 @@ compositor's and is no use as a clock. WGC does not scale: a pool's buffers keep
 were made with, and a larger picture is clipped (Microsoft's screen capture page). The present
 samples without filtering, so with displays of different sizes the relay stays on NvFBC, which
 scales in the grab. Still untested: Smooth Motion x3 and other source rates, HDR sources (the
-pool is 8-bit), and capturing the game's window under Smooth Motion. Two streams have run on
-it (`wgc-capture-spec.md` sections 4 and 5.10).
+pool is 8-bit), and capturing the game's window under Smooth Motion. Six streams have run on
+it (`wgc-capture-spec.md` sections 4, 5.10, 5.12 and 5.14).
 
 **Presenting a ring slot by reference (composition swapchain).** Windows 11's composition
 swapchain registers up to 31 textures with a presentation manager and presents any of them, in any
@@ -698,7 +745,9 @@ problems before it finds a number.
 6. DONE 2026-10-11: one architectural prototype, WGC with the pool as the ring, in the relay
    behind `-wgc` (9.1). Next for it are a whole stream and capturing the game's window. The
    composition swapchain is a later step. NvFBC's CUDA interface was the other choice. It was
-   built, measured and dropped on 2026-10-09 (3.4).
+   built, measured and dropped on 2026-10-09 (3.4). On 2026-10-14 WGC's points were split and
+   the frame pool's device turned out to cost 58 of them; since 2026-10-15 the pool is on a
+   device of its own by default inside `-wgc` (9.1).
 7. The CPU-only cleanups, together, checked by the suite and one stream.
 
 Every row is compared inside one launch with a no-relay row and `b:vsync -src 60` at both ends.
