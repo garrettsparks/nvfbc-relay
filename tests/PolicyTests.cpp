@@ -1277,6 +1277,120 @@ static void test_anchor_chain() {
 // that overlap heavily), because the whole point is that no single batch is decisive.
 // The deferred ring copy's rule: which frame waits uncopied, what becomes of it, and the limits
 // that follow the lag.
+// The WGC pointer drop sized from the game's own frames (policy::IsPointerFrame). Areas are in
+// pixels of a 2560x1440 display, times in microseconds.
+static void test_pointer_drop() {
+    const int64_t kWhole = 2560LL * 1440, kPointer = 32 * 48, kJump = 2048;
+    const int64_t kForget = 1000LL * policy::kPointerDropForgetMs;
+    // Feeds (time, area) frames through the rule and counts what it left out, by area.
+    struct Frame { int64_t t, area; };
+    auto run = [&](const std::vector<Frame>& frames, policy::PointerDropState* state) {
+        std::vector<char> out;
+        policy::PointerDropState local;
+        policy::PointerDropState& s = state ? *state : local;
+        for (const Frame& f : frames) out.push_back(policy::IsPointerFrame(s, f.area, f.t, kForget));
+        return out;
+    };
+    auto count = [](const std::vector<Frame>& frames, const std::vector<char>& out, int64_t area) {
+        int n = 0;
+        for (size_t i = 0; i < frames.size(); i++) if (frames[i].area == area && out[i]) n++;
+        return n;
+    };
+
+    // A game that fills the display, flipping 120 times a second, with the pointer moving
+    // between its frames: every pointer frame is left out and no game frame is.
+    {
+        std::vector<Frame> f;
+        for (int64_t t = 0; t < 1000000; t += 8333) {
+            f.push_back({t, kWhole});
+            f.push_back({t + 2000, kPointer});
+            f.push_back({t + 4000, kJump});
+        }
+        const std::vector<char> out = run(f, NULL);
+        const int pointers = (int)(f.size() / 3);
+        CHECK(count(f, out, kPointer) == pointers && count(f, out, kJump) == pointers &&
+              count(f, out, kWhole) == 0,
+              "full-screen game: %d of %d pointer frames and %d of %d jumps left out, %d game "
+              "frames left out", count(f, out, kPointer), pointers, count(f, out, kJump),
+              pointers, count(f, out, kWhole));
+    }
+    // A game in a 1280x720 window, a quarter of the display: its frames are the largest, so
+    // the pointer's are left out against them. The rule of a twentieth of the screen kept them
+    // here, since no frame changed the whole screen.
+    {
+        const int64_t kWindow = 1280LL * 720;
+        std::vector<Frame> f;
+        for (int64_t t = 0; t < 1000000; t += 16667) {
+            f.push_back({t, kWindow});
+            f.push_back({t + 5000, kPointer});
+        }
+        const std::vector<char> out = run(f, NULL);
+        CHECK(count(f, out, kPointer) == (int)(f.size() / 2) && count(f, out, kWindow) == 0,
+              "windowed game: %d pointer frames left out of %d, %d game frames left out",
+              count(f, out, kPointer), (int)(f.size() / 2), count(f, out, kWindow));
+    }
+    // The line is a tenth of the largest: a game's partial update over a tenth is kept, one
+    // just under a tenth is left out, and a notification over a full-screen game is left out.
+    {
+        policy::PointerDropState s;
+        CHECK(!policy::IsPointerFrame(s, kWhole, 0, kForget), "a full-screen frame was left out");
+        CHECK(!policy::IsPointerFrame(s, kWhole / 10, 1000, kForget),
+              "a frame of exactly a tenth was left out");
+        CHECK(policy::IsPointerFrame(s, kWhole / 10 - 1, 2000, kForget),
+              "a frame just under a tenth was kept");
+        CHECK(policy::IsPointerFrame(s, 400 * 150, 3000, kForget),
+              "a 400x150 notification over a full-screen game was kept");
+        CHECK(!policy::IsPointerFrame(s, kWhole / 5, 4000, kForget),
+              "a game's update of a fifth of the picture was left out");
+    }
+    // A still screen where only the pointer moves keeps the pointer's frames, the only change
+    // it has: with nothing larger remembered, and again once the memory runs out.
+    {
+        std::vector<Frame> f;
+        for (int64_t t = 0; t < 1000000; t += 10000) f.push_back({t, kPointer});
+        const std::vector<char> out = run(f, NULL);
+        CHECK(count(f, out, kPointer) == 0, "a still screen lost %d of %d pointer frames",
+              count(f, out, kPointer), (int)f.size());
+        policy::PointerDropState s;
+        policy::IsPointerFrame(s, kWhole, 0, kForget);
+        CHECK(policy::IsPointerFrame(s, kPointer, kForget - 1, kForget),
+              "a pointer frame inside the forget time after a full-screen frame was kept");
+        CHECK(!policy::IsPointerFrame(s, kPointer, kForget, kForget),
+              "a pointer frame at the forget time after the last full-screen frame was left out");
+    }
+    // Frames with no list of changed areas (-1) or an empty one (0) are kept and do not keep
+    // the memory alive.
+    {
+        policy::PointerDropState s;
+        policy::IsPointerFrame(s, kWhole, 0, kForget);
+        CHECK(!policy::IsPointerFrame(s, -1, 100000, kForget), "a frame with no list was left out");
+        CHECK(!policy::IsPointerFrame(s, 0, 200000, kForget), "an empty frame was left out");
+        CHECK(!policy::IsPointerFrame(s, kPointer, kForget + 1, kForget),
+              "frames with no areas kept the memory of a full-screen frame alive");
+    }
+    // The known cost, as agreed: a game in a window under a tenth of the display loses its own
+    // frames for the forget time after a frame that changed the whole screen, and only that long.
+    {
+        const int64_t kSmall = 640LL * 360;   // 6.25% of the display
+        std::vector<Frame> f;
+        f.push_back({0, kWhole});
+        for (int64_t t = 10000; t < 1000000; t += 16667) f.push_back({t, kSmall});
+        const std::vector<char> out = run(f, NULL);
+        int64_t lastLost = -1, firstKept = -1;
+        for (size_t i = 1; i < f.size(); i++) {
+            if (out[i]) lastLost = f[i].t;
+            else if (firstKept < 0) firstKept = f[i].t;
+        }
+        CHECK(lastLost < kForget && firstKept >= kForget && firstKept < kForget + 16667,
+              "small window after a full-screen frame: last frame lost at %lld us, first kept at "
+              "%lld us, forget time %lld us", (long long)lastLost, (long long)firstKept,
+              (long long)kForget);
+        std::printf("  pointer drop: a 640x360 window lost its own frames for %.0f ms after a "
+                    "full-screen frame (the forget time is %d ms)\n", firstKept / 1000.0,
+                    policy::kPointerDropForgetMs);
+    }
+}
+
 static void test_defer_decision() {
     const int64_t kPeriod = 16667, kPairGap = 1500, kThreshold = 3000;
 
@@ -5687,6 +5801,7 @@ int main(int argc, char** argv) {
     test_anchor_chain();
     test_keep_decision();
     test_defer_decision();
+    test_pointer_drop();
     test_x3_phasekeep_field_failure();
     test_rotation_phase();
     test_dejit_removes_late_blends();

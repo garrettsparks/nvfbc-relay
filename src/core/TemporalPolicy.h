@@ -863,4 +863,31 @@ float LockAnchorFps(bool lock, float srcRateHint);
 // decides. Production and the replay size the comb with this one function.
 int CombDenominator(double srcFps, double presentFps, bool* matched);
 
+// ---------------------------------------------------------------------------------
+// The mouse pointer's frames under Windows.Graphics.Capture. While a WGC session is open,
+// Windows delivers a frame for each move of a visible pointer: a copy of the frame before it,
+// reported as changed only in the pointer's rectangle. A frame is measured against the game's
+// own frames, not the screen, so the rule holds for a game in a window as it does for one
+// that fills the display: the relay remembers the largest changed area any frame was reported
+// with, and forgets it once kPointerDropForgetMs passes with no frame at least that large. A
+// frame is a pointer's frame when its changed area is under a tenth of the remembered one.
+//
+// A frame with no list of changed areas, or an empty one, is never a pointer's frame and
+// leaves the memory as it is. On a still screen where only the pointer moves, the memory runs
+// out after the forget time and the pointer's frames are kept, since they are all the screen
+// has. A game whose own frames are reported with areas more than ten times apart inside the
+// forget time would lose its smaller frames for that long; no game read so far does that.
+const int kPointerDropForgetMs = 500;
+const int kPointerDropRatio = 10;
+
+struct PointerDropState {
+    int64_t largestArea = 0;   // the largest changed area of a frame lately; 0 = none known
+    int64_t largestAt = 0;     // when a frame at least that large last came
+};
+
+// Whether a frame whose changed areas add up to `area` pixels (-1: the frame had no list of
+// them) is a pointer's frame, at time `now`; `forgetTicks` is kPointerDropForgetMs in the same
+// clock. Updates the memory.
+bool IsPointerFrame(PointerDropState& s, int64_t area, int64_t now, int64_t forgetTicks);
+
 }  // namespace policy

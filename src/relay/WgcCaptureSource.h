@@ -376,8 +376,8 @@ public:
             (int)m_size.Width, (int)m_size.Height, (int)m_buffers, place, cursor,
             m_borderOff ? "off" : "ON", (long long)(BatchWindowQpc() * 1000000 / r.m_freqQuad));
         if (r.m_wgcDropPointerFrames) {
-            LOG("WGC: a frame that changed only a small area, as a move of the mouse pointer "
-                "makes, is left out while frames that change the whole picture are arriving "
+            LOG("WGC: a frame that changed under a tenth of the largest area a frame changed in "
+                "the last half second, as a move of the mouse pointer makes, is left out "
                 "(-nowgcdrop keeps them)");
         } else {
             LOG("WGC: frames that changed only a small area are kept (-nowgcdrop)");
@@ -577,17 +577,17 @@ private:
         return opened;
     }
 
-    // True for a frame Windows reports as changed only in a small area, under a twentieth of
-    // the picture, while frames that change the whole picture are still arriving. A move of
-    // the mouse pointer makes one while WGC is capturing: Windows delivers a frame whose
-    // picture is a copy of the frame before it and marks the pointer's rectangle as all that
-    // changed, where a frame the game presented is marked as the whole picture. Left in, such
-    // a frame reaches the ring as a wake between the pairs of a frame-generated source, or as
-    // a third member of one.
+    // True for a frame Windows reports as changed only in a small area against the game's own
+    // frames: under a tenth of the largest area a frame changed lately (policy::IsPointerFrame
+    // has the rule). A move of the mouse pointer makes one while WGC is capturing: Windows
+    // delivers a frame whose picture is a copy of the frame before it and marks the pointer's
+    // rectangle as all that changed, where a frame the game presented is marked as the whole of
+    // what it drew. Left in, such a frame reaches the ring as a wake between the pairs of a
+    // frame-generated source, or as a third member of one.
     //
     // A frame with no list of changed areas, or an empty one, is never this. Neither is a
-    // small change when nothing has changed the whole picture in the last half second, so a
-    // still screen keeps the small updates that are all it has.
+    // small change once nothing larger has come for half a second, so a still screen keeps the
+    // small updates that are all it has.
     bool PointerOnly(wgc::Frame* frame) {
         long long area = -1;
         wgc::Frame2* frame2 = NULL;
@@ -614,14 +614,10 @@ private:
             LOG("WGC: a frame came with no list of changed areas, and such a frame is never "
                 "left out");
         }
-        const long long whole = (long long)m_size.Width * m_size.Height;
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
-        if (area <= 0 || area * 20 >= whole) {
-            if (area >= whole) m_lastWholeQpc = now.QuadPart;
-            return false;
-        }
-        return m_lastWholeQpc != 0 && (now.QuadPart - m_lastWholeQpc) * 2 < r.m_freqQuad;
+        return policy::IsPointerFrame(m_pointerDrop, area, now.QuadPart,
+                                      (r.m_freqQuad * policy::kPointerDropForgetMs) / 1000);
     }
 
     // How long a wait lasts with no frame, as long as NvFBC's grab waits: it bounds how
@@ -703,6 +699,6 @@ private:
     wgc::Frame* m_slotFrame[CaptureRing::RING_SIZE];  // the frame each slot names
     long long m_noTexture = 0;
     long long m_pointerFrames = 0;      // left out by PointerOnly
-    LONGLONG m_lastWholeQpc = 0;        // when a frame last changed the whole picture
+    policy::PointerDropState m_pointerDrop;   // the largest area the game's frames changed lately
     bool m_noAreasLogged = false;
 };

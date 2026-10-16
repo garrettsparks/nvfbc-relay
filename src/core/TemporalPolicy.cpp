@@ -1291,4 +1291,15 @@ int CombDenominator(double srcFps, double presentFps, bool* matched) {
     return 1;
 }
 
+bool IsPointerFrame(PointerDropState& s, int64_t area, int64_t now, int64_t forgetTicks) {
+    if (area <= 0) return false;
+    if (s.largestArea > 0 && now - s.largestAt >= forgetTicks) s.largestArea = 0;
+    if (area >= s.largestArea) {
+        s.largestArea = area;
+        s.largestAt = now;
+        return false;
+    }
+    return area * kPointerDropRatio < s.largestArea;
+}
+
 }  // namespace policy
