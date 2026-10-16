@@ -13,7 +13,8 @@ The goal (user, 2026-10-03): beat OBS's fullscreen projector on both game cost a
 quality. The cost to beat is the projector's with game capture, 3.76% (user, 2026-10-09). NvFBC
 captures the whole display and costs about 5.5%. Capture through Windows (WGC, `-wgc`) cost
 about 4.6% with its frame pool on the present's device, and about 3.6% with the pool on a device
-of its own (9.1), which is the default inside `-wgc` since 2026-10-15.
+of its own (9.1), which is the default inside `-wgc` since 2026-10-15. In one launch beside OBS's
+game capture that default cost the game 17 points less than game capture (9.1).
 
 ## 1. Where things stand
 
@@ -36,8 +37,10 @@ correct for.
 | `60` | 4.69% | one-launch sitting, 2026-10-07 |
 | `60` with the original relay's timer (32.3 loops a second) | 3.05% | the same sitting |
 | `b:vsync -src 60` with the deferred ring copy (the default since 2026-10-08) | 5.1 to 5.4% | three one-launch sittings, 2026-10-08 |
+| the same with the ring copies not waited for (section 3.2, a patch not yet committed) | 14.7 +- 1.4 points less in the same launch: about 260 points, 4.8%, against 275 | one-launch sitting, 2026-10-15, a new capture card |
 | `b:vsync -src 60 -wgc`, capture through Windows, off by default, pool on the present's device (9.1) | 4.6%, and 4.5% | one-launch sitting, 2026-10-11, and two on 2026-10-13 |
 | the same with the pool on a device of its own (the experiment's `-xwgcopen`, 9.1) | about 192 points, 3.6%, against 251 for the row above | one-launch sitting, 2026-10-14 |
+| the same, the default inside `-wgc` on the user's branch (`00987d6`) | about 196 points, 3.6%; in the same launch OBS's game capture 17.1 +- 2.3 more and the pool on the present's device 64.0 +- 3.5 more | one-launch sitting, 2026-10-15, a new capture card |
 | OBS projector, game capture, 2560x1440 canvas | 3.76% | one-launch sitting, 2026-10-08 |
 | the same | 216 points, 4.0%, and 207.6 | one-launch sittings, 2026-10-09 and 2026-10-14 |
 | OBS projector, display capture, 2560x1440 canvas | 6.23% | the same sitting |
@@ -55,8 +58,8 @@ and picture were not. A second sitting on 2026-10-09 ran OBS with each of its ca
 beside the relay in one launch (9.1): game capture 4.0%, the relay 5.3%, window capture by WGC
 5.4%, display capture by WGC 5.5% and display capture by Desktop Duplication 6.8%. On
 2026-10-14 the relay on WGC with its frame pool on a device of its own cost about 192 points,
-under game capture's 202 to 216 from those other launches; no sitting has had the two in one
-launch.
+under game capture's 202 to 216 from those other launches. On 2026-10-15 a sitting put the two
+in one launch, and the relay cost the game 17.1 +- 2.3 points less than game capture (9.1).
 
 The 6% exists only when the GPU has nothing to spare. Capped, the relay takes no frame rate.
 
@@ -124,6 +127,12 @@ device as it ran then; 9.1 has the rows):
 | of which the present itself | about 57 | the rest of the 78 |
 | the frame pool on the present's device | about 58 | moving the stand-in's pool there cost 58.5; a device of its own takes it back (9.1) |
 | Windows capturing and delivering the frames | about 114 | what is left of 250 |
+
+A GPU context switch trace on 2026-10-15 (section 8) put the same parts on the GPU's own clock:
+each present costs the game 0.172 ms of the graphics engine, about two thirds of it switching
+from the game to the relay and back, and the compositor's 110 visits a second for WGC cost the
+same each. A present with no draw still takes the engine and still costs the game 0.153 ms, so
+the present itself is the price of presenting from the game's GPU.
 
 ## 3. Candidates
 
@@ -311,6 +320,36 @@ nearly every slot is turned on one wake late. A third NvFBC buffer would give a 
 It was thought unavailable when this was built; a probe on 2026-10-09 showed NvFBC accepts three
 (section 6), and `-nowaitcopy` has not been tried with three. The copy side as built gives 60 to 65 of its 80 points.
 
+**Ported to the user's branch and measured, 2026-10-15** (patches in the analysis folder,
+not yet committed). The NvFBC source hands each copy to the GPU with one flush and an event
+query of its buffer; `ICaptureSource::Store` says whether the picture is in the slot, and a
+slot whose copy is on its way is published with valid off and awaitingCopy on and turned on
+when the loop finds the copy done, at its next look (before a grab, after one, at a grab
+timeout) and at the latest before NvFBC writes that buffer again. A slot keep-real retracts
+meanwhile stays off, and the reclaim of a coalesced single turns on no slot whose copy is on
+its way. The corpus replay turns every such slot on at that latest point and 12 ms after it
+(the longest wait for a copy measured on a saturated GPU was 11.6 ms): no present changes on
+any of the 44 fixtures, 3,119,018 copies not waited for, and planted faults fail the check
+(slots turned on far too late: 44 fixtures; the gap limit removed: 14). In one launch (sitting
+`buf1`, four rows each, `b:vsync -src 60`):
+
+| build | against 00987d6, paired | fitted | copies waited for before their buffer was reused |
+|---|---|---|---|
+| 00987d6 | | | every copy, p50 84 us, p95 10.2 ms |
+| copies not waited for | **-14.7 +- 1.4 points** | -13.9 +- 1.9 | about 1,030 a run, the longest 11.0 to 11.6 ms |
+| and a third NvFBC buffer | -14.3 +- 2.7 | -13.0 +- 1.9 | 12 to 16 a run, the longest 0.1 ms |
+
+Every row presented 60.01 times a second with no hold, no repeat, no backward step and no
+present gap over 25 ms, blends 6.3 to 7.8% in all three, and the card showed the game. So not
+waiting saves about 14 points, and the third buffer, which removes nearly every wait left, saves
+nothing more: those waits cost the game nothing. The third buffer is also the weaker of the two
+in the worst case. With three buffers a copy may wait two wakes before the loop is made to wait
+for it, and the replay with every slot turned on only then changes 4,592 presents on 10
+fixtures (650 to 1,550 on the Avatar 30 fps ones); it is safe only while copies finish within
+about 12 ms and the loop finds them at its next look, which the realistic replay confirms (no
+present changes). The two-buffer port is safe in the strict replay as well. Not waiting is the
+change to keep; the third buffer is left out. Neither has been through CI or a stream.
+
 ### 3.3 Skip the extra wake (`-grabphase`)
 
 Not built. A stand-in was measured on 2026-10-07: pausing 8 ms before each grab removed 43% of
@@ -432,6 +471,27 @@ by the CPU.
   memory saving.
 - Drop `D3DCREATE_MULTITHREADED` where one thread uses the device.
 
+**Measured 2026-10-15 and left out.** The first, the second and the third were built (the view
+made once at the first present; the copy wait flushing once and then yielding the thread
+between reads of the query; the capture device without `D3DCREATE_MULTITHREADED`, the one D3D9
+device with per-frame calls, which only the capture thread calls once `Start` has made it) and
+benched cumulatively in one launch, four rows each on `b:vsync -src 60` (sitting `cpu1`), with
+the relay's CPU time read as each relay closed:
+
+| change | against 00987d6, paired | fitted | relay CPU, of a core |
+|---|---|---|---|
+| none (00987d6's source) | | | 0.843 |
+| the view kept | +4.5 +- 4.0 points | +6.2 +- 3.1 | +0.009 +- 0.005 |
+| and the yield | +0.5 +- 3.0 | +3.3 +- 3.2 | +0.009 +- 0.007 |
+| and the device single-threaded | -1.5 +- 5.0 | +1.8 +- 3.2 | +0.008 +- 0.010 |
+
+None moved the score or the relay's CPU time; the relay's 0.84 of a core under NvFBC is
+NVIDIA's own thread (section 2), which none of them touch. On a still desktop the WGC path's
+CPU read 0.018 to 0.032 of a core with the view kept against 0.019 to 0.089 without, too spread
+to call. A recording of the card with the view kept showed no stale or black frame. The yield
+would matter only to a game held back by its CPU, which this bench is not. They are left out;
+each is a patch of its own if a CPU-bound game ever wants them.
+
 ## 6. Ruled out
 
 - The candidates section 3.4 lists as dropped, which were measured.
@@ -473,6 +533,55 @@ be moved, and which option in section 9 is worth building.
 - Or extend EtwProbe, which already reads the graphics kernel's provider, to log per-process GPU
   work so the analysis can run on the Mac. Which events carry per-packet GPU timing has not been
   checked.
+
+**Measured 2026-10-15, on WGC.** The rig runs hardware-accelerated GPU scheduling, and with it
+Windows' own trace hardly sees the GPU's packets (the graphics kernel's DmaPacket events fired
+once in 6 s while the relay presented 60 times a second). NVIDIA's Nsight Systems records the
+GPU's own context switches instead: which process's context holds the graphics engine, from
+the moment it is restored to the moment it is saved. One launch, five benchmark runs, each
+traced for 10 s from about 40 s into the run (`nsys profile --trace=wddm --gpuctxsw=true`),
+three with no relay and two with `b:vsync -src 60 -wgc` (the CI build of `00987d6`). The scores
+were 5342 to 5373 with no relay and 5146 and 5158 with the relay, as untraced rows read. Per
+second of the window:
+
+| | no relay (3 runs) | relay on WGC (2 runs) |
+|---|---|---|
+| the game holding the engine | 988.6 to 988.9 ms | 952.9 and 954.5 ms |
+| the game off the engine while nobody else held it (its own contexts switching, about 200 times at 0.053 ms) | 10.8 to 11.1 ms | 9.8 and 10.0 ms |
+| the game off the engine while the compositor (`dwm.exe`) held it | none | 20.6 and 21.0 ms, 110 times, 0.172 ms each at the median |
+| the game off the engine while the relay held it | none | 11.3 and 12.0 ms, 58 times, 0.172 ms each at the median |
+| the same with both in one stretch | none | 2.9 and 3.4 ms |
+
+The game lost about 35 ms of every second of the engine, 3.5%, about 188 points, where the
+benchmark priced the relay at 196 to 200. The trace accounts for the whole cost, in the parts
+section 2 priced by leaving work out: the compositor's 110 visits a second are Windows
+capturing and delivering the frames for WGC (about 112 points, where section 2 has 114), and the
+relay's visits, one per present, are presenting (about 62 to 71 points, where section 2 has 78).
+
+Each of the relay's visits costs the game 0.172 ms at the median: a switch out of the game
+(about 0.055 ms), the relay's own work (0.058 ms at the median, its draw and its present), and a
+switch back (about 0.055 ms). So about two thirds of what a present costs the game is the GPU
+changing context, and a third is the relay's work, as the 21 points of the draw against the 57
+of the present itself suggested. The compositor's visits read the same, 0.060 ms of its work
+inside 0.172 ms. No preemption tags appeared, so how the game is stopped is not seen; the time
+between asking the game to stop and its SAVE_END counts as the game's and may hide more.
+
+A present with no draw still takes the engine once a present. A second traced launch the same
+evening ran the experiment build `wgcopen-1` with `-wgc -xwgcinterval 1 -xwgcdrop -xwgccursor
+-xwgcopen`, two runs as it is and two with `-xnodraw` (present without drawing): the relay held
+the engine 60.0 to 60.3 times a second either way. Without the draw its own hold fell from 0.057
+to 0.039 ms at the median and the game's stretch per present from 0.172 to 0.153 ms, about 1.5
+ms a second less in all; the compositor's visits did not change (108 to 111 a second, 0.172
+ms). So the draw is about 0.02 ms of GPU work a present, and the present itself, with no draw,
+still costs the game two context switches and about 0.04 ms of the relay's own hold. That is
+the cost of presenting from the game's GPU at all: no change to what the relay draws or how it
+presents on that GPU removes it, and only presenting less often or from another GPU (9.3) gets
+under it. The benchmark priced the draw at 20.8 +- 2.3 points, more than the 1.5 ms a second
+the trace shows (about 8 points); what the draw costs the game beyond its own time on the
+engine, such as the game's data pushed out of the GPU's cache by a full-screen read, is a
+guess, not measured. Each trace's end stalls the GPU 43 to 57 ms in every row, relay or
+not, which the user saw as dropped frames; the readings leave everything after the stop mark
+out.
 
 ## 9. Architectural options
 
@@ -645,7 +754,11 @@ points is not known. It went to the user's branch as `-wgcopen` (`ab1772e`, off 
 streamed twice that night with no game frame lost and no torn or stale picture found
 (`wgc-capture-spec.md` 5.14), and since 2026-10-15 is the default inside `-wgc`, made on the
 present's adapter and falling back to the present's device where opening fails, with
-`-nowgcopen` to turn it off. Its benchmark on the user's branch is owed.
+`-nowgcopen` to turn it off. Its benchmark on the user's branch (`obsopen1`, 2026-10-15, 18 rows
+in one launch, the first on a new capture card) put it 64.0 +- 3.5 points under the pool on the
+present's device and 17.1 +- 2.3 under OBS's projector with game capture: about 196 points
+against 260 and 213, each against the no-relay rows of the same launch
+(`wgc-capture-spec.md` 5.15).
 
 The same sittings priced a moving mouse pointer: about 145 points while WGC captures, with or
 without the pointer drawn, and nothing with no relay, on NvFBC as shipped, or under OBS's game

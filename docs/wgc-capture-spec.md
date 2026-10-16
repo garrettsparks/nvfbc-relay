@@ -15,7 +15,8 @@ With the pool on a device of its own and its textures opened by the present, WGC
 points where it cost 251 in the same launch, under OBS's game capture as measured in other
 launches (202 to 216). That is the default inside `-wgc` since 2026-10-15, with `-nowgcopen` to
 keep the pool on the present's device and a fall-back to it where a device of its own does not
-work (section 2). Two streams with the pool on its own device found no torn or stale picture
+work (section 2). In one launch beside OBS's game capture it cost the game 17.1 +- 2.3 points
+less than game capture (5.15). Two streams with the pool on its own device found no torn or stale picture
 (5.14). Sizing the drop from the game's own frames, so that it also works for a game in a
 window, was agreed and is not built (section 8). Last updated 2026-10-15.
 
@@ -95,11 +96,12 @@ and is logged once and counted in the closing line:
 Nothing orders Windows' write into a pool texture with the present's read on the other device
 (the textures carry no keyed mutex). The present reads a frame about 96 ms after it arrives, and
 two streams found no torn or stale picture (5.14). Why the pool's device costs the game 58
-points is not known; a device of its own goes around it (5.13). Checked on this code: the suite
-(C++20 and C++17 alike), controls that fail it without the `-nowgcopen` parse line or with the
-old default, and zig builds. The first version, `-wgcopen` off by default at `ab1772e` with the
-pool's device on the first adapter and no fall-back, streamed twice (5.14). The adapter choice
-and the fall-back have not run on the rig, and the fall-back has never been needed.
+points is not known; a device of its own goes around it (5.13). Checked on this code
+(`00987d6`): the suite (C++20 and C++17 alike), controls that fail it without the `-nowgcopen`
+parse line or with the old default, zig builds, CI, a desktop run of each setting on the rig and
+the sitting of 5.15, where every row opened all 34 textures on the present's adapter. The first
+version, `-wgcopen` off by default at `ab1772e` with the pool's device on the first adapter and no
+fall-back, streamed twice (5.14). The fall-back has not run on the rig and has never been needed.
 
 **Waiting.** The pool's `FrameArrived` sets an event. The capture thread takes frames with
 `TryGetNextFrame` and waits up to 100 ms for one. A frame's arrival stamp is the moment that
@@ -224,6 +226,9 @@ section 9.1 and in `session-kickoff-performance-pass-7.md`.
   takes the 58 back: 58.5 +- 4.0 points in one launch, WGC about 192 against 251 (5.13).
 - **A copy off the present's device costs more than the device does** (105 points, 5.13), so
   the pool's frames are opened on the present's device and never copied.
+- **With the pool on its own device the relay costs the game less than OBS's game capture.** In
+  one launch on 2026-10-15 (5.15): 17.1 +- 2.3 points less than OBS's projector with game
+  capture, and 64.0 +- 3.5 less than the pool on the present's device.
 
 **Retracted (2026-10-09 readings):** "under Smooth Motion WGC's pairs arrive 1 to 4 ms apart", "a
 6 ms pair window pairs every wake". They were one point of a drift that the 1 ms setting made.
@@ -786,7 +791,11 @@ there. Nothing to build.
 Presenting is about 78 points (twice what presenting half as often saved), as on NvFBC (75,
 2026-10-07): drawing WGC's frame about 21, the present itself about 57. The stand-in (WGC
 delivers into a pool on a device of its own and nothing reads it; the present draws ring slots
-nothing wrote) presents and blends like the real path.
+nothing wrote) presents and blends like the real path. GPU context switch traces on 2026-10-15
+(`performance-candidates.md` section 8) found what those parts are on the GPU: every present
+takes the game's graphics engine once, with or without a draw, and costs the game about 0.15
+to 0.17 ms, two thirds of it switching the engine from the game to the relay and back; the
+compositor's 110 visits a second for WGC cost the same each and make up Windows' share.
 
 **The pool's device** (`place1`, 10 rows): no relay 5384 and 5397; wgc 5116 and 5138; the
 stand-in 5202 and 5201; the stand-in with its pool on the present's device (`-xwgcpresentdev`)
@@ -804,8 +813,8 @@ frames stored a second (wgc 92.8 to 93.4), 60.01 presents a second, no holds, no
 over 25 ms, blends 4.6 to 5.7% (wgc 6.3 to 7.3%, not read why), all 34 pool textures opened, and
 the card showing the game in every screenshot (card against game 6.5 to 6.9 where the control
 reads about 9.6, as the wgc rows). OBS's game capture cost 216 (`wg1`, 2026-10-09), 207.6
-(`ptrwhy2`, 2026-10-14) and about 202 (`dl3`, 2026-10-08) in other launches; no sitting has had
-both in one launch. Why the pool's device costs 58 points is not known.
+(`ptrwhy2`, 2026-10-14) and about 202 (`dl3`, 2026-10-08) in other launches; no sitting had both
+in one launch until 5.15. Why the pool's device costs 58 points is not known.
 
 **The user's decisions that day.** WGC stays off by default: "let's actually keep it not
 default for now". Window capture costs what display capture costs and pays the same for a
@@ -880,6 +889,43 @@ over the stretch each video shows.
   1628.4 s) and `gm_60x2_gameplay_2026_10_14_1.trace` (39.1 min, 91.0 to 2439.6 s), each cut to
   gameplay; their replays release the lock at the same moments as the field.
 
+### 5.15 The sitting of 2026-10-15: the default beside OBS's game capture
+
+Sitting `obsopen1`: one launch, 18 rows, one run a row, the CI build of `00987d6`, four cycles
+mirrored in pairs of no relay, OBS's projector with game capture (scene collection
+`bench-game`), `-wgc` (the pool on its own device, the default) and `-wgc -nowgcopen`, with
+no-relay rows at both ends. Every relay row was `-source 0 -target 1 -framerate b:vsync -src 60`
+and the flags shown. It was the first sitting on a new capture card, set to a custom 2560x1440
+mode that the relay's presents measured at 60.0003 Hz.
+
+| setting | flags | mean score | paired against wgc | fitted |
+|---|---|---|---|---|
+| no relay | | 5374.75 | -195.5 +- 3.6 | -196.3 +- 2.9 |
+| OBS game capture | | 5162.25 | +17.1 +- 2.3 | +16.7 +- 2.8 |
+| wgc | `-wgc` | 5179.25 | | |
+| wpres | `-wgc -nowgcopen` | 5115.25 | +64.0 +- 3.5 | +64.2 +- 2.8 |
+
+Against the no-relay rows the default costs the game about 196 points (3.6%), OBS's game capture
+about 213 (4.0%) and the pool on the present's device about 260 (4.8%). The device of its own
+saved 64.0 points on the user's branch, where the experiment build read 58.5 +- 4.0 (5.13).
+
+What the rows captured and showed: wgc stored 93.9 to 94.2 frames a second and wpres 92.5 to
+93.0; both presented 60.01 times a second with no hold and no present gap over 25 ms (the longest
+17.3 to 18.1 ms); blends were 5.6 to 5.9% with the pool on its own device against 6.4 to 7.5%
+without, as in `open1` (not read why). Every wgc row logged the start line of a device of its own
+and opened all 34 pool textures with none failing; no row fell back. OBS hooked the game in every
+row (`d3d12 shared texture capture successful`). The card showed the game in every screenshot:
+card against game 6.3 to 7.1 for the relay's rows and 0.6 to 2.6 for OBS's, where the control
+reads about 9.5 and a row with no relay 42 to 50. The relay's larger figure is most likely its
+delay: it presents a frame about 96 ms after it arrives (section 2), so a screenshot of a moving
+game catches the two displays at different frames. OBS's delay was not measured. The no-relay
+rows read 5342 (the first after the launch), then 5364 to 5381, level from minute 17 to the end.
+
+So like for like and in one launch, the relay on WGC with its pool on its own device costs the
+game about 17 points less than OBS's projector with game capture, the target the performance
+pass set for the capture path. The relay's default capture, NvFBC, was not in this sitting; it
+cost 287 to 297 points in other launches.
+
 ## 6. The cursor under each source
 
 - **NvFBC.** The ring's grab session sets `bWithHWCursor = 0` (`CaptureRing.cpp`). That is T7 of
@@ -952,7 +998,7 @@ Each is the user's.
   and none of their code changes. It passes a frame whenever Windows gives no list, whenever
   the changed area is anything but tiny, and whenever no whole-screen frame has come lately (a
   still screen where the pointer is the only thing moving).
-- **How the drop is sized (agreed 2026-10-13, not built).** The user asked what the size should
+- **How the drop is sized (agreed 2026-10-13, built 2026-10-15 as a patch, below).** The user asked what the size should
   be and called this answer reasonable. A frame is measured by the game's own frames. The relay
   remembers the largest changed area any frame was reported with, and forgets it when half a
   second passes with no frame at least that large. A frame is left out when its changed area is
@@ -1008,6 +1054,33 @@ Each is the user's.
   For a game that fills the display, a fixed share of the picture in `PointerOnly` gives the
   same result with one number, which is what was done (a twentieth). The remembered area is
   what makes the rule work for a game in a window.
+
+  **Built 2026-10-15** at the user's word ("we'll add it in as the standard behavior" if it
+  costs nothing), as `policy::IsPointerFrame` in the policy layer with `WgcCaptureSource`
+  calling it in place of the twentieth, `-nowgcdrop` unchanged; a patch for the user to commit.
+  Checked: unit tests in the suite (a full-screen game loses every pointer frame and no game
+  frame; a game in a 1280x720 window, which the twentieth let through, the same; a frame of
+  exactly a tenth kept and one just under left out; a 400x150 notification over a full-screen
+  game left out; a still screen keeps the pointer's frames; frames with no list or an empty one
+  kept and not refreshing the memory; and the agreed cost, a 640x360 window losing its own
+  frames for 510 ms after a full-screen frame). Both rules replayed over the changed areas
+  logged with `-xwgcdirty` on 2026-10-12 to -14 (seven logs, 62,718 frames, the user's game in
+  its menus with the pointer moving and the Avatar benchmark): they agree on every frame, so in
+  a full-screen game nothing changes. Live on the rig's desktop, a 1280x720 window redrawing at
+  60 Hz with the pointer moving outside it (541 moves in 15 s): the twentieth left out 59 frames
+  and stored 104 to 108 wakes a second, the new rule left out 1,391 and stored 61 to 62, the
+  window's own rate. The same check found the documented cost in practice: while the window was
+  the largest thing changing, small changes elsewhere were left out too (a taskbar button's
+  animation, 2,248 pixels, 10 to 25 times a second; 154 of 196 frames of 0.1 to 5% of the
+  picture while the pointer moved). Each is in the next frame kept, since a WGC frame is a
+  whole picture. Benchmark, one launch (sitting `pdrop1`, `b:vsync -src 60 -wgc`, the rule as
+  it was against the rule sized from the game's frames): with the pointer still, four rows
+  each, -1.5 +- 1.9 points paired (-1.2 +- 4.2 fitted); with the pointer moving through the
+  run, two rows each, -4.0 +- 3.0 (-3.7 +- 5.9). Both rules left out none with the pointer still
+  and the same with it moving (4,928 and 4,921 against 4,927 and 4,930 a run); every row stored
+  91 to 94 frames a second, presented 60.01 times a second with no hold and no present gap over
+  25 ms, and the card showed the game. It costs nothing, and in a full-screen game it decides as
+  the twentieth did.
 - **Whether the pointer goes back in the stream's picture.** The user, 2026-10-12: "it's not a
   huge deal, although I would like to turn mouse back on at some point". On WGC that is cursor
   capture on, and 5.9 shows no cost in extra frames beyond what a moving pointer brings anyway.
@@ -1032,8 +1105,9 @@ Each is the user's.
   the streams of 5.14. The user asked for the device made on the present's adapter ("let's do
   the clean thing") and for the fall-back to the present's device where opening fails ("falling
   back to the previous behavior makes sense to me in this case"); a retry was asked about and
-  is no use, since nothing about it is a race (section 2). Its benchmark on the user's branch is
-  owed: the 58.5 points were measured on the experiment build. The torn or stale frame question
+  is no use, since nothing about it is a race (section 2). Its benchmark on the user's branch ran
+  on 2026-10-15 beside OBS's game capture (5.15) and saved 64.0 +- 3.5 points, where the
+  experiment build had saved 58.5. The torn or stale frame question
   has two further answers if the scan of 5.14 is not enough: an exact check inside the relay (a
   few tiles' checksum on the pool's device at arrival against the present's device before
   drawing, logged with its time) or a fence (a shared fence the present waits on before
