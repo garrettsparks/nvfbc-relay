@@ -439,7 +439,7 @@ public:
     // to the pool. The texture is named before the old frame is given back, and the pool keeps
     // every texture it made for as long as it lives, so a texture the present has just read
     // from a slot is never one that no longer exists.
-    void Store(int slot) override {
+    bool Store(int slot) override {
         ID3D11Texture2D* named = m_presentDevice ? OpenOnPresent(m_texture) : m_texture;
         r.m_wgcTexture[slot].store(named, std::memory_order_release);
         m_texture->Release();
@@ -447,6 +447,7 @@ public:
         wgc::Dispose(m_slotFrame[slot]);
         m_slotFrame[slot] = m_frame;
         m_frame = NULL;
+        return true;
     }
 
     void Published(int, long long, const Placement&, bool) override {}

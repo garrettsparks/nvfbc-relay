@@ -45,6 +45,7 @@ CaptureRing::CaptureRing()
         m_ring[i].sharedHandle = NULL;
         m_ring[i].valid = false;
         m_ring[i].awaitingCopy = false;
+        m_ring[i].copyInFlight = false;
         m_ring[i].timestamp.QuadPart = 0;
         m_ring[i].batchStart.QuadPart = 0;
         m_ring[i].member = 0;
@@ -337,7 +338,17 @@ void CaptureRing::Stop() {
 // NvFBC as the ring's capture source. NvFBC writes each grabbed frame into one of the output
 // buffers it was given at setup, and the next grab into that buffer overwrites it, so a frame
 // the ring keeps is copied into its slot, a shared surface the present reads from another
-// device, and the copy is waited for before the slot is published.
+// device.
+//
+// With the deferral's two buffers the copy is not waited for. It is handed to the GPU with one
+// flush and an event query of its buffer, its slot is published with valid off and
+// awaitingCopy on, so the lookahead reads its stamp and FindBracket does not use it, and the
+// slot is turned on when the loop next finds the query done: before the next grab, at a later
+// wake, or at a grab timeout. Its pixels are therefore always there before the present can
+// read the slot. The copy is waited for before NvFBC writes its buffer again, which with two
+// buffers taken in turn is the grab after next, and a copy after a gap longer than the
+// deferral's gap limit is waited for at once, because that frame is needed too soon. The
+// replay tests run the ring with every such slot turned on a wake late.
 class NvfbcCaptureSource : public ICaptureSource {
 public:
     NvfbcCaptureSource(CaptureRing& ring, NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams)
@@ -374,7 +385,22 @@ public:
         m_srcRect.top = 0;
         m_srcRect.right = (LONG)ring.m_width;
         m_srcRect.bottom = (LONG)ring.m_height;
+        // One event query per buffer for the copies not waited for. Without them every copy is
+        // waited for, as with the deferral off.
+        if (m_deferCopy) {
+            for (int b = 0; b < 2; b++) {
+                if (FAILED(r.m_capDevice->CreateQuery(D3DQUERYTYPE_EVENT, &m_bufSync[b]))) {
+                    LOGERR("CaptureRing: no event query for a buffer's copy; every copy is "
+                           "waited for");
+                    ReleaseBufferQueries();
+                    break;
+                }
+            }
+        }
+        m_noWait = m_bufSync[0] != NULL && m_bufSync[1] != NULL;
     }
+
+    ~NvfbcCaptureSource() override { ReleaseBufferQueries(); }
 
     void LogStart() override {
         if (m_deferCopy) {
@@ -383,6 +409,12 @@ public:
                 m_deferWaitMs, (long long)(m_deferMaxGapQpc * m_usPerTick),
                 (long long)(r.m_deferLagQpc * m_usPerTick),
                 (long long)(r.m_deferMarginQpc * m_usPerTick));
+            if (m_noWait) {
+                LOG("Ring copies not waited for: a copy after a gap of at most %lld us is handed "
+                    "to the GPU and its slot turned on once it is done; the copy out of a buffer "
+                    "is waited for before NvFBC writes that buffer again",
+                    (long long)(m_deferMaxGapQpc * m_usPerTick));
+            }
         } else if (r.m_captureTargetB) {
             LOG("Deferred ring copy off: the lag (%lld us) is too short for a frame to wait at "
                 "this source rate; every frame is copied as it arrives",
@@ -398,9 +430,27 @@ public:
 
     Wake Wait(LARGE_INTEGER* arrived) override {
         if (m_deferCopy) m_grabParams->dwBufferIdx = m_bufferIdx;
-        // A frame waiting uncopied bounds the grab's wait: the timeout is what gets it into the
-        // ring when no frame follows.
-        const bool frameWaiting = m_pendingSlot >= 0;
+        if (m_noWait) {
+            // A copy that finished while the last wake was handled turns its slot on now.
+            for (int b = 0; b < 2; b++) {
+                if (Confirm(b, false)) m_onBeforeGrab++;
+            }
+            // The grab is about to write this buffer, so the copy out of it has to be done.
+            if (m_inFlightSlot[m_bufferIdx] >= 0) {
+                LARGE_INTEGER waitStart, waitEnd;
+                QueryPerformanceCounter(&waitStart);
+                Confirm(m_bufferIdx, true);
+                QueryPerformanceCounter(&waitEnd);
+                m_waitedBeforeGrab++;
+                if (waitEnd.QuadPart - waitStart.QuadPart > m_longestWaitBeforeGrabQpc) {
+                    m_longestWaitBeforeGrabQpc = waitEnd.QuadPart - waitStart.QuadPart;
+                }
+            }
+        }
+        // A frame waiting uncopied, or a copy not yet known done, bounds the grab's wait: the
+        // timeout is what gets either into the ring when no frame follows.
+        const bool frameWaiting =
+            m_pendingSlot >= 0 || m_inFlightSlot[0] >= 0 || m_inFlightSlot[1] >= 0;
         m_grabParams->dwWaitTime = frameWaiting ? m_deferWaitMs : kGrabWaitMs;
         LARGE_INTEGER grabStart;
         QueryPerformanceCounter(&grabStart);
@@ -446,13 +496,26 @@ public:
                 LOG("defer: capture #%lld copied after a grab timeout", m_pendingCount);
                 m_pendingSlot = -1;
             }
+            // So is a copy still not known done this long after it was handed over.
+            if (m_noWait) {
+                for (int b = 0; b < 2; b++) {
+                    if (Confirm(b, true)) m_onAtTimeout++;
+                }
+            }
             return Wake::Timeout;
         }
         m_frames++;
+        // A copy handed over at an earlier wake and found done turns its slot on.
+        if (m_noWait) {
+            for (int b = 0; b < 2; b++) {
+                if (Confirm(b, false)) m_onAtLaterWake++;
+            }
+        }
         return Wake::Frame;
     }
 
     Placement Place(const policy::BatchDecision& batch) override {
+        if (batch.member == 0) m_batchGap = batch.batchGap;
         m_source = (m_deferCopy && m_bufferIdx == 1) ? r.m_captureTargetB : r.m_captureTarget;
         // Which frame waits and which waiting frame is copied is the policy layer's decision,
         // so the replay tests run the same rule on recorded captures.
@@ -479,9 +542,27 @@ public:
         return placement;
     }
 
-    // The copy has to be complete on the capture GPU before the slot is published, so the
-    // present device never reads a shared slot that is not yet coherent.
-    void Store(int slot) override { CopyAndWait(m_source, slot); }
+    // The copy has to be complete on the capture GPU before the slot is turned on, so the
+    // present device never reads a shared slot that is not yet coherent. A frame after a gap
+    // longer than the deferral's limit is needed soon, so its copy is waited for at once.
+    bool Store(int slot) override {
+        if (!m_noWait || m_batchGap > m_deferMaxGapQpc) {
+            CopyAndWait(m_source, slot);
+            return true;
+        }
+        r.m_capDevice->StretchRect(m_source, &m_srcRect, r.m_ring[slot].capSurface, &m_srcRect,
+                                   D3DTEXF_NONE);
+        IDirect3DQuery9* sync = m_bufSync[m_bufferIdx];
+        sync->Issue(D3DISSUE_END);
+        m_notWaitedFor++;
+        if (sync->GetData(NULL, 0, D3DGETDATA_FLUSH) != S_FALSE) {
+            m_doneAtOnce++;
+            return true;
+        }
+        m_inFlightSlot[m_bufferIdx] = slot;
+        r.m_ring[slot].copyInFlight = true;
+        return false;
+    }
 
     void Published(int slot, long long count, const Placement& placement, bool kept) override {
         if (placement.waits) {
@@ -495,8 +576,12 @@ public:
         if (m_deferCopy) m_bufferIdx ^= 1;
     }
 
-    // A frame still waiting in its buffer is copied into its slot before NvFBC is let go.
+    // A frame still waiting in its buffer is copied into its slot, and a copy on its way is
+    // waited for, before NvFBC is let go.
     void Finish() override {
+        if (m_noWait) {
+            for (int b = 0; b < 2; b++) Confirm(b, true);
+        }
         if (m_pendingSlot < 0) return;
         CopyAndWait(m_pendingSource, m_pendingSlot);
         r.m_ring[m_pendingSlot].valid = true;
@@ -518,9 +603,43 @@ public:
                 wakesStored ? 100.0 * (double)m_deferredWakes / (double)wakesStored : 0.0,
                 m_neverCopied, m_copiedLate, m_copiedAtTimeout);
         }
+        if (m_noWait) {
+            LOG("Ring copies not waited for: %lld handed over; found done at once %lld, before "
+                "the next grab %lld, at a later wake %lld, at a grab timeout %lld; waited for "
+                "before their buffer was grabbed into again %lld (longest %lld us)",
+                m_notWaitedFor, m_doneAtOnce, m_onBeforeGrab, m_onAtLaterWake, m_onAtTimeout,
+                m_waitedBeforeGrab, (long long)(m_longestWaitBeforeGrabQpc * m_usPerTick));
+        }
     }
 
 private:
+    // Turns on the slot of a buffer's copy if the GPU has done it, and says whether it did.
+    // With wait set it returns only once the copy is done. A slot keep-real retracted
+    // meanwhile has awaitingCopy off and stays off.
+    bool Confirm(int buffer, bool wait) {
+        const int slot = m_inFlightSlot[buffer];
+        if (slot < 0) return false;
+        HRESULT done = m_bufSync[buffer]->GetData(NULL, 0, 0);
+        while (wait && done == S_FALSE && !r.m_stop.load()) {
+            done = m_bufSync[buffer]->GetData(NULL, 0, 0);
+        }
+        if (done == S_FALSE) return false;
+        r.m_ring[slot].copyInFlight = false;
+        if (r.m_ring[slot].awaitingCopy) {
+            r.m_ring[slot].valid = true;
+            r.m_ring[slot].awaitingCopy = false;
+        }
+        m_inFlightSlot[buffer] = -1;
+        return true;
+    }
+
+    void ReleaseBufferQueries() {
+        for (int b = 0; b < 2; b++) {
+            if (m_bufSync[b]) m_bufSync[b]->Release();
+            m_bufSync[b] = NULL;
+        }
+    }
+
     // Copies a grabbed frame into its ring slot and returns once the GPU has done it, so the
     // slot is complete before it is published and before NvFBC writes that buffer again.
     // D3DGETDATA_FLUSH kicks the command buffer; GetData returns S_FALSE until the GPU signals
@@ -553,6 +672,15 @@ private:
     long long m_frames = 0;                      // wakes that brought a new frame
     long long m_deferredWakes = 0, m_neverCopied = 0, m_copiedLate = 0, m_copiedAtTimeout = 0;
     long long m_grabFailures = 0;
+    // The copies not waited for: one event query per buffer, and the slot each buffer's copy
+    // went to until it is known done.
+    IDirect3DQuery9* m_bufSync[2] = { NULL, NULL };
+    bool m_noWait = false;
+    int m_inFlightSlot[2] = { -1, -1 };
+    LONGLONG m_batchGap = 0;                     // the gap before the batch of the frame in hand
+    long long m_notWaitedFor = 0, m_doneAtOnce = 0, m_onBeforeGrab = 0, m_onAtLaterWake = 0;
+    long long m_onAtTimeout = 0, m_waitedBeforeGrab = 0;
+    LONGLONG m_longestWaitBeforeGrabQpc = 0;
 };
 
 void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
@@ -651,9 +779,10 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         long long count = m_writeCount;
         int slot = (int)(count % m_ringSlots);
         wakesStored++;
-        // The picture has to be where the present can read it before the slot is published. A
-        // frame the source leaves waiting is not stored now.
-        if (!placement.waits) source->Store(slot);
+        // The picture has to be where the present can read it before the slot is turned on. A
+        // frame the source leaves waiting is not stored now, and one whose copy is on its way
+        // is turned on by the source later.
+        const bool ready = !placement.waits && source->Store(slot);
 
         // Measure how long the flush blocked: this is the fix's cost. It should be small and
         // CONSISTENT (a near-constant pipeline offset, off the present path). Spikes here would
@@ -811,7 +940,10 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
             if (m_prevKeeper == 1 && m_prevLastMember == 0 && count >= 1) {
                 const int prevSlot = (int)((count - 1) % m_ringSlots);
                 m_ring[prevSlot].timestamp.QuadPart = m_prevBatchStart + m_prevSpacing;
-                m_ring[prevSlot].valid = true;
+                // A slot whose copy is still on its way is turned on by the source when it is
+                // done; awaitingCopy asks for that.
+                if (m_ring[prevSlot].copyInFlight) m_ring[prevSlot].awaitingCopy = true;
+                else m_ring[prevSlot].valid = true;
                 m_phaseKeepReclaimed++;
             }
             m_prevKeeper = m_rotRealMember;
@@ -833,8 +965,8 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
 
         m_ring[slot].timestamp.QuadPart = keep.stampTs;
         m_ring[slot].batchStart.QuadPart = batch.stampTs;
-        m_ring[slot].valid = keep.keepThis && !placement.waits;
-        m_ring[slot].awaitingCopy = keep.keepThis && placement.waits;
+        m_ring[slot].valid = keep.keepThis && ready;
+        m_ring[slot].awaitingCopy = keep.keepThis && !ready;
         m_writeCount = count + 1;
         m_published.store(count + 1);  // a slot whose pixels are not there yet has valid off
         if (placement.replacedSlot >= 0) m_ring[placement.replacedSlot].awaitingCopy = false;
@@ -843,7 +975,9 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         if (keep.retractPrev && count >= 1) {
             // Retract the previous member (the generated frame): hide it from future brackets.
             // Content is never overwritten, so a present read already in flight stays coherent.
+            // With awaitingCopy off as well, a copy of it that finishes later turns nothing on.
             m_ring[(int)((count - 1) % m_ringSlots)].valid = false;
+            m_ring[(int)((count - 1) % m_ringSlots)].awaitingCopy = false;
         }
         if (keep.collapsed) collapsed++;
 

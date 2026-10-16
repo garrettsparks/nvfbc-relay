@@ -119,8 +119,12 @@ struct SimResult {
     long long deferCopiedLate = 0;      // copied when the next wake opened a new batch
     long long deferCopiedAtLimit = 0;   // copied when the wait limit came first
     // Presents whose nearest frame on either side had arrived and survived keep-real but was
-    // still waiting to be copied, so the bracket had to use an older or a newer one.
+    // still waiting to be copied, so the bracket had to use an older or a newer one. starved
+    // marks them present by present, for a count that leaves out a replay's cold start.
     long long deferStarvedPresents = 0;
+    std::vector<char> starved;
+    // Copies handed to the GPU and not waited for (SimParams::deferNoWait).
+    long long deferNotWaitedFor = 0;
 };
 
 struct SimParams {
@@ -170,6 +174,17 @@ struct SimParams {
     // capture loop copies it, at the next wake when that opens a new batch or at the wait
     // limit when nothing comes first. The lookahead reads its stamp from the moment it arrives.
     bool deferCopy = false;
+    // With the deferral, no copy is waited for, as the relay's NvFBC source runs it: a frame
+    // copied on arrival is handed to the GPU and its slot turned on at the next wake, or at
+    // the wait limit when no wake comes first. That is the latest the capture loop can find
+    // the copy done, since it waits for it before NvFBC writes the buffer again. A frame after
+    // a gap past the deferral's gap limit is waited for at once, and so is a waiting frame
+    // copied a wake late.
+    bool deferNoWait = false;
+    // How long a copy may still run when the loop waits for it there: the slot is turned on
+    // that much later again. The longest such wait measured on a saturated GPU was 11.6 ms
+    // (2026-10-08).
+    int64_t deferCopySlackQpc = 12000;
     // Stage 6: subtract each batch's measured DELIVERY LATENESS (batch start minus its
     // stride-anchored flip) from its slots' stamps, under the coherence rule. The timeline
     // stays on the arrival base - on-time batches are left alone entirely - so the lock
@@ -365,6 +380,7 @@ static SimResult Simulate(const SimParams& p) {
         policy::DeferState ds;
         long long pendingIdx = -1;
         const int64_t waitLimit = deferLimits.maxWaitTicks;
+        int64_t batchGap = 0;   // the gap before the batch the current wake belongs to
         for (size_t i = 0; i < arrivals.size(); i++) {
             if (pendingIdx >= 0 && arrivals[i] - arrivals[(size_t)pendingIdx] >= waitLimit) {
                 if (policy::DeferOnTimeout(ds)) {
@@ -390,6 +406,14 @@ static SimResult Simulate(const SimParams& p) {
             if (dd.deferThis) {
                 pendingIdx = (long long)i;
                 r.deferredWakes++;
+            }
+            if (bd.member == 0) batchGap = bd.batchGap;
+            if (p.deferNoWait && !dd.deferThis && valid[i] && batchGap <= deferLimits.maxGapTicks) {
+                const bool wakeFirst =
+                    i + 1 < arrivals.size() && arrivals[i + 1] - arrivals[i] < waitLimit;
+                visibleAt[i] =
+                    (wakeFirst ? arrivals[i + 1] : arrivals[i] + waitLimit) + p.deferCopySlackQpc;
+                r.deferNotWaitedFor++;
             }
         }
         // A frame still waiting when the capture ends would be copied at the wait limit.
@@ -498,10 +522,11 @@ static SimResult Simulate(const SimParams& p) {
                 if (!b.hasAfter || ts < b.afterTs) { b.hasAfter = true; b.afterTs = ts; }
             }
         }
-        if ((hiddenBefore && (!b.hasBefore || hiddenBeforeTs > b.beforeTs)) ||
-            (hiddenAfter && (!b.hasAfter || hiddenAfterTs < b.afterTs))) {
-            r.deferStarvedPresents++;
-        }
+        const bool starvedNow =
+            (hiddenBefore && (!b.hasBefore || hiddenBeforeTs > b.beforeTs)) ||
+            (hiddenAfter && (!b.hasAfter || hiddenAfterTs < b.afterTs));
+        if (starvedNow) r.deferStarvedPresents++;
+        if (p.deferCopy) r.starved.push_back(starvedNow);
         if (b.hasBefore) b.beforeDiff = target - b.beforeTs;
         if (b.hasAfter) b.afterDiff = b.afterTs - target;
 
@@ -3195,6 +3220,28 @@ static void test_replay_capture_corpus() {
                   "[%s] the deferred ring copy changed %d presents, and %lld needed a frame "
                   "still waiting",
                   fx.description.c_str(), differs, rd.deferStarvedPresents);
+
+            // NO COPY WAITED FOR, as the NvFBC source runs with the deferral: every copy is
+            // handed to the GPU and its slot turned on at the next wake, the latest the loop
+            // finds it done. Past the replay's cold start it must change nothing either. (The
+            // very first frame of a capture has no gap before it and waits, which the first
+            // presents notice.)
+            if (limits.maxWaitTicks > 0) {
+                pd.deferNoWait = true;
+                const SimResult rn = Simulate(pd);
+                int differsNoWait = 0, starvedNoWait = 0;
+                for (size_t i = kWarmup; i < rb.outTs.size() && i < rn.outTs.size(); i++) {
+                    if (rb.outTs[i] != rn.outTs[i]) differsNoWait++;
+                    if (i < rn.starved.size() && rn.starved[i]) starvedNoWait++;
+                }
+                std::printf("    no copy waited for: %lld copies handed over and not waited "
+                            "for; content differs on %d presents\n",
+                            rn.deferNotWaitedFor, differsNoWait);
+                CHECK(differsNoWait == 0 && starvedNoWait == 0,
+                      "[%s] leaving the copies unwaited changed %d presents, and %d past the "
+                      "cold start needed a frame not yet copied",
+                      fx.description.c_str(), differsNoWait, starvedNoWait);
+            }
         }
     }
 }

@@ -271,10 +271,14 @@ private:
         LARGE_INTEGER batchStart;
         int member;                       // position inside its capture batch; 0 opens one
         bool valid;
-        // The deferred ring copy has left this frame waiting in its capture buffer. Its stamp
-        // is final and its pixels are not in the slot, so ReadRecentFrames counts it and
-        // FindBracket does not.
+        // The deferred ring copy has left this frame waiting in its capture buffer, or its copy
+        // is on its way. Its stamp is final and its pixels are not in the slot, so
+        // ReadRecentFrames counts it and FindBracket does not.
         bool awaitingCopy;
+        // Its copy has been handed to the GPU and is not yet known to be done. The source
+        // clears it when the copy is done, and turns the slot on then if awaitingCopy is still
+        // set; nothing else may turn the slot on while it is set.
+        bool copyInFlight;
     };
 
     void CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);

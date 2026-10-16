@@ -41,9 +41,11 @@ public:
     };
     virtual Placement Place(const policy::BatchDecision& batch) = 0;
 
-    // Puts the frame in hand into a ring slot and returns once the present may read it. Not
-    // called for a frame Place left waiting.
-    virtual void Store(int slot) = 0;
+    // Puts the frame in hand into a ring slot. Returns true when the present may read it now,
+    // or false when its picture is still on its way: the slot is then published with valid off
+    // and awaitingCopy on, and the source turns it on once the picture is there. Not called for
+    // a frame Place left waiting.
+    virtual bool Store(int slot) = 0;
 
     // The wake is published in `slot` as capture number `count`. kept is false for a member
     // the keep decision dropped at once.
