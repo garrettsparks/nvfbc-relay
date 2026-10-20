@@ -37,7 +37,7 @@ correct for.
 | `60` | 4.69% | one-launch sitting, 2026-10-07 |
 | `60` with the original relay's timer (32.3 loops a second) | 3.05% | the same sitting |
 | `b:vsync -src 60` with the deferred ring copy (the default since 2026-10-08) | 5.1 to 5.4% | three one-launch sittings, 2026-10-08 |
-| the same with the ring copies not waited for (section 3.2, a patch not yet committed) | 14.7 +- 1.4 points less in the same launch: about 260 points, 4.8%, against 275 | one-launch sitting, 2026-10-15, a new capture card |
+| the same with the ring copies not waited for (section 3.2, the default since `c902ebb`) | 14.7 +- 1.4 points less in the same launch: about 260 points, 4.8%, against 275 | one-launch sitting, 2026-10-15, a new capture card |
 | `b:vsync -src 60 -wgc`, capture through Windows, off by default, pool on the present's device (9.1) | 4.6%, and 4.5% | one-launch sitting, 2026-10-11, and two on 2026-10-13 |
 | the same with the pool on a device of its own (the experiment's `-xwgcopen`, 9.1) | about 192 points, 3.6%, against 251 for the row above | one-launch sitting, 2026-10-14 |
 | the same, the default inside `-wgc` on the user's branch (`00987d6`) | about 196 points, 3.6%; in the same launch OBS's game capture 17.1 +- 2.3 more and the pool on the present's device 64.0 +- 3.5 more | one-launch sitting, 2026-10-15, a new capture card |
@@ -320,8 +320,8 @@ nearly every slot is turned on one wake late. A third NvFBC buffer would give a 
 It was thought unavailable when this was built; a probe on 2026-10-09 showed NvFBC accepts three
 (section 6), and `-nowaitcopy` has not been tried with three. The copy side as built gives 60 to 65 of its 80 points.
 
-**Ported to the user's branch and measured, 2026-10-15** (patches in the analysis folder,
-not yet committed). The NvFBC source hands each copy to the GPU with one flush and an event
+**Ported to the user's branch and measured, 2026-10-15** (committed as `c902ebb` on
+2026-10-16, through CI with `088a5db`). The NvFBC source hands each copy to the GPU with one flush and an event
 query of its buffer; `ICaptureSource::Store` says whether the picture is in the slot, and a
 slot whose copy is on its way is published with valid off and awaitingCopy on and turned on
 when the loop finds the copy done, at its next look (before a grab, after one, at a grab
@@ -348,9 +348,17 @@ for it, and the replay with every slot turned on only then changes 4,592 present
 fixtures (650 to 1,550 on the Avatar 30 fps ones); it is safe only while copies finish within
 about 12 ms and the loop finds them at its next look, which the realistic replay confirms (no
 present changes). The two-buffer port is safe in the strict replay as well. Not waiting is the
-change to keep; the third buffer is left out. Neither has been through CI or a stream.
+change to keep; the third buffer is left out. Not waiting is committed and through CI; it has
+not been streamed yet.
 
 ### 3.3 Skip the extra wake (`-grabphase`)
+
+**Shelved (the user, 2026-10-18): too error-prone for now.** The NvFBC trace of 2026-10-16
+(section 8) sizes it: under frame generation the relay woke about 156 times a second while its
+capture context's visits grouped into about 77 a second, one per real frame, so grabbing only at
+real flips would remove about 35 to 40 visits a second, roughly 40 to 50 points by the trace's
+cost per visit (a guess, not measured). It is the riskiest change on the list: the relay would
+have to predict each real flip, and a wrong prediction loses or repeats a frame.
 
 Not built. A stand-in was measured on 2026-10-07: pausing 8 ms before each grab removed 43% of
 the wakes and saved 75 points, about what `-defercopy` was priced at for skipping the copies of
@@ -583,6 +591,17 @@ guess, not measured. Each trace's end stalls the GPU 43 to 57 ms in every row, r
 not, which the user saw as dropped frames; the readings leave everything after the stop mark
 out.
 
+**Measured 2026-10-16, on NvFBC** (the CI build of `088a5db`, `b:vsync -src 60`, one launch, two
+traced runs against three with no relay). NvFBC's grab runs on the graphics engine in the relay's
+own Direct3D 9 capture context, the device that also makes the ring copy: not on a copy engine,
+not in a driver context, and the compositor is not involved. That context visits 112 to 117 times
+a second, 0.115 ms of its own work each, and costs the game 0.233 ms a visit, about half of it the
+two context switches; the present visits 60 times a second at 0.058 ms, the game's stretch 0.169
+ms, as on WGC. The game held the engine 942 to 944 ms a second against 986 to 989 with no relay:
+44 to 46 ms lost, about 240 to 250 points, where the same rows scored 260 to 284 below the
+no-relay rows. Nothing in the grab can be moved off the game's GPU or made cheaper from the
+relay's side; fewer visits (3.3) is the only lever, and NV12 output (9.2) adds visits.
+
 ## 9. Architectural options
 
 Bigger changes than section 3, each removing work the current design cannot avoid. Two have
@@ -792,7 +811,12 @@ are not. So this pairs with the WGC option, whose frames are created on the D3D1
 each present's target is the vblank minus the lag and the pull, and the pull moves slowly. At
 capture time it can tell which frames can never be a passthrough or a blend partner and skip their
 copies. `-defercopy` drops only frame generation's extra wakes; this also saves when the game
-outruns the card (about a third of the copies at 90 fps into 60, half at 120). Risk: a pull move,
+outruns the card, but only above twice the card's rate (half the copies at 120 real frames a
+second into 60). Between one and two times the card's rate the relay alternates a real frame with
+a blend of the next pair (measured at 90 into 60 on 2026-09-06), which uses every frame; the
+"third of the copies at 90 fps" this paragraph first claimed was wrong by that pattern, though no
+replay has counted it. It stays on the list for games that run past twice the card's rate (the
+user, 2026-10-16: "counter strike for example"). Risk: a pull move,
 wrap or stall changes which frames are needed after they were skipped, so the margin has to cover
 the lock's largest move.
 
@@ -813,13 +837,30 @@ content suits it; an uncapped, wandering rate does not. This is the cleaner form
 to copy and store. The stream is encoded at 4:2:0 anyway, but converting to 4:2:0 twice (here and
 in the encoder) can soften coloured edges, so it needs a quality check on text and HUD.
 
+**Built and measured 2026-10-16: worse; closed.** NvFBC sets up NV12 with two buffers and the
+full-size grab; its NV12 is BT.601 limited range. Direct3D 9 has no NV12 render target or texture
+and will not share an NV12 surface with Direct3D 11 in either direction, so an NV12 ring cannot
+reach the D3D11 present: each kept frame has to be turned back into RGB in the ring copy, by
+DXVA2's video processor (told the source's matrix and range) or by a plain StretchRect (which
+decodes with the wrong matrix and no range expansion, corrected in the present by a matrix the
+relay measures at startup at full size; the driver decodes small surfaces with another matrix).
+Both gave the right colours through the capture card, with a little more loss of thin coloured
+text than the card alone. In one launch, four rows each, against the same build without it:
+the video processor **+90.8 +- 3.8 points**, the plain copy **+160.0 +- 5.7**. A GPU trace shows
+why: the conversion runs on the graphics engine in a context of its own, about 90 visits a second
+at 0.067 ms, each costing the game a pair of context switches, while the capture's own work per
+visit fell only from 0.120 to about 0.09 ms. Anything that adds a visit loses on this GPU,
+whatever it saves in bytes.
+
 ### 9.3 Moving work off the game's GPU
 
 **Present from a second GPU.** With the capture card on the motherboard's output (the CPU's
 integrated graphics), the ring, the blends and the presents all run there. The game's GPU keeps
 only NvFBC's grab and one copy per frame across PCIe, which its copy engine can run beside the
 game. The largest possible cut, and the most hardware-dependent: it needs integrated graphics and a
-motherboard output that drives 2560x1440 at 60 Hz, and a cross-adapter copy path.
+motherboard output that drives 2560x1440 at 60 Hz, and a cross-adapter copy path. Scaling, when
+the game's display and the card's differ, happens in the present's draw
+(`docs/wgc-scaling-spec.md`), so with the present on the second GPU the scaling moves there too.
 
 ## 10. Order
 
@@ -848,10 +889,10 @@ problems before it finds a number.
 2. DONE 2026-10-08: `-defercopy` with its three rules (section 3.1): a sitting on the rig for
    cost and pacing, a capped sitting, and one stream (with the full-size grab and the 1x1 back
    buffers too). It is on by default.
-3. The copies still waited for (section 3.2): build it, then a sitting with a reference row,
-   `-defercopy` and the new switch in one launch.
-4. One profiled look at NvFBC's grab (section 8), then decide whether anything about it can be
-   moved.
+3. DONE 2026-10-16: the copies still waited for (section 3.2), not waited for any more,
+   -14.7 points, committed as `c902ebb`; the third NvFBC buffer measured and left out.
+4. DONE 2026-10-16: one profiled look at NvFBC's grab (section 8): nothing about it can be moved;
+   fewer visits (3.3, shelved) is the only lever, and NV12 output (9.2) lost.
 5. DONE 2026-10-08: OBS's projector as two rows in a one-launch sitting (section 1), and on
    2026-10-09 as four rows, one for each capture method (9.1). Its pacing and picture were not
    measured, and the user does not need them (2026-10-09).
@@ -861,7 +902,10 @@ problems before it finds a number.
    built, measured and dropped on 2026-10-09 (3.4). On 2026-10-14 WGC's points were split and
    the frame pool's device turned out to cost 58 of them; since 2026-10-15 the pool is on a
    device of its own by default inside `-wgc` (9.1).
-7. The CPU-only cleanups, together, checked by the suite and one stream.
+7. DONE 2026-10-15: the CPU-only cleanups, measured and left out (section 5).
+8. Open (the user, 2026-10-18): the pass closes once scaling on WGC is tested
+   (`docs/wgc-scaling-spec.md`): the real build, then the benchmark suite, first proving that
+   displays of one size cost nothing.
 
 Every row is compared inside one launch with a no-relay row and `b:vsync -src 60` at both ends.
 
