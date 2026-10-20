@@ -160,14 +160,17 @@ public:
     // captured picture. ownDevice (on unless -nowgcopen) puts the frame pool on a device of its
     // own in place of the present's, and the present opens each of the pool's textures through
     // a shared handle; where that does not work, the pool goes on the present's device
-    // (WgcCaptureSource::Open).
-    void EnableWgc(bool dropPointerFrames, bool cursor, bool ownDevice) {
+    // (WgcCaptureSource::Open). A source display of another size than the output is captured at
+    // its own size, and the present scales its frames with scaleFilter (WgcScaler::Filter).
+    void EnableWgc(bool dropPointerFrames, bool cursor, bool ownDevice, int scaleFilter) {
         m_wgcRequested = true;
         m_wgcDropPointerFrames = dropPointerFrames;
         m_wgcCursor = cursor;
         m_wgcOwnDevice = ownDevice;
+        m_wgcScale = scaleFilter;
     }
     bool WgcRequested() const { return m_wgcRequested; }
+    int WgcScale() const { return m_wgcScale; }
     // The D3D11 present's device, offered once it is set up. The capture thread makes the frame
     // pool on it and makes no call on its context.
     void OfferWgcDevice(ID3D11Device* device) {
@@ -376,6 +379,7 @@ private:
     bool m_wgcDropPointerFrames = true;
     bool m_wgcCursor = true;
     bool m_wgcOwnDevice = true;
+    int m_wgcScale = 0;
     HMONITOR m_sourceMonitor = NULL;                       // the display WGC captures
     std::atomic<ID3D11Device*> m_wgcDevice{NULL};          // offered once by the present
     std::atomic<ID3D11Texture2D*> m_wgcTexture[RING_SIZE];   // written by the capture thread

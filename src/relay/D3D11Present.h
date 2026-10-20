@@ -8,6 +8,7 @@
 
 #include "IPresentPath.h"
 #include "FrameMarker.h"
+#include "WgcScaler.h"
 
 // D3D11 PRESENT BACKEND: decides, composites and presents straight onto a DXGI flip-model
 // swapchain, the present path that replaces the D3D9 compose-and-PresentEx one.
@@ -110,7 +111,11 @@ public:
 private:
     bool CreateDeviceAndSwapChain(HWND hwnd, int width, int height);
     bool OpenRingAliases(CaptureRing* ring);
+    bool NeedsScaling(int slot) const;
     bool CreatePipeline();
+    // Readies the -wgcscale filter; bicubic or Lanczos that cannot be readied falls back to
+    // bilinear.
+    bool SetupScaling(int filter, int width, int height);
     // Re-acquire back buffer 0 as the render target. Under flip model the buffer behind
     // index 0 changes after every Present, so this runs once per present.
     bool AcquireBackBuffer();
@@ -164,6 +169,13 @@ private:
     // m_ring is set and slots are looked up there first (SourceFor).
     bool m_wgc = false;
     CaptureRing* m_ring = NULL;
+    // -wgcscale: the filter a WGC frame of another size than the output is scaled with
+    // (WgcScaler::Filter) and its scaler, and the presents that scaled and that drew frames at
+    // the output's size.
+    int m_scale = WgcScaler::Bilinear;
+    WgcScaler m_scaler;
+    long long m_scaledDraws = 0;
+    long long m_unscaledDraws = 0;
     std::vector<std::pair<ID3D11Texture2D*, ID3D11ShaderResourceView*>> m_poolSrvs;
 
     ID3D11VertexShader* m_vs;

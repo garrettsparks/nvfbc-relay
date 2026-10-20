@@ -175,6 +175,8 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
     if (!CreateDeviceAndSwapChain(hwnd, width, height)) return false;
     if (!OpenRingAliases(ring)) return false;
     if (!CreatePipeline()) return false;
+    // Only WGC's frames can be another size than the output.
+    if (m_wgc && !SetupScaling(ring->WgcScale(), width, height)) return false;
     if (mark) {
         m_marker.InitCounter(markFrames);
         m_markerRect = FrameMarker::StripRect(width, height);
@@ -395,6 +397,20 @@ bool D3D11PresentBackend::CreatePipeline() {
     return true;
 }
 
+bool D3D11PresentBackend::SetupScaling(int filter, int width, int height) {
+    m_scale = filter;
+    if (!m_scaler.Setup(m_dev, m_ctx, m_scale, width, height)) {
+        if (m_scale == WgcScaler::Bilinear) return false;
+        LOGERR("WGC scaling: %s could not be readied; bilinear in its place",
+               WgcScaler::Name(m_scale));
+        m_scale = WgcScaler::Bilinear;
+        if (!m_scaler.Setup(m_dev, m_ctx, m_scale, width, height)) return false;
+    }
+    LOG("D3D11Present: a WGC frame of another size than the output is scaled with %s "
+        "(-wgcscale)", WgcScaler::Name(m_scale));
+    return true;
+}
+
 bool D3D11PresentBackend::AcquireBackBuffer() {
     // Back buffer 0 is re-acquired every present: under flip model the identities of the
     // back buffers change after each Present, so a cached view would render into a surface
@@ -437,9 +453,26 @@ ID3D11ShaderResourceView* D3D11PresentBackend::SourceFor(int slot) {
     return view;
 }
 
+// A slot whose picture is a WGC pool texture of another size than the output. A slot without
+// one holds the picture NvFBC grabbed, at the output's size.
+bool D3D11PresentBackend::NeedsScaling(int slot) const {
+    ID3D11Texture2D* texture = m_ring ? m_ring->WgcTexture(slot) : NULL;
+    if (!texture) return false;
+    D3D11_TEXTURE2D_DESC d;
+    texture->GetDesc(&d);
+    return (int)d.Width != m_width || (int)d.Height != m_height;
+}
+
 bool D3D11PresentBackend::Draw(int slotA, int slotB, float w) {
     if (slotA < 0 || slotA >= m_ringSlots || slotB < 0 || slotB >= m_ringSlots) return false;
     if (!m_rtv) return false;
+    // Only a present with a frame of another size than the output scales. Frames at the
+    // output's size take the plain composite, so displays of one size cost nothing more.
+    const bool scale = NeedsScaling(slotA) || NeedsScaling(slotB);
+    if (m_wgc) {
+        if (scale) m_scaledDraws++;
+        else m_unscaledDraws++;
+    }
 
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (SUCCEEDED(m_ctx->Map(m_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
@@ -459,6 +492,12 @@ bool D3D11PresentBackend::Draw(int slotA, int slotB, float w) {
     m_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_ctx->IASetInputLayout(NULL);
     m_ctx->VSSetShader(m_vs, NULL, 0);
+    if (scale) {
+        const bool drawn = m_scaler.Draw(srvs[0], srvs[1], w, m_rtv);
+        ID3D11ShaderResourceView* none[2] = { NULL, NULL };
+        m_ctx->PSSetShaderResources(0, 2, none);
+        return drawn;
+    }
     m_ctx->PSSetShader(m_ps, NULL, 0);
     m_ctx->PSSetShaderResources(0, 2, srvs);
     m_ctx->PSSetSamplers(0, 1, &m_sampler);
@@ -721,6 +760,10 @@ LONGLONG D3D11PresentBackend::Present(bool vsync) {
 
 void D3D11PresentBackend::LogSummary() const {
     if (!m_enabled) return;
+    if (m_wgc) {
+        LOG("WGC scaling summary: %lld presents scaled with %s, %lld drew frames at the output's "
+            "size unscaled", m_scaledDraws, WgcScaler::Name(m_scale), m_unscaledDraws);
+    }
     LOG("d3d11 presentstats summary: %lld refreshes showed no new frame over %lld sampled "
         "presents (%.3f/s at a 60 Hz sink); %lld presents, %lld reported a problem, "
         "%lld draws failed, %lld frame waits timed out, %lld presentation-path changes",

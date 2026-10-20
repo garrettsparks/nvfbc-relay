@@ -285,11 +285,8 @@ private:
         m_result = m_item->get_Size(&m_size);
         if (FAILED(m_result)) return Fail("the capture item's size");
         if (m_size.Width != r.m_width || m_size.Height != r.m_height) {
-            snprintf(m_why, sizeof(m_why), "the source display is %dx%d and the output %dx%d, "
-                     "and WGC is used only when they are the same size", (int)m_size.Width,
-                     (int)m_size.Height, r.m_width, r.m_height);
-            Close();
-            return m_why;
+            LOG("WGC: the source display is %dx%d and the output %dx%d; the present scales its "
+                "frames", (int)m_size.Width, (int)m_size.Height, r.m_width, r.m_height);
         }
         m_contentSize = m_size;
 

@@ -790,9 +790,11 @@ is busy loses none. In the 13-minute read-back run the thread spent 1.5 to 2.5 m
 frame and all 92,470 frames arrived. What Windows drops when the relay stalls for longer than
 the pool's two spare buffers last has not been seen. WGC's own per-frame timestamp is the
 compositor's and is no use as a clock. WGC does not scale: a pool's buffers keep the size they
-were made with, and a larger picture is clipped (Microsoft's screen capture page). The present
-samples without filtering, so with displays of different sizes the relay stays on NvFBC, which
-scales in the grab. Still untested: Smooth Motion x3 and other source rates, HDR sources (the
+were made with, and a larger picture is clipped (Microsoft's screen capture page). Since
+2026-10-19 the present scales instead: with `-wgc` and displays of different sizes, WGC captures
+at the source's size and the present scales each frame, bilinear by default (`-wgcscale` picks
+bicubic or Lanczos; `docs/wgc-scaling-spec.md`). Before that the relay stayed on NvFBC, which
+scales in the grab. NvFBC is still the default capture without `-wgc`. Still untested: Smooth Motion x3 and other source rates, HDR sources (the
 pool is 8-bit), and capturing the game's window under Smooth Motion. Six streams have run on
 it (`wgc-capture-spec.md` sections 4, 5.10, 5.12 and 5.14).
 

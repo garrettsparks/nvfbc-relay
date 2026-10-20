@@ -17,8 +17,11 @@ launches (202 to 216). That is the default inside `-wgc` since 2026-10-15, with 
 keep the pool on the present's device and a fall-back to it where a device of its own does not
 work (section 2). In one launch beside OBS's game capture it cost the game 17.1 +- 2.3 points
 less than game capture (5.15). Two streams with the pool on its own device found no torn or stale picture
-(5.14). Sizing the drop from the game's own frames, so that it also works for a game in a
-window, was agreed and is not built (section 8). Last updated 2026-10-15.
+(5.14). Since `4d7ba03` the drop is sized from the game's own frames, so that it also works for
+a game in a window (sections 2 and 8); it has not yet run in a real game in a window. Since
+2026-10-18 a game display of another size
+than the capture card's is captured too and scaled by the present (section 2). Last updated
+2026-10-18.
 
 This file is the reference for WGC capture: what is built, what has been measured, what is not
 known and what to test next. How it got here stays where it was written. The costs, the sittings
@@ -59,14 +62,23 @@ moves to it. NvFBC is let go only once WGC is capturing. The log says each step:
 **When it stays on NvFBC.** Each of these leaves the relay on NvFBC with the reason in the log:
 
 - the Windows Runtime entry points or a WGC call fail;
-- the source display and the output differ in size (WGC does not scale, and the present samples
-  the pool without filtering);
 - this Windows has no setting for the least time between frames (it came with Windows 11 24H2,
   build 26100), or Windows keeps that time above 0.001 ms.
 
 **Pool.** `CreateFreeThreaded`, BGRA 8-bit, the source display's size, one buffer for every ring
 slot and two more (34 on the rig). A frame stays out of the pool for as long as its slot names
 it and goes back when the slot is used again.
+
+**A source display of another size than the output** (2026-10-18). WGC captures it at its own
+size and the present scales each frame as it draws it: bilinear by default, as NvFBC's grab
+does, or bicubic or Lanczos with `-wgcscale` (not in the help text). A present whose frames are
+the output's size draws them as before. Before this a display of another size left the relay on
+NvFBC. Design, pictures and costs: `wgc-scaling-spec.md`. The log says the filter at start and
+counts both kinds of present at the end:
+
+    D3D11Present: a WGC frame of another size than the output is scaled with bilinear (-wgcscale)
+    WGC: the source display is 2560x1440 and the output 1920x1080; the present scales its frames
+    WGC scaling summary: N presents scaled with bilinear, M drew frames at the output's size unscaled
 
 **Where the pool lives** (on by default since 2026-10-15; `-nowgcopen` keeps the pool on the
 present's device, `-wgcopen` is accepted). The pool is made on a D3D11 device of its own,
@@ -131,15 +143,20 @@ keeps them, `-wgcdrop` is accepted). While WGC is
 capturing, Windows delivers a frame for each move of a visible mouse pointer: a copy of the
 frame before it, reported as changed only in the pointer's rectangle (5.9). `Wait` gives such a
 frame straight back to the pool and goes on waiting, so the ring is never told of it and none
-of the ring's, the lock's or the policy's code is involved. The rule
-(`WgcCaptureSource::PointerOnly`): the frame's changed areas sum to under a twentieth of the
-picture (a hundredth up to `c448312`), and a frame that changed the whole picture arrived in
-the last half second. A frame
-with no list of changed areas, or an empty one, is kept, and so is a small change on a screen
-where nothing has redrawn the whole picture for half a second. Both numbers are defaults the
-user owns. The log says which way it is set, and the closing line counts them:
+of the ring's, the lock's or the policy's code is involved. The rule, since `4d7ba03`
+(`policy::IsPointerFrame`, called by `WgcCaptureSource::PointerOnly`), is sized from the game's
+own frames, so it holds for a game in a window as for one that fills the display: the relay
+remembers the largest changed area any frame was reported with, forgets it once half a second
+passes with no frame at least that large, and leaves out a frame whose changed areas sum to
+under a tenth of the remembered one. A frame with no list of changed areas, or an empty one, is
+kept and leaves the memory as it is; on a still screen where only the pointer moves, the memory
+runs out and the pointer's frames are kept, since they are all the screen has. Up to `4d7ba03`
+the line was a share of the whole picture (a hundredth up to `c448312`, then a twentieth) while
+a whole-picture frame had arrived in the last half second. Both numbers are defaults the user
+owns. Section 8 has how the rule was chosen and checked. The log says which way it is set, and
+the closing line counts them:
 
-    WGC: a frame that changed only a small area, as a move of the mouse pointer makes, is left out while frames that change the whole picture are arriving (-nowgcdrop keeps them)
+    WGC: a frame that changed under a tenth of the largest area a frame changed in the last half second, as a move of the mouse pointer makes, is left out (-nowgcdrop keeps them)
     WGC summary: N wakes stored, M frames came with no texture and were dropped, K frames that changed only a small area were left out
 
 Checked on this code so far: the suite (652 lines, equal to the baseline, C++17 the same), a
@@ -176,8 +193,8 @@ largest, 256 pixels, is 3.6% of the picture when it jumps), all but the largest 
 so far the hundredth and the twentieth give the same result, since nothing between 0.06% of the
 picture and the whole of it has been seen; the benchmark's frames were all the whole picture,
 and the work a frame does is the same, so no benchmark row was run for it. Checked: a zig build
-(`drop5pct1`). The suite does not compile this code. Section 8 has the rule that is to replace
-it, sized from the game's own frames.
+(`drop5pct1`). That rule was replaced in `4d7ba03` by the one sized from the game's own frames
+(above, and section 8), which decides as the twentieth did on every full-screen frame read.
 
 **Lines that mean trouble.** `WGC: frames are now WxH, and the pool's buffers WxH` (the content
 changed size), `WGC: a frame came with no texture and was dropped`, and `WGC: a frame came with
@@ -204,7 +221,8 @@ section 9.1 and in `session-kickoff-performance-pass-7.md`.
   92,470.
 - **`SystemRelativeTime` is no use as a clock.** Which clock it follows changes with how the
   game's frames reach the compositor. Dropped; the ETW flips are the clock.
-- **WGC does not scale.** A pool's buffers keep their size and bigger content is clipped.
+- **WGC does not scale.** A pool's buffers keep their size and bigger content is clipped. The
+  present scales instead (section 2).
 - **Cost.** About 249 points where NvFBC costs 297, in one launch on 2026-10-11, and 244 and 290
   over two launches on 2026-10-13 (5.11).
 - **0.001 ms costs the game no more than 0.01 or 0.1 ms.** Eight rows of each on 2026-10-13:
@@ -1057,7 +1075,7 @@ Each is the user's.
 
   **Built 2026-10-15** at the user's word ("we'll add it in as the standard behavior" if it
   costs nothing), as `policy::IsPointerFrame` in the policy layer with `WgcCaptureSource`
-  calling it in place of the twentieth, `-nowgcdrop` unchanged; a patch for the user to commit.
+  calling it in place of the twentieth, `-nowgcdrop` unchanged; committed as `4d7ba03`.
   Checked: unit tests in the suite (a full-screen game loses every pointer frame and no game
   frame; a game in a 1280x720 window, which the twentieth let through, the same; a frame of
   exactly a tenth kept and one just under left out; a 400x150 notification over a full-screen
@@ -1134,7 +1152,9 @@ Carried from `performance-candidates.md` section 9.1 and `session-kickoff-perfor
 - The pairs under DLSS frame generation, 1.1 to 1.4% of wakes on 2026-10-11 and 3 to 6% on
   2026-10-13 at 0.001, 0.01 and 0.1 ms alike. The readback of 5.11 reads them as a generated
   frame followed by its real frame. Why only about two a second come through is not known.
-- Displays of different sizes: WGC refuses, and a scaler would be needed.
+- Displays of different sizes: scaled by the present since 2026-10-18 (section 2), measured only
+  at 2560x1440 into 1920x1080. Not measured: a smaller source than the output, other ratios
+  such as 4K into 1080p, ringing at mid-grey edges (`wgc-scaling-spec.md`).
 - Any GPU but the rig's. On a Windows before build 26100 WGC stays off, since the setting it
   needs is not there.
 - 0.001 ms compared with 1 ms. 0.001, 0.01 and 0.1 ms cost the same (5.11); 1 ms was not run

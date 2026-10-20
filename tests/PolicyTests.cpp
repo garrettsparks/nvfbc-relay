@@ -4974,7 +4974,7 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.phaseKeep == b.phaseKeep && a.flipEx == b.flipEx && a.mark == b.mark &&
            a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs &&
            a.deferCopy == b.deferCopy && a.wgc == b.wgc && a.wgcDrop == b.wgcDrop &&
-           a.wgcCursor == b.wgcCursor && a.wgcOpen == b.wgcOpen;
+           a.wgcCursor == b.wgcCursor && a.wgcOpen == b.wgcOpen && a.wgcScale == b.wgcScale;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
@@ -5001,6 +5001,8 @@ static void test_launch_defaults() {
     CHECK(o.wgcDrop, "leaving out the frames a mouse pointer move brings must default on");
     CHECK(o.wgcCursor, "the mouse pointer in the WGC picture must default on");
     CHECK(o.wgcOpen, "the WGC frame pool on a device of its own must default on");
+    CHECK(o.wgcScale == 0 && !std::strcmp(launch::WgcScaleNames()[o.wgcScale], "bilinear"),
+          "WGC's scaling must default to bilinear, got %d", o.wgcScale);
     CHECK(CountSwitchesOn(o) == 7 && o.markFrames == 0,
           "exactly the lock, flip timing, late-batch correction, the deferred ring copy, "
           "leaving out pointer frames, the pointer in the WGC picture and the WGC frame pool on "
@@ -5177,6 +5179,31 @@ static void test_launch_option_parsing() {
               "-src 60fps must read the numeric prefix");
         t = launch::SplitTokens("-src");
         CHECK(launch::ApplyOption(t, 0, &x, &w) == 0, "-src with no value must be unknown");
+    }
+
+    // -wgcscale takes a filter by name; any other word is consumed, ignored and reported.
+    {
+        launch::Options x;
+        std::string w;
+        std::vector<std::string> t = launch::SplitTokens("-wgcscale lanczos");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 &&
+                  !std::strcmp(launch::WgcScaleNames()[x.wgcScale], "lanczos") && w.empty(),
+              "-wgcscale lanczos must be accepted");
+        t = launch::SplitTokens("-wgcscale bicubic");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 &&
+                  !std::strcmp(launch::WgcScaleNames()[x.wgcScale], "bicubic") && w.empty(),
+              "-wgcscale bicubic must be accepted");
+        t = launch::SplitTokens("-wgcscale linear");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 &&
+                  !std::strcmp(launch::WgcScaleNames()[x.wgcScale], "bicubic") &&
+                  w == "-wgcscale takes bilinear, bicubic or lanczos, not 'linear'",
+              "-wgcscale linear must be consumed, ignored and reported, got '%s'", w.c_str());
+        w.clear();
+        t = launch::SplitTokens("-wgcscale bilinear");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.wgcScale == 0 && w.empty(),
+              "-wgcscale bilinear must set the default back");
+        t = launch::SplitTokens("-wgcscale");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 0, "-wgcscale with no value must be unknown");
     }
 
     // Flags match exactly: case and spelling variants are unknown, and consume nothing. The
@@ -5417,6 +5444,10 @@ static void test_launch_relaunch_round_trip() {
         "-wgc -wgcopen -nowgccursor -src 60",
         "-wgc -nowgcopen",
         "-nowgcopen -wgcopen -lag 60",
+        "-wgc -wgcscale lanczos",
+        "-wgc -wgcscale bicubic -src 60",
+        "-wgcscale lanczos -wgcscale bilinear",
+        "-wgc -wgcscale bilinear -lag 60",
     };
     for (const char* text : launches) {
         launch::Options typed = ParseOptionString(text, nullptr, nullptr);

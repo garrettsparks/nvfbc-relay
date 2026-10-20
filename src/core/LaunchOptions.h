@@ -51,7 +51,16 @@ struct Options {
                                     // is in the picture
     bool wgcOpen = true;            // -wgcopen / -nowgcopen: with -wgc, the frame pool on a
                                     // device of its own, its textures opened by the present
+    int wgcScale = 0;               // -wgcscale <filter>: with -wgc, the filter the present
+                                    // scales a source display of another size with,
+                                    // WgcScaleNames()[wgcScale]; 0 bilinear
 };
+
+// -wgcscale's filters by number, bilinear (0) the default. The names are OBS's.
+inline const char* const* WgcScaleNames() {
+    static const char* const names[] = { "bilinear", "bicubic", "lanczos", NULL };
+    return names;
+}
 
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths always
 // split options identically. Splits on spaces only.
@@ -164,6 +173,10 @@ inline const std::vector<UsageRow>& OptionRows() {
                            "costs the game less", false, false},
         {"-wgcopen", "", "The frame pool on a device of its own; on by default, accepted so a "
                          "launch string that names it keeps working", false, false},
+        {"-wgcscale", "bilinear", "With -wgc, how a game display of another size than the "
+                                  "capture card's is scaled: bilinear (the default, as NvFBC "
+                                  "scales), bicubic or lanczos (sharper, and cost more)",
+         false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -320,6 +333,16 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
         }
         return 1;
     }
+    if (t == "-wgcscale" && i + 1 < tokens.size()) {
+        const std::string& v = tokens[i + 1];
+        int found = -1;
+        for (int k = 0; WgcScaleNames()[k]; k++) {
+            if (v == WgcScaleNames()[k]) found = k;
+        }
+        if (found >= 0) o->wgcScale = found;
+        else if (warning) *warning = "-wgcscale takes bilinear, bicubic or lanczos, not '" + v + "'";
+        return 2;
+    }
     if (t == "-lag" && i + 1 < tokens.size()) {
         const long v = std::strtol(tokens[i + 1].c_str(), NULL, 10);
         if (v >= 0 && v <= 200) o->extraLagMs = (unsigned int)v;
@@ -475,6 +498,7 @@ inline std::string FormatOptions(const Options& o) {
     if (o.wgcDrop != d.wgcDrop) add(o.wgcDrop ? "-wgcdrop" : "-nowgcdrop");
     if (o.wgcCursor != d.wgcCursor) add(o.wgcCursor ? "-wgccursor" : "-nowgccursor");
     if (o.wgcOpen != d.wgcOpen) add(o.wgcOpen ? "-wgcopen" : "-nowgcopen");
+    if (o.wgcScale != d.wgcScale) add(std::string("-wgcscale ") + WgcScaleNames()[o.wgcScale]);
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");
