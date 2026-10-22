@@ -4974,7 +4974,8 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.phaseKeep == b.phaseKeep && a.flipEx == b.flipEx && a.mark == b.mark &&
            a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs &&
            a.deferCopy == b.deferCopy && a.wgc == b.wgc && a.wgcDrop == b.wgcDrop &&
-           a.wgcCursor == b.wgcCursor && a.wgcOpen == b.wgcOpen && a.wgcScale == b.wgcScale;
+           a.wgcCursor == b.wgcCursor && a.wgcOpen == b.wgcOpen && a.wgcScale == b.wgcScale &&
+           a.copyEngine == b.copyEngine;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
@@ -5001,6 +5002,7 @@ static void test_launch_defaults() {
     CHECK(o.wgcDrop, "leaving out the frames a mouse pointer move brings must default on");
     CHECK(o.wgcCursor, "the mouse pointer in the WGC picture must default on");
     CHECK(o.wgcOpen, "the WGC frame pool on a device of its own must default on");
+    CHECK(o.copyEngine, "the copy-engine present must default on");
     CHECK(o.wgcScale == 0 && !std::strcmp(launch::WgcScaleNames()[o.wgcScale], "bilinear"),
           "WGC's scaling must default to bilinear, got %d", o.wgcScale);
     CHECK(CountSwitchesOn(o) == 7 && o.markFrames == 0,
@@ -5045,11 +5047,28 @@ static void test_launch_option_parsing() {
     warnings.clear();
     unknown.clear();
     o = ParseOptionString(
-        "-nolock -noetw -nodejit -lag 0 -nodefercopy -nowgcdrop -nowgccursor -nowgcopen",
+        "-nolock -noetw -nodejit -lag 0 -nodefercopy -nowgcdrop -nowgccursor -nowgcopen "
+        "-nocopyengine",
         &warnings, &unknown);
     CHECK(!o.lock && !o.etw && !o.dejitter && o.extraLagMs == 0 && !o.deferCopy &&
-              !o.wgcDrop && !o.wgcCursor && !o.wgcOpen && CountSwitchesOn(o) == 0,
+              !o.wgcDrop && !o.wgcCursor && !o.wgcOpen && !o.copyEngine &&
+              CountSwitchesOn(o) == 0,
           "the opt-outs must turn every default off");
+
+    // -nocopyengine has no positive spelling (no launch string ever named one): it clears
+    // only its own field, and a launch that does not name it keeps the default.
+    {
+        launch::Options x;
+        std::string w;
+        const std::vector<std::string> t = {"-nocopyengine"};
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 1 && !x.copyEngine && w.empty(),
+              "-nocopyengine must clear the copy engine and consume one token");
+        x.copyEngine = true;
+        CHECK(SameOptions(x, launch::Options()), "-nocopyengine must change nothing else");
+        const std::vector<std::string> on = {"-copyengine"};
+        CHECK(launch::ApplyOption(on, 0, &x, &w) == 0,
+              "-copyengine must be unknown: the copy engine is on unless turned off");
+    }
     CHECK(warnings.empty() && unknown.empty(), "the opt-outs must parse clean");
 
     // Each switch sets its own field, only that field, and consumes one token: seen from
@@ -5448,6 +5467,8 @@ static void test_launch_relaunch_round_trip() {
         "-wgc -wgcscale bicubic -src 60",
         "-wgcscale lanczos -wgcscale bilinear",
         "-wgc -wgcscale bilinear -lag 60",
+        "-wgc -nocopyengine",
+        "-wgc -nocopyengine -wgcscale lanczos -src 60",
     };
     for (const char* text : launches) {
         launch::Options typed = ParseOptionString(text, nullptr, nullptr);

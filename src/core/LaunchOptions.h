@@ -27,7 +27,9 @@ namespace launch {
 // in the captured picture by default, because the benchmark measured no cost for it;
 // -nowgccursor leaves it out. With -wgc the frame pool is on a device of its own by default,
 // because the benchmark measured it about 58 points cheaper for the game than the pool on the
-// present's device; -nowgcopen keeps it on the present's device.
+// present's device; -nowgcopen keeps it on the present's device. With -wgc a frame shown as it
+// is goes to the screen through the GPU's copy engine, because the benchmark measured it about
+// 72 points cheaper for the game than drawing it; -nocopyengine draws every frame.
 struct Options {
     float srcRateHint = 0.0f;       // -src: declared BASE render rate; 0 = not declared
     bool lock = true;               // -lock / -nolock: the phase comb lock
@@ -54,6 +56,9 @@ struct Options {
     int wgcScale = 0;               // -wgcscale <filter>: with -wgc, the filter the present
                                     // scales a source display of another size with,
                                     // WgcScaleNames()[wgcScale]; 0 bilinear
+    bool copyEngine = true;         // -nocopyengine: with -wgc, a frame shown as it is is
+                                    // copied by the copy engine and shown through the
+                                    // composition swapchain (CopyEngineTarget)
 };
 
 // -wgcscale's filters by number, bilinear (0) the default. The names are OBS's.
@@ -176,6 +181,10 @@ inline const std::vector<UsageRow>& OptionRows() {
         {"-wgcscale", "bilinear", "With -wgc, how a game display of another size than the "
                                   "capture card's is scaled: bilinear (the default, as NvFBC "
                                   "scales), bicubic or lanczos (sharper, and cost more)",
+         false, false},
+        {"-nocopyengine", "", "With -wgc, draw every frame onto the capture card display. By "
+                              "default a frame shown as it is is copied by a part of the "
+                              "graphics card the game does not use, which costs the game less",
          false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
@@ -319,6 +328,7 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-nowgccursor") { o->wgcCursor = false; return 1; }
     if (t == "-wgcopen")     { o->wgcOpen = true;    return 1; }
     if (t == "-nowgcopen")   { o->wgcOpen = false;   return 1; }
+    if (t == "-nocopyengine") { o->copyEngine = false; return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -499,6 +509,7 @@ inline std::string FormatOptions(const Options& o) {
     if (o.wgcCursor != d.wgcCursor) add(o.wgcCursor ? "-wgccursor" : "-nowgccursor");
     if (o.wgcOpen != d.wgcOpen) add(o.wgcOpen ? "-wgcopen" : "-nowgcopen");
     if (o.wgcScale != d.wgcScale) add(std::string("-wgcscale ") + WgcScaleNames()[o.wgcScale]);
+    if (!o.copyEngine) add("-nocopyengine");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");

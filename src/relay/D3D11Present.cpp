@@ -1,4 +1,5 @@
 #include "D3D11Present.h"
+#include "CopyEnginePresent.h"
 
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
@@ -142,6 +143,7 @@ D3D11PresentBackend::D3D11PresentBackend(bool tint)
 }
 
 D3D11PresentBackend::~D3D11PresentBackend() {
+    delete m_copyEngine;                // draws with this device, so goes first
     for (int i = 0; i < CaptureRing::RING_SIZE; i++) {
         if (m_ringSrv[i]) m_ringSrv[i]->Release();
         if (m_ringAlias[i]) m_ringAlias[i]->Release();
@@ -172,7 +174,10 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
     m_cfg = cfg;
     if (m_tintRequested) LOG("-tint ignored: the D3D11 present path has no tint pass");
     m_wgc = ring->WgcRequested();
-    if (!CreateDeviceAndSwapChain(hwnd, width, height)) return false;
+    if (!CreateDeviceAndSwapChain(hwnd, width, height, m_wgc && ring->WgcCopyEngine(),
+                                  ctx.sinkRefreshHz)) {
+        return false;
+    }
     if (!OpenRingAliases(ring)) return false;
     if (!CreatePipeline()) return false;
     // Only WGC's frames can be another size than the output.
@@ -191,7 +196,8 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
     return true;
 }
 
-bool D3D11PresentBackend::CreateDeviceAndSwapChain(HWND hwnd, int width, int height) {
+bool D3D11PresentBackend::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
+                                                   bool copyEngine, int sinkRefreshHz) {
     // Default adapter, matching InterpSidecar. Correct while the relay is single-GPU; a
     // multi-adapter box would want the adapter driving the TARGET output, which is a
     // different (and currently hypothetical) selection problem. WGC makes its frame pool only
@@ -229,6 +235,24 @@ bool D3D11PresentBackend::CreateDeviceAndSwapChain(HWND hwnd, int width, int hei
     if (bitsPerColor >= 10) {
         formats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
         formats[1] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    }
+    if (copyEngine) {
+        // The copy-engine target takes the swapchain's place, its buffers in the format the
+        // swapchain would have had; a WGC frame is copied only when its format is the same.
+        // A target that cannot be built refuses the mode rather than falling back: the D3D12
+        // runtime and the composition swapchain are part of the Windows the relay supports, so
+        // a failure is a fault to report, and -nocopyengine is the user's way round it.
+        LOG("D3D11Present: output reports %u bits per color; copy-engine buffers %s",
+            bitsPerColor, FormatName(formats[0]));
+        factory->Release();
+        adapter->Release();
+        dxgiDev->Release();
+        m_copyEngine = new CopyEngineTarget();
+        if (!m_copyEngine->Setup(m_dev, m_ctx, hwnd, width, height, formats[0], sinkRefreshHz)) {
+            m_copyEngineFailed = true;
+            return false;
+        }
+        return true;
     }
     LOG("D3D11Present: output reports %u bits per color; trying %s then %s",
         bitsPerColor, FormatName(formats[0]), FormatName(formats[1]));
@@ -412,6 +436,12 @@ bool D3D11PresentBackend::SetupScaling(int filter, int width, int height) {
 }
 
 bool D3D11PresentBackend::AcquireBackBuffer() {
+    if (m_copyEngine) {
+        if (m_rtv) m_rtv->Release();
+        m_rtv = m_copyEngine->NextTarget();
+        m_rtv->AddRef();
+        return true;
+    }
     // Back buffer 0 is re-acquired every present: under flip model the identities of the
     // back buffers change after each Present, so a cached view would render into a surface
     // that is no longer the one about to be scanned out.
@@ -451,6 +481,15 @@ ID3D11ShaderResourceView* D3D11PresentBackend::SourceFor(int slot) {
     m_poolSrvs.push_back(std::make_pair(texture, view));
     LOG("D3D11Present: sampling capture pool texture %zu directly", m_poolSrvs.size());
     return view;
+}
+
+// A slot NvFBC filled holds its picture in the ring's own surface, which is drawn, as is a
+// frame of another size than the output. The marker does not decide it: a copied present gets
+// its strip from the copy engine as well (BurnMarker).
+ID3D11Texture2D* D3D11PresentBackend::CopySourceFor(int slot) {
+    if (!m_ring || NeedsScaling(slot)) return NULL;
+    ID3D11Texture2D* texture = m_ring->WgcTexture(slot);
+    return texture && m_copyEngine->CanCopy(texture) ? texture : NULL;
 }
 
 // A slot whose picture is a WGC pool texture of another size than the output. A slot without
@@ -664,12 +703,15 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome*
 
     // Acquired even when there is nothing to draw, so the marker lands on THIS present's
     // buffer and never on the one already handed to the display.
+    m_copySource = NULL;
     if (!AcquireBackBuffer()) {
         m_drawFailures++;
         return;
     }
     if (slotA < 0) return;   // nothing presentable yet; the buffer stays as created
-    if (!Draw(slotA, slotB, w)) {
+    // A frame shown as it is goes to the copy engine at the present, in place of the draw.
+    if (m_copyEngine && slotA == slotB) m_copySource = CopySourceFor(slotA);
+    if (!m_copySource && !Draw(slotA, slotB, w)) {
         m_drawFailures++;
         if (m_drawFailures == 1 || (m_drawFailures % 600) == 0) {
             LOGERR("D3D11Present: draw failed (%lld so far); the buffer presents as is",
@@ -692,7 +734,11 @@ long long D3D11PresentBackend::BurnMarker(const CompositeOutcome& out) {
                        out.pixelExec, &burned, cells)) {
         return burned;
     }
-    if (!DrawMarker(cells)) {
+    // A present the copy engine copies gets its strip copied in after the frame, so a marked
+    // run takes the same path as an unmarked one and the game's GPU is not interrupted for it.
+    if (m_copySource) {
+        m_copyEngine->MarkNextCopy(cells);
+    } else if (!DrawMarker(cells)) {
         m_drawFailures++;
     }
     return burned;
@@ -700,7 +746,19 @@ long long D3D11PresentBackend::BurnMarker(const CompositeOutcome& out) {
 
 bool D3D11PresentBackend::WaitForFrame() {
     if (!m_enabled) return false;
-    const DWORD r = WaitForSingleObject(m_frameWait, kWaitTimeoutMs);
+    DWORD r = WAIT_TIMEOUT;
+    if (m_copyEngine) {
+        // The copy-engine target's buffer coming back is the same clock as the swapchain's
+        // waitable object. A lost presentation manager never comes back: the mode stops.
+        const int back = m_copyEngine->WaitForBuffer(kWaitTimeoutMs);
+        if (back < 0) {
+            m_copyEngineLost = true;
+            return false;
+        }
+        if (back > 0) r = WAIT_OBJECT_0;
+    } else {
+        r = WaitForSingleObject(m_frameWait, kWaitTimeoutMs);
+    }
     if (r == WAIT_OBJECT_0) {
         // Logged on the way OUT of the condition as well as into it. A counter that prints
         // every Nth line cannot distinguish a burst from a permanent fault, and at one
@@ -732,11 +790,20 @@ bool D3D11PresentBackend::SwapChainStalled() const {
     //
     // The threshold is far beyond any legitimate pause: healthy captures record ZERO timeouts
     // end to end, and a display mode change or an alt-tab costs at most a period or two.
-    return m_consecutiveWaitTimeouts >= kStallTimeouts;
+    return m_copyEngineLost || m_consecutiveWaitTimeouts >= kStallTimeouts;
 }
 
 LONGLONG D3D11PresentBackend::Present(bool vsync) {
     if (!m_enabled) return 0;
+    if (m_copyEngine) {
+        // Always on a vblank: the presentation manager has no tearing present.
+        const bool shown = m_copySource ? m_copyEngine->PresentCopy(m_copySource)
+                                        : m_copyEngine->PresentDrawn();
+        m_copySource = NULL;
+        m_presents++;
+        if (!shown) m_presentFailures++;
+        return 0;
+    }
     // Queues the frame; WaitForFrame already made the room, so this returns promptly and
     // reports no pacing block. Sync interval 1 puts the flip on a vblank. Under independent
     // flip that vblank is the sink's, which is the entire point of this backend.
@@ -763,6 +830,13 @@ void D3D11PresentBackend::LogSummary() const {
     if (m_wgc) {
         LOG("WGC scaling summary: %lld presents scaled with %s, %lld drew frames at the output's "
             "size unscaled", m_scaledDraws, WgcScaler::Name(m_scale), m_unscaledDraws);
+    }
+    if (m_copyEngine) {
+        m_copyEngine->LogSummary();
+        LOG("d3d11 present summary (copy engine): %lld presents, %lld reported a problem, "
+            "%lld draws failed, %lld frame waits timed out",
+            m_presents, m_presentFailures, m_drawFailures, m_waitTimeouts);
+        return;
     }
     LOG("d3d11 presentstats summary: %lld refreshes showed no new frame over %lld sampled "
         "presents (%.3f/s at a 60 Hz sink); %lld presents, %lld reported a problem, "

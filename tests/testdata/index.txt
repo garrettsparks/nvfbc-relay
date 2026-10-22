@@ -129,6 +129,12 @@ gm_60x2_gameplay_2026_10_14_0.trace
 # 0.2 to 1.3 s after a hitch of 29 to 41 ms, three of them within a second; the worst blend run
 # (35) is the first.
 gm_60x2_gameplay_2026_10_14_1.trace
+# 82 minutes of the 2026-10-21 stream, through Windows.Graphics.Capture with the pool on its own
+# device and the small-change frames left out by a threshold sized from the game's own frames:
+# 398 hitches and 102 stalls an hour, the most of any stream here, in 131 bursts. 14 lock
+# releases (10 an hour), 7 of them with no hitch in the 3 s before, four within 6.6 s at 2528 s
+# to 2535 s. The worst blend run (42) is the last release, 0.25 s after a 41 ms hitch.
+gm_60x2_gameplay_2026_10_21_0.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions
