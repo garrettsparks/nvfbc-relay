@@ -304,7 +304,7 @@ must follow THIS spec where they differ.)*
 
 Methodology: UFO test or KCD2 as noted; OBS CBR ~6 Mbps (verify **0 dropped frames**); empty
 `NvFBCR.log` beside the exe; ~3–5 min runs unless noted; same-session baseline comparisons where
-specified; analysis via `detect.py` (`reverse`, `dupes --mad --max-dupes 0`, `pacing` incl.
+specified; analysis with the video analysis tools (reverse motion, duplicate frames, pacing incl.
 Roughness) + log assertions.
 
 | # | run | config | pass criteria |
@@ -367,7 +367,7 @@ The validation table's runs map to: V1 `60_x1_vsync_ufo`, V2 `60_x1_60_ufo`, V3
 
 | regression class | instrument |
 |---|---|
-| stale/out-of-order pixels (coherency) | `detect.py reverse` (scroll-direction) |
+| stale/out-of-order pixels (coherency) | a reverse-motion check on the recording (scroll direction) |
 | re-shown frames (selection/pacing) | `dupes --mad`, `pick=repeat` vs dupes reconciliation |
 | wrong-time frames, periodic beats | `pacing` Roughness (periodicity warning) |
 | capture timeline corruption | capture `dt` histogram (sub-2 ms %, cadence buckets) |

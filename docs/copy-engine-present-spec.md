@@ -79,7 +79,7 @@ a fault to see).
   check below compares pictures byte for byte, and a marked run checks every frame.
 - **The format.** A copy needs the pool texture's format and size to equal the buffer's. WGC's
   frames are always `B8G8R8A8`, so the buffers are made `B8G8R8A8` whatever the output reports.
-  Until 2026-10-22 they followed the output, and on a 10-bit output every frame was drawn with
+  Before `268da9a` they followed the output, and on a 10-bit output every frame was drawn with
   nothing said (see "10-bit outputs" below).
 - **What took the relay's no-draw visit on 2026-10-15** is not known (the probe's bare present
   takes none, and a render target view made each present does not explain it). The traced row
@@ -97,7 +97,7 @@ a fault to see).
    engine should fall from 60 to about the share of presents that are not passthrough (34% of
    `loadpa1`'s), and its copies should not appear.
 4. A sitting, `-wgc` against `-wgc -xcopyengine`, one launch, minutes said first. Before it, the
-   rig's 2026-10-20 evening slowdown (every pass about a third slower than that morning) has to be
+   rig's slowdown of 2026-10-20 (every pass about a third slower than in the traced runs before it) has to be
    understood or gone, so the points compare with the earlier sittings.
 
 ## Results (2026-10-20)
@@ -122,13 +122,13 @@ As built (`src/relay/CopyEnginePresent.cpp`, zig build `copyengine-1`), the card
   presents copied, the visits left are the draws); the game's time off the engine 49.8 against
   44.5 ms a second, of it with the relay 14.8 against 8.6. Present failures 0, skipped 0, 24
   refreshes with no new frame either way. Both runs read about 137 fps, under the sitting's
-  150 floor, from the evening's slowdown (research doc).
+  150 floor, from that day's slowdown (research doc).
 - **Cost** (sitting `ce1cost`, one launch, no relay at both ends, `-wgc` and `-wgc -xcopyengine`
   alternating five times, one run each, all checks passed with the fps floor at 125):
   `-wgc` cost 134.8 points (3.3%), `-wgc -xcopyengine` 98.2 (2.4%): **36.7 +- 2.2 points less
   (paired, n=5; fitted 36.9 +- 2.1)**, about 27% of the relay's cost. Each copy-engine run copied
   4,978 to 5,020 of about 7,350 presents (68%), 0 failed, 1 skipped, 5 or 6 refreshes with no new
-  frame (the drawn path 5 or 6). The no-relay level was 4,039 and 4,047, the evening's slowdown;
+  frame (the drawn path 5 or 6). The no-relay level was 4,039 and 4,047, that day's slowdown;
   the cost is in points against rows of the same launch.
 - **Cost at normal speed** (sitting `ce2cost`, 2026-10-21 after a reboot cleared the slowdown,
   the same design): no relay 5,403 and 5,429; `-wgc` cost 191.2 points (3.5%), `-wgc
@@ -160,7 +160,7 @@ As built (`src/relay/CopyEnginePresent.cpp`, zig build `copyengine-1`), the card
   122.8 unmarked, a difference inside the bench's noise: no measurable cost. Every copied present
   of the marked runs carried the marker (6,906 and 6,944), 0 failed.
 
-## 10-bit outputs (2026-10-22)
+## 10-bit outputs
 
 **Found:** the buffers followed the output's bit depth, so on a capture card display running at
 10 bits per color no WGC frame matched them and every present was drawn, with nothing in the log
@@ -185,7 +185,8 @@ to the display, composed by Windows, and drawn over a format mismatch.
   which the 10-bit output had taken away, is back. On the 8-bit XR1 the two builds cost the same
   (`fmtcost1`: +5, -1, +4).
 
-**NvFBC's frames through the copy engine** were tried the same day (`-xnvcopy`, removed): D3D12
+**NvFBC's frames through the copy engine** were tried too (`-xnvcopy`, `54244c7`, removed in
+`268da9a`): D3D12
 opened the D3D9 ring slots' legacy shared handles and copied about 94% of presents, but saved
 nothing (`nvce1`: 278 against 272 points drawn), because a context that exists only in that mode
 took the graphics engine 60 times a second instead (GPU traces `nvtrace1`/`nvtrace2`; not the

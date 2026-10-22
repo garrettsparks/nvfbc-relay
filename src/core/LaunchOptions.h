@@ -729,7 +729,7 @@ inline PromptAnswer ParsePromptAnswer(const std::string& line) {
 
 // The startup line that records every resolved option, including those entered at the prompt,
 // which appear nowhere else. mktrace.py reads its "src rate hint <n> fps" and "extra lag <n> ms"
-// phrases, and relaylog.py echoes it as a header, so its wording and field order stay fixed.
+// phrases, and log readers echo it as a header, so its wording and field order stay fixed.
 inline std::string ResolvedOptionsLine(const Options& o, bool d3d11Present) {
     char mark[48];
     if (!o.mark) snprintf(mark, sizeof(mark), "off");

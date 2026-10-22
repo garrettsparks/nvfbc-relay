@@ -17,7 +17,7 @@
 // WHY. Every present of the D3D11 path took the game's graphics engine once, for the draw that
 // goes in with it, and the game is switched out and back for each. A present with no GPU work
 // behind it takes no visit, and neither does a copy on a D3D12 copy queue (measured beside a
-// benchmark, 2026-10-20). A copy queue cannot write a DXGI swapchain's own buffers (the device is
+// benchmark). A copy queue cannot write a DXGI swapchain's own buffers (the device is
 // removed), so the output is a composition swapchain: the presentation manager presents any
 // displayable texture, bound to the output window through DirectComposition.
 //

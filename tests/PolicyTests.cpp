@@ -607,8 +607,7 @@ static bool IsPass(policy::CompositeOp op) {
 static int CountExcursions(const SimResult& r, int64_t srcPeriod,
                            const std::vector<bool>* requireEngaged = nullptr) {
     // A pull wrap legitimately produces one Repeat plus a comb-spacing jump (the beat
-    // slip, the same slip an unlocked beat pays); relaylog.py classifies it separately
-    // from the gate-excursion class. Exclude the wrap neighborhood.
+    // slip, the same slip an unlocked beat pays), a class apart from the gate excursions. Exclude the wrap neighborhood.
     // Skip startup: lastShownTs seeds at 0, so the first real pick is a giant jump by
     // construction (and the lock gate starts optimistically engaged on zero history).
     int count = 0;
@@ -758,7 +757,7 @@ static void test_hysteresis_no_flip_flop() {
     // STRIDES (steps of the shown-frame chain), not pick labels: at the alignment phase
     // the same shown frame legitimately relabels between Before and After (bd~0 and
     // ad~0 select the same arrival), so labels alternate while the output is steady.
-    // The validated invariant (stride.py, v0.0.11): >=99% stride-4, off-strides are
+    // The validated invariant: >=99% stride-4, off-strides are
     // isolated lone slips at sweep crossings, and no period-2 alternation window.
     SimParams p{};
     p.srcPeriod = 4167;

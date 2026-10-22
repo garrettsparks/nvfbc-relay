@@ -257,8 +257,8 @@ Get Medieval (KCD at 60 fps with Smooth Motion x2), 2h34m, the CI build of `e79a
 `-mark 5400 -wgc`, driver 610.88. The log is `Get Medieval 2026-10-11 0.log` in the analysis
 root. Everything below is on the stretch the stream's video shows, relay time 51.4 to 9292.4 s,
 lined up by the 2,340 marked frames of its opening (2,282 of them within 0.37 ms at the 90th
-percentile). The capture figures are from `wgcsingles.py <log> 51.4 9292.4`, which sorts
-each second into ordinary (the 60 fps regime, `regimegaps.py`'s rule), extra (out of the regime
+percentile). The capture figures are from an analysis tool run over relay time 51.4 to 9292.4 s,
+which sorts each second into ordinary (the 60 fps regime), extra (out of the regime
 with 70 or more batches) and other (hitches, stalls, loading). That gave 8,620, 449 and 172
 seconds.
 
@@ -478,10 +478,8 @@ present by a quarter of a millisecond.
 One sitting in the user's game at 60 fps with Smooth Motion x2, a menu open, nobody touching
 the mouse. Each arm is a relay launch: 10 s with the pointer still, 10 s with the bench runner
 moving it (`sweep`: about 63 relative moves of 6 pixels a second, left and right), twice. A
-stretch is read less 1 s at its start and 0.5 s at its end. The logs are
-`rigbench/checks-1012/out/m_<arm>.log` in the analysis folder, the runner's logs
-`mouse1.run.log` and `mouse2.run.log` beside them, and the reader is
-`rigbench/checks-1012/stretches.py`. Every arm is `-source 0 -target 1 -framerate b:vsync -src
+stretch is read less 1 s at its start and 0.5 s at its end. The logs, the runner's logs and the
+reader are kept with the private analysis tools. Every arm is `-source 0 -target 1 -framerate b:vsync -src
 60` and the flags shown. The inventory unless it says the map.
 
 | arm | build | flags | still: wakes, requests in no pair, a second | moving: wakes, requests in no pair, a second | moving: relay presents that drew one |
@@ -570,7 +568,7 @@ pointer moving throughout, 10 s each.
 | gameplay, camera turning | 120.1, 0.0, 0.0 | 120.1, 0.0, 0.0 | 120.1, 0.0, 0.0 |
 | frames let go in the launch | 1,798 | none | 1,805 |
 
-Over the route (relay seconds 12 to 75, `wgcsingles.py`): with the drop on no second is
+Over the route (relay seconds 12 to 75): with the drop on no second is
 out of the 60 fps regime and 99.97% of presents show a frame from a pair; with it off 10 seconds
 are out of the regime and 39% of the presents in the others show a frame from a batch of three.
 With cursor capture on the pointer is in the picture on the card and the drop works the same
@@ -591,7 +589,7 @@ Get Medieval, 31 minutes, the CI build of `407caaf`, typed at the prompt with th
 for the first 5400 presents and `-wgc`. The log is `Get Medieval 2026-10-12 0.log` in the
 analysis root. The video pairs with it at log time = video time + 45.155 s, from 2,716 marked
 frames within 0.45 ms (p90), and everything below is on the stretch the video shows, relay time
-45.2 to 1926.6 s, read with `wgcsingles.py` and the stream's streamcheck report.
+45.2 to 1926.6 s, read from the log and the stream's post-stream report.
 
 | | 2026-10-08, NvFBC | 2026-10-09, NvFBC | 2026-10-11, WGC | 2026-10-12, WGC, pointer frames left out |
 |---|---|---|---|---|
@@ -632,8 +630,8 @@ streams, and anything about another game's pointer (section 8).
 
 Three sittings in the Avatar benchmark, one launch each, one run a row. The user asked for the
 drop's row, the mouse pointer in the picture, and the least time between frames again with
-more data. The files are `wgcset1`, `wgcset2` and `ww1` under `rigbench/sittings` in the
-analysis folder.
+more data. The sittings are `wgcset1`, `wgcset2` and `ww1`, kept with the private analysis
+tools.
 
 **The five settings.** Every row is `-source 0 -target 1 -framerate b:vsync -src 60 -wgc` and
 the flags shown, on zig builds of the tree with `-wgccursor` in it. The 0.01 and 0.1 ms rows
@@ -720,8 +718,9 @@ time 51.2 to 4235.2 s. Stream 1 runs 60.0 minutes with no marker, and streamchec
 match was not decisive (ratio 2.5). It is placed from the OBS log's stream start times at log
 time = video time + 4247.6 s, good to a few tenths of a second: the held-present check put its
 best match 13 frames away, with its thirds disagreeing. So its counts below are per second and
-nothing about it is frame-exact. The wake, request and release counts are from `wgcsingles.py`,
-`wgclost.py` and a count of `lk=1` to `lk=0` on the temporal lines, over each stream's stretch.
+nothing about it is frame-exact. The wake, request and release counts are from the log (the
+capture and flip lines, and a count of `lk=1` to `lk=0` on the temporal lines), over each
+stream's stretch.
 
 | | 2026-10-12, `407caaf` | 2026-10-13 stream 0 | 2026-10-13 stream 1 |
 |---|---|---|---|
@@ -764,8 +763,8 @@ nothing about it is frame-exact. The wake, request and release counts are from `
 
 ### 5.13 The sittings of 2026-10-14: the moving pointer, where WGC's points go, the pool's device
 
-Avatar benchmark sittings in one launch each, one run a row, no-relay rows through each, files
-under `rigbench/sittings` in the analysis folder. The experiment branch's flags are named as
+Avatar benchmark sittings in one launch each, one run a row, no-relay rows through each, kept
+with the private analysis tools. The experiment branch's flags are named as
 they were run (`-xwgcinterval 1`, `-xwgcdrop` and `-xwgccursor` there match the user's branch's
 defaults).
 
@@ -843,7 +842,7 @@ future project probably. not part of the optimization work". On 2026-10-15, afte
 5.14, the pool on its own device became the default inside `-wgc` with the fall-back of section
 2.
 
-Under NvFBC the busy core seen on a still desktop is NVIDIA's (`checks-1014/tcpu1`,
+Under NvFBC the busy core seen on a still desktop is NVIDIA's (a desktop check with
 `-xthreadcpu`): one thread starting in `nvd3dumx.dll` holds 93 to 95% of a core and the relay's
 own threads stay under 1%; on WGC the whole process uses under 1%.
 
@@ -882,8 +881,8 @@ over the stretch each video shows.
 - **No torn or stale picture.** A picture the present read before Windows finished writing it
   would most likely show an older frame, whole or in part, between two frames that match each
   other. Every frame whose differences to both neighbours are large against the motion either
-  side was listed from streamcheck's cache (`tools-1015/oddframes.py`, factor 2), and each was
-  decoded with its neighbours (`oddcheck.py`): it reads apart when the frames before and after are
+  side was listed from the post-stream report's cache (factor 2), and each was decoded with its
+  neighbours: it reads apart when the frames before and after are
   closer to each other than either is to it. Controls, planted in 6 s of stream 0's fastest
   steady motion: a picture 17 frames old reads 0.32, half the picture 17 frames old 0.76, every
   other 32-pixel tile 17 frames old 0.54, an untouched frame 1.70, and real menu-cadence frames
@@ -967,7 +966,7 @@ cost 287 to 297 points in other launches.
 ## 7. Tests still to run
 
 In this order. Each is a rig job in the user's game with the user playing, a minute or two, and
-each is read with `wgcsingles.py` on its log unless it says otherwise. They are numbered W
+each is read from its log unless it says otherwise. They are numbered W
 so as not to be taken for the T rules of `dual-device-capture-present-spec.md`.
 
 | | test | read | settles |
@@ -983,7 +982,7 @@ so as not to be taken for the T rules of `dual-device-capture-present-spec.md`.
 **W1 to W5 ran on 2026-10-12; the results are in 5.9. W7 ran on 2026-10-13 (5.11): the drop
 and the cursor setting cost nothing measurable.** W6 has not run. As W1 to W5 were prepared:
 
-W1 to W5 are prepared as one job, `rigbench/checks-1012/mouse1.json` in the analysis folder: a
+W1 to W5 are prepared as one rig job, kept with the private analysis tools: a
 menu open (the inventory, if its centre moves, so that W4's hash can tell a copy), and for each
 arm 10 s with the pointer still and 10 s with the runner moving it (`sweep`, relative mouse
 input on a timer), twice. The arms are the stream's build with `-wgc`; the experiment build
@@ -992,8 +991,8 @@ with `-wgc -xwgcinterval 1`; the same with `-xwgccursor`; with `-xwgcdirty`; wit
 build on NvFBC. A last stretch has the user move the mouse by hand, in case input made by the
 runner does not behave as a hand does. Not yet run.
 
-Not a test, but owed from Part B: `tools-1010/kfshown.py` on the singles around hitches, if any
-are to be classed.
+Not a test, but owed from Part B: the short-run tool on the singles around hitches, if any are
+to be classed.
 
 ## 8. Decisions that wait on the tests
 
@@ -1021,7 +1020,7 @@ Each is the user's.
   remembers the largest changed area any frame was reported with, and forgets it when half a
   second passes with no frame at least that large. A frame is left out when its changed area is
   under a tenth of the remembered one. A frame with no list of changed areas, or an empty one,
-  is kept as now, and `-nowgcdrop` keeps every frame as now. The user, later that day: "I
+  is kept as now, and `-nowgcdrop` keeps every frame as now. The user, afterwards: "I
   think we keep it at 10% for now. we'll adjust later if we need to", and then asked for 2% or
   5% of the picture "without requiring a ton more testing". So the rule as built moved from a
   hundredth to a twentieth of the picture (section 2), and this rule stays agreed and unbuilt.
@@ -1106,8 +1105,8 @@ Each is the user's.
   170 wakes a second with nothing to tell them from frames (5.9). The user, 2026-10-13: "part of
   this benchmark should also be with the cursor re-enabled just for wgc mode? Since that's what
   we really want ideally". The switch `-wgccursor` is built and its benchmark rows cost nothing
-  (5.11). DECIDED 2026-10-13: "let's make wgccursor the default now. I'll use that build to
-  stream tonight." The pointer is in the picture by default with `-wgc`, and `-nowgccursor`
+  (5.11). DECIDED 2026-10-13: "let's make wgccursor the default now", the user streaming on that
+  build next. The pointer is in the picture by default with `-wgc`, and `-nowgccursor`
   leaves it out. The default's rows are the `-wgccursor` rows of 5.11, so no new row is owed.
   Streamed the same night (5.12): the pointer shows in the menus and the menus held.
 - **Which member the ring keeps from a batch of three.** Today it is the last, which is the
@@ -1166,21 +1165,15 @@ Carried from `performance-candidates.md` section 9.1 and `session-kickoff-perfor
   device and its fall-back),
   `src/relay/ICaptureSource.h` (what the ring asks of a source), `src/relay/CaptureRing.cpp` (the
   move from NvFBC, and NvFBC's cursor setting), `src/relay/FlipDecode.h` (what a flip line is).
-- **Logs.** The streams' are `Get Medieval 2026-10-11 0.log`, `2026-10-12 0.log`,
-  `2026-10-13 0.log` (both streams of that night) and `2026-10-14 0.log` and `1.log` in the
-  analysis root, with the NvFBC streams they are compared to beside them. The short runs of
-  section 3 are named in `session-kickoff-performance-pass-7.md`, and the sittings of 5.11 and
-  5.13 are under `rigbench/sittings`.
-- **Tools.** `wgcsingles.py <log> <from_s> <to_s>`, in the analysis folder, prints the capture,
-  flip, lock and step counts of sections 4 and 5: batch sizes and gaps inside a pair, singles
-  and batches of three and where the odd member sits, flip requests a second on the game
-  display, the requests that belong to no pair and how many follow the relay's own present, the
-  lock, the step of the shown frame and the batch it came from, and the seconds after each
-  stretch of extras. The rows an hour in section 4 are from each stream's streamcheck
-  report, and what was on screen (5.1) was read by eye from the video. In the analysis root,
-  `regimegaps.py` lists the seconds out of the gameplay rate, and `tools-1010/kfstats.py` and
-  `kfshown.py` are the short-run tools of Part B. `wgclost.py <log> <from_s> <to_s>` compares
-  wakes with the game display's pair requests second by second. For a video's frames,
-  `tools-1015/oddframes.py <video>.streamcheck-mad --ratio 2` lists frames apart from both
-  neighbours, `tools-1015/oddcheck.py <video> <frame> ...` decodes each with its neighbours, and
-  `tools-1015/freezemap.py` maps where freezes fall (5.14).
+- **Logs, sittings and tools** are kept with the private analysis tools: the logs of the WGC
+  streams and of the NvFBC streams they are compared to, the short runs of section 3, the
+  sittings of 5.11 and 5.13, and the tools that read them. One tool prints the capture, flip,
+  lock and step counts of sections 4 and 5: batch sizes and gaps inside a pair, singles and
+  batches of three and where the odd member sits, flip requests a second on the game display,
+  the requests that belong to no pair and how many follow the relay's own present, the lock, the
+  step of the shown frame and the batch it came from, and the seconds after each stretch of
+  extras. Others list the seconds out of the gameplay rate, compare wakes with the game
+  display's pair requests second by second, and, for a video's frames, list frames apart from
+  both neighbours, decode each with its neighbours, and map where freezes fall (5.14). The rows
+  an hour in section 4 are from each stream's post-stream report, and what was on screen (5.1)
+  was read by eye from the video.

@@ -23,7 +23,7 @@ keeps the GPU fully loaded, so anything the relay costs shows up as a lower scor
 point of that score. The score with no relay is about 5,380, so 54 points is 1%.
 
 The game's level differs between launches by tens of points (no-relay rows on fresh launches read
-5,345 to 5,394 in one afternoon), while runs inside one launch agree within about 6. Since
+5,345 to 5,394 on one day), while runs inside one launch agree within about 6. Since
 2026-10-07 rows are therefore compared inside one launch: the game stays running, the relay is
 swapped between rows, a reference row and a no-relay row run at both ends, and the first run
 after the launch is thrown away. A sitting is one such batch of rows, a row is one configuration,
@@ -65,7 +65,7 @@ The 6% exists only when the GPU has nothing to spare. Capped, the relay takes no
 
 On quality `b:vsync` was ahead on 2026-10-03, when the projector ran game capture on a 1080p
 canvas. In motion the relay showed 1.5 repeated frames a second where the projector showed 3.7
-(`mgdupes.py` over ten 30 s windows of each recording, no marker, so what the chain and the
+(a duplicate-frame count over ten 30 s windows of each recording, no marker, so what the chain and the
 game add is not split out). The repeat count does not see blends or
 skips.
 
@@ -575,7 +575,7 @@ inside 0.172 ms. No preemption tags appeared, so how the game is stopped is not 
 between asking the game to stop and its SAVE_END counts as the game's and may hide more.
 
 A present with no draw still takes the engine once a present. A second traced launch the same
-evening ran the experiment build `wgcopen-1` with `-wgc -xwgcinterval 1 -xwgcdrop -xwgccursor
+day ran the experiment build `wgcopen-1` with `-wgc -xwgcinterval 1 -xwgcdrop -xwgccursor
 -xwgcopen`, two runs as it is and two with `-xnodraw` (present without drawing): the relay held
 the engine 60.0 to 60.3 times a second either way. Without the draw its own hold fell from 0.057
 to 0.039 ms at the median and the game's stretch per present from 0.172 to 0.153 ms, about 1.5
@@ -905,9 +905,29 @@ problems before it finds a number.
    the frame pool's device turned out to cost 58 of them; since 2026-10-15 the pool is on a
    device of its own by default inside `-wgc` (9.1).
 7. DONE 2026-10-15: the CPU-only cleanups, measured and left out (section 5).
-8. Open (the user, 2026-10-18): the pass closes once scaling on WGC is tested
-   (`docs/wgc-scaling-spec.md`): the real build, then the benchmark suite, first proving that
-   displays of one size cost nothing.
+8. DONE: scaling on WGC tested (`docs/wgc-scaling-spec.md`, `6d17691`): displays of one size
+   cost nothing, and `-wgcscale` ships.
+9. DONE: the present through the GPU's copy engine (`docs/copy-engine-present-spec.md`,
+   `4205f93`, the default with `-wgc`; `268da9a` keeps it on 10-bit capture card displays). Two
+   streams closed the pass by the user's rule ("if it's still smooth to stream with, I think
+   that closes out the optimization pass"): one on the WGC changes before the copy engine, one
+   on the copy engine, both smooth, the relay not the source of any freeze measured.
+
+**Where the pass ended** (Avatar benchmark, 2560x1440, DLSS frame generation 2X, RTX 5080, one
+launch per comparison): `-wgc` with the copy engine about 122 to 127 points (2.2 to
+2.3%), OBS's projector with game capture about 204 (3.7%), NvFBC, still the default, about 272
+to 282 (5.0 to 5.2%). With `-wgc` most of what is left is Windows' own copy of each frame for the
+capture (dwm, about 24 of the game's 35 ms a second off the graphics engine in a trace).
+
+**Tried and left out, for the record:** NvFBC's frames through the copy engine (built, measured,
+removed: the D3D9 shared textures cost a graphics-engine visit per present anyway); asking WGC
+for fewer frames (rejected by the user: the ring is meant to hold every frame the game draws, so
+the policy can pick the best-timed one); capturing the game's window (measured: the same
+frames and cost as the display, `docs/wgc-capture-spec.md`).
+
+**After the pass:** NvFBC stays the default capture and `-wgc` the choice (the user's call). A
+game hook like OBS's (the one capture that measured cheaper) is a possible future capture,
+written from the documented technique, not from OBS's GPL code.
 
 Every row is compared inside one launch with a no-relay row and `b:vsync -src 60` at both ends.
 

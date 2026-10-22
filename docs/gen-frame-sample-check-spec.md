@@ -189,7 +189,7 @@ it has earned trust.)
 - **Positive control.** Consecutive first members in motion differ on most samples, so the
   batch-to-batch `ndiff_prev` median over a capture must be large. A median near zero in
   gameplay means the instrument is not reading the frame, whatever the agreement matrix says.
-  Its independent cross-check is the marked recording: `picturerepeats.py` counts the same
+  Its independent cross-check is the marked recording: an analysis tool counts the same
   batch-to-batch repeats from pixels.
 
 `ndiff` is what makes the disagreement cases readable: 3 of 256 differing is a partial or
@@ -209,8 +209,8 @@ batch, against words already read, puts it on the capture line:
     gencheck: ... same_prev=<0|1> ndiff_prev=<n>
 
 and in the summary as a count and a rate per minute. Measurement only, like the rest of the
-instrument. Its cross-check is the recording: `picturerepeats.py` in the analysis repository
-counts the same events from pixels, and the two counts should agree inside the sampling
+instrument. Its cross-check is the recording: an analysis tool counts the same events from
+pixels, and the two counts should agree inside the sampling
 blind spot.
 
 ### Flag
@@ -308,7 +308,7 @@ logged on a line of its own:
 Reading it: `diff=0` means the late grab found the real frame again (too early); a large `diff`
 followed by a capture line whose own `diff` is in the thousands means it found the generated
 frame; a large `diff` followed by a capture line with `diff=0` means it found the next real
-frame early (too late). `gencheck.py` tabulates the three, the landing time, and the flush
+frame early (too late). An analysis tool tabulates the three, the landing time, and the flush
 cost. Setup failure refuses to start; a failed no-wait grab is counted, not fatal.
 
 Result: at 1000 us the late grab returned the second member's picture on 5200 of 5209 batches

@@ -893,8 +893,8 @@ enum NvOFFRUCSurfaceFormat {
 I got the sample built, however when I ran it after copying the DLLs next to the sample executable, I got this error
 
 ```
-● Bash(mkdir -p /c/Users/garrett/Downloads/fruc_test/output && \                              
-      "/c/Users/garrett/Downloads/Optical_Flow_SDK5.0.7/Optical_Flow_SDK_5.0.7/NvOFFRUC/NvOFFR
+● Bash(mkdir -p ~/Downloads/fruc_test/output && \                              
+      "~/Downloads/Optical_Flow_SDK5.0.7/Optical_Flow_SDK_5.0.7/NvOFFRUC/NvOFFR
       UCSample/build…)                                                                        
   ⎿  Error: Exit code 127                                                                     
      CryptQueryObject failed with 80092009                                                    

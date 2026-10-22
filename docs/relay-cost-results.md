@@ -1,8 +1,8 @@
 # Relay cost: results
 
 Answers `docs/relay-cost-spec.md`. Measured 2026-09-18 on the release build (CI run 35306514411,
-commit `f953554`, the reverted policy). Files: `frame-drop-analysis/cost_r<row>_<run>.csv` and
-`cost_r<row>.log`.
+commit `f953554`, the reverted policy). The CSVs and logs are kept with the private analysis
+tools.
 
 **Headline.** The release configuration (`b:vsync -src 60 -lock -lag 75 -etw -dejit`) costs the game
 about 5.5% of its benchmark score, and is the cheapest relay mode measured. `-lock -lag 75` and

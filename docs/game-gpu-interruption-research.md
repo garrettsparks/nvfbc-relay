@@ -55,7 +55,7 @@ its surface bound to the window through DirectComposition, three pictures in tur
 presents), and `flipclear` (alternating greys drawn, a control for the card capture). The
 interfaces are declared from the SDK's `Presentation.idl`, since the MinGW headers have none.
 
-Later modes (2026-10-20, evening): `flipcopy` (a D3D11 CopyResource of a ready picture into each
+Later modes (2026-10-20): `flipcopy` (a D3D11 CopyResource of a ready picture into each
 back buffer), `q12copy` (a D3D12 swapchain whose back buffers a copy queue fills; fails, below)
 and `q12comp` (the composition swapchain's buffers opened on a D3D12 device and filled by its copy
 queue before each present, the D3D11 device waiting on the copy's shared fence).
@@ -67,7 +67,7 @@ every present's picture (the three greys in turn, read from the card capture). W
 the present's visit on the game's GPU needs the card display on the 5080 again, a trace of `flip`
 against `comp` against `idle`, and the probe's and the compositor's holds counted.
 
-### Measured with the card display on the 5080 (2026-10-20, evening)
+### Measured with the card display on the 5080 (2026-10-20)
 
 The card display back on the RTX 5080 at 60.000199 Hz (a display override made with CRU). Each
 row a 10 s GPU trace of the 5080's graphics engine (its context switches), the probe running
@@ -95,11 +95,11 @@ running.
 A D3D12 copy queue's copy into a D3D12 flip-model swapchain's own back buffer removed the device
 on the first present (`DXGI_ERROR_DEVICE_REMOVED`, reason `DXGI_ERROR_ACCESS_DENIED`).
 
-Every benchmark run of 2026-10-20 evening scored about 4,000 (3,974 to 4,008 without the relay),
-where the traced runs of the morning scored 5,258 to 5,261: the game's GPU time per frame was
+Every benchmark run after the card display moved to the 5080 scored about 4,000 (3,974 to 4,008
+without the relay), where the traced runs before the move scored 5,258 to 5,261: the game's GPU time per frame was
 14.1 ms against 10.8, about a third more in every pass, with the same settings file and settings
-screens. A reboot the next morning cleared it (no relay 5,397 and 5,398, GPU time 10.5 ms a
-frame); it was state left by that evening's display and driver changes, which one is not known.
+screens. A reboot the next day cleared it (no relay 5,397 and 5,398, GPU time 10.5 ms a frame);
+it was state left by that day's display and driver changes, which one is not known.
 The visit counts compare inside a launch and do not depend on it.
 
 A slip found on the way: the card captures taken with a frame skip (`select`) and raw output

@@ -14,7 +14,7 @@ and a compositor on top; built on the current entangled path, a blend bug and a
 selection-interaction bug are indistinguishable. Extracting the decision logic into a pure,
 tested unit: (1) isolates blend's bugs to blend's new code, (2) creates the `IFrameCompositor`
 seam blend needs anyway, (3) freezes the current mechanisms as tested-known-good before blend
-perturbs selection, (4) lets `relaylog.py replay` and the C++ unit share one definition of
+perturbs selection, (4) lets the log replay tool and the C++ unit share one definition of
 truth. The logic has ZERO timing dependence (pure arithmetic on passed-in timestamps), so it is
 fully deterministic and platform-independent — ideal for fast CI unit tests with no GPU/Windows.
 
@@ -89,7 +89,7 @@ Policy` + a tiny assert (macro + failure count + non-zero exit). Drives:
 - **Synthetic timelines**: generate source arrivals at a rate with configurable jitter/drops,
   present deadlines at the present rate, feed through `SelectFrame`/`UpdatePhaseLock`, assert.
 - **Replayed real logs**: parse a captured `NvFBCR.log`'s before=/after= stamps (the same data
-  `relaylog.py replay` uses), feed through the policy, assert the produced pick sequence matches
+  log replay tool uses), feed through the policy, assert the produced pick sequence matches
   the logged `pick=` (regression pin) or the expected invariant.
 
 CI: an ubuntu job compiles `PolicyTests.cpp` + the pure sources with g++ and runs it (seconds,
@@ -122,7 +122,7 @@ Each is a Windows-corner-validated behavior turned into a fast assertion:
 This is a REFACTOR of production code, not additive — the risk is a behavior change during the
 move. Rules: the pure function must return EXACTLY what the inline code computed (same integer
 ops, same order, same truncation). Prove unchanged by (a) a Windows corner run showing identical
-output, and/or (b) `relaylog.py replay` producing the same pick sequence as before on a real log.
+output, and/or (b) the log replay tool producing the same pick sequence as before on a real log.
 Extract in order of math density / test value: `WrapHalf` + comb lock first, selection/gate
 second. Own branch off dev (phase-comb-lock merged as v0.0.16). Keep the temporal log line
 append-only (parsers depend on it).

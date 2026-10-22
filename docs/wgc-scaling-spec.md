@@ -12,8 +12,7 @@ end, under the experiment's names.
 Capture through Windows.Graphics.Capture (`-wgc`) is used only when the game's display and the
 capture card's display are the same size. Otherwise the relay stays on NvFBC, which can scale
 inside its grab (`SOURCEMODE_SCALE`). A 4K game display into a 1440p card, or a 1440p one into a
-1080p card, is common, so WGC has to scale before it can be the default capture anywhere (the
-fork for the Steam app plans WGC as its default).
+1080p card, is common, so WGC has to scale before it can be the default capture.
 
 ## Where the scaling goes
 

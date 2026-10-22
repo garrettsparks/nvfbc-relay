@@ -34,7 +34,7 @@ the log in minutes. The harness moves that diagnosis before the capture instead 
 
 ## Inputs
 
-The captures already on disk in /Users/gsparks/dev/frame-drop-analysis - no new recordings:
+The captures already on disk with the private analysis tools - no new recordings:
 
 | log | why it matters |
 |---|---|
@@ -73,15 +73,15 @@ All from `samples/NvFBC/NvFBCR/`, sharing the real policy code by linking
 6. **Selection**: `policy::SelectFrame` with production stickiness, target = present - lag
    (model the lock pull as a parameter; 20833+12000 reproduced the starved run's reach).
 7. **An ORACLE mode**: steering forced correct on every batch, from ground truth computed
-   the way `x3residue.py` does (anchor flip index mod 6, class alignment). This is the
+   the way the residue analysis does (anchor flip index mod 6, class alignment). This is the
    floor measurement: everything else identical, only the vote made perfect.
 
 ## Outputs, per run
 
 - steering % and a timeline of unsteered stretches with their cause (reset id, re-earn
   window, placement failure) - the diagnosis for question 2;
-- the pacing census (`pacing.py` in frame-drop-analysis prints the same table from a live
-  log, so replayed and live runs are directly comparable): steps/s in the classes
+- the pacing census (an analysis tool prints the same table from a live log, so replayed and
+  live runs are directly comparable): steps/s in the classes
   zero / flip-size / full-period / 1.5-2.5x / >42ms / backward;
 - gen-frames-entering-ring per second and gen-shown per second;
 - holes per second, split isolated vs the >42 ms stall class (the stall class runs 0.7/s

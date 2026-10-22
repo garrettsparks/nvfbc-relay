@@ -35,7 +35,7 @@ after frame for pass-after, the target for synth, and unchanged for a hold; a co
 the difference between consecutive content times in source periods. A midpoint present has w
 in [0.35, 0.65]. Step deviation is the rms of (step minus 1.5) in milliseconds.
 
-From the recording: `marker.py decode` on every frame, cross-checked against the log
+From the recording: the marker decoder on every frame, cross-checked against the log
 (counter repeats are downstream duplication, counter skips are presents that never reached the
 file, and the interp flag and weight cells are compared with the log's op and blend weight).
 
@@ -196,7 +196,7 @@ frames sit only 6 to 9 ms apart (none in the new), which reads as pair members a
 frames of their own. Both are hypotheses.
 
 Each such pair is a 16.7 ms hold in the output, a visible judder event that no log metric in
-this document counts. The tool is `picturerepeats.py` in the analysis repository.
+this document counts. The tool that counts them is one of the private analysis tools.
 
 ## The replay agrees with the field, and the corpus now describes the shipping relay
 

@@ -241,8 +241,8 @@ bool D3D11PresentBackend::CreateDeviceAndSwapChain(HWND hwnd, int width, int hei
         // frames it copies, whatever the output reports: a copy cannot change a format, so
         // buffers that followed the output would leave every frame of the other format drawn
         // (on a 10-bit output, every WGC frame). WGC's frames are 8-bit; the display's own
-        // scanout widens them, and buffers of another format than an 8-bit output's were
-        // flipped straight to it (2026-10-22).
+        // scanout widens them, and a buffer in another format than the output's still flips
+        // straight to it.
         formats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
         // A target that cannot be built refuses the mode rather than falling back: the D3D12
         // runtime and the composition swapchain are part of the Windows the relay supports, so
