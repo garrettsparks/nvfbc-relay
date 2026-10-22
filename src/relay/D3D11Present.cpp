@@ -174,8 +174,9 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
     m_cfg = cfg;
     if (m_tintRequested) LOG("-tint ignored: the D3D11 present path has no tint pass");
     m_wgc = ring->WgcRequested();
-    if (!CreateDeviceAndSwapChain(hwnd, width, height, m_wgc && ring->WgcCopyEngine(),
-                                  ctx.sinkRefreshHz)) {
+    m_nvCopy = !m_wgc && ring->NvCopyEngine();
+    if (!CreateDeviceAndSwapChain(hwnd, width, height,
+                                  m_wgc ? ring->WgcCopyEngine() : m_nvCopy, ctx.sinkRefreshHz)) {
         return false;
     }
     if (!OpenRingAliases(ring)) return false;
@@ -235,6 +236,11 @@ bool D3D11PresentBackend::CreateDeviceAndSwapChain(HWND hwnd, int width, int hei
     if (bitsPerColor >= 10) {
         formats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
         formats[1] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    }
+    if (copyEngine && m_nvCopy) {
+        // NvFBC's ring slots are 10-bit, and a copy cannot change a format, so the buffers are
+        // 10-bit too whatever the output reports; the display's own scanout narrows them.
+        formats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
     }
     if (copyEngine) {
         // The copy-engine target takes the swapchain's place, its buffers in the format the
@@ -483,10 +489,14 @@ ID3D11ShaderResourceView* D3D11PresentBackend::SourceFor(int slot) {
     return view;
 }
 
-// A slot NvFBC filled holds its picture in the ring's own surface, which is drawn, as is a
-// frame of another size than the output. The marker does not decide it: a copied present gets
-// its strip from the copy engine as well (BurnMarker).
+// A slot NvFBC filled holds its picture in the ring's own surface, which is drawn unless
+// -xnvcopy has it copied from there, as is a frame of another size than the output. The marker
+// does not decide it: a copied present gets its strip from the copy engine as well (BurnMarker).
 ID3D11Texture2D* D3D11PresentBackend::CopySourceFor(int slot) {
+    if (m_nvCopy) {
+        ID3D11Texture2D* alias = slot < m_ringSlots ? m_ringAlias[slot] : NULL;
+        return alias && m_copyEngine->CanCopy(alias) ? alias : NULL;
+    }
     if (!m_ring || NeedsScaling(slot)) return NULL;
     ID3D11Texture2D* texture = m_ring->WgcTexture(slot);
     return texture && m_copyEngine->CanCopy(texture) ? texture : NULL;

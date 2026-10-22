@@ -4975,7 +4975,7 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs &&
            a.deferCopy == b.deferCopy && a.wgc == b.wgc && a.wgcDrop == b.wgcDrop &&
            a.wgcCursor == b.wgcCursor && a.wgcOpen == b.wgcOpen && a.wgcScale == b.wgcScale &&
-           a.copyEngine == b.copyEngine;
+           a.copyEngine == b.copyEngine && a.nvCopyEngine == b.nvCopyEngine;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
@@ -5003,6 +5003,7 @@ static void test_launch_defaults() {
     CHECK(o.wgcCursor, "the mouse pointer in the WGC picture must default on");
     CHECK(o.wgcOpen, "the WGC frame pool on a device of its own must default on");
     CHECK(o.copyEngine, "the copy-engine present must default on");
+    CHECK(!o.nvCopyEngine, "the NvFBC copy-engine experiment must default off");
     CHECK(o.wgcScale == 0 && !std::strcmp(launch::WgcScaleNames()[o.wgcScale], "bilinear"),
           "WGC's scaling must default to bilinear, got %d", o.wgcScale);
     CHECK(CountSwitchesOn(o) == 7 && o.markFrames == 0,
@@ -5068,6 +5069,19 @@ static void test_launch_option_parsing() {
         const std::vector<std::string> on = {"-copyengine"};
         CHECK(launch::ApplyOption(on, 0, &x, &w) == 0,
               "-copyengine must be unknown: the copy engine is on unless turned off");
+    }
+    // -xnvcopy, the NvFBC copy-engine experiment: sets only its own field, and a launch string
+    // that carries it keeps it.
+    {
+        launch::Options x;
+        std::string w;
+        const std::vector<std::string> t = {"-xnvcopy"};
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 1 && x.nvCopyEngine && w.empty(),
+              "-xnvcopy must set the NvFBC copy engine and consume one token");
+        CHECK(launch::FormatOptions(x).find("-xnvcopy") != std::string::npos,
+              "a launch with -xnvcopy must say so in its options string");
+        x.nvCopyEngine = false;
+        CHECK(SameOptions(x, launch::Options()), "-xnvcopy must change nothing else");
     }
     CHECK(warnings.empty() && unknown.empty(), "the opt-outs must parse clean");
 

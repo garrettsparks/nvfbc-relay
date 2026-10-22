@@ -115,7 +115,10 @@ private:
     // -nocopyengine clears it: with -wgc, the present copies a frame shown as it is on the copy
     // engine (CopyEngineTarget).
     bool m_wgcCopyEngine;
-    bool m_phaseKeepRequested;     // asked for, so an unmet prerequisite can say so once
+    // -xnvcopy (experiment): without -wgc, the present copies NvFBC's frames shown as they are
+    // on the copy engine.
+    bool m_nvCopyEngine;
+    bool m_phaseKeepRequested;    // asked for, so an unmet prerequisite can say so once
     char m_modeName[64];            // GetModeName: the compositor kind and the present path
     policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
     policy::StampOverlay m_overlay;      // present-thread-owned; FindBracket reads through it
@@ -152,7 +155,7 @@ public:
                         unsigned int extraLagMs = 0, bool d3d11Present = false,
                         bool deferCopy = false, bool wgc = false, bool wgcDrop = true,
                         bool wgcCursor = true, bool wgcOpen = true, int wgcScale = 0,
-                        bool wgcCopyEngine = true);
+                        bool wgcCopyEngine = true, bool nvCopyEngine = false);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

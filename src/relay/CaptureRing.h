@@ -176,6 +176,10 @@ public:
     bool WgcRequested() const { return m_wgcRequested; }
     int WgcScale() const { return m_wgcScale; }
     bool WgcCopyEngine() const { return m_wgcCopyEngine; }
+    // -xnvcopy (experiment): the present copies a frame NvFBC put in a ring slot, shown as it
+    // is, on the copy engine; nothing here changes for it.
+    void EnableNvCopyEngine() { m_nvCopyEngine = true; }
+    bool NvCopyEngine() const { return m_nvCopyEngine; }
     // The D3D11 present's device, offered once it is set up. The capture thread makes the frame
     // pool on it and makes no call on its context.
     void OfferWgcDevice(ID3D11Device* device) {
@@ -386,6 +390,7 @@ private:
     bool m_wgcOwnDevice = true;
     int m_wgcScale = 0;
     bool m_wgcCopyEngine = false;
+    bool m_nvCopyEngine = false;
     HMONITOR m_sourceMonitor = NULL;                      // the display WGC captures
     std::atomic<ID3D11Device*> m_wgcDevice{NULL};          // offered once by the present
     std::atomic<ID3D11Texture2D*> m_wgcTexture[RING_SIZE];   // written by the capture thread

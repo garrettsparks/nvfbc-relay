@@ -66,7 +66,8 @@ IFrameCaptureMode* CreateCaptureMode(const std::string& modeText, const launch::
                                    compositor, o.mark, o.markFrames, o.tint, o.etw, o.noJoin,
                                    o.dejitter, o.fgPhase, o.phaseKeep, o.extraLagMs,
                                    spec.d3d11Present, o.deferCopy, o.wgc, o.wgcDrop,
-                                   o.wgcCursor, o.wgcOpen, o.wgcScale, o.copyEngine);
+                                   o.wgcCursor, o.wgcOpen, o.wgcScale, o.copyEngine,
+                                   o.nvCopyEngine);
 }
 
 // Takes the named lock that keeps a second relay from starting. Two relays cannot share NvFBC,
@@ -174,9 +175,11 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
     ctx.flipEx = options.flipEx;
     LOG("Buffer size: %dx%d", ctx.width, ctx.height);
 
-    // The copy engine copies WGC's frames, so only a -wgc launch presents through it, and its
-    // output window has no redirection bitmap: DirectComposition gives it all its content.
-    const bool copyEngine = r.mode->PresentsViaD3D11() && options.wgc && options.copyEngine;
+    // The copy engine copies WGC's frames, and with -xnvcopy NvFBC's, so only those launches
+    // present through it, and its output window has no redirection bitmap: DirectComposition
+    // gives it all its content.
+    const bool copyEngine = r.mode->PresentsViaD3D11() &&
+                            (options.wgc ? options.copyEngine : options.nvCopyEngine);
     if (MaybeFailure f = CreateOutputWindows(instance, showCommand, target,
                                              r.mode->PresentsViaD3D11(), copyEngine,
                                              &r.windows)) {

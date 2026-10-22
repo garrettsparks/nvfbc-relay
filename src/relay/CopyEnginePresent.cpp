@@ -365,7 +365,10 @@ void CopyEngineTarget::MarkNextCopy(const bool cells[FrameMarker::kCells]) {
 void CopyEngineTarget::WriteMarkerStrip(int buffer) {
     const int width = m_strip.right - m_strip.left;
     const int height = m_strip.bottom - m_strip.top;
-    const UINT32 white = 0xFFFFFFFFu, black = 0xFF000000u;
+    // Opaque black is the alpha bits alone: the top byte of an 8-bit pixel, the top two bits of
+    // a 10-bit one (where the top byte would reach into blue).
+    const UINT32 white = 0xFFFFFFFFu;
+    const UINT32 black = m_format == DXGI_FORMAT_R10G10B10A2_UNORM ? 0xC0000000u : 0xFF000000u;
     BYTE* base = m_stripMapped[buffer];
     const UINT pitch = m_stripFootprint.Footprint.RowPitch;
     // Every row is one of two: all black, or the cell row's pattern.
@@ -443,6 +446,22 @@ ID3D12Resource* CopyEngineTarget::OpenOnD3D12(ID3D11Texture2D* texture) {
         hr = m_d3d12->OpenSharedHandle(handle, __uuidof(ID3D12Resource), (void**)&opened);
     }
     if (handle) CloseHandle(handle);
+    // A texture shared the older way (D3D9's, as NvFBC's ring slots are) has no NT handle, only
+    // a global one; D3D12 is tried with that. It is not a kernel handle, so it is not closed.
+    if (FAILED(hr) && resource) {
+        HANDLE legacy = NULL;
+        const HRESULT nt = hr;
+        hr = resource->GetSharedHandle(&legacy);
+        if (SUCCEEDED(hr) && legacy) {
+            hr = m_d3d12->OpenSharedHandle(legacy, __uuidof(ID3D12Resource), (void**)&opened);
+            if (m_opened == 0 && m_openFailures == 0) {
+                LOG("Copy engine: no NT handle (0x%08lx); the global shared handle %s on the "
+                    "D3D12 device (0x%08lx)", nt, SUCCEEDED(hr) ? "opened" : "did not open", hr);
+            }
+        } else {
+            hr = nt;
+        }
+    }
     Release(resource);
     // The first of each is logged and the summary counts them all: a pool makes every texture
     // alike, so one texture's result stands for the rest.

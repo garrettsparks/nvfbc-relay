@@ -59,6 +59,7 @@ struct Options {
     bool copyEngine = true;         // -nocopyengine: with -wgc, a frame shown as it is is
                                     // copied by the copy engine and shown through the
                                     // composition swapchain (CopyEngineTarget)
+    bool nvCopyEngine = false;      // -xnvcopy: the same for NvFBC's frames (experiment, off)
 };
 
 // -wgcscale's filters by number, bilinear (0) the default. The names are OBS's.
@@ -186,6 +187,8 @@ inline const std::vector<UsageRow>& OptionRows() {
                               "default a frame shown as it is is copied by a part of the "
                               "graphics card the game does not use, which costs the game less",
          false, false},
+        {"-xnvcopy", "", "Experiment: without -wgc, copy NvFBC's frames shown as they are on the "
+                         "copy engine", false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -329,6 +332,7 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-wgcopen")     { o->wgcOpen = true;    return 1; }
     if (t == "-nowgcopen")   { o->wgcOpen = false;   return 1; }
     if (t == "-nocopyengine") { o->copyEngine = false; return 1; }
+    if (t == "-xnvcopy")      { o->nvCopyEngine = true; return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -510,6 +514,7 @@ inline std::string FormatOptions(const Options& o) {
     if (o.wgcOpen != d.wgcOpen) add(o.wgcOpen ? "-wgcopen" : "-nowgcopen");
     if (o.wgcScale != d.wgcScale) add(std::string("-wgcscale ") + WgcScaleNames()[o.wgcScale]);
     if (!o.copyEngine) add("-nocopyengine");
+    if (o.nvCopyEngine) add("-xnvcopy");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");
