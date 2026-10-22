@@ -272,6 +272,12 @@ bool CopyEngineTarget::CreateBuffers(HWND hwnd, DXGI_FORMAT format) {
     RECT source = {0, 0, m_width, m_height};
     m_surface->SetSourceRect(&source);
     m_manager->EnablePresentStatisticsKind(composition::PresentStatisticsKind_PresentStatus, TRUE);
+    // How each present reached the screen: flipped straight to it, or composed by Windows (a
+    // buffer the display cannot take as it is, such as one of another format).
+    m_manager->EnablePresentStatisticsKind(
+        composition::PresentStatisticsKind_IndependentFlipFrame, TRUE);
+    m_manager->EnablePresentStatisticsKind(composition::PresentStatisticsKind_CompositionFrame,
+                                           TRUE);
     m_manager->GetLostEvent(&m_lost);
     m_manager->GetPresentStatisticsAvailableEvent(&m_statsEvent);
     return true;
@@ -365,10 +371,7 @@ void CopyEngineTarget::MarkNextCopy(const bool cells[FrameMarker::kCells]) {
 void CopyEngineTarget::WriteMarkerStrip(int buffer) {
     const int width = m_strip.right - m_strip.left;
     const int height = m_strip.bottom - m_strip.top;
-    // Opaque black is the alpha bits alone: the top byte of an 8-bit pixel, the top two bits of
-    // a 10-bit one (where the top byte would reach into blue).
-    const UINT32 white = 0xFFFFFFFFu;
-    const UINT32 black = m_format == DXGI_FORMAT_R10G10B10A2_UNORM ? 0xC0000000u : 0xFF000000u;
+    const UINT32 white = 0xFFFFFFFFu, black = 0xFF000000u;
     BYTE* base = m_stripMapped[buffer];
     const UINT pitch = m_stripFootprint.Footprint.RowPitch;
     // Every row is one of two: all black, or the cell row's pattern.
@@ -446,22 +449,6 @@ ID3D12Resource* CopyEngineTarget::OpenOnD3D12(ID3D11Texture2D* texture) {
         hr = m_d3d12->OpenSharedHandle(handle, __uuidof(ID3D12Resource), (void**)&opened);
     }
     if (handle) CloseHandle(handle);
-    // A texture shared the older way (D3D9's, as NvFBC's ring slots are) has no NT handle, only
-    // a global one; D3D12 is tried with that. It is not a kernel handle, so it is not closed.
-    if (FAILED(hr) && resource) {
-        HANDLE legacy = NULL;
-        const HRESULT nt = hr;
-        hr = resource->GetSharedHandle(&legacy);
-        if (SUCCEEDED(hr) && legacy) {
-            hr = m_d3d12->OpenSharedHandle(legacy, __uuidof(ID3D12Resource), (void**)&opened);
-            if (m_opened == 0 && m_openFailures == 0) {
-                LOG("Copy engine: no NT handle (0x%08lx); the global shared handle %s on the "
-                    "D3D12 device (0x%08lx)", nt, SUCCEEDED(hr) ? "opened" : "did not open", hr);
-            }
-        } else {
-            hr = nt;
-        }
-    }
     Release(resource);
     // The first of each is logged and the summary counts them all: a pool makes every texture
     // alike, so one texture's result stands for the rest.
@@ -483,7 +470,16 @@ bool CopyEngineTarget::CanCopy(ID3D11Texture2D* source) {
     if (!source) return false;
     D3D11_TEXTURE2D_DESC d;
     source->GetDesc(&d);
-    if ((int)d.Width != m_width || (int)d.Height != m_height || d.Format != m_format) return false;
+    if ((int)d.Width != m_width || (int)d.Height != m_height) return false;
+    // The buffers are made in the frames' format, so a frame of another format is a fault
+    // (a frame source this code does not know), not a choice: it is drawn, counted and said.
+    if (d.Format != m_format) {
+        if (m_formatMismatches++ == 0) {
+            LOGERR("Copy engine: a frame in DXGI format %d is not the buffers' format %d; such "
+                   "frames are drawn", (int)d.Format, (int)m_format);
+        }
+        return false;
+    }
     return OpenOnD3D12(source) != NULL;
 }
 
@@ -546,7 +542,10 @@ void CopyEngineTarget::DrainStatistics() {
     while (m_statsEvent && WaitForSingleObject(m_statsEvent, 0) == WAIT_OBJECT_0) {
         composition::IPresentStatistics* stats = NULL;
         if (FAILED(m_manager->GetNextPresentStatistics(&stats)) || !stats) break;
-        if (stats->GetKind() == composition::PresentStatisticsKind_PresentStatus) {
+        const composition::PresentStatisticsKind kind = stats->GetKind();
+        if (kind == composition::PresentStatisticsKind_IndependentFlipFrame) m_flipFrames++;
+        else if (kind == composition::PresentStatisticsKind_CompositionFrame) m_composedFrames++;
+        if (kind == composition::PresentStatisticsKind_PresentStatus) {
             composition::IPresentStatusPresentStatistics* status = NULL;
             if (SUCCEEDED(stats->QueryInterface(kIidPresentStatusPresentStatistics,
                                                 (void**)&status))) {
@@ -567,4 +566,7 @@ void CopyEngineTarget::LogSummary() const {
         "back); %lld capture textures opened on D3D12, %lld could not be",
         m_presents, m_copies, m_markedCopies, m_draws, m_presentFailures, m_skipped, m_canceled,
         m_missedRefreshes, m_opened, m_openFailures);
+    LOG("copy engine presentation: %lld frames flipped straight to the display, %lld composed "
+        "by Windows; %lld presents drawn because the frame's format was not the buffers'",
+        m_flipFrames, m_composedFrames, m_formatMismatches);
 }

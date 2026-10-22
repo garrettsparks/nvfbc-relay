@@ -77,9 +77,10 @@ a fault to see).
   the relay today; a D3D12 copy gets no such help. If Windows hands over a frame before its
   compositor's copy into it has finished, the copy could read a picture part written. The desktop
   check below compares pictures byte for byte, and a marked run checks every frame.
-- **The format.** A copy needs the pool texture's format and size to equal the buffer's. On an
-  8-bit output (the card's on the 5080, 2026-10-20) both are `B8G8R8A8`. On a 10-bit output the
-  relay's buffer is `R10G10B10A2`; there it draws, as the switch's log line says.
+- **The format.** A copy needs the pool texture's format and size to equal the buffer's. WGC's
+  frames are always `B8G8R8A8`, so the buffers are made `B8G8R8A8` whatever the output reports.
+  Until 2026-10-22 they followed the output, and on a 10-bit output every frame was drawn with
+  nothing said (see "10-bit outputs" below).
 - **What took the relay's no-draw visit on 2026-10-15** is not known (the probe's bare present
   takes none, and a render target view made each present does not explain it). The traced row
   below shows whether the new path really leaves the game alone.
@@ -158,6 +159,38 @@ As built (`src/relay/CopyEnginePresent.cpp`, zig build `copyengine-1`), the card
   launch, `-wgc` and `-wgc -mark` twice each between no-relay rows): marked 119.2 points against
   122.8 unmarked, a difference inside the bench's noise: no measurable cost. Every copied present
   of the marked runs carried the marker (6,906 and 6,944), 0 failed.
+
+## 10-bit outputs (2026-10-22)
+
+**Found:** the buffers followed the output's bit depth, so on a capture card display running at
+10 bits per color no WGC frame matched them and every present was drawn, with nothing in the log
+to say so. **Changed:** the buffers are in the frames' format (`B8G8R8A8`) always; the display's
+scanout widens them. A frame whose format is not the buffers' is now counted and logged as an
+error the first time, and the copy engine's "presentation" line counts presents flipped straight
+to the display, composed by Windows, and drawn over a format mismatch.
+
+- **Premise:** a buffer in another format than the output's still flips straight to it (10-bit
+  buffers on the 8-bit XR1: 1,166 of 1,177 presents flipped, 1 composed).
+- **Control** (a build with the buffers forced to 10-bit, never committed): 6,875 presents drawn
+  over the format, the error logged, and a sitting's copy-row check (`0 presents drawn because`)
+  fails on it while passing the real build.
+- **On a real 10-bit output** (the Elgato 4K X at 10 bpc, 2560x1440 at 59.95 Hz, the standard
+  mode): the shipped build (`4205f93`) copied 0 presents; the new build copied about 94% (6,887
+  of 7,329 in a benchmark run), 0 composed, 0 drawn over the format. Marked recordings from the
+  card, decoded: 480/480, every step +1, for the new build, the shipped one and NvFBC drawn (whose
+  swapchain is 10-bit there and stayed on the hardware overlay, 0 composed).
+- **Cost** (sitting `tenbit1`, one launch, baseline 5,427): shipped `-wgc` 5,223, 5,234, 5,249
+  (191.7 points, 3.5%); new `-wgc` 5,293, 5,301, 5,306 (127.0, 2.3%); NvFBC drawn 5,141, 5,148,
+  5,145 (282.3, 5.2%). New against shipped by round: +70, +67, +57: the copy engine's saving,
+  which the 10-bit output had taken away, is back. On the 8-bit XR1 the two builds cost the same
+  (`fmtcost1`: +5, -1, +4).
+
+**NvFBC's frames through the copy engine** were tried the same day (`-xnvcopy`, removed): D3D12
+opened the D3D9 ring slots' legacy shared handles and copied about 94% of presents, but saved
+nothing (`nvce1`: 278 against 272 points drawn), because a context that exists only in that mode
+took the graphics engine 60 times a second instead (GPU traces `nvtrace1`/`nvtrace2`; not the
+10-bit buffers, which the control showed take no visit). The likely cause, not proven, is the
+synchronization of D3D9's legacy shared textures.
 
 ## Expected effect (written before the build; measured above at 36.7 points)
 

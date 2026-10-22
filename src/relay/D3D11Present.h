@@ -184,7 +184,6 @@ private:
     // -wgc: the ring was asked for WGC, so this device is offered to it, and once it has been
     // m_ring is set and slots are looked up there first (SourceFor).
     bool m_wgc = false;
-    bool m_nvCopy = false;          // -xnvcopy: NvFBC's ring slots copied on the copy engine
     CaptureRing* m_ring = NULL;
     // The copy engine (-wgc without -nocopyengine): the target in place of the swapchain, the
     // WGC texture this present copies (NULL when it drew), and whether its setup failed, which

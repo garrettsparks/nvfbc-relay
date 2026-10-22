@@ -223,6 +223,8 @@ private:
     LONGLONG m_lastBack = 0;            // QPC when a buffer last came back
     long long m_copies = 0, m_markedCopies = 0, m_draws = 0, m_presents = 0;
     long long m_presentFailures = 0, m_skipped = 0, m_canceled = 0, m_missedRefreshes = 0;
+    long long m_flipFrames = 0, m_composedFrames = 0;   // how presents reached the screen
+    long long m_formatMismatches = 0;                   // presents drawn over a frame's format
     long long m_opened = 0, m_openFailures = 0;
     bool m_lostReported = false;
 };
