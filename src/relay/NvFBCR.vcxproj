@@ -116,6 +116,7 @@
     <ClCompile Include="EtwConsumer.cpp" />
     <ClCompile Include="Failure.cpp" />
     <ClCompile Include="FlipDecode.cpp" />
+    <ClCompile Include="FlowProbeMode.cpp" />
     <ClCompile Include="FlowWarpEngine.cpp" />
     <ClCompile Include="FrameCompositors.cpp" />
     <ClCompile Include="FrameMarker.cpp" />
@@ -134,6 +135,8 @@
     <ClInclude Include="..\common\NvFBCApi.h" />
     <ClInclude Include="..\common\NvFBCLoader.h" />
     <ClInclude Include="..\common\SimpleLogger.h" />
+    <ClInclude Include="..\core\FlowPlan.h" />
+    <ClInclude Include="..\core\FlowWarpMath.h" />
     <ClInclude Include="..\core\LaunchOptions.h" />
     <ClInclude Include="..\core\TemporalPolicy.h" />
     <ClInclude Include="BlendRenderer.h" />
@@ -147,6 +150,7 @@
     <ClInclude Include="EtwConsumer.h" />
     <ClInclude Include="Failure.h" />
     <ClInclude Include="FlipDecode.h" />
+    <ClInclude Include="FlowProbeMode.h" />
     <ClInclude Include="FlowWarpEngine.h" />
     <ClInclude Include="FrameCompositors.h" />
     <ClInclude Include="FrameMarker.h" />

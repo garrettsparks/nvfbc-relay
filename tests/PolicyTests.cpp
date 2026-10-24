@@ -14,6 +14,8 @@
 
 #include "TemporalPolicy.h"
 #include "LaunchOptions.h"
+#include "FlowPlan.h"
+#include "FlowWarpMath.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -5295,6 +5297,26 @@ static void test_launch_mode_parsing() {
                             "d:60"}) {
         CHECK(launch::ParseMode(bad).kind == ModeKind::Invalid, "mode '%s' must be refused", bad);
     }
+
+    // The optical flow probe: no loop, a loop, a loop with the control draw; seconds 1 to 3600.
+    struct Probe { const char* text; int seconds; bool draw; };
+    const Probe probes[] = {
+        {"ofprobe", 0, false},
+        {"OFPROBE", 0, false},
+        {"ofprobe:30", 30, false},
+        {"ofprobedraw:30", 30, true},
+        {"ofprobe:3600", 3600, false},
+    };
+    for (const Probe& p : probes) {
+        const launch::ModeSpec s = launch::ParseMode(p.text);
+        CHECK(s.kind == ModeKind::FlowProbe && s.probeSeconds == p.seconds && s.probeDraw == p.draw,
+              "mode '%s' parsed as kind %d seconds %d draw %d", p.text, (int)s.kind,
+              s.probeSeconds, (int)s.probeDraw);
+    }
+    for (const char* bad : {"ofprobe:", "ofprobe:0", "ofprobe:3601", "ofprobe:1.5", "ofprobedraw",
+                            "ofprobe:-5", "ofprobex:30"}) {
+        CHECK(launch::ParseMode(bad).kind == ModeKind::Invalid, "mode '%s' must be refused", bad);
+    }
 }
 
 static void test_launch_dependencies() {
@@ -5799,6 +5821,448 @@ static void test_lock_anchor_and_comb() {
           "the matched flag must be optional");
 }
 
+// ---------------------------------------------------------------------------------
+// THE OPTICAL-FLOW COMPOSITOR'S PLANNER AND WARP (docs/optical-flow-interpolation-spec.md).
+// ---------------------------------------------------------------------------------
+
+struct FlowPlanRun {
+    int synths = 0;
+    int ownPresents = 0;          // synthesized presents that had to flow their own pair
+    int slotRefusals = 0;         // synthesized presents that found no slot
+    long long flows = 0;
+    long long predictedUsed = 0;
+    long long predictedUnused = 0;
+    long long ownFlows = 0;
+};
+
+// Drives the planner as the present loop does: frames are in the ring once their stamp has
+// passed, each present targets now - lag, first takes its own pair if it synthesizes, then plans
+// the next horizon presents. Synthesis here is the bare-gate prediction itself, so the run
+// measures the planner, not the composite policy.
+static FlowPlanRun RunFlowPlan(const std::vector<int64_t>& stamps, int64_t presentPeriod,
+                               int64_t lag, int64_t phase, int presents, int horizon,
+                               int64_t gate) {
+    policy::FlowPlanner planner;
+    FlowPlanRun r;
+    for (int k = 0; k < presents; k++) {
+        const int64_t now = lag + phase + (int64_t)k * presentPeriod;
+        const int n = (int)(std::upper_bound(stamps.begin(), stamps.end(), now) - stamps.begin());
+        policy::FlowPair pair;
+        if (policy::PredictSynthPair(stamps.data(), n, now - lag, gate, &pair)) {
+            r.synths++;
+            bool submitted = false;
+            policy::FlowUse use = policy::FlowUse::Hit;
+            const int slot = planner.Use(pair, k, &submitted, &use);
+            if (slot < 0) r.slotRefusals++;
+            if (use == policy::FlowUse::Own) r.ownPresents++;
+        }
+        // Only presents the run will reach, so a pair is never counted unused for want of a
+        // present after the last.
+        std::vector<int64_t> targets;
+        for (int j = 1; j <= horizon && k + j < presents; j++) {
+            targets.push_back(now - lag + j * presentPeriod);
+        }
+        int slots[policy::kFlowSlots];
+        planner.Plan(stamps.data(), n, targets.data(), (int)targets.size(), gate, k, slots,
+                     policy::kFlowSlots);
+    }
+    planner.Reset();
+    r.flows = planner.Flows();
+    r.predictedUsed = planner.PredictedUsed();
+    r.predictedUnused = planner.PredictedUnused();
+    r.ownFlows = planner.OwnFlows();
+    return r;
+}
+
+static std::vector<int64_t> EvenStamps(int64_t period, int count) {
+    std::vector<int64_t> s;
+    for (int i = 0; i < count; i++) s.push_back((int64_t)i * period);
+    return s;
+}
+
+static void test_flow_plan() {
+    const int64_t kPresent = 16667, kLag = 95833;
+
+    // 90 into 60: every other present lands mid-gap and synthesizes, each from a pair of its
+    // own. All of them were planned a present ahead, none was flowed twice or for nothing.
+    {
+        const int64_t gate = policy::PassthroughThreshold(11111, kPresent);
+        const FlowPlanRun r = RunFlowPlan(EvenStamps(11111, 1000), kPresent, kLag, 0, 600, 3, gate);
+        CHECK(r.synths == 300 && r.flows == 300 && r.predictedUsed == 300 && r.ownFlows == 0 &&
+                  r.predictedUnused == 0 && r.slotRefusals == 0,
+              "90 into 60: %d synths, %lld flows, %lld predicted and used, %lld own, %lld "
+              "unused, %d refused (want 300, 300, 300, 0, 0, 0)", r.synths, r.flows,
+              r.predictedUsed, r.ownFlows, r.predictedUnused, r.slotRefusals);
+    }
+    // A locked 60 into 60 with a one-frame hole and a two-frame hole: three presents
+    // synthesize, the two of the long hole from one pair, so two flows, both planned.
+    {
+        std::vector<int64_t> s;
+        for (int i = 0; i < 400; i++) {
+            if (i == 100 || i == 200 || i == 201) continue;
+            s.push_back((int64_t)i * kPresent);
+        }
+        const int64_t gate = policy::PassthroughThreshold(kPresent, kPresent);
+        const FlowPlanRun r = RunFlowPlan(s, kPresent, kLag, 1000, 380, 3, gate);
+        CHECK(r.synths == 3 && r.flows == 2 && r.predictedUsed == 2 && r.ownFlows == 0 &&
+                  r.predictedUnused == 0,
+              "60 into 60 with holes: %d synths, %lld flows, %lld predicted and used, %lld own, "
+              "%lld unused (want 3, 2, 2, 0, 0)", r.synths, r.flows, r.predictedUsed,
+              r.ownFlows, r.predictedUnused);
+    }
+    // 240 into 60: a real frame is always inside the gate, so nothing flows.
+    {
+        const int64_t gate = policy::PassthroughThreshold(4167, kPresent);
+        const FlowPlanRun r = RunFlowPlan(EvenStamps(4167, 4000), kPresent, kLag, 1234, 900, 3, gate);
+        CHECK(r.synths == 0 && r.flows == 0, "240 into 60: %d synths, %lld flows (want 0, 0)",
+              r.synths, r.flows);
+    }
+    // A stall of 19 missing frames: the presents inside it see no after frame until the
+    // resume frame arrives, then the five whose targets still sit in the gap synthesize from
+    // the one pair across it. The first of them could not have been planned (the resume frame
+    // arrived after the present before it), so it flows its own pair and the rest reuse it.
+    {
+        std::vector<int64_t> s;
+        for (int i = 0; i < 500; i++) {
+            if (i > 300 && i < 320) continue;
+            s.push_back((int64_t)i * kPresent);
+        }
+        const int64_t gate = policy::PassthroughThreshold(kPresent, kPresent);
+        const FlowPlanRun r = RunFlowPlan(s, kPresent, kLag, 1000, 480, 3, gate);
+        CHECK(r.synths == 5 && r.flows == 1 && r.ownFlows == 1 && r.predictedUsed == 0 &&
+                  r.ownPresents == 5 && r.predictedUnused == 0,
+              "stall: %d synths, %lld flows, %lld own flows, %lld predicted and used, %d own "
+              "presents, %lld unused (want 5, 1, 1, 0, 5, 0)", r.synths, r.flows, r.ownFlows,
+              r.predictedUsed, r.ownPresents, r.predictedUnused);
+    }
+    // A mispredicted pair (the lock moved the target) is flowed by the present that needs it,
+    // and the predicted one is counted unused once it leaves the cache.
+    {
+        const int64_t stamps[] = {0, 16667, 33333, 50000, 66667, 83333, 100000, 116667};
+        const int64_t gate = 4166;
+        policy::FlowPlanner p;
+        int slots[policy::kFlowSlots];
+        const int64_t predicted[] = {8000};  // mid-gap of (0, 16667)
+        CHECK(p.Plan(stamps, 8, predicted, 1, gate, 10, slots, policy::kFlowSlots) == 1,
+              "the mid-gap target must be planned");
+        policy::FlowPair actual;
+        CHECK(policy::PredictSynthPair(stamps, 8, 25000, gate, &actual) &&
+                  actual.beforeTs == 16667 && actual.afterTs == 33333,
+              "the moved target must bracket (16667, 33333)");
+        bool submitted = false;
+        policy::FlowUse use = policy::FlowUse::Hit;
+        p.Use(actual, 11, &submitted, &use);
+        CHECK(submitted && use == policy::FlowUse::Own, "a mispredicted pair must flow at its "
+              "own present");
+        // Four more pairs push the unused one out of the four slots.
+        const int64_t later[] = {41667, 58333, 75000, 91667};
+        p.Plan(stamps, 8, later, 4, gate, 12, slots, policy::kFlowSlots);
+        CHECK(p.PredictedUnused() == 1 && p.OwnFlows() == 1 && p.Flows() == 6,
+              "after eviction: %lld unused, %lld own, %lld flows (want 1, 1, 6)",
+              p.PredictedUnused(), p.OwnFlows(), p.Flows());
+        // Every slot was touched at present 12, so a fifth pair planned at 12 finds no slot.
+        const int64_t fifth[] = {108333};
+        CHECK(p.Plan(stamps, 8, fifth, 1, gate, 12, slots, policy::kFlowSlots) == 0,
+              "a slot touched at this present must not be taken");
+    }
+    // Hints from the previous execute help only on the neighbouring pair.
+    {
+        policy::FlowPair a, b, c;
+        a.beforeTs = 0; a.afterTs = 100;
+        b.beforeTs = 100; b.afterTs = 200;
+        c.beforeTs = 300; c.afterTs = 400;
+        CHECK(policy::FlowHintsUsable(a, b) && !policy::FlowHintsUsable(a, c),
+              "hints: neighbour pair usable, unrelated pair not");
+    }
+}
+
+// A one-channel image sampled as the GPU's linear, clamped sampler samples it.
+struct TestImage {
+    int w = 0;
+    int h = 0;
+    std::vector<float> px;
+    float At(int x, int y) const {
+        x = std::min(std::max(x, 0), w - 1);
+        y = std::min(std::max(y, 0), h - 1);
+        return px[(size_t)y * w + x];
+    }
+    float Sample(flowwarp::Vec2 p) const {
+        const float u = p.x - 0.5f, v = p.y - 0.5f;
+        const float fu = std::floor(u), fv = std::floor(v);
+        const int x = (int)fu, y = (int)fv;
+        const float tx = u - fu, ty = v - fv;
+        const float top = At(x, y) + (At(x + 1, y) - At(x, y)) * tx;
+        const float bottom = At(x, y + 1) + (At(x + 1, y + 1) - At(x, y + 1)) * tx;
+        return top + (bottom - top) * ty;
+    }
+};
+
+static flowwarp::FlowField UniformField(std::vector<flowwarp::Vec2>& store, int cellsX,
+                                        int cellsY, float grid, flowwarp::Vec2 v) {
+    store.assign((size_t)cellsX * cellsY, v);
+    flowwarp::FlowField f;
+    f.cellsX = cellsX;
+    f.cellsY = cellsY;
+    f.grid = grid;
+    f.vectors = store.data();
+    return f;
+}
+
+static void test_flow_warp_math() {
+    using flowwarp::Vec2;
+    // Uniform motion is reproduced exactly at every weight: the before frame read at p - w d
+    // and the after frame at p + (1 - w) d are the same point of the scene.
+    {
+        auto scene = [](Vec2 p) {
+            return 0.5f + 0.2f * std::sin(0.11f * p.x + 0.3f) + 0.2f * std::cos(0.07f * p.y);
+        };
+        const Vec2 d = {3.2f, -1.7f};
+        auto before = [&](Vec2 p) { return scene(p); };
+        auto after = [&](Vec2 p) { return scene(flowwarp::Sub(p, d)); };
+        std::vector<Vec2> fs, bs;
+        const flowwarp::FlowField fwd = UniformField(fs, 16, 16, 4.0f, d);
+        const flowwarp::FlowField bwd = UniformField(bs, 16, 16, 4.0f, flowwarp::Scale(d, -1.0f));
+        float worst = 0.0f;
+        for (float w : {0.0f, 0.25f, 0.5f, 0.75f, 1.0f}) {
+            for (float y = 8.5f; y < 56.0f; y += 2.5f) {
+                for (float x = 8.5f; x < 56.0f; x += 2.5f) {
+                    const Vec2 p = {x, y};
+                    const flowwarp::WarpResult r = flowwarp::WarpPixel(before, after, fwd, bwd, p, w);
+                    const float truth = scene(flowwarp::Sub(p, flowwarp::Scale(d, w)));
+                    worst = std::max(worst, std::fabs(r.value - truth));
+                }
+            }
+        }
+        CHECK(worst < 5e-4f, "uniform motion: worst error %g (want < 5e-4)", (double)worst);
+    }
+    // Large uniform motion over a scene that differs from itself everywhere: still exact, and
+    // the static guard stays out of it.
+    {
+        auto scene = [](Vec2 p) { return 0.1f + 0.003f * p.x; };
+        const Vec2 d = {30.0f, 0.0f};
+        auto before = [&](Vec2 p) { return scene(p); };
+        auto after = [&](Vec2 p) { return scene(flowwarp::Sub(p, d)); };
+        std::vector<Vec2> fs, bs;
+        const flowwarp::FlowField fwd = UniformField(fs, 80, 8, 4.0f, d);
+        const flowwarp::FlowField bwd = UniformField(bs, 80, 8, 4.0f, flowwarp::Scale(d, -1.0f));
+        float worst = 0.0f, worstGuard = 0.0f;
+        for (float x = 40.5f; x < 280.0f; x += 1.0f) {
+            const Vec2 p = {x, 16.5f};
+            const flowwarp::WarpResult r = flowwarp::WarpPixel(before, after, fwd, bwd, p, 0.5f);
+            worst = std::max(worst, std::fabs(r.value - scene({x - 15.0f, 16.5f})));
+            worstGuard = std::max(worstGuard, r.guard);
+        }
+        CHECK(worst < 1e-4f && worstGuard < 1e-3f,
+              "large motion: worst error %g, worst guard %g (want < 1e-4, < 1e-3)",
+              (double)worst, (double)worstGuard);
+    }
+    // A zoom: the picture grows 10% about x = 150 between the frames, so the motion grows with
+    // the distance from the centre and the flow at a pixel's source differs from the flow at
+    // the output pixel. The fixed-point steps find the source; reading the flow at the output
+    // pixel alone misses it by up to a third of a pixel here, which this texture shows.
+    {
+        const float c = 150.0f, a = 0.1f;
+        auto scene = [](float x) { return 0.5f + 0.3f * std::sin(0.4f * x); };
+        auto before = [&](Vec2 p) { return scene(p.x); };
+        auto after = [&](Vec2 p) { return scene(c + (p.x - c) / (1.0f + a)); };
+        const int W = 300, H = 4;
+        std::vector<Vec2> fs((size_t)W * H), bs((size_t)W * H);
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                const float centre = x + 0.5f - c;
+                fs[(size_t)y * W + x] = {a * centre, 0.0f};
+                bs[(size_t)y * W + x] = {centre * (1.0f / (1.0f + a) - 1.0f), 0.0f};
+            }
+        }
+        flowwarp::FlowField fwd, bwd;
+        fwd.cellsX = bwd.cellsX = W;
+        fwd.cellsY = bwd.cellsY = H;
+        fwd.vectors = fs.data();
+        bwd.vectors = bs.data();
+        // Pixels near the sides are left out: their after-frame source lies outside the picture
+        // (content zooming in from beyond the edge), where any warp can only clamp.
+        float worst = 0.0f;
+        for (float w : {0.25f, 0.5f, 0.75f}) {
+            for (int x = 20; x < W - 20; x++) {
+                const Vec2 p = {x + 0.5f, 2.0f};
+                const float truth = scene(c + (p.x - c) / (1.0f + w * a));
+                worst = std::max(worst,
+                                 std::fabs(flowwarp::WarpPixel(before, after, fwd, bwd, p, w).value - truth));
+            }
+        }
+        CHECK(worst < 0.01f, "zoom: worst error %g (want < 0.01)", (double)worst);
+    }
+    // The endpoints return the frames themselves, whatever the flow says.
+    {
+        TestImage a, b;
+        a.w = b.w = 32;
+        a.h = b.h = 32;
+        for (int i = 0; i < 32 * 32; i++) {
+            a.px.push_back((float)((i * 7919) % 101) / 100.0f);
+            b.px.push_back((float)((i * 104729) % 97) / 96.0f);
+        }
+        std::vector<Vec2> fs((size_t)8 * 8), bs((size_t)8 * 8);
+        for (size_t i = 0; i < fs.size(); i++) {
+            fs[i] = {(float)((int)(i * 37 % 41) - 20), (float)((int)(i * 53 % 29) - 14)};
+            bs[i] = {(float)((int)(i * 31 % 23) - 11), (float)((int)(i * 17 % 43) - 21)};
+        }
+        flowwarp::FlowField fwd, bwd;
+        fwd.cellsX = bwd.cellsX = 8;
+        fwd.cellsY = bwd.cellsY = 8;
+        fwd.grid = bwd.grid = 4.0f;
+        fwd.vectors = fs.data();
+        bwd.vectors = bs.data();
+        auto before = [&](Vec2 p) { return a.Sample(p); };
+        auto after = [&](Vec2 p) { return b.Sample(p); };
+        int wrong = 0;
+        for (int y = 0; y < 32; y++) {
+            for (int x = 0; x < 32; x++) {
+                const Vec2 p = {x + 0.5f, y + 0.5f};
+                if (flowwarp::WarpPixel(before, after, fwd, bwd, p, 0.0f).value != a.At(x, y)) wrong++;
+                if (flowwarp::WarpPixel(before, after, fwd, bwd, p, 1.0f).value != b.At(x, y)) wrong++;
+            }
+        }
+        CHECK(wrong == 0, "endpoints: %d pixels differ from the frames (want 0)", wrong);
+    }
+    // A bright square moving 12 px right over a static textured background. Away from its
+    // edges every output pixel is right: the background it uncovers comes from the after
+    // frame, the background it is about to cover from the before frame, and its own pixels from
+    // both. The crossfade (blend mode) and the warp that reads the flow at the output pixel
+    // (the first version) are both wrong at the leading edge, which shows the test can tell.
+    {
+        const int W = 160, H = 40;
+        const int sx0 = 60, sx1 = 100, sy0 = 10, sy1 = 30, move = 12;
+        auto background = [](int x, int y) {
+            return 0.3f + 0.15f * std::sin(0.45f * x) + 0.05f * std::cos(0.3f * y);
+        };
+        auto inSquare = [&](int x, int y, int shift) {
+            return x >= sx0 + shift && x < sx1 + shift && y >= sy0 && y < sy1;
+        };
+        TestImage f0, f1, truth;
+        f0.w = f1.w = truth.w = W;
+        f0.h = f1.h = truth.h = H;
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                f0.px.push_back(inSquare(x, y, 0) ? 0.95f : background(x, y));
+                f1.px.push_back(inSquare(x, y, move) ? 0.95f : background(x, y));
+                truth.px.push_back(inSquare(x, y, move / 2) ? 0.95f : background(x, y));
+            }
+        }
+        std::vector<Vec2> fs((size_t)W * H), bs((size_t)W * H);
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                fs[(size_t)y * W + x] = inSquare(x, y, 0) ? Vec2{(float)move, 0.0f} : Vec2{};
+                bs[(size_t)y * W + x] = inSquare(x, y, move) ? Vec2{-(float)move, 0.0f} : Vec2{};
+            }
+        }
+        flowwarp::FlowField fwd, bwd;
+        fwd.cellsX = bwd.cellsX = W;
+        fwd.cellsY = bwd.cellsY = H;
+        fwd.vectors = fs.data();
+        bwd.vectors = bs.data();
+        auto before = [&](Vec2 p) { return f0.Sample(p); };
+        auto after = [&](Vec2 p) { return f1.Sample(p); };
+        const int edges[] = {sx0, sx0 + move / 2, sx0 + move, sx1, sx1 + move / 2, sx1 + move};
+        float worstWarp = 0.0f, worstBlendLead = 0.0f, worstFirstLead = 0.0f;
+        const int y = 20;
+        for (int x = 0; x < W; x++) {
+            bool nearEdge = false;
+            for (int e : edges) {
+                if (x >= e - 2 && x < e + 2) nearEdge = true;
+            }
+            if (nearEdge) continue;
+            const Vec2 p = {x + 0.5f, y + 0.5f};
+            const float want = truth.At(x, y);
+            worstWarp = std::max(worstWarp,
+                                 std::fabs(flowwarp::WarpPixel(before, after, fwd, bwd, p, 0.5f).value - want));
+            const bool leading = x >= sx1 && x < sx1 + move / 2;
+            if (leading) {
+                const float blend = 0.5f * (f0.At(x, y) + f1.At(x, y));
+                const Vec2 f = fwd.At(p);
+                const float first = 0.5f * (f0.Sample(flowwarp::Sub(p, flowwarp::Scale(f, 0.5f))) +
+                                            f1.Sample(flowwarp::Add(p, flowwarp::Scale(f, 0.5f))));
+                worstBlendLead = std::max(worstBlendLead, std::fabs(blend - want));
+                worstFirstLead = std::max(worstFirstLead, std::fabs(first - want));
+            }
+        }
+        CHECK(worstWarp < 0.02f, "moving square: worst warp error %g away from edges (want < 0.02)",
+              (double)worstWarp);
+        CHECK(worstBlendLead > 0.2f && worstFirstLead > 0.2f,
+              "moving square controls: crossfade %g and first-version warp %g at the leading edge "
+              "(both must be > 0.2, or the test cannot see the error)", (double)worstBlendLead,
+              (double)worstFirstLead);
+    }
+    // An opaque static overlay over a scene moving 24 px. With the overlay's own (zero) flow,
+    // the overlay and the scene beside it are both right; with flow that does not see the
+    // overlay (the scene's motion everywhere), the static guard still keeps the overlay itself.
+    // An even motion puts every source on a pixel centre at w = 0.5: at an odd one the sources
+    // of two output pixels land half a pixel from the overlay's edge, where the linear sampler
+    // mixes the overlay in, which is the sampler's limit and not the warp's.
+    {
+        const int W = 200, H = 24;
+        const int hx0 = 80, hx1 = 120, move = 24;
+        auto scene = [](int x) { return 0.1f + 0.003f * x; };
+        auto inHud = [&](int x) { return x >= hx0 && x < hx1; };
+        TestImage f0, f1;
+        f0.w = f1.w = W;
+        f0.h = f1.h = H;
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                f0.px.push_back(inHud(x) ? 0.9f : scene(x));
+                f1.px.push_back(inHud(x) ? 0.9f : scene(x - move));
+            }
+        }
+        auto before = [&](Vec2 p) { return f0.Sample(p); };
+        auto after = [&](Vec2 p) { return f1.Sample(p); };
+        std::vector<Vec2> fs((size_t)W * H), bs((size_t)W * H), blindF, blindB;
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                fs[(size_t)y * W + x] = inHud(x) ? Vec2{} : Vec2{(float)move, 0.0f};
+                bs[(size_t)y * W + x] = inHud(x) ? Vec2{} : Vec2{-(float)move, 0.0f};
+            }
+        }
+        flowwarp::FlowField fwd, bwd;
+        fwd.cellsX = bwd.cellsX = W;
+        fwd.cellsY = bwd.cellsY = H;
+        fwd.vectors = fs.data();
+        bwd.vectors = bs.data();
+        const flowwarp::FlowField blindFwd = UniformField(blindF, W, H, 1.0f, {(float)move, 0.0f});
+        const flowwarp::FlowField blindBwd = UniformField(blindB, W, H, 1.0f, {-(float)move, 0.0f});
+        float worstTrue = 0.0f, worstBlindHud = 0.0f;
+        for (int x = 40; x < 160; x++) {
+            if ((x >= hx0 - 2 && x < hx0 + 2) || (x >= hx1 - 2 && x < hx1 + 2)) continue;
+            const Vec2 p = {x + 0.5f, 12.5f};
+            const float want = inHud(x) ? 0.9f : scene(x) - 0.003f * (move / 2.0f);
+            worstTrue = std::max(worstTrue,
+                                 std::fabs(flowwarp::WarpPixel(before, after, fwd, bwd, p, 0.5f).value - want));
+            if (inHud(x)) {
+                worstBlindHud = std::max(worstBlindHud,
+                    std::fabs(flowwarp::WarpPixel(before, after, blindFwd, blindBwd, p, 0.5f).value - 0.9f));
+            }
+        }
+        CHECK(worstTrue < 0.02f, "overlay with its own flow: worst error %g (want < 0.02)",
+              (double)worstTrue);
+        CHECK(worstBlindHud < 0.01f, "overlay under the scene's flow: worst overlay error %g "
+              "(want < 0.01)", (double)worstBlindHud);
+    }
+    // No flow, or the largest flow the engine reports, never yields a value outside the frames'.
+    {
+        auto before = [](Vec2) { return 0.25f; };
+        auto after = [](Vec2) { return 0.75f; };
+        int bad = 0;
+        for (float m : {0.0f, 1023.97f, -1024.0f}) {
+            std::vector<Vec2> fs, bs;
+            const flowwarp::FlowField fwd = UniformField(fs, 4, 4, 4.0f, {m, -m});
+            const flowwarp::FlowField bwd = UniformField(bs, 4, 4, 4.0f, {-m, m});
+            for (float w : {0.0f, 0.1f, 0.5f, 0.9f, 1.0f}) {
+                const float v = flowwarp::WarpPixel(before, after, fwd, bwd, {7.5f, 7.5f}, w).value;
+                if (!(v >= 0.25f && v <= 0.75f)) bad++;
+            }
+        }
+        CHECK(bad == 0, "extreme flow: %d outputs outside the frames' range or NaN (want 0)", bad);
+    }
+}
+
 int main(int argc, char** argv) {
     const char* replayPath = nullptr;
     int64_t combUs = 0;
@@ -5872,6 +6336,8 @@ int main(int argc, char** argv) {
     test_launch_prompt_answers();
     test_launch_resolved_options_line();
     test_lock_anchor_and_comb();
+    test_flow_plan();
+    test_flow_warp_math();
     test_replay_capture_corpus();
 
     if (g_failures) {

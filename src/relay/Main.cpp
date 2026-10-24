@@ -13,6 +13,7 @@
 #include "BuildCommit.h"
 #include "D3D9Setup.h"
 #include "DiagCaptureMode.h"
+#include "FlowProbeMode.h"
 #include "Displays.h"
 #include "Failure.h"
 #include "IFrameCaptureMode.h"
@@ -52,6 +53,8 @@ IFrameCaptureMode* CreateCaptureMode(const std::string& modeText, const launch::
         return new VsyncCaptureMode();
     case launch::ModeKind::Diag:
         return new DiagCaptureMode(spec.vsyncPresent);
+    case launch::ModeKind::FlowProbe:
+        return new FlowProbeMode(spec.probeSeconds, spec.probeDraw);
     case launch::ModeKind::Timer:
         return new TimerCaptureMode(spec.framerate);
     case launch::ModeKind::Invalid:

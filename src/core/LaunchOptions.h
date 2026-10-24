@@ -220,6 +220,9 @@ inline const std::vector<UsageRow>& ModeRows() {
          false},
         {"diag, diag:vsync", "", "Clock probes: DWM compose timing and the card's raster", false,
          false},
+        {"ofprobe, ofprobe:30, ofprobedraw:30", "", "Optical flow engine probe: capabilities, "
+                                                    "cost and accuracy, then an optional loop "
+                                                    "for a GPU trace", false, false},
     };
     return rows;
 }
@@ -530,7 +533,7 @@ inline std::string RelaunchArguments(int source, int target, const std::string& 
     return s + " -relaunched";
 }
 
-enum class ModeKind { Invalid, Vsync, Temporal, Diag, Timer };
+enum class ModeKind { Invalid, Vsync, Temporal, Diag, Timer, FlowProbe };
 enum class Compositor { Nearest, Blend, Interp };
 
 // What a capture-mode string asks for. framerate is the rate a timer present runs at, and the
@@ -541,6 +544,8 @@ struct ModeSpec {
     bool vsyncPresent = false;   // present on vsync; false = QPC timer
     bool d3d11Present = false;   // the D3D11 flip-model swapchain rather than D3D9
     float framerate = 0.0f;
+    int probeSeconds = 0;        // FlowProbe: the sustained loop's length; 0 = no loop
+    bool probeDraw = false;      // FlowProbe: a full-screen draw before each looped flow
 };
 
 inline char LowerAscii(char c) {
@@ -553,6 +558,36 @@ inline bool EqualsNoCase(const std::string& a, const char* b) {
     for (size_t i = 0; i < n; i++) {
         if (LowerAscii(a[i]) != LowerAscii(b[i])) return false;
     }
+    return true;
+}
+
+// The optical flow probe's spellings: "ofprobe", "ofprobe:<seconds>", "ofprobedraw:<seconds>".
+// The loop length is a whole number of seconds, 1 to 3600.
+inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
+    if (EqualsNoCase(modeStr, "ofprobe")) {
+        s->kind = ModeKind::FlowProbe;
+        return true;
+    }
+    const size_t colon = modeStr.find(':');
+    if (colon == std::string::npos) return false;
+    const std::string head = modeStr.substr(0, colon);
+    bool draw = false;
+    if (EqualsNoCase(head, "ofprobedraw")) {
+        draw = true;
+    } else if (!EqualsNoCase(head, "ofprobe")) {
+        return false;
+    }
+    const std::string digits = modeStr.substr(colon + 1);
+    if (digits.empty() || digits.size() > 4) return false;
+    int seconds = 0;
+    for (char c : digits) {
+        if (c < '0' || c > '9') return false;
+        seconds = seconds * 10 + (c - '0');
+    }
+    if (seconds < 1 || seconds > 3600) return false;
+    s->kind = ModeKind::FlowProbe;
+    s->probeSeconds = seconds;
+    s->probeDraw = draw;
     return true;
 }
 
@@ -577,6 +612,7 @@ inline ModeSpec ParseMode(const std::string& modeStr) {
         s.kind = ModeKind::Vsync;
         return s;
     }
+    if (ParseFlowProbe(modeStr, &s)) return s;
 
     const char c0 = LowerAscii(modeStr[0]);
     Compositor comp = Compositor::Nearest;
