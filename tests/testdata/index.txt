@@ -141,6 +141,17 @@ gm_60x2_gameplay_2026_10_21_0.trace
 # burst of hitches; the worst blend run (40) is one of two releases inside a burst with a 184 ms
 # stall.
 gm_60x2_gameplay_2026_10_21_1.trace
+# 37 minutes of the first 2026-10-22 stream, through NvFBC on the defaults: 410 hitches and 54
+# stalls an hour. It holds a scripted horseback chase with 58 hitches in 4 s and the present
+# blocked 33 times, kept as a pathological case. 5 lock releases; the replay's worst blend run
+# (30) is at a pull wrap after a hitch burst where the field's ran 14, the one number outside the
+# fidelity limits.
+gm_60x2_gameplay_2026_10_22_0.trace
+# 73 minutes of the second 2026-10-22 stream, through Windows.Graphics.Capture and the GPU's copy
+# engine (263209 of 266632 presents copied): 512 hitches and 48 stalls an hour, the most hitches
+# of any stream here. 4 lock releases at the same moments in the field and on the replay; the
+# replay's worst blend run (22) follows a burst with 3 stalls where the field's ran 14.
+gm_60x2_gameplay_2026_10_22_1.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions
