@@ -95,7 +95,27 @@ private:
     // 0.29/s at +50 ms, 0.01/s at +75 ms; the frames those holds wanted DID arrive, just
     // later than the target. The cost is that they become blends, not passthroughs.
     unsigned int m_extraLagMs;
-    bool m_phaseKeepRequested;      // asked for, so an unmet prerequisite can say so once
+    // The deferred ring copy (CaptureRing::EnableDeferCopy). Off with -fgphase or -phasekeep,
+    // which read every captured frame's pixels.
+    bool m_deferCopy;
+    // -wgc: capture through Windows.Graphics.Capture (CaptureRing::EnableWgc). Only on the
+    // D3D11 present, whose device the frame pool lives on.
+    bool m_wgc;
+    // -nowgcdrop clears it: with -wgc, the frames a move of the mouse pointer alone brings are
+    // left out of the ring.
+    bool m_wgcDrop;
+    // -nowgccursor clears it: with -wgc, the mouse pointer is in the captured picture.
+    bool m_wgcCursor;
+    // -nowgcopen clears it: with -wgc, the frame pool on a device of its own, its textures
+    // opened by the present.
+    bool m_wgcOpen;
+    // -wgcscale: with -wgc, the filter the present scales a source display of another size
+    // with (CaptureRing::EnableWgc); 0 bilinear.
+    int m_wgcScale;
+    // -nocopyengine clears it: with -wgc, the present copies a frame shown as it is on the copy
+    // engine (CopyEngineTarget).
+    bool m_wgcCopyEngine;
+    bool m_phaseKeepRequested;     // asked for, so an unmet prerequisite can say so once
     char m_modeName[64];            // GetModeName: the compositor kind and the present path
     policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
     policy::StampOverlay m_overlay;      // present-thread-owned; FindBracket reads through it
@@ -129,7 +149,10 @@ public:
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
                         bool etw = false, bool noJoin = false, bool dejitter = false,
                         bool fgPhase = false, bool phaseKeep = false,
-                        unsigned int extraLagMs = 0, bool d3d11Present = false);
+                        unsigned int extraLagMs = 0, bool d3d11Present = false,
+                        bool deferCopy = false, bool wgc = false, bool wgcDrop = true,
+                        bool wgcCursor = true, bool wgcOpen = true, int wgcScale = 0,
+                        bool wgcCopyEngine = true);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

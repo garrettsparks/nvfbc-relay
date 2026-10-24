@@ -107,6 +107,7 @@
     <ClCompile Include="..\core\TemporalPolicy.cpp" />
     <ClCompile Include="BlendRenderer.cpp" />
     <ClCompile Include="CaptureRing.cpp" />
+    <ClCompile Include="CopyEnginePresent.cpp" />
     <ClCompile Include="D3D11Present.cpp" />
     <ClCompile Include="D3D9Present.cpp" />
     <ClCompile Include="D3D9Setup.cpp" />
@@ -137,6 +138,7 @@
     <ClInclude Include="..\core\TemporalPolicy.h" />
     <ClInclude Include="BlendRenderer.h" />
     <ClInclude Include="CaptureRing.h" />
+    <ClInclude Include="CopyEnginePresent.h" />
     <ClInclude Include="D3D11Present.h" />
     <ClInclude Include="D3D9Present.h" />
     <ClInclude Include="D3D9Setup.h" />

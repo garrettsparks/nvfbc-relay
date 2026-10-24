@@ -365,13 +365,13 @@ An invalid mode is no longer an exit: it re-asks (section 4). Rows 18 and 19 are
 
 **Parsed by a tool.** `mktrace.py` reads `Resolved options: src rate hint <n> fps` and
 `Resolved options: ... extra lag <n> ms`. The whole `Resolved options:` line is kept word for
-word, field for field, in the same order, which also keeps `relaylog.py` echoing it as a header
-line (it echoes any line containing "comb lock"). `mktrace.py`'s comb-lock pattern and
-`relaylog.py`'s other header keys come from `TemporalCaptureMode.cpp`, which this work does not
-reword.
+word, field for field, in the same order, which also keeps the analysis tools' log reader echoing
+it as a header line (it echoes any line containing "comb lock"). `mktrace.py`'s comb-lock pattern
+and the log reader's other header keys come from `TemporalCaptureMode.cpp`, which this work does
+not reword.
 
-**The startup lines, in order** (tags change to the new files; `startupcmp.py` compares message
-text only):
+**The startup lines, in order** (tags change to the new files; the startup comparison compares
+message text only):
 
 | line | status |
 |---|---|
@@ -403,8 +403,8 @@ or the console's input ended), the mode's summaries, the loader's `NvFBC library
 `Cleanup started` and `Cleanup completed`.
 
 The reference logs (`defaults.log`, `cli_shortcut.log`, `cli_badindex.log`, `cli_relaunch.log`)
-are replaced by logs from the new build (section 16); `startupcmp.py` needs the wall-clock line
-masked the way it masks the QPC origin, if decision 7 is taken.
+are replaced by logs from the new build (section 16); the startup comparison needs the
+wall-clock line masked the way it masks the QPC origin, if decision 7 is taken.
 
 ## 12. Changes from today
 
@@ -465,7 +465,7 @@ rebind, the admin manifest, and every per-frame and summary line.
 | 4 | Keep the first process's lines when it relaunches (the child appends, marked by a hidden `-relaunched` flag)? | **Yes.** The marker is needed anyway to stop a second relaunch; appending costs one branch in the logger's open. |
 | 5 | Popups for a run that stops by itself (capture lost, output stalled)? | **Yes.** The output window closes either way; without a popup the relay seems to vanish mid-stream. |
 | 6 | Pass one `RelayContext` to the modes instead of the twelve `extern` globals? | **Yes.** The session gets one owner, which fixes both ring bugs in section 13, and the mode files are being touched for the message pump regardless. The alternative keeps the globals, defined in the new files. |
-| 7 | A UTC wall-clock line at startup, paired with a QPC reading, to align the log with the OBS frame trace's `unix_ns`? | **Yes.** One line; `startupcmp.py` masks it. |
+| 7 | A UTC wall-clock line at startup, paired with a QPC reading, to align the log with the OBS frame trace's `unix_ns`? | **Yes.** One line; the startup comparison masks it. |
 | 8 | ASLR for the relay in the new project file (today `RandomizedBaseAddress` is false; both tools have it on by default)? | **Yes, on**, matching the tools and the template; the import check and the Defender scan judge it. |
 | 9 | `NvFBCR.slnx` (the XML solution format VS2026 creates) instead of a new `NvFBCR.sln`? | **Yes**, if the first CI run builds it; it has no GUID boilerplate. Both workflows name the solution and change with it. |
 | 10 | Move the output window when the desktop layout changes (the README's display-coordinates note)? | **Not in this phase.** It is new behavior with its own tests; the README keeps the advice, rewritten in our words. |
@@ -500,8 +500,8 @@ rebind, the admin manifest, and every per-frame and summary line.
 **Checks:** `git blame -w -M -C` over the tree finds no line by CB; the suite output is the
 baseline's 527 lines, byte for byte; CI green on both jobs; the import check against
 `import-baseline-75af577` with every difference explained (expected: the console, window and
-time calls the new behavior uses); a Defender scan of all three exes; `tagcheck.py` on every
-run's log.
+time calls the new behavior uses); a Defender scan of all three exes; a check of every run's log
+for the tags it should carry.
 
 **Runs** (`NvFBCR.log` present beside the exe unless the row says otherwise):
 

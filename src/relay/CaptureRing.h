@@ -9,6 +9,9 @@
 #include "RelayContext.h"
 #include "TemporalPolicy.h"
 
+struct ID3D11Device;
+struct ID3D11Texture2D;
+
 // Result of a bracketing query: the captured frames immediately before and after a target
 // time, plus the interpolation weight a blending consumer would use. The timestamp/diff
 // half lives in the embedded policy::BracketInfo so the policy layer consumes it without
@@ -69,6 +72,20 @@ public:
     int SlotsInUse() const { return m_ringSlots; }
     // Before Setup only. Clamped to [kDefaultRingSlots, RING_SIZE].
     void SetSlotsInUse(int n);
+
+    // Before Start. Turns the deferred ring copy on: while frames arrive in frame-generated
+    // pairs, a pair's first frame, which keep-real drops a wake later, is not copied into the
+    // ring. It sizes its limits (policy::SizeDeferLimits) from the bracketing lag the present
+    // side runs, the source period that lag was sized for, and a margin of one refresh of the
+    // output, the time a ring copy can take on a saturated GPU. A frame waits uncopied only
+    // while the gap before it, the longest wait and the margin fit inside the lag, so with a
+    // lag too short nothing waits and every frame is copied as it arrives.
+    void EnableDeferCopy(LONGLONG bracketingLagQpc, LONGLONG srcPeriodQpc, LONGLONG marginQpc) {
+        m_deferRequested = true;
+        m_deferLagQpc = bracketingLagQpc;
+        m_deferSrcPeriodQpc = srcPeriodQpc;
+        m_deferMarginQpc = marginQpc;
+    }
 
     CaptureRing();
     ~CaptureRing();
@@ -133,6 +150,42 @@ public:
 
     // Shared handle of slot i, for opening the same texture on another API's device.
     HANDLE SlotSharedHandle(int i) const { return m_ring[i].sharedHandle; }
+
+    // Before Start. Asks for Windows.Graphics.Capture (-wgc) in place of NvFBC. The ring starts
+    // on NvFBC as it always does. Once the D3D11 present has offered its device, the capture
+    // thread opens a WGC session with its frame pool on that device, and only when WGC is
+    // capturing is NvFBC let go. If WGC cannot open, capture stays on NvFBC and the log says
+    // why. dropPointerFrames leaves out the frames WGC delivers for a move of the mouse pointer
+    // alone (WgcCaptureSource::PointerOnly). cursor has Windows draw the mouse pointer into the
+    // captured picture. ownDevice (on unless -nowgcopen) puts the frame pool on a device of its
+    // own in place of the present's, and the present opens each of the pool's textures through
+    // a shared handle; where that does not work, the pool goes on the present's device
+    // (WgcCaptureSource::Open). A source display of another size than the output is captured at
+    // its own size, and the present scales its frames with scaleFilter (WgcScaler::Filter).
+    // copyEngine (on unless -nocopyengine) has the present copy a frame it shows as it is on
+    // the copy engine (CopyEngineTarget); nothing here changes for it.
+    void EnableWgc(bool dropPointerFrames, bool cursor, bool ownDevice, int scaleFilter,
+                   bool copyEngine) {
+        m_wgcRequested = true;
+        m_wgcDropPointerFrames = dropPointerFrames;
+        m_wgcCursor = cursor;
+        m_wgcOwnDevice = ownDevice;
+        m_wgcScale = scaleFilter;
+        m_wgcCopyEngine = copyEngine;
+    }
+    bool WgcRequested() const { return m_wgcRequested; }
+    int WgcScale() const { return m_wgcScale; }
+    bool WgcCopyEngine() const { return m_wgcCopyEngine; }
+    // The D3D11 present's device, offered once it is set up. The capture thread makes the frame
+    // pool on it and makes no call on its context.
+    void OfferWgcDevice(ID3D11Device* device) {
+        m_wgcDevice.store(device, std::memory_order_release);
+    }
+    // The frame pool texture slot i's picture is in, or NULL when the slot holds a frame NvFBC
+    // delivered, which is in the slot itself.
+    ID3D11Texture2D* WgcTexture(int slot) const {
+        return m_wgcTexture[slot].load(std::memory_order_acquire);
+    }
 
     // What the ring needs from the flip grid to read the batch-composition rotation, kept
     // to two questions so the ring never learns about ETW. Both are answered on the CAPTURE
@@ -206,6 +259,10 @@ public:
     void EnableFgPhase() { m_fgPhaseRequested = true; }
 
 private:
+    // The capture sources fill the ring's slots, so they work on its devices and slots.
+    friend class NvfbcCaptureSource;
+    friend class WgcCaptureSource;
+
     struct Slot {
         IDirect3DTexture9* capTexture;    // capture device (StretchRect destination)
         IDirect3DSurface9* capSurface;
@@ -222,6 +279,14 @@ private:
         LARGE_INTEGER batchStart;
         int member;                       // position inside its capture batch; 0 opens one
         bool valid;
+        // The deferred ring copy has left this frame waiting in its capture buffer, or its copy
+        // is on its way. Its stamp is final and its pixels are not in the slot, so
+        // ReadRecentFrames counts it and FindBracket does not.
+        bool awaitingCopy;
+        // Its copy has been handed to the GPU and is not yet known to be done. The source
+        // clears it when the copy is done, and turns the slot on then if awaitingCopy is still
+        // set; nothing else may turn the slot on while it is set.
+        bool copyInFlight;
     };
 
     void CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams);
@@ -284,7 +349,17 @@ private:
 
     Slot m_ring[RING_SIZE];
     int m_ringSlots = kDefaultRingSlots;
+    // The grab asks NvFBC for the frame at its own size, with no scaling: set when the source
+    // display is the size of the ring, and cleared again if NvFBC refuses such a grab.
+    bool m_fullSizeGrab = false;
+    bool m_deferRequested = false;        // see EnableDeferCopy
+    LONGLONG m_deferLagQpc = 0;
+    LONGLONG m_deferSrcPeriodQpc = 0;
+    LONGLONG m_deferMarginQpc = 0;
     IDirect3DSurface9* m_captureTarget;   // on the capture device; NvFBC writes here
+    // The second NvFBC output buffer, which the deferred ring copy grabs into in turn with the
+    // first. NULL when the deferral is off or NvFBC refused two buffers.
+    IDirect3DSurface9* m_captureTargetB = NULL;
     IDirect3DDevice9Ex* m_presentDevice;
     IDirect3DDevice9Ex* m_capDevice;      // private capture device
     IDirect3DQuery9* m_capSync;           // event query: flush capture writes before publish
@@ -303,4 +378,15 @@ private:
     long long m_grabTimeoutsSkipped = 0;  // capture-thread-local; see GrabTimeoutsSkipped
     LONGLONG m_batchStarts[kBatchHistory] = {};   // written by capture thread at batch open
     std::atomic<long long> m_batchOpens{0};
+
+    // -wgc; see EnableWgc.
+    bool m_wgcRequested = false;
+    bool m_wgcDropPointerFrames = true;
+    bool m_wgcCursor = true;
+    bool m_wgcOwnDevice = true;
+    int m_wgcScale = 0;
+    bool m_wgcCopyEngine = false;
+    HMONITOR m_sourceMonitor = NULL;                      // the display WGC captures
+    std::atomic<ID3D11Device*> m_wgcDevice{NULL};          // offered once by the present
+    std::atomic<ID3D11Texture2D*> m_wgcTexture[RING_SIZE];   // written by the capture thread
 };

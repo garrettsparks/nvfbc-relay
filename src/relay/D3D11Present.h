@@ -3,9 +3,14 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_3.h>
+#include <utility>
+#include <vector>
 
 #include "IPresentPath.h"
 #include "FrameMarker.h"
+#include "WgcScaler.h"
+
+class CopyEngineTarget;
 
 // D3D11 PRESENT BACKEND: decides, composites and presents straight onto a DXGI flip-model
 // swapchain, the present path that replaces the D3D9 compose-and-PresentEx one.
@@ -50,6 +55,11 @@
 //
 // BLEND ONLY. This backend is the blend pipeline: the lerp shader is the compositor, and
 // nearest and interp are not ported. The parser only pairs it with the blend mode.
+//
+// WITH -wgc THE SWAPCHAIN IS A CopyEngineTarget (unless -nocopyengine): the same decision and
+// draw, into its buffers, except that a present showing one WGC frame as it is (no blend, no
+// scaling) is copied on the copy engine, its marker strip with it, and so takes no turn on the
+// game's graphics engine.
 class D3D11PresentBackend : public IPresentPath {
 public:
     // tint is accepted so the mode string's options parse the same on either path; this
@@ -99,6 +109,10 @@ public:
 
     const char* Name() const override { return "D3D11 flip-model present"; }
     const char* RefusalAdvice() const override {
+        if (m_copyEngineFailed) {
+            return "To start with the older output method, add -nocopyengine to the launch "
+                   "options.";
+        }
         return "To try the older output method, type b:dwm at the mode prompt.";
     }
     bool OwnsOutputWindow() const override { return true; }
@@ -106,16 +120,28 @@ public:
     bool Enabled() const { return m_enabled; }
 
 private:
-    bool CreateDeviceAndSwapChain(HWND hwnd, int width, int height);
+    bool CreateDeviceAndSwapChain(HWND hwnd, int width, int height, bool copyEngine,
+                                  int sinkRefreshHz);
     bool OpenRingAliases(CaptureRing* ring);
+    bool NeedsScaling(int slot) const;
     bool CreatePipeline();
+    // Readies the -wgcscale filter; bicubic or Lanczos that cannot be readied falls back to
+    // bilinear.
+    bool SetupScaling(int filter, int width, int height);
     // Re-acquire back buffer 0 as the render target. Under flip model the buffer behind
-    // index 0 changes after every Present, so this runs once per present.
+    // index 0 changes after every Present, so this runs once per present. With the copy engine
+    // the target is the copy-engine target's next buffer.
     bool AcquireBackBuffer();
+    // With the copy engine: the WGC texture a present of slot as it is can be copied from, or
+    // NULL when it has to be drawn.
+    ID3D11Texture2D* CopySourceFor(int slot);
     // Draw lerp(a, b, w) over the whole back buffer. Passthrough binds the same slot to both
     // inputs with w = 0, so there is ONE code path and the swapchain format is free to differ
     // from the ring's (a CopyResource would demand they match exactly).
     bool Draw(int slotA, int slotB, float w);
+    // The view to sample for a ring slot. Under -wgc a slot may name a texture of WGC's frame
+    // pool on this device; one view is made per pool texture the first time it is seen.
+    ID3D11ShaderResourceView* SourceFor(int slot);
     bool DrawMarker(const bool cells[FrameMarker::kCells]);
     void SampleStats();
     void SamplePresentationPath();
@@ -154,6 +180,26 @@ private:
 
     ID3D11Texture2D* m_ringAlias[CaptureRing::RING_SIZE];
     ID3D11ShaderResourceView* m_ringSrv[CaptureRing::RING_SIZE];
+
+    // -wgc: the ring was asked for WGC, so this device is offered to it, and once it has been
+    // m_ring is set and slots are looked up there first (SourceFor).
+    bool m_wgc = false;
+    CaptureRing* m_ring = NULL;
+    // The copy engine (-wgc without -nocopyengine): the target in place of the swapchain, the
+    // WGC texture this present copies (NULL when it drew), and whether its setup failed, which
+    // changes what the refusal tells the user.
+    CopyEngineTarget* m_copyEngine = NULL;
+    ID3D11Texture2D* m_copySource = NULL;
+    bool m_copyEngineLost = false;
+    bool m_copyEngineFailed = false;
+    // -wgcscale: the filter a WGC frame of another size than the output is scaled with
+    // (WgcScaler::Filter) and its scaler, and the presents that scaled and that drew frames at
+    // the output's size.
+    int m_scale = WgcScaler::Bilinear;
+    WgcScaler m_scaler;
+    long long m_scaledDraws = 0;
+    long long m_unscaledDraws = 0;
+    std::vector<std::pair<ID3D11Texture2D*, ID3D11ShaderResourceView*>> m_poolSrvs;
 
     ID3D11VertexShader* m_vs;
     ID3D11PixelShader* m_ps;

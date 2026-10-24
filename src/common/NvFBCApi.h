@@ -94,6 +94,7 @@ enum NVFBCToDx9VidBufferFormat : int
 
 enum NVFBCToDx9VidGrabMode : int
 {
+    NVFBC_TODX9VID_SOURCEMODE_FULL = 0,
     NVFBC_TODX9VID_SOURCEMODE_SCALE = 1,
 };
 

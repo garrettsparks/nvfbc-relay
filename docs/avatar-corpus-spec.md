@@ -174,7 +174,7 @@ so C2 pins that it stays inert.
    windowed to these. Loading fades between tests are excluded by construction.
 3. **Log, per test.** Presents/s, present spacing stdev and 5th-95th percentile, `blk`
    median, `lk=1` fraction, op mix as fractions, synth/s, hold-comb/s, hold count.
-4. **Marker.** `uv run marker.py decode <mp4> --log <log> --csv <out>`. Per test: counter
+4. **Marker.** The marker decoder over the recording, against its log. Per test: counter
    repeats and skips (exact at one present per video frame, which every row here is), blend
    frames, pass-gen frames, provenance agreement. Whole-video checksum must be 100%.
 5. **Source.** The game CSV's Fps min per section must equal the DISPLAYED rate (base x FG)

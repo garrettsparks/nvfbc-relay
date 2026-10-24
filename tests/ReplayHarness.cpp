@@ -562,8 +562,8 @@ struct PresentCensus {
     long long opHold = 0, opHoldComb = 0, opPassBefore = 0, opPassAfter = 0, opSynth = 0;
     long long tgtDiffSum = 0, tgtDiffMax = 0;
     long long pullDiffSum = 0, pullDiffMax = 0;
-    // Shown-stamp step census, the same six classes pacing.py prints so replayed and live
-    // runs are directly comparable.
+    // Shown-stamp step census, in the same six classes the pacing census of a live log uses,
+    // so replayed and live runs are directly comparable.
     long long stepZero = 0, stepFlip = 0, stepPeriod = 0, stepOneFive = 0, stepBig = 0,
               stepBack = 0;
     double spanS = 0.0;
@@ -822,7 +822,7 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
             if (depth == p.beforeDepth) pc->depthAgree++;
         }
 
-        // What this present SHOWED, by the same rule pacing.py applies to a live log.
+        // What this present SHOWED, by the same rule the pacing census applies to a live log.
         int64_t shown = 0;
         bool has = false;
         if (pick == policy::Pick::Before || pick == policy::Pick::BeforeAdv) {
@@ -1442,7 +1442,7 @@ void ReportPresent(const PresentCensus& p, const Config& cfg) {
                     (double)p.pullDiffMax / (double)kTicksPerUs);
     }
     if (p.spanS > 0) {
-        std::printf("  pacing (shown-stamp steps/s, pacing.py's classes): zero %.1f"
+        std::printf("  pacing (shown-stamp steps/s, the live pacing census's classes): zero %.1f"
                     "  flip-size %.1f  period %.1f  1.5-2.5x %.2f  BIG %.2f"
                     "  backward %.2f\n",
                     p.stepZero / p.spanS, p.stepFlip / p.spanS, p.stepPeriod / p.spanS,

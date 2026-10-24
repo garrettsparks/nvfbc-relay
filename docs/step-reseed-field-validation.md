@@ -235,7 +235,7 @@ have ended when the game took the phase back. With it, nine presents of blend an
 
 The 241, 1351 and 1911 events differ only in that the lock released for part of the following run
 (the second disturbance arrived while the estimator was still fast, and the deviation crossed the
-gate), which is why `zonecross.py` files them as disengaged sweeps and 298.5 as an engaged crossing.
+gate), which is why the blend-run classifier files them as disengaged sweeps and 298.5 as an engaged crossing.
 
 ### 2.3 Blend runs against the 09-16 baseline
 
@@ -403,7 +403,7 @@ which forfeits most of the benefit. Both are post-release questions.
 
 ## 4. Video census, gameplay (motion-gated)
 
-`mgdupes.py` over the whole 1840 s stream recording: 1727 motion-gated duplicate events, 0.94/s,
+The duplicate-frame count over the whole 1840 s stream recording: 1727 motion-gated duplicate events, 0.94/s,
 3103 frames, with 52.4% of the recording counted as moving. Controls for the instrument: 0.00/s on
 the static capture, 0.12/s on a recording whose marker proves one repeat in 18446 frames. The 09-16
 stream recording, same output path, sat at 0.18 to 0.42/s in typical 60 s windows with a worst window
@@ -422,8 +422,8 @@ None of this touches the verdict in section 3, which rests on the relay log and 
 
 ## Instruments
 
-Repo-independent, in `/Users/gsparks/dev/frame-drop-analysis`: `runs.py`, `zonecross.py`,
-`loghitches.py`, `marker.py decode --log --csv`, `mgdupes.py`, `pkdupes.py`. Session scratch scripts
-used for the windowing and the exact join: `winruns.py` (blend-run histogram inside a log-time
-window), `holdsvsmap.py` (holds against source stalls), `repeatjoin.py` (video counter repeats joined
-to blocked presents in both directions, with the offset census as its control).
+Kept outside the relay with the private analysis tools: a blend-run census, a blend-run
+classifier, a hitch finder, the marker decoder, and two video duplicate finders. Scratch scripts
+did the windowing and the exact join: a blend-run histogram inside a log-time window, holds
+against source stalls, and video counter repeats joined to blocked presents in both directions,
+with the offset census as its control.

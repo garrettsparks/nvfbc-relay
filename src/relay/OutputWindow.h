@@ -14,8 +14,10 @@ struct OutputWindows {
     HWND host = NULL;
 };
 
+// noRedirection makes the output window without a redirection bitmap, for content that comes
+// only from DirectComposition (the copy engine's composition swapchain).
 MaybeFailure CreateOutputWindows(HINSTANCE instance, int showCommand, const DisplayInfo& target,
-                                 bool withHost, OutputWindows* out);
+                                 bool withHost, bool noRedirection, OutputWindows* out);
 
 // Destroys whichever of the windows still exist. The output window's destruction is what ends a
 // run, so this also discards the quit request it leaves behind: a pending quit dismisses the

@@ -9,11 +9,11 @@ the lock", on the strength of four blend runs of 50+ presents in the 52.8 minute
 `Get_Medieval_2026-09-16_0`. The original framing was wrong in three separate ways, each killed by
 measurement, and the mechanism that survived suggests a different fix than the one the item named.
 
-Material: `Get_Medieval_2026-09-16_0.log` (this build), `Get_Medieval_2026-09-13_0.log` (pre-window,
-same present path), `Get_Medieval_2026-09-14_0.log` (`b:dwm`), `kcd2_b_vsync.log`. Instruments:
-`frame-drop-analysis/zonecross.py` (classifies each blend run) and `frame-drop-analysis/locksim.cpp`
-(drives the REAL `UpdatePhaseLock` over a log's own error sequence and exposes `devEmaQpc`, which no
-log records).
+Material: three stream logs (one on this build, one from before the window on the same present
+path, one on `b:dwm`) and `kcd2_b_vsync.log`. Instruments,
+kept with the private analysis tools: a classifier for each blend run, and a lock simulator that
+drives the REAL `UpdatePhaseLock` over a log's own error sequence and exposes `devEmaQpc`, which no
+log records.
 
 **The instrument's own control.** `locksim` predicts the lock's engage flag from the logged error
 sequence alone and compares it against the logged `lk=`: 99.64% agreement on 09-16, 99.48% on 09-13,
@@ -24,7 +24,7 @@ sequence alone and compares it against the logged `lk=`: 99.64% agreement on 09-
 
 | hypothesis | measurement | verdict |
 |---|---|---|
-| the target crossing the zone while engaged (the item's premise) | `zonecross.py`: engaged crossings are 24 runs / 251 presents = 0.13% of presents on 09-16, and only 1 of the 12 longest runs. On KCD, zero | DEAD: the long runs are not this |
+| the target crossing the zone while engaged (the item's premise) | the blend-run classifier: engaged crossings are 24 runs / 251 presents = 0.13% of presents on 09-16, and only 1 of the 12 longest runs. On KCD, zero | DEAD: the long runs are not this |
 | a snap to the nearer real frame | worst distance to a real frame inside the long runs is 0.48-0.50 of a source period on nearly every run, so a snap must move content by up to 8.3 ms, making one present advance 8.3 or 25 ms instead of 16.7, and repeat about every 45 presents as the phase drifts back | DEAD: trades a ghost for a recurring cadence break |
 | marginal flapping a Schmitt band would hold | every lock release in all four logs had `devEma` below comb/6 (53/53, 145/145, 45/45, 12/12), but the episodes a comb/6 release threshold would ELIMINATE are the short ones: 28 of 53 episodes covering 300 of 2652 presents on 09-16, touching 6.8% of long-run presents (9.0% on 09-13, 7.5% on 09-14, 0% on KCD) | DEAD as a cure for the long runs; a 0.16% tidy-up at best |
 | a dejit feedback loop (jitter releases the lock, dejit needs lock state, declines, jitter persists) | 20 of the 21 `lock-declined` verdicts on 09-16 are at 2.8-3.1 s (startup acquisition); exactly one (2452.8 s) falls inside a long run, and dejit corrected 1148 of 1169 late batches | DEAD |
@@ -138,9 +138,9 @@ regardless: nothing below has been applied to the repo.
 
 ## The sixth candidate: step re-seed, built and measured 2026-09-17
 
-The one idea the verdict above left open, implemented after the user asked for a pass at it. Patch
-kept at `frame-drop-analysis/step-reseed-experiment.patch` (against `79f33e9`); the scratch tree it
-was built in does not survive the session.
+The one idea the verdict above left open, implemented after the user asked for a pass at it. The
+patch (against `79f33e9`) is kept with the private analysis tools; the scratch tree it was built
+in does not survive the session.
 
 **The rule.** A phase step leaves the error at a new constant offset that the /16 estimator needs a
 dozen presents to follow, and the deviation it reports meanwhile releases the lock. So: after a

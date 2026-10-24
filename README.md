@@ -13,7 +13,7 @@ capture rate. The temporal modes below choose which captured frame to show at
 each present.
 
 I use this daily, but it's rough. Flags change, and the temporal modes are
-still being tested against real captures.
+still being tested on real captures.
 
 ---
 
@@ -84,7 +84,7 @@ update its numbers.
 | `vsync` | Plain capture, present blocked on DWM's compose clock. No temporal selection. |
 | `t` or `t:dwm` | Temporal selection, present blocked on DWM's compose clock. |
 | `t:<fps>` | Temporal selection, present driven by a QPC timer at the given rate. |
-| `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the bracket pair otherwise), presented through a D3D11 flip-model swapchain on the capture card's own vblank. The default. |
+| `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the frame before it and the frame after it otherwise), presented through a D3D11 flip-model swapchain on the capture card's own vblank. The default. |
 | `b:dwm` | The same blend on the D3D9 swapchain, present blocked on DWM's compose clock. The path `t` runs on. |
 | `b:<fps>` | The same blend, present driven by a QPC timer at the given rate. |
 | `<fps>` | Plain timer capture at the given rate. No temporal selection. How the original relay ran. |
@@ -92,10 +92,10 @@ update its numbers.
 | `diag:vsync` | Diagnostic probe on `INTERVAL_ONE`. Present block time measures DWM's delivery cadence. |
 
 `t:dwm` presents on DWM's compose clock. While a game runs fullscreen on the
-source, the card holds that clock at 60 Hz, so `t:dwm` presents 60 times a
-second whatever the game renders. On the desktop nothing holds it, and a 240 Hz
-source display gives 240 presents a second. Expect that when reading present
-rates from a desktop capture.
+source display, that clock runs at the capture card's 60 Hz, so `t:dwm`
+presents 60 times a second whatever the game renders. On the desktop the clock
+can run faster, and with a 240 Hz source display a log taken there shows 240
+presents a second.
 
 ## Options
 
@@ -112,9 +112,8 @@ generation don't count. If DLSS Frame Generation or Smooth Motion doubles a game
 to 120 FPS, use `-src 60`.
 
 If the frame rate varies, bias lower. For a game running mostly 75 to 90 FPS,
-use `-src 80`, not 90. Set too high, it makes the relay blend more frames when
-the game dips, and that's when a blended frame's double image is easiest to
-see.
+use `-src 80`. Set too high, it makes the relay blend more frames when the game
+dips, and that's when a blended frame's double image is easiest to see.
 
 Without `-src` the relay assumes 60.
 
@@ -123,8 +122,10 @@ Without `-src` the relay assumes 60.
 The relay's frame pacing features are all on by default. It locks onto the
 game's frame timing, adds the 75 ms of extra delay above, and reads frame timing
 from the graphics driver to correct frames that arrive late. None of them costs
-anything measurable (see Present paths). For troubleshooting, each can be
-turned off.
+anything measurable (see Present paths). When the game uses frame generation,
+frames reach the relay in pairs and it keeps one of each pair. It skips copying
+the one it drops, which lowers what the relay costs the game. For
+troubleshooting, each can be turned off.
 
 | Option | Turns off |
 | ------ | --------- |
@@ -132,6 +133,7 @@ turned off.
 | `-noetw` | Reading frame timing from the graphics driver, and with it the late-frame correction |
 | `-nodejit` | The late-frame correction only |
 | `-lag 0` | The extra delay |
+| `-nodefercopy` | Skipping the copy of the dropped frame of each pair |
 
 The older spellings `-lock`, `-etw` and `-dejit` still work and change nothing.
 If the relay can't read frame timing from the driver, it says so once and keeps
@@ -149,16 +151,16 @@ write about 160 MB an hour.
 
 NvFBCR relays video only. Audio through the relay is planned but not there yet.
 
-To pace frames evenly, the relay holds the picture back briefly. At the
-defaults that's between 95 and 113 ms, about 104 ms typically, measured over 90
-minutes of gameplay. A lower `-src` holds it longer, about 20 ms more at
-`-src 30`, and each ms of `-lag` adds one ms.
+To pace frames evenly, the relay delays the picture. With the default settings
+the delay is 95 to 113 ms, typically about 104 ms, measured over 90 minutes of
+gameplay. A lower `-src` adds to it, about 20 ms more at `-src 30`, and each ms
+of `-lag` adds one ms.
 
-Audio that reaches the capture card some other way doesn't get that hold, so it
-can arrive ahead of the picture. How far ahead depends on the audio's own route,
-which adds delay of its own. Fix it in OBS by delaying the capture card's audio.
-In the Audio Mixer, open the audio source's menu, choose Advanced Audio
-Properties, and set its Sync Offset. A positive value delays the audio.
+Audio that reaches the capture card some other way isn't delayed by the relay,
+so it can arrive ahead of the picture. How far ahead depends on the audio's own
+route, which adds delay of its own. Fix it in OBS by delaying the capture
+card's audio. In the Audio Mixer, open the audio source's menu, choose Advanced
+Audio Properties, and set its Sync Offset. A positive value delays the audio.
 
 With system audio sent over the card's HDMI by Elgato Wave Link, about 20 ms
 has looked right, which suggests the route itself adds most of the relay's
@@ -172,7 +174,7 @@ the card to 2560x1440 in Windows display settings. It costs the game no more
 than 1080p does.
 
 Use a mode that runs at exactly 60.000 Hz. The standard 2560x1440 "60 Hz" mode
-many cards offer really runs at 59.95 Hz. Against a 60 FPS game that means a
+many cards offer really runs at 59.95 Hz. With a 60 FPS game that means a
 skipped frame about every 20 seconds, plus a repeated one where the stream fills
 back up to 60. An NVIDIA custom resolution fixes it. In the NVIDIA Control
 Panel, under Change resolution, choose Customize, create a 2560x1440 mode at
@@ -189,15 +191,17 @@ waits on. `b:vsync` presents through a D3D11 flip-model swapchain on the output
 window. Windows promotes it to independent flip, so each present waits for the
 capture card's own vblank. `b:dwm` presents through the D3D9 swapchain and
 waits on DWM's compose clock, like `t`. Under in-game frame generation that
-clock runs at the displayed rate, so `b:dwm` presents twice per source frame
-into a 60 Hz sink, and the recording shows repeated frames.
+clock runs at the displayed rate, so `b:dwm` presents twice for each frame the
+game renders. The capture card shows only 60 of those a second, so recordings
+from it have repeated frames.
 
-Measured in one session, a game at 60x2 with in-game frame generation, on the
-default settings plus `-mark`, inside the game's benchmark tests:
+Measured in one session with a game rendering 60 FPS and in-game frame
+generation doubling it to 120, on the default settings plus `-mark`, during the
+game's benchmark tests:
 
-| | `b:dwm` (D3D9, DWM compose clock) | `b:vsync` (D3D11 flip model, sink vblank) |
+| | `b:dwm` (D3D9, DWM compose clock) | `b:vsync` (D3D11 flip model, capture card's vblank) |
 | --- | --- | --- |
-| presents/s on the 60Hz sink | 117 to 120 | 60.00 |
+| presents/s on the 60Hz capture card | 117 to 120 | 60.00 |
 | present spacing stdev | 575 to 2076 us | 20 to 97 us |
 | comb lock engaged | 0.0% | 100% |
 | hold-comb/s | 53 to 60 | 0 |
@@ -230,7 +234,7 @@ full numbers are in [`docs/relay-cost-results.md`](docs/relay-cost-results.md).
 Capture and present run on separate threads with separate devices. Capture
 grabs into its own D3D9Ex device. `b:vsync` presents through a D3D11 device and
 a flip-model swapchain, and every other mode presents through a second D3D9Ex
-device. With one shared device, the blocking NvFBC grab held the device lock
+device. With one shared device, the blocking NvFBC grab kept the device locked
 while it waited, which tied present timing to capture arrivals and measured as
 present jitter of half a capture period.
 
@@ -354,15 +358,13 @@ flowchart TD
 
 The relay keeps a ring of captured frames, each stamped with the QPC time its
 grab returned. At every present it computes a selection target, finds the two
-ring frames bracketing that target, and picks one:
+ring frames bracketing that target, and picks one.
 
-* The nearer frame wins. A hysteresis band stops a target near the midpoint
-  from switching between the two frames every present, which would show as
-  judder.
-* An advance gate stops it skipping a frame that hasn't been shown yet when
-  only the after side is newer.
-* If nothing in the ring is newer than what was last shown, it re-presents the
-  last surface instead of copying anything.
+The nearer frame wins. A hysteresis band stops a target near the midpoint from
+switching between the two frames every present, which would show as judder. An
+advance gate stops it from skipping a frame that hasn't been shown yet when only
+the after side is newer. If nothing in the ring is newer than what was last
+shown, it re-presents the last surface and copies nothing.
 
 ```mermaid
 flowchart TD
@@ -386,8 +388,8 @@ because they're the 3-bit pick code burned into every `-mark` recording. New
 outcomes can only be appended.
 
 The comb lock, on by default, adds a control loop on top of selection. Source
-frames arrive on a repeating pattern of phases, the comb. The lock measures the
-target's error against the comb and adds a small extra lag, the pull, to keep
+frames arrive on a repeating pattern of phases, the comb. The lock measures how
+far the target is from the comb and adds a small extra lag, the pull, to keep
 the target on a stable tooth. It smooths the error with an EMA, waits for it to
 settle, moves the pull at a bounded rate in either direction, and wraps it
 around the comb behind a hysteresis band. While a bracket has only one side,
@@ -451,8 +453,8 @@ resolution and subsample color (4:2:0), and the cells come through a Twitch
 transcode, a download and a re-encode intact. A 32 px cell covers several
 16x16 macroblocks, so it survives as roughly a DC coefficient even at high QP.
 A QR code's small modules would not survive that as well. The payload is a
-fixed 39 bits and this project controls both ends, so a checksum and a counter
-that only counts up take the place of error correction.
+fixed 39 bits and this project controls both ends, so the marker uses a
+checksum and a counter that only counts up, with no error correction.
 
 The decoder samples the middle 50% of each cell to ignore blur at the edges,
 checks that cell 0 is white, and verifies the checksum.
@@ -508,12 +510,12 @@ it, and `NvFBCR.exe` doesn't need it to start.
 
 # Display arrangement
 
-The relay places its window over the capture card display once, when it
-starts. When the capture card display sits to the right of or below the game
-display in Windows' display settings, a game that changes the game display's
-resolution also moves the capture card display across the desktop, and the
-window stays where it was. Put the capture card display to the left of the game
-display, or keep the game display at one resolution while the relay runs.
+The relay opens its window on the capture card display once, when it starts.
+When the capture card display sits to the right of or below the game display in
+Windows' display settings, a game that changes the game display's resolution
+also moves the capture card display across the desktop, and the window stays
+where it was. Put the capture card display to the left of the game display, or
+keep the game display at one resolution while the relay runs.
 
 ---
 

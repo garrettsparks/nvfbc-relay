@@ -76,7 +76,7 @@ hundred-plus presents.
 
 **Method.** For each log: blend runs by length with their log time, lock transitions in both
 directions, and for every re-engage the longest blend run starting within the next 300 presents plus
-how fast `pull=` moved across it. Script kept as the session's scratch `runs.py`; it refuses a log
+how fast `pull=` moved across it. The script was the session's scratch; it refuses a log
 with under 100 parsed presents and prints its own op census so a parse failure cannot read as a
 clean result.
 
@@ -103,7 +103,7 @@ run 226 at 60 Hz replay), so the window stands unconfirmed in the field until th
 
 ## 3. The two pins
 
-Per-benchmark-test windows via `benchtests.py` (marker CSV plus packet sizes for the fades; every
+Per-benchmark-test windows from an analysis tool (marker CSV plus packet sizes for the fades; every
 number gated on the source delivering at the declared cadence).
 
 **B, `avatar_60x2_vsync_steady`: pin is 0 synth, 0 repeats.** Test 2, log 42.8..72.9 s, 1807
@@ -140,7 +140,7 @@ every other trace predates it. The suite passes with all four registered, 43 fix
 
 ### The 60x2 steady window exposed a replay-model cold start, and that cost a window shift
 
-Cut where `benchtests.py` puts it, 0.3 s after the fade into the test ends, the steady fixture replayed
+Cut where that tool puts it, 0.3 s after the fade into the test ends, the steady fixture replayed
 at 3.8% synth with a worst blend run of 47 presents against a field that blended NOTHING on that
 window. The suite's own instruction is that bounds on a material disagreement are theatre, so the
 disagreement was chased rather than bounded, and it is the model's, not the relay's:
@@ -171,7 +171,7 @@ or above 50 ms in 31860 and 9102 arrivals, so the loader has nothing to drop in 
 
 ## 4. Video: the marker says the chain was clean on these runs
 
-`marker.py decode` over the whole of each recording, cross-checked against its log.
+The marker decoder over the whole of each recording, cross-checked against its log.
 
 | video | frames | marker + checksum | counter repeats (downstream dupes) | skips | provenance agreement |
 |---|---|---|---|---|---|

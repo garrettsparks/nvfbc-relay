@@ -65,7 +65,8 @@ IFrameCaptureMode* CreateCaptureMode(const std::string& modeText, const launch::
     return new TemporalCaptureMode(spec.framerate, spec.vsyncPresent, o.srcRateHint, o.lock,
                                    compositor, o.mark, o.markFrames, o.tint, o.etw, o.noJoin,
                                    o.dejitter, o.fgPhase, o.phaseKeep, o.extraLagMs,
-                                   spec.d3d11Present);
+                                   spec.d3d11Present, o.deferCopy, o.wgc, o.wgcDrop,
+                                   o.wgcCursor, o.wgcOpen, o.wgcScale, o.copyEngine);
 }
 
 // Takes the named lock that keeps a second relay from starting. Two relays cannot share NvFBC,
@@ -115,6 +116,8 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
     launch::Options& options = r.choice.options;
     const std::string note = launch::ResolveDependencies(&options);
     if (!note.empty()) LOG("%s", note.c_str());
+    const std::string deferNote = launch::ResolveDeferCopy(&options);
+    if (!deferNote.empty()) LOG("%s", deferNote.c_str());
 
     const DisplayInfo& source = displays[r.choice.source];
     const DisplayInfo& target = displays[r.choice.target];
@@ -131,7 +134,12 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
             "rotates");
         options.flipEx = false;
     }
-
+    // WGC's frame pool lives on the D3D11 present's device, which only b:vsync has.
+    if (options.wgc && !r.mode->PresentsViaD3D11()) {
+        LOG("-wgc ignored: capture through Windows.Graphics.Capture needs b:vsync; capturing "
+            "with NvFBC");
+        options.wgc = false;
+    }
     LOG("Source display: [%u] %s (%s)", source.adapter, source.Name().c_str(),
         source.deviceName.c_str());
     LOG("Target display: [%u] %s (%s)", target.adapter, target.Name().c_str(),
@@ -160,12 +168,18 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
     ctx.targetAdapter = target.adapter;
     ctx.width = target.Width();
     ctx.height = target.Height();
+    ctx.sourceWidth = source.Width();
+    ctx.sourceHeight = source.Height();
     ctx.sinkRefreshHz = target.refreshHz;
     ctx.flipEx = options.flipEx;
     LOG("Buffer size: %dx%d", ctx.width, ctx.height);
 
+    // The copy engine copies WGC's frames, so only a -wgc launch presents through it, and its
+    // output window has no redirection bitmap: DirectComposition gives it all its content.
+    const bool copyEngine = r.mode->PresentsViaD3D11() && options.wgc && options.copyEngine;
     if (MaybeFailure f = CreateOutputWindows(instance, showCommand, target,
-                                             r.mode->PresentsViaD3D11(), &r.windows)) {
+                                             r.mode->PresentsViaD3D11(), copyEngine,
+                                             &r.windows)) {
         return f;
     }
     ctx.outputWindow = r.windows.output;

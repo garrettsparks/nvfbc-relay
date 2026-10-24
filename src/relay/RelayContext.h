@@ -22,6 +22,8 @@ struct RelayContext {
     UINT targetAdapter = 0;
     int width = 0;              // the target display's size: back buffer, ring slots, swapchain
     int height = 0;
+    int sourceWidth = 0;        // the source display's size
+    int sourceHeight = 0;
     int sinkRefreshHz = 0;      // the target display's refresh rate; 0 when it could not be read
     bool flipEx = false;        // the present device uses the FLIPEX swap effect (-flipex)
     NvFBCLoader* nvfbc = NULL;

@@ -440,7 +440,7 @@ gen, real, gen: **2 of every 6 output frames carry real pixels**. Keeping member
 keep. Twice the real content.
 
 **The phase is READ, not guessed, and the label assignment is anchored** (2026-08-16, three x3
-captures via x3residue.py plus five x2 controls). Exactly one of the three classes wakes BEFORE
+captures read by an analysis tool plus five x2 controls). Exactly one of the three classes wakes BEFORE
 its flip (aoff p50 -43/-61/-105 us) while the other two sit at +76/+77/+78; an independent signal
 (elevated single-wake share) names a class exactly +2 away, which is what the tiling predicts for
 real-led vs real-trailing. The assignment is fixed by a KNOWN-composition control: every x2 batch
@@ -770,7 +770,7 @@ lose zero events across seven runs, but that is a property of a measured workloa
 
    **The experiment is one capture at `-lag 75` WITHOUT `-dejit`**, compared against a run with
    it. Note such a capture has no ETW flip stream, so the replay harness cannot read it - judge
-   it on `bpacing.py`'s own op census. If synths land at the same rate either way, the default
+   it on the log's own op census. If synths land at the same rate either way, the default
    collapses to `b:vsync -src 60 -lock -lag 75 -subgen`, which is FEWER moving parts than today.
    `-subgen` does not need ETW: the change map is an NvFBC feature and the placement comes from
    batch structure, so this decision is orthogonal to the substitution.
@@ -872,7 +872,7 @@ lose zero events across seven runs, but that is a property of a measured workloa
    keeps the real frame only in [gen, real] batches - one source period in two - and DISCARDS
    the real in [real, gen] batches. A phase-aware keep-real (member 0 in real-led batches,
    member 1 in real-trailing ones) keeps exactly one real frame per source period. Analysis:
-   `x3residue.py` against `etw_x3_walk` and `join2_x3_on`.
+   the residue reading against `etw_x3_walk` and `join2_x3_on`.
 4. **Does DLSS-FG look structurally different** from driver-level Smooth Motion? It is an in-game
    SDK path rather than a driver one, so it may not emit FlipRequest with the same shape, or at
    all. Everything below assumes it does until measured.

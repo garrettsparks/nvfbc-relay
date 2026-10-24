@@ -217,12 +217,11 @@ This closes the gap that currently forces offset-guessing on unmarked stream VOD
   So the log stays fully joinable and the video carries markers only on the first N frames; the
   join stays `read counter off the frame, grep mark=<counter>`.
 
-## Analysis tool (frame-drop-analysis) — co-designed with the encoder
+## The decoder, co-designed with the encoder
 
 The decoder is half the system; its geometry, thresholds, and checksum MUST match the encoder's,
-so it is specced here alongside. Lives beside `detect.py` / `relaylog.py`, either as a new
-`detect.py marker` subcommand or a `relaylog marker` command (it bridges both worlds: it reads a
-video AND cross-checks a log).
+so it is specced here alongside. It is an analysis tool, kept outside the relay with the other
+private analysis tools (it bridges both worlds: it reads a video AND cross-checks a log).
 
 ### Decode pipeline (per frame)
 

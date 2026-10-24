@@ -20,7 +20,16 @@ namespace launch {
 // with: a launch starts from a default-constructed Options, so a default is changed here and
 // nowhere else. The comb lock, the extra lag, flip timing and delivery-lateness
 // correction are on by default because the relay-cost ladder measured no cost for any of them;
-// -nolock, -lag 0, -noetw and -nodejit turn them off.
+// -nolock, -lag 0, -noetw and -nodejit turn them off. The deferred ring copy is on by default
+// because it lowers what the relay costs the game; -nodefercopy turns it off. With -wgc, the
+// frames Windows sends for a move of the mouse pointer alone are left out by default, because
+// each is a copy of the frame before it; -nowgcdrop keeps them. With -wgc the mouse pointer is
+// in the captured picture by default, because the benchmark measured no cost for it;
+// -nowgccursor leaves it out. With -wgc the frame pool is on a device of its own by default,
+// because the benchmark measured it about 58 points cheaper for the game than the pool on the
+// present's device; -nowgcopen keeps it on the present's device. With -wgc a frame shown as it
+// is goes to the screen through the GPU's copy engine, because the benchmark measured it about
+// 72 points cheaper for the game than drawing it; -nocopyengine draws every frame.
 struct Options {
     float srcRateHint = 0.0f;       // -src: declared BASE render rate; 0 = not declared
     bool lock = true;               // -lock / -nolock: the phase comb lock
@@ -35,7 +44,28 @@ struct Options {
     bool mark = false;              // -mark: burn the frame-counter marker
     unsigned int markFrames = 0;    // -mark N: first N presents only; 0 = every present
     unsigned int extraLagMs = 75;   // -lag N: extra bracketing delay, 0 to 200 ms
+    bool deferCopy = true;          // -defercopy / -nodefercopy: no ring copy for the frame of a
+                                    // frame-generated pair that keep-real drops
+    bool wgc = false;               // -wgc: capture through Windows.Graphics.Capture (b:vsync)
+    bool wgcDrop = true;            // -wgcdrop / -nowgcdrop: with -wgc, leave out the frames
+                                    // that only a move of the mouse pointer brought
+    bool wgcCursor = true;          // -wgccursor / -nowgccursor: with -wgc, the mouse pointer
+                                    // is in the picture
+    bool wgcOpen = true;            // -wgcopen / -nowgcopen: with -wgc, the frame pool on a
+                                    // device of its own, its textures opened by the present
+    int wgcScale = 0;               // -wgcscale <filter>: with -wgc, the filter the present
+                                    // scales a source display of another size with,
+                                    // WgcScaleNames()[wgcScale]; 0 bilinear
+    bool copyEngine = true;         // -nocopyengine: with -wgc, a frame shown as it is is
+                                    // copied by the copy engine and shown through the
+                                    // composition swapchain (CopyEngineTarget)
 };
+
+// -wgcscale's filters by number, bilinear (0) the default. The names are OBS's.
+inline const char* const* WgcScaleNames() {
+    static const char* const names[] = { "bilinear", "bicubic", "lanczos", NULL };
+    return names;
+}
 
 // Whitespace tokenizer shared by the command line and the console prompt, so both paths always
 // split options identically. Splits on spaces only.
@@ -127,6 +157,35 @@ inline const std::vector<UsageRow>& OptionRows() {
          false, false},
         {"-dejit", "", "Late-batch correction; on by default, and typed it refuses loudly when a "
                        "prerequisite is off", false, false},
+        {"-nodefercopy", "", "Copy every captured frame into the ring. By default, when frames "
+                             "arrive in pairs, the one that is dropped a moment later is not "
+                             "copied", false, false},
+        {"-defercopy", "", "Skipping that copy; on by default, accepted so a launch string that "
+                           "names it keeps working", false, false},
+        {"-wgc", "", "Capture through Windows (Windows.Graphics.Capture) in place of NvFBC, with "
+                     "b:vsync only; NvFBC stays when it cannot start", false, false},
+        {"-nowgcdrop", "", "With -wgc, keep the frames Windows sends when only the mouse pointer "
+                           "moved. By default they are left out, since each is a copy of the "
+                           "frame before it", false, false},
+        {"-wgcdrop", "", "Leaving those frames out; on by default, accepted so a launch string "
+                         "that names it keeps working", false, false},
+        {"-nowgccursor", "", "With -wgc, leave the mouse pointer out of the captured picture, "
+                             "as NvFBC does. By default it is in the picture", false, false},
+        {"-wgccursor", "", "The mouse pointer in the picture; on by default, accepted so a "
+                           "launch string that names it keeps working", false, false},
+        {"-nowgcopen", "", "With -wgc, keep Windows' frame pool on the device the relay shows "
+                           "its frames with. By default it is on a device of its own, which "
+                           "costs the game less", false, false},
+        {"-wgcopen", "", "The frame pool on a device of its own; on by default, accepted so a "
+                         "launch string that names it keeps working", false, false},
+        {"-wgcscale", "bilinear", "With -wgc, how a game display of another size than the "
+                                  "capture card's is scaled: bilinear (the default, as NvFBC "
+                                  "scales), bicubic or lanczos (sharper, and cost more)",
+         false, false},
+        {"-nocopyengine", "", "With -wgc, draw every frame onto the capture card display. By "
+                              "default a frame shown as it is is copied by a part of the "
+                              "graphics card the game does not use, which costs the game less",
+         false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -260,6 +319,16 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-nojoin")    { o->noJoin = true;    return 1; }
     if (t == "-dejit")     { o->dejitter = true;  o->dejitterRequested = true; return 1; }
     if (t == "-nodejit")   { o->dejitter = false; o->dejitterRequested = false; return 1; }
+    if (t == "-defercopy")   { o->deferCopy = true;  return 1; }
+    if (t == "-nodefercopy") { o->deferCopy = false; return 1; }
+    if (t == "-wgc")       { o->wgc = true;       return 1; }
+    if (t == "-wgcdrop")   { o->wgcDrop = true;   return 1; }
+    if (t == "-nowgcdrop") { o->wgcDrop = false;  return 1; }
+    if (t == "-wgccursor")   { o->wgcCursor = true;  return 1; }
+    if (t == "-nowgccursor") { o->wgcCursor = false; return 1; }
+    if (t == "-wgcopen")     { o->wgcOpen = true;    return 1; }
+    if (t == "-nowgcopen")   { o->wgcOpen = false;   return 1; }
+    if (t == "-nocopyengine") { o->copyEngine = false; return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -273,6 +342,16 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
             return 2;
         }
         return 1;
+    }
+    if (t == "-wgcscale" && i + 1 < tokens.size()) {
+        const std::string& v = tokens[i + 1];
+        int found = -1;
+        for (int k = 0; WgcScaleNames()[k]; k++) {
+            if (v == WgcScaleNames()[k]) found = k;
+        }
+        if (found >= 0) o->wgcScale = found;
+        else if (warning) *warning = "-wgcscale takes bilinear, bicubic or lanczos, not '" + v + "'";
+        return 2;
     }
     if (t == "-lag" && i + 1 < tokens.size()) {
         const long v = std::strtol(tokens[i + 1].c_str(), NULL, 10);
@@ -316,6 +395,16 @@ inline std::string ResolveDependencies(Options* o) {
     if (!reason) return std::string();
     o->dejitter = false;
     return std::string("Delivery-lateness correction off: -dejit needs ") + reason;
+}
+
+// The deferred ring copy leaves the first frame of a frame-generated pair uncopied, and the
+// phase instrument and the rotation vote both read every captured frame's pixels. With either
+// of those on it steps aside, and this returns the line to log.
+inline std::string ResolveDeferCopy(Options* o) {
+    if (!o->deferCopy || (!o->fgPhase && !o->phaseKeep)) return std::string();
+    o->deferCopy = false;
+    return std::string("Deferred ring copy off: ") + (o->fgPhase ? "-fgphase" : "-phasekeep") +
+           " reads every captured frame";
 }
 
 // What a command line names besides the options: the display pair and the capture mode, for a
@@ -414,6 +503,13 @@ inline std::string FormatOptions(const Options& o) {
         add(o.dejitter ? "-dejit" : "-nodejit");
     }
     if (o.extraLagMs != d.extraLagMs) add("-lag " + std::to_string(o.extraLagMs));
+    if (o.deferCopy != d.deferCopy) add(o.deferCopy ? "-defercopy" : "-nodefercopy");
+    if (o.wgc) add("-wgc");
+    if (o.wgcDrop != d.wgcDrop) add(o.wgcDrop ? "-wgcdrop" : "-nowgcdrop");
+    if (o.wgcCursor != d.wgcCursor) add(o.wgcCursor ? "-wgccursor" : "-nowgccursor");
+    if (o.wgcOpen != d.wgcOpen) add(o.wgcOpen ? "-wgcopen" : "-nowgcopen");
+    if (o.wgcScale != d.wgcScale) add(std::string("-wgcscale ") + WgcScaleNames()[o.wgcScale]);
+    if (!o.copyEngine) add("-nocopyengine");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");
@@ -633,7 +729,7 @@ inline PromptAnswer ParsePromptAnswer(const std::string& line) {
 
 // The startup line that records every resolved option, including those entered at the prompt,
 // which appear nowhere else. mktrace.py reads its "src rate hint <n> fps" and "extra lag <n> ms"
-// phrases, and relaylog.py echoes it as a header, so its wording and field order stay fixed.
+// phrases, and log readers echo it as a header, so its wording and field order stay fixed.
 inline std::string ResolvedOptionsLine(const Options& o, bool d3d11Present) {
     char mark[48];
     if (!o.mark) snprintf(mark, sizeof(mark), "off");

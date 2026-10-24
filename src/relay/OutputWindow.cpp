@@ -22,7 +22,7 @@ LRESULT CALLBACK RelayWindowProc(HWND window, UINT message, WPARAM wParam, LPARA
 }  // namespace
 
 MaybeFailure CreateOutputWindows(HINSTANCE instance, int showCommand, const DisplayInfo& target,
-                                 bool withHost, OutputWindows* out) {
+                                 bool withHost, bool noRedirection, OutputWindows* out) {
     WNDCLASSEXA windowClass = {};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.style = CS_HREDRAW | CS_VREDRAW;
@@ -34,7 +34,8 @@ MaybeFailure CreateOutputWindows(HINSTANCE instance, int showCommand, const Disp
         return WindowFailed("window class", GetLastError());
     }
 
-    out->output = CreateWindowExA(WS_EX_TOPMOST, kWindowClass, "NvFBCR", WS_POPUP,
+    const DWORD exStyle = WS_EX_TOPMOST | (noRedirection ? WS_EX_NOREDIRECTIONBITMAP : 0);
+    out->output = CreateWindowExA(exStyle, kWindowClass, "NvFBCR", WS_POPUP,
                                   target.rect.left, target.rect.top, target.Width(),
                                   target.Height(), NULL, NULL, instance, NULL);
     if (!out->output) {

@@ -33,11 +33,19 @@ MaybeFailure CreatePresentDevice(RelayContext* ctx, UINT adapter, UINT presentat
     // DWM with nowhere to convert, and the device is refused unless the format follows the mode.
     D3DFORMAT format = D3DFMT_A2R10G10B10;
 
+    // When the D3D11 swapchain owns the output window, this device sits on the hidden host and
+    // never presents. D3D9 cannot make a device without a back buffer, so it gets the smallest
+    // there is.
+    const bool idle = ctx->deviceWindow != ctx->outputWindow;
+
     // Whether the back buffer matches the mode of the adapter it is shown on decides between a
     // clean present and a converted one, so it is logged on every run rather than deduced.
     D3DDISPLAYMODEEX mode = {};
     mode.Size = sizeof(mode);
-    if (SUCCEEDED(ctx->d3d->GetAdapterDisplayModeEx(adapter, &mode, NULL))) {
+    if (idle) {
+        LOG("The D3D9 present device never presents in this mode (the D3D11 swapchain owns the "
+            "output window); its back buffer is 1x1");
+    } else if (SUCCEEDED(ctx->d3d->GetAdapterDisplayModeEx(adapter, &mode, NULL))) {
         if (ctx->flipEx) format = mode.Format;
         const bool matches = mode.Format == format && mode.Width == (UINT)ctx->width &&
                              mode.Height == (UINT)ctx->height;
@@ -53,7 +61,8 @@ MaybeFailure CreatePresentDevice(RelayContext* ctx, UINT adapter, UINT presentat
     }
 
     D3DPRESENT_PARAMETERS params = WindowedPresentParams(
-        ctx->deviceWindow, ctx->width, ctx->height, format, ctx->flipEx ? 2 : 1,
+        ctx->deviceWindow, idle ? 1 : ctx->width, idle ? 1 : ctx->height, format,
+        ctx->flipEx ? 2 : 1,
         ctx->flipEx ? D3DSWAPEFFECT_FLIPEX : D3DSWAPEFFECT_DISCARD, presentationInterval);
     // Multithreaded because the temporal modes call the device from the capture thread and the
     // present loop at once. Present statistics are only gathered when asked for at creation, and
