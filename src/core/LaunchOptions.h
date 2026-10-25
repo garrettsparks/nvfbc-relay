@@ -59,9 +59,6 @@ struct Options {
     bool copyEngine = true;         // -nocopyengine: with -wgc, a frame shown as it is is
                                     // copied by the copy engine and shown through the
                                     // composition swapchain (CopyEngineTarget)
-    bool ofDirect = false;          // -xofdirect: with o and -wgc, WGC's frames go to the
-                                    // optical flow engine as they are, without the luma
-                                    // conversion draw (an experiment, to be benched)
 };
 
 // -wgcscale's filters by number, bilinear (0) the default. The names are OBS's.
@@ -189,9 +186,6 @@ inline const std::vector<UsageRow>& OptionRows() {
                               "default a frame shown as it is is copied by a part of the "
                               "graphics card the game does not use, which costs the game less",
          false, false},
-        {"-xofdirect", "", "Experiment: with o and -wgc, hand Windows' frames to the optical "
-                           "flow engine as they are, without first drawing them as luma",
-         false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -226,8 +220,7 @@ inline const std::vector<UsageRow>& ModeRows() {
                            "as b:vsync", false, false},
         {"diag, diag:vsync", "", "Clock probes: DWM compose timing and the card's raster", false,
          false},
-        {"ofprobe, ofprobe:30, ofprobedraw:30, ofprobenowait:30, ofprobenowaitfwd:30, "
-         "ofprobedrawnowait:30, ofprobedrawonly:30, ofprobe12:30, ofprobe12fwd:30", "",
+        {"ofprobe, ofprobe:30", "",
          "Optical flow engine probe: capabilities, cost and accuracy, then an optional loop "
          "for a GPU trace", false, false},
     };
@@ -339,7 +332,6 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-wgcopen")     { o->wgcOpen = true;    return 1; }
     if (t == "-nowgcopen")   { o->wgcOpen = false;   return 1; }
     if (t == "-nocopyengine") { o->copyEngine = false; return 1; }
-    if (t == "-xofdirect")    { o->ofDirect = true;    return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -521,7 +513,6 @@ inline std::string FormatOptions(const Options& o) {
     if (o.wgcOpen != d.wgcOpen) add(o.wgcOpen ? "-wgcopen" : "-nowgcopen");
     if (o.wgcScale != d.wgcScale) add(std::string("-wgcscale ") + WgcScaleNames()[o.wgcScale]);
     if (!o.copyEngine) add("-nocopyengine");
-    if (o.ofDirect) add("-xofdirect");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");
@@ -544,18 +535,6 @@ inline std::string RelaunchArguments(int source, int target, const std::string& 
 
 enum class ModeKind { Invalid, Vsync, Temporal, Diag, Timer, FlowProbe };
 enum class Compositor { Nearest, Blend, Interp };
-// What the flow probe's sustained loop does each tick.
-struct ProbeLoop {
-    bool d3d12 = false;        // the engine's D3D12 interface; otherwise its D3D11 one
-    bool forwardOnly = false;  // the forward flow alone; otherwise both directions
-    bool draw = false;         // a full-screen draw on the flow's D3D11 context before it
-    bool query = true;         // D3D11: wait on an event query after each flow
-    bool flow = true;          // false: the draw alone, the control with no flow
-    bool operator==(const ProbeLoop& o) const {
-        return d3d12 == o.d3d12 && forwardOnly == o.forwardOnly && draw == o.draw &&
-               query == o.query && flow == o.flow;
-    }
-};
 
 // What a capture-mode string asks for. framerate is the rate a timer present runs at, and the
 // nominal 60 that sizes the bracketing lag on a vsync present.
@@ -566,7 +545,6 @@ struct ModeSpec {
     bool d3d11Present = false;   // the D3D11 flip-model swapchain rather than D3D9
     float framerate = 0.0f;
     int probeSeconds = 0;        // FlowProbe: the sustained loop's length; 0 = no loop
-    ProbeLoop probeLoop;         // FlowProbe: what the loop does
 };
 
 inline char LowerAscii(char c) {
@@ -582,9 +560,8 @@ inline bool EqualsNoCase(const std::string& a, const char* b) {
     return true;
 }
 
-// The optical flow probe's spellings: "ofprobe", and a loop of <seconds> as one of the heads in
-// the table below followed by ":<seconds>". The loop length is a whole number of seconds, 1 to
-// 3600.
+// The optical flow probe's spellings: "ofprobe", and "ofprobe:<seconds>" for its loop. The loop
+// length is a whole number of seconds, 1 to 3600.
 inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
     if (EqualsNoCase(modeStr, "ofprobe")) {
         s->kind = ModeKind::FlowProbe;
@@ -592,24 +569,7 @@ inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
     }
     const size_t colon = modeStr.find(':');
     if (colon == std::string::npos) return false;
-    const std::string head = modeStr.substr(0, colon);
-    // Columns: D3D12, forward only, draw, query, flow.
-    struct Spelling { const char* head; ProbeLoop loop; };
-    static const Spelling kSpellings[] = {
-        {"ofprobe", {false, false, false, true, true}},
-        {"ofprobedraw", {false, false, true, true, true}},
-        {"ofprobenowait", {false, false, false, false, true}},
-        {"ofprobenowaitfwd", {false, true, false, false, true}},
-        {"ofprobedrawnowait", {false, false, true, false, true}},
-        {"ofprobedrawonly", {false, false, true, false, false}},
-        {"ofprobe12", {true, false, false, false, true}},
-        {"ofprobe12fwd", {true, true, false, false, true}},
-    };
-    const Spelling* spelling = nullptr;
-    for (const Spelling& sp : kSpellings) {
-        if (EqualsNoCase(head, sp.head)) spelling = &sp;
-    }
-    if (!spelling) return false;
+    if (!EqualsNoCase(modeStr.substr(0, colon), "ofprobe")) return false;
     const std::string digits = modeStr.substr(colon + 1);
     if (digits.empty() || digits.size() > 4) return false;
     int seconds = 0;
@@ -620,7 +580,6 @@ inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
     if (seconds < 1 || seconds > 3600) return false;
     s->kind = ModeKind::FlowProbe;
     s->probeSeconds = seconds;
-    s->probeLoop = spelling->loop;
     return true;
 }
 

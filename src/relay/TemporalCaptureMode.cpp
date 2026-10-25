@@ -17,7 +17,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
                                          bool fgPhase, bool phaseKeep, unsigned int extraLagMs,
                                          bool d3d11Present, bool deferCopy, bool wgc,
                                          bool wgcDrop, bool wgcCursor, bool wgcOpen, int wgcScale,
-                                         bool wgcCopyEngine, bool flowDirect)
+                                         bool wgcCopyEngine)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_present(NULL)
@@ -53,8 +53,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     // Setup fills in before either reads it. Nothing touches a device here: the paths create
     // their resources in Setup, after the ring has started.
     if (d3d11Present) {
-        m_present =
-            new D3D11PresentBackend(tint, compositor == kCompositorInterp, flowDirect);
+        m_present = new D3D11PresentBackend(tint, compositor == kCompositorInterp);
     } else {
         IFrameCompositor* c;
         if (compositor == kCompositorBlend) {

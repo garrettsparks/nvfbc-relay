@@ -1,5 +1,4 @@
 #include "FlowProbeMode.h"
-#include "FlowProbeLoops.h"
 #include "FlowWarpShader.h"
 #include "OutputWindow.h"
 #include <SimpleLogger.h>
@@ -388,67 +387,11 @@ bool WaitIdle(Device& d, ID3D11Query* event) {
     return true;
 }
 
-using flowprobe::Percentile;
-
-// A full-screen draw of a constant colour: the loop's positive control.
-struct Draw {
-    Tex target;
-    ID3D11VertexShader* vs = NULL;
-    ID3D11PixelShader* ps = NULL;
-    ~Draw() {
-        if (ps) ps->Release();
-        if (vs) vs->Release();
-    }
-};
-
-bool MakeDraw(Device& d, Draw* draw) {
-    static const char* kVs =
-        "void main(uint id : SV_VertexID, out float4 pos : SV_Position) {\n"
-        "    float2 uv = float2((id << 1) & 2, id & 2);\n"
-        "    pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);\n"
-        "}\n";
-    static const char* kPs = "float4 main() : SV_Target { return float4(0.2, 0.4, 0.6, 1.0); }\n";
-    ID3DBlob* blob = NULL;
-    if (FAILED(D3DCompile(kVs, strlen(kVs), "ProbeVS", NULL, NULL, "main", "vs_5_0", 0, 0, &blob,
-                          NULL))) {
-        return false;
-    }
-    HRESULT hr = d.dev->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), NULL,
-                                           &draw->vs);
-    blob->Release();
-    if (FAILED(hr)) return false;
-    if (FAILED(D3DCompile(kPs, strlen(kPs), "ProbePS", NULL, NULL, "main", "ps_5_0", 0, 0, &blob,
-                          NULL))) {
-        return false;
-    }
-    hr = d.dev->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), NULL, &draw->ps);
-    blob->Release();
-    if (FAILED(hr)) return false;
-    D3D11_TEXTURE2D_DESC td = {};
-    td.Width = kWidth;
-    td.Height = kHeight;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_RENDER_TARGET;
-    if (FAILED(d.dev->CreateTexture2D(&td, NULL, &draw->target.tex))) return false;
-    return SUCCEEDED(d.dev->CreateRenderTargetView(draw->target.tex, NULL, &draw->target.rtv));
-}
-
-void RunDraw(Device& d, Draw& draw) {
-    D3D11_VIEWPORT vp = {};
-    vp.Width = (FLOAT)kWidth;
-    vp.Height = (FLOAT)kHeight;
-    vp.MaxDepth = 1.0f;
-    d.ctx->OMSetRenderTargets(1, &draw.target.rtv, NULL);
-    d.ctx->RSSetViewports(1, &vp);
-    d.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    d.ctx->IASetInputLayout(NULL);
-    d.ctx->VSSetShader(draw.vs, NULL, 0);
-    d.ctx->PSSetShader(draw.ps, NULL, 0);
-    d.ctx->Draw(3, 0);
+double Percentile(std::vector<double> v, double q) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    const size_t i = (size_t)std::min((double)(v.size() - 1), q * (double)(v.size() - 1) + 0.5);
+    return v[i];
 }
 
 // ---------------------------------------------------------------------------------
@@ -836,18 +779,13 @@ void WarpSelfTest(NV_OF_D3D11_API_FUNCTION_LIST& of, Device& d) {
 
 }  // namespace
 
-FlowProbeMode::FlowProbeMode(int loopSeconds, launch::ProbeLoop loop)
-    : m_loopSeconds(loopSeconds), m_loop(loop) {}
+FlowProbeMode::FlowProbeMode(int loopSeconds) : m_loopSeconds(loopSeconds) {}
 
 UINT FlowProbeMode::GetPresentationInterval() const { return D3DPRESENT_INTERVAL_IMMEDIATE; }
 
 MaybeFailure FlowProbeMode::Setup(const RelayContext& /*ctx*/) { return std::nullopt; }
 
-// The loop's own line in the log says what each tick does.
-const char* FlowProbeMode::GetModeName() const {
-    if (m_loop.d3d12) return "Optical flow engine probe, D3D12 interface";
-    return "Optical flow engine probe";
-}
+const char* FlowProbeMode::GetModeName() const { return "Optical flow engine probe"; }
 
 MaybeFailure FlowProbeMode::Run(RelayContext& /*ctx*/,
                                 NVFBC_TODX9VID_GRAB_FRAME_PARAMS* /*grabParams*/) {
@@ -903,24 +841,6 @@ MaybeFailure FlowProbeMode::Run(RelayContext& /*ctx*/,
     }
     if (flowFormat == DXGI_FORMAT_UNKNOWN) flowFormat = DXGI_FORMAT_R16G16_SINT;
     if (costFormat == DXGI_FORMAT_UNKNOWN) costFormat = DXGI_FORMAT_R8_UINT;
-
-    // The D3D12 loop runs on a device of its own, on the same frames as luma.
-    if (m_loop.d3d12) {
-        const std::vector<float> pattern = Pattern();
-        flowprobe::LoopFrames frames;
-        frames.width = kWidth;
-        frames.height = kHeight;
-        frames.moveX = kMoveX;
-        frames.moveY = kMoveY;
-        frames.before = FrameBytes(pattern, 0, 0, 1);
-        frames.after = FrameBytes(pattern, kMoveX, kMoveY, 1);
-        IDXGIAdapter* loopAdapter = PickAdapter();
-        flowprobe::RunLoopD3D12(loopAdapter, frames, m_loopSeconds, kLoopRate,
-                                m_loop.forwardOnly);
-        if (loopAdapter) loopAdapter->Release();
-        LOG("ofprobe: done");
-        return std::nullopt;
-    }
 
     // The looping spellings go straight to the loop, so a trace taken a fixed time into a
     // benchmark finds the loop and not the sweep; the plain spelling does the sweep alone.
@@ -990,7 +910,6 @@ MaybeFailure FlowProbeMode::Run(RelayContext& /*ctx*/,
                            NV_OF_PERF_LEVEL_MEDIUM, true, true});
     }
 
-    bool bgraWorks = false;
     for (const Config& cfg : configs) {
         if (!PumpMessages()) {
             LOG("ofprobe: the output window closed; stopping");
@@ -1062,9 +981,6 @@ MaybeFailure FlowProbeMode::Run(RelayContext& /*ctx*/,
                 bwdRead ? bx : 0.0f, bwdRead ? by : 0.0f, bwdRead ? 100.0f * bRight : 0.0f,
                 bwdRead ? "" : " (unread)");
         }
-        if (cfg.inputDxgi == DXGI_FORMAT_B8G8R8A8_UNORM && fwdRead && fRight > 0.9f) {
-            bgraWorks = true;
-        }
     }
 
     if (m_loopSeconds <= 0) {
@@ -1072,41 +988,18 @@ MaybeFailure FlowProbeMode::Run(RelayContext& /*ctx*/,
         return std::nullopt;
     }
 
-    // P2: the compositor's likely configuration at 60 flows a second for the trace, on BGRA
-    // frames registered as ABGR8 when that worked above, on luma otherwise.
-    Config loop = {NV_OF_BUFFER_FORMAT_GRAYSCALE8, DXGI_FORMAT_R8_UNORM, 4, NV_OF_PERF_LEVEL_MEDIUM,
-                   !m_loop.forwardOnly, true};
-    Tex* a = &lumaA;
-    Tex* b = &lumaB;
-    if (bgraWorks) {
-        loop.input = NV_OF_BUFFER_FORMAT_ABGR8;
-        loop.inputDxgi = DXGI_FORMAT_B8G8R8A8_UNORM;
-        a = &bgraA;
-        b = &bgraB;
-    }
+    // P2: the compositor's configuration at 60 flows a second for the trace, on luma as the
+    // compositor hands it over, and nothing waiting for the end, as the compositor does not.
+    const Config loop = {NV_OF_BUFFER_FORMAT_GRAYSCALE8, DXGI_FORMAT_R8_UNORM, 4,
+                         NV_OF_PERF_LEVEL_MEDIUM, true, true};
     Session s;
-    if (!OpenSession(of, d, loop, a->tex, b->tex, flowFormat, costFormat, &s, "loop")) {
+    if (!OpenSession(of, d, loop, lumaA.tex, lumaB.tex, flowFormat, costFormat, &s, "loop")) {
         LOG("ofprobe: done");
         return std::nullopt;
     }
-    Draw draw;
-    if (m_loop.draw && !MakeDraw(d, &draw)) {
-        LOG("ofprobe: RESULT the control draw could not be set up; no loop");
-        LOG("ofprobe: done");
-        return std::nullopt;
-    }
-    if (!m_loop.flow) {
-        LOG("ofprobe: loop: %d s at %d draws a second, the draw alone, flushed, no flow",
-            m_loopSeconds, kLoopRate);
-    } else {
-        LOG("ofprobe: loop: %d s at %d flows a second, %s input, grid 4 MEDIUM %s, cost on%s%s",
-            m_loopSeconds, kLoopRate, bgraWorks ? "BGRA8 as ABGR8" : "R8 as GRAYSCALE8",
-            m_loop.forwardOnly ? "forward only" : "both ways",
-            m_loop.draw ? ", one full-screen draw before each flow" : "",
-            m_loop.query ? ""
-                         : ", no completion query (times are the execute's return, not the "
-                           "flow's end)");
-    }
+    LOG("ofprobe: loop: %d s at %d flows a second, R8 as GRAYSCALE8 input, grid 4 MEDIUM both "
+        "ways, cost on, no completion query (times are the execute's return, not the flow's end)",
+        m_loopSeconds, kLoopRate);
     LARGE_INTEGER start;
     QueryPerformanceCounter(&start);
     const LONGLONG period = freq.QuadPart / kLoopRate;
@@ -1124,21 +1017,18 @@ MaybeFailure FlowProbeMode::Run(RelayContext& /*ctx*/,
                 else YieldProcessor();
                 QueryPerformanceCounter(&now);
             }
-            if (m_loop.draw) RunDraw(d, draw);
             LARGE_INTEGER c0, c1;
             QueryPerformanceCounter(&c0);
-            if (!m_loop.flow) {
-                d.ctx->Flush();
-            } else if (!Execute(s, true) || (m_loop.query && !WaitIdle(d, event))) {
-                LOG("ofprobe: loop: an execute failed or did not finish; stopping");
+            if (!Execute(s, true)) {
+                LOG("ofprobe: loop: an execute failed; stopping");
                 LOG("ofprobe: done");
                 return std::nullopt;
             }
             QueryPerformanceCounter(&c1);
             second.push_back(1000.0 * (double)(c1.QuadPart - c0.QuadPart) / (double)freq.QuadPart);
         }
-        LOG("ofprobe: loop second %d: %d %s, to done p50 %.2f max %.2f ms", sec + 1, kLoopRate,
-            m_loop.flow ? "flows" : "draws", Percentile(second, 0.5), Percentile(second, 1.0));
+        LOG("ofprobe: loop second %d: %d flows, returned p50 %.2f max %.2f ms", sec + 1,
+            kLoopRate, Percentile(second, 0.5), Percentile(second, 1.0));
         if (!PumpMessages()) {
             LOG("ofprobe: the output window closed; stopping");
             break;

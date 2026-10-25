@@ -121,7 +121,7 @@ UINT OutputBitsPerColor(IDXGIAdapter* adapter, HWND hwnd) {
 
 }  // namespace
 
-D3D11PresentBackend::D3D11PresentBackend(bool tint, bool interp, bool flowDirect)
+D3D11PresentBackend::D3D11PresentBackend(bool tint, bool interp)
     : m_enabled(false)
     , m_width(0), m_height(0), m_ringSlots(0)
     , m_cfg(NULL), m_tintRequested(tint)
@@ -136,7 +136,6 @@ D3D11PresentBackend::D3D11PresentBackend(bool tint, bool interp, bool flowDirect
     , m_consecutiveWaitTimeouts(0), m_lastPresentHr(S_OK), m_presents(0)
 {
     m_interp = interp;
-    m_flowDirect = flowDirect;
     for (int i = 0; i < CaptureRing::RING_SIZE; i++) {
         m_ringAlias[i] = NULL;
         m_ringSrv[i] = NULL;
@@ -186,11 +185,8 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
     // Only WGC's frames can be another size than the output.
     if (m_wgc && !SetupScaling(ring->WgcScale(), width, height)) return false;
     if (m_interp) {
-        if (m_flowDirect && !m_wgc) {
-            LOG("-xofdirect ignored: it hands WGC's frames to the flow engine, and -wgc is off");
-        }
         m_flow = new OpticalFlowWarp();
-        if (!m_flow->Setup(m_dev, m_ctx, width, height, m_flowDirect && m_wgc)) {
+        if (!m_flow->Setup(m_dev, m_ctx, width, height)) {
             m_flowFailed = true;
             return false;
         }
@@ -783,7 +779,6 @@ OpticalFlowWarp::Frame D3D11PresentBackend::FlowFrame(int slot, int64_t ts) {
     OpticalFlowWarp::Frame f;
     f.ts = ts;
     f.srv = SourceFor(slot);
-    f.texture = (m_flowDirect && m_ring) ? m_ring->WgcTexture(slot) : NULL;
     return f;
 }
 

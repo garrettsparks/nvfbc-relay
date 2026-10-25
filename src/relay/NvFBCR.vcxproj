@@ -116,8 +116,6 @@
     <ClCompile Include="EtwConsumer.cpp" />
     <ClCompile Include="Failure.cpp" />
     <ClCompile Include="FlipDecode.cpp" />
-    <ClCompile Include="FlowProbeD3D12.cpp" />
-    <ClCompile Include="FlowProbeLoops.cpp" />
     <ClCompile Include="FlowProbeMode.cpp" />
     <ClCompile Include="FrameCompositors.cpp" />
     <ClCompile Include="FrameMarker.cpp" />
@@ -151,7 +149,6 @@
     <ClInclude Include="EtwConsumer.h" />
     <ClInclude Include="Failure.h" />
     <ClInclude Include="FlipDecode.h" />
-    <ClInclude Include="FlowProbeLoops.h" />
     <ClInclude Include="FlowProbeMode.h" />
     <ClInclude Include="FrameCompositors.h" />
     <ClInclude Include="FrameMarker.h" />

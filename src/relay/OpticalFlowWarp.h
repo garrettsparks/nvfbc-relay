@@ -4,8 +4,6 @@
 #include <d3d11.h>
 
 #include <cstdint>
-#include <utility>
-#include <vector>
 
 #include "FlowPlan.h"
 #include "nvof/nvOpticalFlowCommon.h"
@@ -23,9 +21,9 @@
 //
 // Each frame reaches the engine as 8-bit luma at the output's size, drawn from the frame the
 // present samples (an NvFBC ring slot or a WGC texture, of the output's size or not), once per
-// frame and kept for the pair after. With direct input (-xofdirect, an experiment) a WGC texture
-// at the output's size goes to the engine as it is, registered as ABGR8; a frame that is not one
-// has no flow and its present draws the blend.
+// frame and kept for the pair after. One path for every capture: handing WGC's frames over as
+// they are measured no cheaper for the game (sittings ofcap2, ofpts2) and had no input for the
+// frames NvFBC captured before WGC took over.
 //
 // The flow fields live in policy::kFlowSlots cache slots, one forward and one backward field and
 // their costs each, numbered as the FlowPlanner numbers them.
@@ -35,7 +33,6 @@ public:
     struct Frame {
         int64_t ts = 0;                          // capture stamp, the frame's identity
         ID3D11ShaderResourceView* srv = NULL;    // the colour the luma draw and the warp sample
-        ID3D11Texture2D* texture = NULL;         // direct input: the WGC texture, else NULL
     };
 
     OpticalFlowWarp() = default;
@@ -44,7 +41,7 @@ public:
     OpticalFlowWarp& operator=(const OpticalFlowWarp&) = delete;
 
     // Opens the engine on dev/ctx at the output's size and readies the shaders. Loud on failure.
-    bool Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int width, int height, bool direct);
+    bool Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int width, int height);
 
     // Hands the flow of before to after into cache slot `slot` to the engine. hints: the slot's
     // previous flow was the pair just before this one. False when it could not be handed over
@@ -81,14 +78,11 @@ private:
 
     bool MakeField(DXGI_FORMAT format, bool view, Field* out);
     bool CompileShaders();
-    // The engine's input for a frame: its luma, drawn now if not kept, or with direct input the
-    // frame's own registered texture. NULL when it has none.
+    // The engine's input for a frame: its luma, drawn now if not kept. NULL when it has none.
     NvOFGPUBufferHandle InputFor(const Frame& frame, int64_t keep);
     bool DrawLuma(const Frame& frame, Luma* into);
-    NvOFGPUBufferHandle Registered(ID3D11Texture2D* texture);
 
     bool m_ready = false;
-    bool m_direct = false;
     int m_width = 0, m_height = 0;
     int m_cellsX = 0, m_cellsY = 0;
     ID3D11Device* m_dev = NULL;            // borrowed from the present
@@ -98,7 +92,6 @@ private:
     NvOFHandle m_session = NULL;
     Slot m_slots[policy::kFlowSlots];
     Luma m_luma[kLumaSlots];
-    std::vector<std::pair<ID3D11Texture2D*, NvOFGPUBufferHandle>> m_registered;
 
     ID3D11VertexShader* m_vs = NULL;
     ID3D11PixelShader* m_lumaPs = NULL;
@@ -111,7 +104,6 @@ private:
     long long m_flows = 0;
     long long m_flowFailures = 0;
     long long m_lumaDraws = 0;
-    long long m_noDirectInput = 0;
     long long m_warps = 0;
     double m_submitMsTotal = 0.0;
     double m_submitMsMax = 0.0;

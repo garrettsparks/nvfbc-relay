@@ -445,6 +445,11 @@ Each row reads `fl=` and `sx=` censuses from the log and the summary lines of 4.
    lost 12.7 ms/s more than with the blend under `-wgc` (91.3 against 78.6) and 10.8 more on
    NvFBC (102.7 against 91.9), about 0.4 ms per synthesized present. Points at a 90 fps source
    that is also GPU-bound are not measured (the game's 90 is a cap).
+   **Trimmed after `d1856fd`:** `-xofdirect` removed (no measured gain, blends for want of a
+   flow); the probe keeps `ofprobe` and `ofprobe:<s>` (now without the completion query, as the
+   compositor runs); the D3D12 loop, its header and the loop variants were removed (the user,
+   2026-10-24: "we can restore it later if we need more experimentation"), and `d1856fd` holds
+   them.
 4. The GPU self-test (6.3); the frame dump and the quality harness (6.4).
 5. The live rows (6.5), then a stream.
 

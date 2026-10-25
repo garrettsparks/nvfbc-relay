@@ -54,7 +54,7 @@ IFrameCaptureMode* CreateCaptureMode(const std::string& modeText, const launch::
     case launch::ModeKind::Diag:
         return new DiagCaptureMode(spec.vsyncPresent);
     case launch::ModeKind::FlowProbe:
-        return new FlowProbeMode(spec.probeSeconds, spec.probeLoop);
+        return new FlowProbeMode(spec.probeSeconds);
     case launch::ModeKind::Timer:
         return new TimerCaptureMode(spec.framerate);
     case launch::ModeKind::Invalid:
@@ -69,7 +69,7 @@ IFrameCaptureMode* CreateCaptureMode(const std::string& modeText, const launch::
                                    compositor, o.mark, o.markFrames, o.tint, o.etw, o.noJoin,
                                    o.dejitter, o.fgPhase, o.phaseKeep, o.extraLagMs,
                                    spec.d3d11Present, o.deferCopy, o.wgc, o.wgcDrop,
-                                   o.wgcCursor, o.wgcOpen, o.wgcScale, o.copyEngine, o.ofDirect);
+                                   o.wgcCursor, o.wgcOpen, o.wgcScale, o.copyEngine);
 }
 
 // Takes the named lock that keeps a second relay from starting. Two relays cannot share NvFBC,

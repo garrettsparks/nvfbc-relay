@@ -4976,7 +4976,7 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs &&
            a.deferCopy == b.deferCopy && a.wgc == b.wgc && a.wgcDrop == b.wgcDrop &&
            a.wgcCursor == b.wgcCursor && a.wgcOpen == b.wgcOpen && a.wgcScale == b.wgcScale &&
-           a.copyEngine == b.copyEngine && a.ofDirect == b.ofDirect;
+           a.copyEngine == b.copyEngine;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
@@ -5069,17 +5069,6 @@ static void test_launch_option_parsing() {
         const std::vector<std::string> on = {"-copyengine"};
         CHECK(launch::ApplyOption(on, 0, &x, &w) == 0,
               "-copyengine must be unknown: the copy engine is on unless turned off");
-    }
-    // -xofdirect, the experiment, is off by default and sets only its own field.
-    {
-        launch::Options x;
-        std::string w;
-        CHECK(!x.ofDirect, "-xofdirect must default off");
-        const std::vector<std::string> t = {"-xofdirect"};
-        CHECK(launch::ApplyOption(t, 0, &x, &w) == 1 && x.ofDirect && w.empty(),
-              "-xofdirect must set its field and consume one token");
-        x.ofDirect = false;
-        CHECK(SameOptions(x, launch::Options()), "-xofdirect must change nothing else");
     }
     CHECK(warnings.empty() && unknown.empty(), "the opt-outs must parse clean");
 
@@ -5312,33 +5301,23 @@ static void test_launch_mode_parsing() {
     }
 
     // The optical flow probe: no loop, then each loop by its spelling; seconds 1 to 3600.
-    // Loop columns: D3D12, forward only, draw, query, flow.
-    using launch::ProbeLoop;
-    struct Probe { const char* text; int seconds; ProbeLoop loop; };
+    // The optical flow probe: no loop, or a loop of 1 to 3600 seconds. The experiments' spellings
+    // are gone and refused.
+    struct Probe { const char* text; int seconds; };
     const Probe probes[] = {
-        {"ofprobe", 0, {false, false, false, true, true}},
-        {"OFPROBE", 0, {false, false, false, true, true}},
-        {"ofprobe:30", 30, {false, false, false, true, true}},
-        {"ofprobedraw:30", 30, {false, false, true, true, true}},
-        {"ofprobenowait:30", 30, {false, false, false, false, true}},
-        {"ofprobenowaitfwd:30", 30, {false, true, false, false, true}},
-        {"ofprobedrawnowait:30", 30, {false, false, true, false, true}},
-        {"OFPROBEDRAWONLY:30", 30, {false, false, true, false, false}},
-        {"ofprobe12:30", 30, {true, false, false, false, true}},
-        {"ofprobe12fwd:30", 30, {true, true, false, false, true}},
-        {"ofprobe:3600", 3600, {false, false, false, true, true}},
+        {"ofprobe", 0},
+        {"OFPROBE", 0},
+        {"ofprobe:30", 30},
+        {"ofprobe:3600", 3600},
     };
     for (const Probe& p : probes) {
         const launch::ModeSpec s = launch::ParseMode(p.text);
-        const ProbeLoop& l = s.probeLoop;
-        CHECK(s.kind == ModeKind::FlowProbe && s.probeSeconds == p.seconds && l == p.loop,
-              "mode '%s' parsed as kind %d seconds %d d3d12 %d forward %d draw %d query %d "
-              "flow %d", p.text, (int)s.kind, s.probeSeconds, (int)l.d3d12, (int)l.forwardOnly,
-              (int)l.draw, (int)l.query, (int)l.flow);
+        CHECK(s.kind == ModeKind::FlowProbe && s.probeSeconds == p.seconds,
+              "mode '%s' parsed as kind %d seconds %d", p.text, (int)s.kind, s.probeSeconds);
     }
-    for (const char* bad : {"ofprobe:", "ofprobe:0", "ofprobe:3601", "ofprobe:1.5", "ofprobedraw",
-                            "ofprobenowait", "ofprobe12", "ofprobe12fwd", "ofprobedrawonly",
-                            "ofprobecuda:30", "ofprobe13:30", "ofprobe:-5", "ofprobex:30"}) {
+    for (const char* bad : {"ofprobe:", "ofprobe:0", "ofprobe:3601", "ofprobe:1.5",
+                            "ofprobedraw:30", "ofprobenowait:30", "ofprobe12:30",
+                            "ofprobedrawonly:30", "ofprobecuda:30", "ofprobe:-5", "ofprobex:30"}) {
         CHECK(launch::ParseMode(bad).kind == ModeKind::Invalid, "mode '%s' must be refused", bad);
     }
 }
@@ -5514,8 +5493,6 @@ static void test_launch_relaunch_round_trip() {
         "-wgc -wgcscale bilinear -lag 60",
         "-wgc -nocopyengine",
         "-wgc -nocopyengine -wgcscale lanczos -src 60",
-        "-wgc -xofdirect",
-        "-wgc -xofdirect -src 90 -mark 5400",
     };
     for (const char* text : launches) {
         launch::Options typed = ParseOptionString(text, nullptr, nullptr);

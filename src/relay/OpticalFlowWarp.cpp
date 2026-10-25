@@ -62,7 +62,6 @@ OpticalFlowWarp::~OpticalFlowWarp() {
         for (Luma& l : m_luma) {
             if (l.handle) m_of.nvOFUnregisterResourceD3D11(l.handle);
         }
-        for (const auto& r : m_registered) m_of.nvOFUnregisterResourceD3D11(r.second);
         m_of.nvOFDestroy(m_session);
     }
     for (Slot& s : m_slots) {
@@ -83,13 +82,11 @@ OpticalFlowWarp::~OpticalFlowWarp() {
     if (m_vs) m_vs->Release();
 }
 
-bool OpticalFlowWarp::Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int width, int height,
-                            bool direct) {
+bool OpticalFlowWarp::Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int width, int height) {
     m_dev = dev;
     m_ctx = ctx;
     m_width = width;
     m_height = height;
-    m_direct = direct;
     m_cellsX = (width + kGrid - 1) / kGrid;
     m_cellsY = (height + kGrid - 1) / kGrid;
 
@@ -115,7 +112,7 @@ bool OpticalFlowWarp::Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int wid
     init.perfLevel = NV_OF_PERF_LEVEL_MEDIUM;
     init.enableOutputCost = NV_OF_TRUE;
     init.predDirection = NV_OF_PRED_DIRECTION_BOTH;
-    init.inputBufferFormat = direct ? NV_OF_BUFFER_FORMAT_ABGR8 : NV_OF_BUFFER_FORMAT_GRAYSCALE8;
+    init.inputBufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
     st = m_of.nvOFInit(m_session, &init);
     if (st != NV_OF_SUCCESS) {
         LOGERR("OpticalFlowWarp: the engine refused %dx%d grid 4 MEDIUM both ways (status %d)",
@@ -131,34 +128,32 @@ bool OpticalFlowWarp::Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int wid
             return false;
         }
     }
-    if (!direct) {
-        for (Luma& l : m_luma) {
-            D3D11_TEXTURE2D_DESC td = {};
-            td.Width = (UINT)width;
-            td.Height = (UINT)height;
-            td.MipLevels = 1;
-            td.ArraySize = 1;
-            td.Format = DXGI_FORMAT_R8_UNORM;
-            td.SampleDesc.Count = 1;
-            td.Usage = D3D11_USAGE_DEFAULT;
-            td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            if (FAILED(dev->CreateTexture2D(&td, NULL, &l.texture)) ||
-                FAILED(dev->CreateRenderTargetView(l.texture, NULL, &l.rtv))) {
-                LOGERR("OpticalFlowWarp: a luma frame could not be created");
-                return false;
-            }
-            st = m_of.nvOFRegisterResourceD3D11(m_session, l.texture, &l.handle);
-            if (st != NV_OF_SUCCESS) {
-                LOGERR("OpticalFlowWarp: a luma frame was not registered (status %d)", (int)st);
-                return false;
-            }
+    for (Luma& l : m_luma) {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = (UINT)width;
+        td.Height = (UINT)height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(dev->CreateTexture2D(&td, NULL, &l.texture)) ||
+            FAILED(dev->CreateRenderTargetView(l.texture, NULL, &l.rtv))) {
+            LOGERR("OpticalFlowWarp: a luma frame could not be created");
+            return false;
+        }
+        st = m_of.nvOFRegisterResourceD3D11(m_session, l.texture, &l.handle);
+        if (st != NV_OF_SUCCESS) {
+            LOGERR("OpticalFlowWarp: a luma frame was not registered (status %d)", (int)st);
+            return false;
         }
     }
     if (!CompileShaders()) return false;
     m_ready = true;
     LOG("OpticalFlowWarp: optical flow engine on the present's device, %dx%d, grid 4 MEDIUM, "
-        "both ways, cost on, %d flow slots, input %s", width, height, policy::kFlowSlots,
-        direct ? "WGC frames as they are (ABGR8, -xofdirect)" : "luma drawn from each frame");
+        "both ways, cost on, %d flow slots, input luma drawn from each frame", width, height,
+        policy::kFlowSlots);
     return true;
 }
 
@@ -247,32 +242,7 @@ bool OpticalFlowWarp::DrawLuma(const Frame& frame, Luma* into) {
     return true;
 }
 
-NvOFGPUBufferHandle OpticalFlowWarp::Registered(ID3D11Texture2D* texture) {
-    for (const auto& r : m_registered) {
-        if (r.first == texture) return r.second;
-    }
-    NvOFGPUBufferHandle handle = NULL;
-    const NV_OF_STATUS st = m_of.nvOFRegisterResourceD3D11(m_session, texture, &handle);
-    if (st != NV_OF_SUCCESS) {
-        LOGERR("OpticalFlowWarp: a WGC texture was not registered as engine input (status %d)",
-               (int)st);
-        return NULL;
-    }
-    m_registered.push_back(std::make_pair(texture, handle));
-    LOG("OpticalFlowWarp: registered WGC texture %zu as engine input", m_registered.size());
-    return handle;
-}
-
 NvOFGPUBufferHandle OpticalFlowWarp::InputFor(const Frame& frame, int64_t keep) {
-    if (m_direct) {
-        D3D11_TEXTURE2D_DESC d = {};
-        if (frame.texture) frame.texture->GetDesc(&d);
-        if (!frame.texture || (int)d.Width != m_width || (int)d.Height != m_height) {
-            m_noDirectInput++;
-            return NULL;
-        }
-        return Registered(frame.texture);
-    }
     Luma* use = NULL;
     for (Luma& l : m_luma) {
         if (l.valid && l.ts == frame.ts) use = &l;
@@ -372,8 +342,4 @@ void OpticalFlowWarp::LogSummary() const {
         "%.3f max), %lld refused or without input, %lld luma draws, %lld warps drawn",
         m_flows, m_flows ? m_submitMsTotal / (double)m_flows : 0.0, m_submitMsMax,
         m_flowFailures, m_lumaDraws, m_warps);
-    if (m_direct) {
-        LOG("optical flow summary (-xofdirect): %zu WGC textures registered, %lld frames had no "
-            "WGC texture at the output's size", m_registered.size(), m_noDirectInput);
-    }
 }

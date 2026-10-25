@@ -70,9 +70,8 @@ class CopyEngineTarget;
 class D3D11PresentBackend : public IPresentPath {
 public:
     // tint is accepted so the mode string's options parse the same on either path; this
-    // path has no tint pass and says so at Setup. interp selects the optical flow; flowDirect
-    // (-xofdirect) hands WGC's frames to its engine as they are.
-    D3D11PresentBackend(bool tint, bool interp, bool flowDirect);
+    // path has no tint pass and says so at Setup. interp selects the optical flow.
+    D3D11PresentBackend(bool tint, bool interp);
     ~D3D11PresentBackend();
 
     D3D11PresentBackend(const D3D11PresentBackend&) = delete;
@@ -162,7 +161,7 @@ private:
     bool DrawMarker(const bool cells[FrameMarker::kCells]);
     void SampleStats();
     void SamplePresentationPath();
-    // The optical flow's view of a ring slot: its stamp, the view to sample, its WGC texture.
+    // The optical flow's view of a ring slot: its stamp and the view to sample.
     OpticalFlowWarp::Frame FlowFrame(int slot, int64_t ts);
     // Plans the flows of the brackets PlanAhead kept, by the decision each would get.
     void PlanFlows();
@@ -257,8 +256,7 @@ private:
 
     // The optical flow (o): NULL on the blend pipeline.
     bool m_interp = false;
-    bool m_flowDirect = false;
-    bool m_flowFailed = false;          // the flow engine could not be set up
+    bool m_flowFailed = false;         // the flow engine could not be set up
     OpticalFlowWarp* m_flow = NULL;
     policy::FlowPlanner m_planner;
     // What each cache slot holds beyond the planner's pair: the ring slots its frames were in
