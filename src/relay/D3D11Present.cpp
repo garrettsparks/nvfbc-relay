@@ -673,8 +673,18 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome*
     out->synthesized = false;
     out->opWeight = 0.0;
     out->synthUs = -1;
+    out->synthAge = -1;
     out->synthExec = NULL;
     out->pixelExec = 0;
+    // pt= and pta=: the GPU time of an earlier warp, read now that the GPU has it.
+    if (m_flow) {
+        long long us = 0;
+        int ago = 0;
+        if (m_flow->TakeWarpTime(m_presents, &us, &ago)) {
+            out->synthUs = us;
+            out->synthAge = ago;
+        }
+    }
 
     int slotA = -1, slotB = -1;
     float w = 0.0f;
@@ -740,7 +750,7 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome*
                policy::SamePair(m_planned[m_lastFlowSlot].pair, m_lastFlowPair)) {
         // A hold of a warp draws the same warp again, from the flow it was drawn with.
         flowSlot = m_lastFlowSlot;
-        drawn = m_flow->Warp(flowSlot, SourceFor(slotA), SourceFor(slotB), w, m_rtv);
+        drawn = m_flow->Warp(flowSlot, SourceFor(slotA), SourceFor(slotB), w, m_rtv, m_presents);
     } else {
         // A held warp whose flow is gone is held as the lerp of the same pair.
         if (exec == kExecWarp) exec = kExecBlend;
@@ -849,7 +859,7 @@ bool D3D11PresentBackend::DrawSynthesis(const FrameBracket& bracket, float w, in
         }
     }
     if (ready && m_flow->Warp(slot, SourceFor(bracket.beforeSlot), SourceFor(bracket.afterSlot),
-                              w, m_rtv)) {
+                              w, m_rtv, m_presents)) {
         (*counter)++;
         *flowLabel = label;
         *exec = kExecWarp;

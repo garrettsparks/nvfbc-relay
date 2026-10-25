@@ -4,6 +4,7 @@
 #include <d3d11.h>
 
 #include <cstdint>
+#include <vector>
 
 #include "FlowPlan.h"
 #include "nvof/nvOpticalFlowCommon.h"
@@ -49,8 +50,16 @@ public:
     bool Flow(int slot, const Frame& before, const Frame& after, bool hints);
 
     // Draws the warp at w from slot's fields over rtv, sampling colour from before and after.
+    // present numbers the present it is drawn for, for its GPU time (TakeWarpTime).
     bool Warp(int slot, ID3D11ShaderResourceView* before, ID3D11ShaderResourceView* after,
-              float w, ID3D11RenderTargetView* rtv);
+              float w, ID3D11RenderTargetView* rtv, long long present);
+
+    // The GPU time of warps drawn at earlier presents, read without waiting: each warp is timed
+    // with timestamp queries around its draw, and the result is read once the GPU has it,
+    // normally a present or two later. Returns false when no new result has arrived; otherwise
+    // the newest one's microseconds and how many presents before present its warp was drawn.
+    // Every result goes into the summary; the newest is returned.
+    bool TakeWarpTime(long long present, long long* us, int* presentsAgo);
 
     void LogSummary() const;
 
@@ -75,6 +84,16 @@ private:
     struct Slot {
         Field fwd, bwd, fwdCost, bwdCost;
     };
+    // One warp's timestamp queries, in flight until read.
+    struct Timing {
+        ID3D11Query* disjoint = NULL;
+        ID3D11Query* start = NULL;
+        ID3D11Query* end = NULL;
+        long long present = 0;
+        bool pending = false;
+    };
+    // Warps whose times can be in flight at once; one more is drawn untimed.
+    static const int kTimings = 8;
 
     bool MakeField(DXGI_FORMAT format, bool view, Field* out);
     bool CompileShaders();
@@ -99,6 +118,9 @@ private:
     ID3D11SamplerState* m_linear = NULL;
     ID3D11Buffer* m_lumaCb = NULL;
     ID3D11Buffer* m_warpCb = NULL;
+    Timing m_timings[kTimings];
+    std::vector<float> m_warpUs;           // every warp GPU time read, for the summary
+    long long m_warpsUntimed = 0;
 
     long long m_uses = 0;
     long long m_flows = 0;

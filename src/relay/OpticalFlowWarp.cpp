@@ -3,6 +3,8 @@
 
 #include <d3dcompiler.h>
 #include <string.h>
+
+#include <algorithm>
 #include <SimpleLogger.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
@@ -73,6 +75,11 @@ OpticalFlowWarp::~OpticalFlowWarp() {
     for (Luma& l : m_luma) {
         if (l.rtv) l.rtv->Release();
         if (l.texture) l.texture->Release();
+    }
+    for (Timing& t : m_timings) {
+        if (t.end) t.end->Release();
+        if (t.start) t.start->Release();
+        if (t.disjoint) t.disjoint->Release();
     }
     if (m_warpCb) m_warpCb->Release();
     if (m_lumaCb) m_lumaCb->Release();
@@ -214,6 +221,17 @@ bool OpticalFlowWarp::CompileShaders() {
     if (FAILED(m_dev->CreateBuffer(&bd, &init, &m_lumaCb))) return false;
     bd.ByteWidth = sizeof(FlowWarpParams);
     if (FAILED(m_dev->CreateBuffer(&bd, NULL, &m_warpCb))) return false;
+
+    // Timestamp queries for the warp's GPU time. Without them the warps are drawn untimed, so a
+    // failure here costs pt= and nothing else.
+    D3D11_QUERY_DESC qd = {};
+    for (Timing& t : m_timings) {
+        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        if (FAILED(m_dev->CreateQuery(&qd, &t.disjoint))) t.disjoint = NULL;
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        if (FAILED(m_dev->CreateQuery(&qd, &t.start))) t.start = NULL;
+        if (FAILED(m_dev->CreateQuery(&qd, &t.end))) t.end = NULL;
+    }
     return true;
 }
 
@@ -301,9 +319,23 @@ bool OpticalFlowWarp::Flow(int slot, const Frame& before, const Frame& after, bo
 }
 
 bool OpticalFlowWarp::Warp(int slot, ID3D11ShaderResourceView* before,
-                           ID3D11ShaderResourceView* after, float w, ID3D11RenderTargetView* rtv) {
+                           ID3D11ShaderResourceView* after, float w, ID3D11RenderTargetView* rtv,
+                           long long present) {
     if (!m_ready || slot < 0 || slot >= policy::kFlowSlots || !before || !after || !rtv) {
         return false;
+    }
+    Timing* timing = NULL;
+    for (Timing& t : m_timings) {
+        if (!t.pending && t.disjoint && t.start && t.end) {
+            timing = &t;
+            break;
+        }
+    }
+    if (timing) {
+        m_ctx->Begin(timing->disjoint);
+        m_ctx->End(timing->start);
+    } else {
+        m_warpsUntimed++;
     }
     FlowWarpParams params = {};
     params.w = w;
@@ -329,11 +361,47 @@ bool OpticalFlowWarp::Warp(int slot, ID3D11ShaderResourceView* before,
     m_ctx->PSSetSamplers(0, 1, &m_linear);
     m_ctx->PSSetConstantBuffers(0, 1, &m_warpCb);
     m_ctx->Draw(3, 0);
+    if (timing) {
+        m_ctx->End(timing->end);
+        m_ctx->End(timing->disjoint);
+        timing->present = present;
+        timing->pending = true;
+    }
     // The fields are the engine's output next; nothing may still hold them as inputs.
     ID3D11ShaderResourceView* none[4] = {NULL, NULL, NULL, NULL};
     m_ctx->PSSetShaderResources(0, 4, none);
     m_warps++;
     return true;
+}
+
+bool OpticalFlowWarp::TakeWarpTime(long long present, long long* us, int* presentsAgo) {
+    bool any = false;
+    long long newest = -1;
+    for (Timing& t : m_timings) {
+        if (!t.pending) continue;
+        // DONOTFLUSH: asking must never push work to the GPU or wait for it.
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+        if (m_ctx->GetData(t.disjoint, &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+            continue;
+        }
+        UINT64 t0 = 0, t1 = 0;
+        if (m_ctx->GetData(t.start, &t0, sizeof(t0), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+            m_ctx->GetData(t.end, &t1, sizeof(t1), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+            continue;
+        }
+        t.pending = false;
+        // A disjoint interval (a clock change mid-way) leaves this warp untimed.
+        if (dj.Disjoint || dj.Frequency == 0 || t1 < t0) continue;
+        const long long value = (long long)((t1 - t0) * 1000000ULL / dj.Frequency);
+        m_warpUs.push_back((float)value);
+        if (t.present > newest) {
+            newest = t.present;
+            *us = value;
+            *presentsAgo = (int)(present - t.present);
+            any = true;
+        }
+    }
+    return any;
 }
 
 void OpticalFlowWarp::LogSummary() const {
@@ -342,4 +410,11 @@ void OpticalFlowWarp::LogSummary() const {
         "%.3f max), %lld refused or without input, %lld luma draws, %lld warps drawn",
         m_flows, m_flows ? m_submitMsTotal / (double)m_flows : 0.0, m_submitMsMax,
         m_flowFailures, m_lumaDraws, m_warps);
+    std::vector<float> us = m_warpUs;
+    std::sort(us.begin(), us.end());
+    auto at = [&](double q) {
+        return us.empty() ? 0.0 : (double)us[(size_t)(q * (double)(us.size() - 1) + 0.5)] / 1000.0;
+    };
+    LOG("optical flow warp GPU time (pt=): p50 %.3f p99 %.3f max %.3f ms over %zu warps timed, "
+        "%lld drawn untimed", at(0.5), at(0.99), at(1.0), us.size(), m_warpsUntimed);
 }

@@ -285,7 +285,8 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
         LOG("%s compositor ACTIVE on the %s: passthrough threshold %lld us; %s on the temporal line",
             interp ? "Interp" : "Blend", m_present->Name(),
             m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq(),
-            interp ? "op=/bw=/sx=/fl=" : "op=/bw=");
+            interp ? "op=/bw=/sx=/fl=, and pt= (an earlier warp's GPU microseconds) with pta= "
+                     "(how many presents earlier)" : "op=/bw=");
         // The phase-step lookahead needs the comb to be one source frame, which is where a step
         // leaves the target between real frames. It reads frames ahead of the target, so it
         // only has room to work when the lag is longer than a few source periods.
@@ -671,15 +672,20 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
                 snprintf(easeField, sizeof(easeField), " ease=%lldus",
                          (long long)(m_lockState.easeQpc * usPerTick));
             }
-            // How the optical flow's synthesized present got its flow, last on the line.
-            char flowField[16] = "";
+            // How the optical flow's synthesized present got its flow, then how many presents ago
+            // the warp pt= timed was drawn, last on the line.
+            char flowField[32] = "";
+            int nf = 0;
             if (outcome.flowLabel) {
-                snprintf(flowField, sizeof(flowField), " fl=%s", outcome.flowLabel);
+                nf = snprintf(flowField, sizeof(flowField), " fl=%s", outcome.flowLabel);
             }
-            // blk= goes after the appended op/flip fields, followed only by ease= and fl=. The
-            // offline parsers match this line as a contiguous chain of named fields, so a field
-            // inserted between two existing ones silently drops every field after it rather than
-            // failing.
+            if (outcome.synthAge >= 0 && nf >= 0 && (size_t)nf < sizeof(flowField)) {
+                snprintf(flowField + nf, sizeof(flowField) - nf, " pta=%d", outcome.synthAge);
+            }
+            // blk= goes after the appended op/flip fields, followed only by ease=, fl= and pta=.
+            // The offline parsers match this line as a contiguous chain of named fields, so a
+            // field inserted between two existing ones silently drops every field after it rather
+            // than failing.
             LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld%s%s blk=%lldus%s%s",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),

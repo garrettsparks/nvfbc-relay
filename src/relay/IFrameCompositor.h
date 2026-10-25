@@ -23,6 +23,8 @@ struct CompositeOutcome {
     int pixelExec;           // marker executor cells: what made THIS frame's pixels
                              // (0 real, 1 blend, 2 fruc, 3 flow-warp; holds inherit
                              // the held content's executor). synthesized == (pixelExec != 0).
+    int synthAge = -1;             // pta= field: how many presents ago the frame pt= timed was
+                                   // drawn, when pt= is a GPU time read back later; -1 = no field
     const char* flowLabel = NULL;  // fl= field: how a synthesized present of the optical flow
                                    // got its flow ("hit" handed over at an earlier present,
                                    // "late" planned but handed over at this one, "own" not
