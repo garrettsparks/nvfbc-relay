@@ -2,7 +2,6 @@
 
 #include "IFrameCompositor.h"
 #include "BlendRenderer.h"
-#include "InterpSidecar.h"
 #include "TemporalPolicy.h"
 
 // Nearest-frame composition: SelectFrame picks one real ring frame (or a repeat) and it
@@ -78,26 +77,4 @@ protected:
 private:
     BlendRenderer m_blender;
     bool m_tint;
-};
-
-// Interpolating composition: the synthesized frame comes from the D3D11 sidecar
-// (raw NVOFA flow + our warp), with the lerp as the per-present fallback when the
-// engine cannot deliver. The sidecar initializes in OnCaptureStarted (it opens ring
-// slot shared handles, which exist only after CaptureRing::Start); a sidecar that
-// cannot initialize refuses the mode.
-class InterpCompositor : public SynthCompositorBase {
-public:
-    explicit InterpCompositor(const policy::PolicyConfig* cfg);
-    virtual int Id() const override;
-    virtual bool OnCaptureStarted(CaptureRing* ring, LARGE_INTEGER baseQpc,
-                                  LONGLONG freqQpc) override;
-
-protected:
-    virtual bool SetupResources() override;
-    virtual bool RenderSynthesis(const FrameBracket& bracket, double weight,
-                                 IDirect3DSurface9* backbuffer) override;
-
-private:
-    InterpSidecar m_sidecar;
-    BlendRenderer m_blender;   // lerp fallback; output stays synthesized-at-target
 };

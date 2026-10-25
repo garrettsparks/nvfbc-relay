@@ -23,6 +23,10 @@ struct CompositeOutcome {
     int pixelExec;           // marker executor cells: what made THIS frame's pixels
                              // (0 real, 1 blend, 2 fruc, 3 flow-warp; holds inherit
                              // the held content's executor). synthesized == (pixelExec != 0).
+    const char* flowLabel = NULL;  // fl= field: how a synthesized present of the optical flow
+                                   // got its flow ("hit" handed over at an earlier present,
+                                   // "late" planned but handed over at this one, "own" not
+                                   // planned, "miss" no flow, the blend drawn); NULL = no field
 };
 
 // Synthesis executor codes: what actually produced a present's pixels. One vocabulary

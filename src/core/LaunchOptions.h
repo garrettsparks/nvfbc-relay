@@ -59,6 +59,9 @@ struct Options {
     bool copyEngine = true;         // -nocopyengine: with -wgc, a frame shown as it is is
                                     // copied by the copy engine and shown through the
                                     // composition swapchain (CopyEngineTarget)
+    bool ofDirect = false;          // -xofdirect: with o and -wgc, WGC's frames go to the
+                                    // optical flow engine as they are, without the luma
+                                    // conversion draw (an experiment, to be benched)
 };
 
 // -wgcscale's filters by number, bilinear (0) the default. The names are OBS's.
@@ -186,6 +189,9 @@ inline const std::vector<UsageRow>& OptionRows() {
                               "default a frame shown as it is is copied by a part of the "
                               "graphics card the game does not use, which costs the game less",
          false, false},
+        {"-xofdirect", "", "Experiment: with o and -wgc, hand Windows' frames to the optical "
+                           "flow engine as they are, without first drawing them as luma",
+         false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -216,13 +222,14 @@ inline const std::vector<UsageRow>& ModeRows() {
         {"vsync", "", "Shows the newest frame, in step with Windows' desktop.", true, false},
         {"60", "", "Shows the newest frame, on a timer at the given frame rate. This is how "
                    "the original relay ran.", true, false},
-        {"o, o:vsync, o:60", "", "Optical-flow interp compositor on the D3D9 swapchain", false,
-         false},
+        {"o, o:vsync", "", "Optical-flow interpolation in place of the blend, on the same output "
+                           "as b:vsync", false, false},
         {"diag, diag:vsync", "", "Clock probes: DWM compose timing and the card's raster", false,
          false},
-        {"ofprobe, ofprobe:30, ofprobedraw:30", "", "Optical flow engine probe: capabilities, "
-                                                    "cost and accuracy, then an optional loop "
-                                                    "for a GPU trace", false, false},
+        {"ofprobe, ofprobe:30, ofprobedraw:30, ofprobenowait:30, ofprobenowaitfwd:30, "
+         "ofprobedrawnowait:30, ofprobedrawonly:30, ofprobe12:30, ofprobe12fwd:30", "",
+         "Optical flow engine probe: capabilities, cost and accuracy, then an optional loop "
+         "for a GPU trace", false, false},
     };
     return rows;
 }
@@ -332,6 +339,7 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-wgcopen")     { o->wgcOpen = true;    return 1; }
     if (t == "-nowgcopen")   { o->wgcOpen = false;   return 1; }
     if (t == "-nocopyengine") { o->copyEngine = false; return 1; }
+    if (t == "-xofdirect")    { o->ofDirect = true;    return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -513,6 +521,7 @@ inline std::string FormatOptions(const Options& o) {
     if (o.wgcOpen != d.wgcOpen) add(o.wgcOpen ? "-wgcopen" : "-nowgcopen");
     if (o.wgcScale != d.wgcScale) add(std::string("-wgcscale ") + WgcScaleNames()[o.wgcScale]);
     if (!o.copyEngine) add("-nocopyengine");
+    if (o.ofDirect) add("-xofdirect");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");
@@ -535,6 +544,18 @@ inline std::string RelaunchArguments(int source, int target, const std::string& 
 
 enum class ModeKind { Invalid, Vsync, Temporal, Diag, Timer, FlowProbe };
 enum class Compositor { Nearest, Blend, Interp };
+// What the flow probe's sustained loop does each tick.
+struct ProbeLoop {
+    bool d3d12 = false;        // the engine's D3D12 interface; otherwise its D3D11 one
+    bool forwardOnly = false;  // the forward flow alone; otherwise both directions
+    bool draw = false;         // a full-screen draw on the flow's D3D11 context before it
+    bool query = true;         // D3D11: wait on an event query after each flow
+    bool flow = true;          // false: the draw alone, the control with no flow
+    bool operator==(const ProbeLoop& o) const {
+        return d3d12 == o.d3d12 && forwardOnly == o.forwardOnly && draw == o.draw &&
+               query == o.query && flow == o.flow;
+    }
+};
 
 // What a capture-mode string asks for. framerate is the rate a timer present runs at, and the
 // nominal 60 that sizes the bracketing lag on a vsync present.
@@ -545,7 +566,7 @@ struct ModeSpec {
     bool d3d11Present = false;   // the D3D11 flip-model swapchain rather than D3D9
     float framerate = 0.0f;
     int probeSeconds = 0;        // FlowProbe: the sustained loop's length; 0 = no loop
-    bool probeDraw = false;      // FlowProbe: a full-screen draw before each looped flow
+    ProbeLoop probeLoop;         // FlowProbe: what the loop does
 };
 
 inline char LowerAscii(char c) {
@@ -561,8 +582,9 @@ inline bool EqualsNoCase(const std::string& a, const char* b) {
     return true;
 }
 
-// The optical flow probe's spellings: "ofprobe", "ofprobe:<seconds>", "ofprobedraw:<seconds>".
-// The loop length is a whole number of seconds, 1 to 3600.
+// The optical flow probe's spellings: "ofprobe", and a loop of <seconds> as one of the heads in
+// the table below followed by ":<seconds>". The loop length is a whole number of seconds, 1 to
+// 3600.
 inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
     if (EqualsNoCase(modeStr, "ofprobe")) {
         s->kind = ModeKind::FlowProbe;
@@ -571,12 +593,23 @@ inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
     const size_t colon = modeStr.find(':');
     if (colon == std::string::npos) return false;
     const std::string head = modeStr.substr(0, colon);
-    bool draw = false;
-    if (EqualsNoCase(head, "ofprobedraw")) {
-        draw = true;
-    } else if (!EqualsNoCase(head, "ofprobe")) {
-        return false;
+    // Columns: D3D12, forward only, draw, query, flow.
+    struct Spelling { const char* head; ProbeLoop loop; };
+    static const Spelling kSpellings[] = {
+        {"ofprobe", {false, false, false, true, true}},
+        {"ofprobedraw", {false, false, true, true, true}},
+        {"ofprobenowait", {false, false, false, false, true}},
+        {"ofprobenowaitfwd", {false, true, false, false, true}},
+        {"ofprobedrawnowait", {false, false, true, false, true}},
+        {"ofprobedrawonly", {false, false, true, false, false}},
+        {"ofprobe12", {true, false, false, false, true}},
+        {"ofprobe12fwd", {true, true, false, false, true}},
+    };
+    const Spelling* spelling = nullptr;
+    for (const Spelling& sp : kSpellings) {
+        if (EqualsNoCase(head, sp.head)) spelling = &sp;
     }
+    if (!spelling) return false;
     const std::string digits = modeStr.substr(colon + 1);
     if (digits.empty() || digits.size() > 4) return false;
     int seconds = 0;
@@ -587,20 +620,20 @@ inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
     if (seconds < 1 || seconds > 3600) return false;
     s->kind = ModeKind::FlowProbe;
     s->probeSeconds = seconds;
-    s->probeDraw = draw;
+    s->probeLoop = spelling->loop;
     return true;
 }
 
 // The capture-mode grammar. The first letter picks the temporal compositor: t nearest selection,
 // b blend, o optical-flow interp. The bare letter and X:vsync present on vsync, X:<fps> on a QPC
-// timer at that rate.
+// timer at that rate (t and b only).
 //
-// Two present paths carry the vsync present. t and o run on the D3D9 swapchain, whose windowed
+// Two present paths carry the vsync present. t runs on the D3D9 swapchain, whose windowed
 // INTERVAL_ONE present blocks on DWM's compose clock (card-locked 60 Hz under a fullscreen game on
-// the source; the DISPLAYED rate under in-game frame generation). The blend mode has both: b and
-// b:vsync present through a D3D11 flip-model swapchain on the output window, which Windows
-// promotes to independent flip so the present blocks on the SINK's own vblank, and b:dwm is the
-// same blend on the D3D9 swapchain. The D3D11 path carries the blend compositor only.
+// the source; the DISPLAYED rate under in-game frame generation). b and b:vsync, o and o:vsync
+// present through a D3D11 flip-model swapchain on the output window, which Windows promotes to
+// independent flip so the present blocks on the SINK's own vblank, and b:dwm is the blend on the
+// D3D9 swapchain. The D3D11 path carries the blend and the optical-flow interp.
 //
 // An empty string is a bare launch and selects b:vsync, the release path. "vsync" selects the
 // plain vsync mode, "diag" and "diag:vsync" the clock probes, and a bare number the plain timer
@@ -620,7 +653,6 @@ inline ModeSpec ParseMode(const std::string& modeStr) {
     else if (c0 == 'o') comp = Compositor::Interp;
 
     if (EqualsNoCase(modeStr, "t") || EqualsNoCase(modeStr, "t:dwm") ||
-        EqualsNoCase(modeStr, "o") || EqualsNoCase(modeStr, "o:vsync") ||
         EqualsNoCase(modeStr, "b:dwm")) {
         s.kind = ModeKind::Temporal;
         s.compositor = comp;
@@ -628,7 +660,8 @@ inline ModeSpec ParseMode(const std::string& modeStr) {
         s.framerate = 60.0f;
         return s;
     }
-    if (EqualsNoCase(modeStr, "b") || EqualsNoCase(modeStr, "b:vsync")) {
+    if (EqualsNoCase(modeStr, "b") || EqualsNoCase(modeStr, "b:vsync") ||
+        EqualsNoCase(modeStr, "o") || EqualsNoCase(modeStr, "o:vsync")) {
         s.kind = ModeKind::Temporal;
         s.compositor = comp;
         s.vsyncPresent = true;
@@ -636,7 +669,7 @@ inline ModeSpec ParseMode(const std::string& modeStr) {
         s.framerate = 60.0f;
         return s;
     }
-    if (modeStr.length() > 2 && (c0 == 't' || c0 == 'b' || c0 == 'o') && modeStr[1] == ':') {
+    if (modeStr.length() > 2 && (c0 == 't' || c0 == 'b') && modeStr[1] == ':') {
         float fps;
         if (ParseFps(modeStr.substr(2), &fps)) {
             s.kind = ModeKind::Temporal;

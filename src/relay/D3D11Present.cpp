@@ -121,7 +121,7 @@ UINT OutputBitsPerColor(IDXGIAdapter* adapter, HWND hwnd) {
 
 }  // namespace
 
-D3D11PresentBackend::D3D11PresentBackend(bool tint)
+D3D11PresentBackend::D3D11PresentBackend(bool tint, bool interp, bool flowDirect)
     : m_enabled(false)
     , m_width(0), m_height(0), m_ringSlots(0)
     , m_cfg(NULL), m_tintRequested(tint)
@@ -135,6 +135,8 @@ D3D11PresentBackend::D3D11PresentBackend(bool tint)
     , m_presentFailures(0), m_drawFailures(0), m_waitTimeouts(0)
     , m_consecutiveWaitTimeouts(0), m_lastPresentHr(S_OK), m_presents(0)
 {
+    m_interp = interp;
+    m_flowDirect = flowDirect;
     for (int i = 0; i < CaptureRing::RING_SIZE; i++) {
         m_ringAlias[i] = NULL;
         m_ringSrv[i] = NULL;
@@ -144,6 +146,7 @@ D3D11PresentBackend::D3D11PresentBackend(bool tint)
 
 D3D11PresentBackend::~D3D11PresentBackend() {
     delete m_copyEngine;                // draws with this device, so goes first
+    delete m_flow;                      // so does the optical flow
     for (int i = 0; i < CaptureRing::RING_SIZE; i++) {
         if (m_ringSrv[i]) m_ringSrv[i]->Release();
         if (m_ringAlias[i]) m_ringAlias[i]->Release();
@@ -182,6 +185,16 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
     if (!CreatePipeline()) return false;
     // Only WGC's frames can be another size than the output.
     if (m_wgc && !SetupScaling(ring->WgcScale(), width, height)) return false;
+    if (m_interp) {
+        if (m_flowDirect && !m_wgc) {
+            LOG("-xofdirect ignored: it hands WGC's frames to the flow engine, and -wgc is off");
+        }
+        m_flow = new OpticalFlowWarp();
+        if (!m_flow->Setup(m_dev, m_ctx, width, height, m_flowDirect && m_wgc)) {
+            m_flowFailed = true;
+            return false;
+        }
+    }
     if (mark) {
         m_marker.InitCounter(markFrames);
         m_markerRect = FrameMarker::StripRect(width, height);
@@ -198,7 +211,7 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
 
 bool D3D11PresentBackend::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
                                                    bool copyEngine, int sinkRefreshHz) {
-    // Default adapter, matching InterpSidecar. Correct while the relay is single-GPU; a
+    // Default adapter. Correct while the relay is single-GPU; a
     // multi-adapter box would want the adapter driving the TARGET output, which is a
     // different (and currently hypothetical) selection problem. WGC makes its frame pool only
     // on a device with BGRA support.
@@ -654,6 +667,8 @@ void D3D11PresentBackend::SampleStats() {
 void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome* out) {
     const policy::CompositeDecision d =
         policy::DecideComposite(bracket.info, m_compState, *m_cfg);
+    // The flows of the next presents, predicted from the state this decision left.
+    if (m_flow) PlanFlows();
 
     out->pickLabel = policy::PickLabel(policy::Pick::None);
     out->opLabel = policy::CompositeLabel(d.op);
@@ -685,8 +700,6 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome*
             out->synthesized = true;
             out->weightQ = (int)(d.weight * 15.0 + 0.5);
             out->opWeight = d.weight;
-            out->synthExec = SynthExecLabel(kExecBlend);
-            out->pixelExec = kExecBlend;
             break;
         default:
             // Hold / HoldComb: re-draw what the last present drew. The fallback chain covers
@@ -711,12 +724,42 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome*
     m_copySource = NULL;
     if (!AcquireBackBuffer()) {
         m_drawFailures++;
+        if (m_flow && !m_copyEngine) SubmitPlanned(false);
         return;
     }
-    if (slotA < 0) return;   // nothing presentable yet; the buffer stays as created
+    if (slotA < 0) {         // nothing presentable yet; the buffer stays as created
+        if (m_flow && !m_copyEngine) SubmitPlanned(false);
+        return;
+    }
     // A frame shown as it is goes to the copy engine at the present, in place of the draw.
     if (m_copyEngine && slotA == slotB) m_copySource = CopySourceFor(slotA);
-    if (!m_copySource && !Draw(slotA, slotB, w)) {
+    int flowSlot = -1;
+    bool drawn = true;
+    if (m_copySource) {
+        // Copied at the present; nothing is drawn.
+    } else if (m_flow && d.op == policy::CompositeOp::Synthesize) {
+        drawn = DrawSynthesis(bracket, w, &exec, &flowSlot, &out->flowLabel);
+    } else if (m_flow && exec == kExecWarp && m_lastFlowSlot >= 0 &&
+               m_planned[m_lastFlowSlot].handed &&
+               policy::SamePair(m_planned[m_lastFlowSlot].pair, m_lastFlowPair)) {
+        // A hold of a warp draws the same warp again, from the flow it was drawn with.
+        flowSlot = m_lastFlowSlot;
+        drawn = m_flow->Warp(flowSlot, SourceFor(slotA), SourceFor(slotB), w, m_rtv);
+    } else {
+        // A held warp whose flow is gone is held as the lerp of the same pair.
+        if (exec == kExecWarp) exec = kExecBlend;
+        drawn = Draw(slotA, slotB, w);
+    }
+    if (d.op == policy::CompositeOp::Synthesize) out->synthExec = SynthExecLabel(exec);
+    out->synthesized = exec != 0;
+    out->pixelExec = exec;
+    // Planned flows ride this present's draw, or go alone when the next present needs them. With
+    // the copy engine they wait until after the present (Present): a drawn present reaches the
+    // screen behind everything queued on this context before it, a flow included, and a present
+    // held for a flow is a repeated frame on the card (sitting ofcap1: 53 long present gaps,
+    // 37 right after a warp, against 17 for the blend).
+    if (m_flow && !m_copyEngine) SubmitPlanned(drawn && !m_copySource);
+    if (!drawn) {
         m_drawFailures++;
         if (m_drawFailures == 1 || (m_drawFailures % 600) == 0) {
             LOGERR("D3D11Present: draw failed (%lld so far); the buffer presents as is",
@@ -729,14 +772,187 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome*
     m_lastWeight = w;
     m_lastExec = exec;
     m_haveLast = true;
+    if (flowSlot >= 0 && d.op == policy::CompositeOp::Synthesize) {
+        m_lastFlowSlot = flowSlot;
+        m_lastFlowPair.beforeTs = bracket.info.beforeTs;
+        m_lastFlowPair.afterTs = bracket.info.afterTs;
+    }
+}
+
+OpticalFlowWarp::Frame D3D11PresentBackend::FlowFrame(int slot, int64_t ts) {
+    OpticalFlowWarp::Frame f;
+    f.ts = ts;
+    f.srv = SourceFor(slot);
+    f.texture = (m_flowDirect && m_ring) ? m_ring->WgcTexture(slot) : NULL;
+    return f;
+}
+
+bool D3D11PresentBackend::SubmitFlow(int cacheSlot) {
+    PlannedFlow& p = m_planned[cacheSlot];
+    const bool hints = m_haveLastHanded && policy::FlowHintsUsable(m_lastHanded, p.pair);
+    p.pending = false;
+    if (p.beforeSlot < 0 || p.afterSlot < 0 ||
+        !m_flow->Flow(cacheSlot, FlowFrame(p.beforeSlot, p.pair.beforeTs),
+                      FlowFrame(p.afterSlot, p.pair.afterTs), hints)) {
+        p.failed = true;
+        return false;
+    }
+    p.handed = true;
+    m_lastHanded = p.pair;
+    m_haveLastHanded = true;
+    return true;
+}
+
+void D3D11PresentBackend::SubmitPlanned(bool drew, bool afterPresent) {
+    for (int i = 0; i < policy::kFlowSlots; i++) {
+        PlannedFlow& p = m_planned[i];
+        if (!p.pending) continue;
+        // A prediction whose present has gone by without using it is not handed over at all.
+        if (p.needBy < m_presents) {
+            p.pending = false;
+            continue;
+        }
+        if (!drew && !afterPresent && p.needBy > m_presents + 1) continue;
+        if (SubmitFlow(i)) {
+            if (afterPresent) m_flowsAfterPresent++;
+            else if (drew) m_flowsRidden++;
+            else m_flowsAlone++;
+        }
+    }
+}
+
+bool D3D11PresentBackend::DrawSynthesis(const FrameBracket& bracket, float w, int* exec,
+                                        int* flowSlot, const char** flowLabel) {
+    policy::FlowPair pair;
+    pair.beforeTs = bracket.info.beforeTs;
+    pair.afterTs = bracket.info.afterTs;
+    bool submitted = false;
+    policy::FlowUse use = policy::FlowUse::Own;
+    const int slot = m_planner.Use(pair, m_presents, &submitted, &use);
+    bool ready = false;
+    const char* label = "miss";
+    long long* counter = NULL;
+    if (slot >= 0) {
+        PlannedFlow& p = m_planned[slot];
+        if (submitted || !policy::SamePair(p.pair, pair)) {
+            // Not planned (or planned from other frames): this present hands it over itself.
+            p.pair = pair;
+            p.beforeSlot = bracket.beforeSlot;
+            p.afterSlot = bracket.afterSlot;
+            p.handed = false;
+            p.failed = false;
+            p.needBy = m_presents;
+        }
+        if (p.handed) {
+            label = "hit";
+            counter = &m_flowHit;
+            ready = true;
+        } else if (!p.failed) {
+            label = submitted ? "own" : "late";
+            counter = submitted ? &m_flowOwn : &m_flowLate;
+            ready = SubmitFlow(slot);
+        }
+    }
+    if (ready && m_flow->Warp(slot, SourceFor(bracket.beforeSlot), SourceFor(bracket.afterSlot),
+                              w, m_rtv)) {
+        (*counter)++;
+        *flowLabel = label;
+        *exec = kExecWarp;
+        *flowSlot = slot;
+        return true;
+    }
+    m_flowMiss++;
+    *flowLabel = "miss";
+    *exec = kExecBlend;
+    *flowSlot = -1;
+    return Draw(bracket.beforeSlot, bracket.afterSlot, w);
+}
+
+// Kept until Compose has made this present's decision, which the prediction starts from.
+void D3D11PresentBackend::PlanAhead(const FrameBracket* upcoming, const LONGLONG* targets,
+                                    int count) {
+    m_aheadCount = 0;
+    if (!m_flow || count <= 0) return;
+    if (count > kFlowLookahead) count = kFlowLookahead;
+    for (int j = 0; j < count; j++) {
+        m_ahead[j] = upcoming[j];
+        m_aheadTargets[j] = targets[j];
+    }
+    m_aheadCount = count;
+}
+
+void D3D11PresentBackend::PlanFlows() {
+    const FrameBracket* upcoming = m_ahead;
+    const LONGLONG* targets = m_aheadTargets;
+    const int count = m_aheadCount;
+    m_aheadCount = 0;
+    if (!m_flow || count <= 0) return;
+    // The stamps of the upcoming brackets, ascending, each once: the planner predicts each
+    // target's pair from them exactly as the bracket around it was read.
+    int64_t stamps[2 * kFlowLookahead];
+    int n = 0;
+    auto add = [&](int64_t ts) {
+        for (int i = 0; i < n; i++) {
+            if (stamps[i] == ts) return;
+        }
+        int i = n++;
+        while (i > 0 && stamps[i - 1] > ts) {
+            stamps[i] = stamps[i - 1];
+            i--;
+        }
+        stamps[i] = ts;
+    };
+    // Which upcoming presents synthesize, by the present's own decision run on a copy of its
+    // state, present after present: the stickiness band and the tooth guard predict as they will
+    // decide. The plain passthrough gate alone predicted a synthesis for 88% of flows that never
+    // came at a 115 fps source (sitting ofpts1), the band holding those presents on real frames.
+    policy::CompositeState ahead = m_compState;
+    int64_t tg[kFlowLookahead];
+    int forPresent[kFlowLookahead];
+    int synth = 0;
+    for (int j = 0; j < count; j++) {
+        if (!upcoming[j].info.hasBefore || !upcoming[j].info.hasAfter) continue;
+        add(upcoming[j].info.beforeTs);
+        add(upcoming[j].info.afterTs);
+        const policy::CompositeDecision d =
+            policy::DecideComposite(upcoming[j].info, ahead, *m_cfg);
+        if (d.op != policy::CompositeOp::Synthesize) continue;
+        tg[synth] = targets[j];
+        forPresent[synth] = j;
+        synth++;
+    }
+    if (synth == 0) return;
+    // The decision already ruled out passthrough, so the planner's own gate is set to nothing:
+    // every target given it flows the pair around it.
+    int planned[kFlowLookahead];
+    const int k = m_planner.Plan(stamps, n, tg, synth, 0, m_presents, planned, kFlowLookahead);
+    // Which upcoming present each newly planned slot is for: its frames and when it is needed.
+    for (int i = 0; i < k; i++) {
+        for (int t = 0; t < synth; t++) {
+            policy::FlowPair pair;
+            if (!policy::PredictSynthPair(stamps, n, tg[t], 0, &pair)) continue;
+            if (m_planner.Find(pair) != planned[i]) continue;
+            const int j = forPresent[t];
+            PlannedFlow& p = m_planned[planned[i]];
+            p.pair = pair;
+            p.beforeSlot = upcoming[j].beforeSlot;
+            p.afterSlot = upcoming[j].afterSlot;
+            p.pending = true;
+            p.handed = false;
+            p.failed = false;
+            p.needBy = m_presents + 1 + j;
+            break;
+        }
+    }
 }
 
 long long D3D11PresentBackend::BurnMarker(const CompositeOutcome& out) {
     if (!m_mark) return -1;
     unsigned int burned = 0;
     bool cells[FrameMarker::kCells];
-    if (!m_marker.Next(out.pickCode, out.weightQ, out.synthesized, kCompositorIdBlend,
-                       out.pixelExec, &burned, cells)) {
+    if (!m_marker.Next(out.pickCode, out.weightQ, out.synthesized,
+                       m_interp ? kCompositorIdFlow : kCompositorIdBlend, out.pixelExec, &burned,
+                       cells)) {
         return burned;
     }
     // A present the copy engine copies gets its strip copied in after the frame, so a marked
@@ -805,6 +1021,8 @@ LONGLONG D3D11PresentBackend::Present(bool vsync) {
         const bool shown = m_copySource ? m_copyEngine->PresentCopy(m_copySource)
                                         : m_copyEngine->PresentDrawn();
         m_copySource = NULL;
+        // The planned flows go now, behind the present rather than in front of it (Compose).
+        if (m_flow) SubmitPlanned(false, true);
         m_presents++;
         if (!shown) m_presentFailures++;
         return 0;
@@ -832,6 +1050,16 @@ LONGLONG D3D11PresentBackend::Present(bool vsync) {
 
 void D3D11PresentBackend::LogSummary() const {
     if (!m_enabled) return;
+    if (m_flow) {
+        m_flow->LogSummary();
+        LOG("optical flow presents: %lld warped from a flow handed over earlier (fl=hit), %lld "
+            "planned but handed over at the present (fl=late), %lld not planned (fl=own), %lld "
+            "drew the blend for want of a flow (fl=miss); flows planned or handed over %lld, "
+            "planned and used %lld, planned and unused %lld; %lld rode a present's draw, %lld "
+            "went alone, %lld went after a copy-engine present", m_flowHit, m_flowLate,
+            m_flowOwn, m_flowMiss, m_planner.Flows(), m_planner.PredictedUsed(),
+            m_planner.PredictedUnused(), m_flowsRidden, m_flowsAlone, m_flowsAfterPresent);
+    }
     if (m_wgc) {
         LOG("WGC scaling summary: %lld presents scaled with %s, %lld drew frames at the output's "
             "size unscaled", m_scaledDraws, WgcScaler::Name(m_scale), m_unscaledDraws);

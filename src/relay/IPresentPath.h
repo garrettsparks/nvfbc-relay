@@ -46,6 +46,16 @@ public:
     // when a bounded wait timed out, which the caller reads as a present that was not paced.
     virtual bool WaitForFrame() = 0;
 
+    // How many presents ahead this path plans for, 0 for none. A path that plans (the optical
+    // flow, which hands a pair's flow to the engine presents before the present that warps it)
+    // is given the brackets of that many upcoming presents before each Compose.
+    virtual int LookaheadPresents() const { return 0; }
+
+    // The brackets the next count presents would have, upcoming[i] at targets[i], nearest
+    // first, read from the ring as this present's bracket was.
+    virtual void PlanAhead(const FrameBracket* /*upcoming*/, const LONGLONG* /*targets*/,
+                           int /*count*/) {}
+
     // Decide this present and draw it onto this path's own target.
     virtual void Compose(const FrameBracket& bracket, CompositeOutcome* out) = 0;
 

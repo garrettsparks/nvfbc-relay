@@ -17,7 +17,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
                                          bool fgPhase, bool phaseKeep, unsigned int extraLagMs,
                                          bool d3d11Present, bool deferCopy, bool wgc,
                                          bool wgcDrop, bool wgcCursor, bool wgcOpen, int wgcScale,
-                                         bool wgcCopyEngine)
+                                         bool wgcCopyEngine, bool flowDirect)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_present(NULL)
@@ -48,17 +48,16 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     m_baseQpc.QuadPart = 0;
 
     // The one place that knows there are two present paths. The D3D11 backend IS the blend
-    // pipeline and brings its own compositor; the D3D9 path hosts whichever IFrameCompositor
-    // the mode letter selected. Both take &m_policyCfg, which Setup fills in before either
-    // reads it. Nothing touches a device here: the paths create their resources in Setup,
-    // after the ring has started.
+    // pipeline, or the optical flow, and brings its own compositor; the D3D9 path hosts the
+    // blend or nearest IFrameCompositor the mode letter selected. Both take &m_policyCfg, which
+    // Setup fills in before either reads it. Nothing touches a device here: the paths create
+    // their resources in Setup, after the ring has started.
     if (d3d11Present) {
-        m_present = new D3D11PresentBackend(tint);
+        m_present =
+            new D3D11PresentBackend(tint, compositor == kCompositorInterp, flowDirect);
     } else {
         IFrameCompositor* c;
-        if (compositor == kCompositorInterp) {
-            c = new InterpCompositor(&m_policyCfg);
-        } else if (compositor == kCompositorBlend) {
+        if (compositor == kCompositorBlend) {
             c = new BlendCompositor(&m_policyCfg, tint);
         } else {
             c = new NearestCompositor(&m_policyCfg);
@@ -287,7 +286,7 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
         LOG("%s compositor ACTIVE on the %s: passthrough threshold %lld us; %s on the temporal line",
             interp ? "Interp" : "Blend", m_present->Name(),
             m_policyCfg.passthroughQpc * 1000000 / m_scheduler.Freq(),
-            interp ? "op=/bw=/pt=" : "op=/bw=");
+            interp ? "op=/bw=/sx=/fl=" : "op=/bw=");
         // The phase-step lookahead needs the comb to be one source frame, which is where a step
         // leaves the target between real frames. It reads frames ahead of the target, so it
         // only has room to work when the lag is longer than a few source periods.
@@ -556,6 +555,21 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
         // identifies presented frames, not source frames; before the present stamp so
         // jit/pdt absorb its cost) and shows it. This loop owns the timing, the bracket,
         // the lock and the log.
+        // A path that plans ahead (the optical flow) sees the brackets of the next presents
+        // first, read the way this one was, at targets one present period apart.
+        const int ahead = m_present->LookaheadPresents();
+        if (ahead > 0) {
+            static const int kMaxAhead = 4;
+            FrameBracket upcoming[kMaxAhead];
+            LONGLONG targets[kMaxAhead];
+            const int n = ahead < kMaxAhead ? ahead : kMaxAhead;
+            for (int j = 0; j < n; j++) {
+                targets[j] = target + (LONGLONG)(j + 1) * m_scheduler.PeriodQpc();
+                m_ring.FindBracket(targets[j], m_dejitter ? &m_overlay : NULL, &upcoming[j]);
+            }
+            m_present->PlanAhead(upcoming, targets, n);
+        }
+
         CompositeOutcome outcome;
         m_present->Compose(bracket, &outcome);
         const long long markN = m_present->BurnMarker(outcome);
@@ -658,10 +672,16 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
                 snprintf(easeField, sizeof(easeField), " ease=%lldus",
                          (long long)(m_lockState.easeQpc * usPerTick));
             }
-            // blk= goes after the appended op/flip fields, followed only by ease=. The offline
-            // parsers match this line as a contiguous chain of named fields, so a field inserted
-            // between two existing ones silently drops every field after it rather than failing.
-            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld%s%s blk=%lldus%s",
+            // How the optical flow's synthesized present got its flow, last on the line.
+            char flowField[16] = "";
+            if (outcome.flowLabel) {
+                snprintf(flowField, sizeof(flowField), " fl=%s", outcome.flowLabel);
+            }
+            // blk= goes after the appended op/flip fields, followed only by ease= and fl=. The
+            // offline parsers match this line as a contiguous chain of named fields, so a field
+            // inserted between two existing ones silently drops every field after it rather than
+            // failing.
+            LOG("temporal dl=%lldus tgt=%lldus before=%lldus(d%d) after=%lldus w=%.3f pick=%s jit=%lldus pdt=%lldus lag=%lldus pull=%lldus lk=%d mark=%lld%s%s blk=%lldus%s%s",
                 (long long)((deadline - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((target - m_baseQpc.QuadPart) * usPerTick),
                 (long long)((bracket.info.beforeTs - m_baseQpc.QuadPart) * usPerTick), bracket.beforeDepth,
@@ -676,7 +696,8 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
                 opFields,
                 flipFields,
                 (long long)(blockTicks * usPerTick),
-                easeField);
+                easeField,
+                flowField);
             // Once per run rather than once per present: a static screen delivers no new
             // frames at all, so a run lasts as long as the screen does, and every present in
             // it already carries after=-1 on its own line.

@@ -142,8 +142,9 @@ private:
     LONGLONG LagForSourcePeriod(LONGLONG srcPeriodQpc) const;
 
 public:
-    // d3d11Present selects the D3D11 flip-model present path, which carries the blend
-    // compositor only; the parser pairs it with kCompositorBlend and nothing else.
+    // d3d11Present selects the D3D11 flip-model present path, which carries the blend and the
+    // optical flow interp; the parser pairs it with kCompositorBlend and kCompositorInterp, and
+    // the interp with nothing else. flowDirect is -xofdirect.
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
                         bool lock = false, CompositorKind compositor = kCompositorNearest,
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
@@ -152,7 +153,7 @@ public:
                         unsigned int extraLagMs = 0, bool d3d11Present = false,
                         bool deferCopy = false, bool wgc = false, bool wgcDrop = true,
                         bool wgcCursor = true, bool wgcOpen = true, int wgcScale = 0,
-                        bool wgcCopyEngine = true);
+                        bool wgcCopyEngine = true, bool flowDirect = false);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

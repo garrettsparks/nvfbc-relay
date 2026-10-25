@@ -7,7 +7,9 @@
 #include <vector>
 
 #include "IPresentPath.h"
+#include "FlowPlan.h"
 #include "FrameMarker.h"
+#include "OpticalFlowWarp.h"
 #include "WgcScaler.h"
 
 class CopyEngineTarget;
@@ -53,8 +55,13 @@ class CopyEngineTarget;
 // bands, the last output and target stamps), so the D3D9 compositor and this backend must
 // never both decide the same present; a mode runs exactly one present path.
 //
-// BLEND ONLY. This backend is the blend pipeline: the lerp shader is the compositor, and
-// nearest and interp are not ported. The parser only pairs it with the blend mode.
+// BLEND OR OPTICAL FLOW. This backend is the blend pipeline (b, b:vsync) or, with interp, the
+// optical flow interpolation (o, o:vsync): the same decision, holds and passthrough, with a
+// synthesized present drawn as the flow warp (OpticalFlowWarp) where the blend would draw the
+// lerp, and the lerp in its place when there is no flow for it. Each pair a present is
+// predicted to synthesize is flowed ahead (policy::FlowPlanner), handed to the engine right
+// after a present that draws, where its turns on the game's graphics engine take the draw's
+// with them. Nearest is not ported.
 //
 // WITH -wgc THE SWAPCHAIN IS A CopyEngineTarget (unless -nocopyengine): the same decision and
 // draw, into its buffers, except that a present showing one WGC frame as it is (no blend, no
@@ -63,8 +70,9 @@ class CopyEngineTarget;
 class D3D11PresentBackend : public IPresentPath {
 public:
     // tint is accepted so the mode string's options parse the same on either path; this
-    // path has no tint pass and says so at Setup.
-    explicit D3D11PresentBackend(bool tint);
+    // path has no tint pass and says so at Setup. interp selects the optical flow; flowDirect
+    // (-xofdirect) hands WGC's frames to its engine as they are.
+    D3D11PresentBackend(bool tint, bool interp, bool flowDirect);
     ~D3D11PresentBackend();
 
     D3D11PresentBackend(const D3D11PresentBackend&) = delete;
@@ -78,6 +86,10 @@ public:
     bool Setup(const RelayContext& ctx, CaptureRing* ring, const policy::PolicyConfig* cfg,
                bool mark, unsigned int markFrames, LARGE_INTEGER baseQpc,
                LONGLONG freqQpc) override;
+
+    // With the optical flow: two presents ahead, the horizon the flow planner was built for.
+    int LookaheadPresents() const override { return m_flow ? kFlowLookahead : 0; }
+    void PlanAhead(const FrameBracket* upcoming, const LONGLONG* targets, int count) override;
 
     // Decide this present and draw it onto the current back buffer. Fills out exactly as
     // the D3D9 synthesizing compositor would, so the temporal log line reads the same.
@@ -107,8 +119,13 @@ public:
     // Whole-run present statistics; safe to call when disabled.
     void LogSummary() const override;
 
-    const char* Name() const override { return "D3D11 flip-model present"; }
+    const char* Name() const override {
+        return m_interp ? "D3D11 flip-model present, optical flow" : "D3D11 flip-model present";
+    }
     const char* RefusalAdvice() const override {
+        if (m_flowFailed) {
+            return "To use the blend instead, type b:vsync at the mode prompt.";
+        }
         if (m_copyEngineFailed) {
             return "To start with the older output method, add -nocopyengine to the launch "
                    "options.";
@@ -145,6 +162,20 @@ private:
     bool DrawMarker(const bool cells[FrameMarker::kCells]);
     void SampleStats();
     void SamplePresentationPath();
+    // The optical flow's view of a ring slot: its stamp, the view to sample, its WGC texture.
+    OpticalFlowWarp::Frame FlowFrame(int slot, int64_t ts);
+    // Plans the flows of the brackets PlanAhead kept, by the decision each would get.
+    void PlanFlows();
+    // Hands cache slot's planned pair to the engine. False leaves it planned.
+    bool SubmitFlow(int cacheSlot);
+    // After this present's draw (or in place of one): the planned flows that ride it, and every
+    // one the next present needs whether or not anything was drawn. afterPresent: the copy
+    // engine's place for them, behind the present, where every planned flow goes.
+    void SubmitPlanned(bool drew, bool afterPresent = false);
+    // A synthesized present's frame: the warp from the pair's flow, or the lerp when there is
+    // none. Sets exec (3 warp, 1 lerp), the cache slot it read (-1 for the lerp) and fl=.
+    bool DrawSynthesis(const FrameBracket& bracket, float w, int* exec, int* flowSlot,
+                       const char** flowLabel);
 
     // How long one frame-pacing wait may block. Far above any real vblank interval, far below
     // anything a user would notice, so the loop keeps turning even if the swapchain stops.
@@ -154,10 +185,14 @@ private:
     // a mode change or an alt-tab, and it bounds how long a dead run can sit unnoticed.
     static const int kStallTimeouts = 5000 / kWaitTimeoutMs;
 
-    // Marker compositor-ID cell: this backend is the blend pipeline.
+    // Marker compositor-ID cell: the blend pipeline, or the optical flow.
     static const int kCompositorIdBlend = 1;
-    // Synthesis executor code for the lerp, matching the D3D9 blend compositor's.
+    static const int kCompositorIdFlow = 3;
+    // Synthesis executor codes: the lerp, matching the D3D9 blend compositor's, and the warp.
     static const int kExecBlend = 1;
+    static const int kExecWarp = 3;
+    // Presents ahead the optical flow plans for.
+    static const int kFlowLookahead = 2;
 
     bool m_enabled;
     int m_width, m_height;
@@ -216,6 +251,38 @@ private:
     float m_lastWeight;
     int m_lastExec;                     // executor code of the held pixels (0 = real)
     bool m_haveLast;
+    // A held warp draws again from the same flow while its cache slot still holds that pair.
+    int m_lastFlowSlot = -1;
+    policy::FlowPair m_lastFlowPair;
+
+    // The optical flow (o): NULL on the blend pipeline.
+    bool m_interp = false;
+    bool m_flowDirect = false;
+    bool m_flowFailed = false;          // the flow engine could not be set up
+    OpticalFlowWarp* m_flow = NULL;
+    policy::FlowPlanner m_planner;
+    // What each cache slot holds beyond the planner's pair: the ring slots its frames were in
+    // when it was planned, whether it still waits to be handed over, and the present that needs
+    // it first.
+    struct PlannedFlow {
+        policy::FlowPair pair;
+        int beforeSlot = -1;
+        int afterSlot = -1;
+        bool pending = false;           // planned, waiting to be handed over
+        bool handed = false;            // handed to the engine: the slot's fields are this pair's
+        bool failed = false;            // the engine refused it, or a frame had no input
+        long long needBy = 0;
+    };
+    PlannedFlow m_planned[policy::kFlowSlots];
+    // The upcoming brackets PlanAhead handed in, planned once Compose has decided this present.
+    FrameBracket m_ahead[kFlowLookahead];
+    LONGLONG m_aheadTargets[kFlowLookahead] = {};
+    int m_aheadCount = 0;
+    // The pair handed over last, for the engine's temporal hints.
+    policy::FlowPair m_lastHanded;
+    bool m_haveLastHanded = false;
+    long long m_flowHit = 0, m_flowLate = 0, m_flowOwn = 0, m_flowMiss = 0;
+    long long m_flowsRidden = 0, m_flowsAlone = 0, m_flowsAfterPresent = 0;
 
     bool m_mark;
     FrameMarker m_marker;               // counter and cell layout only; drawn here

@@ -53,7 +53,7 @@ class CaptureRing {
 public:
     // The ARRAY BOUND, not the number of slots in use: SlotsInUse() is what the loops walk
     // and what Setup allocates, so raising this costs no VRAM on its own. It is a constant
-    // because InterpSidecar sizes its own alias arrays from it.
+    // because the D3D11 present sizes its own alias arrays from it.
     //
     // 16 was itself doubled from 8 on a measured failure: at x3 with phase-aware keep-real
     // the window must hold the bracket while a third of batches contribute no valid frame,

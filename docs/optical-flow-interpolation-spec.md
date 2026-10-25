@@ -253,8 +253,9 @@ side.
   grid 2: 1.81 / 4.44 / 7.25; grid 1: 5.84 / 14.64 / 15.64. Both directions about twice that
   (grid 4 MEDIUM both ways, cost on: 2.73 ms; cost off: 2.50). These track NVIDIA's published Ada
   figures scaled by pixel count (grid 1 MEDIUM 15.7 ms, grid 4 MEDIUM about 1.8 ms), which reads as
-  the same dedicated unit. `nvOFExecute` returns only when the flow is done (submit time equals
-  completion time in every row), and graphics-queue timestamps around it read 0.
+  the same dedicated unit. Idle, `nvOFExecute` returned only when the flow was done (submit time
+  equals completion time in every row; under load it does not, see the 2026-10-24 run below), and
+  graphics-queue timestamps around it read 0.
 - **P4:** B8G8R8A8 registered as ABGR8 gives exactly the luma result, so WGC's frames go to the
   engine as they are. R8G8B8A8 is not in the engine's list and gives wrong flow (27.94 px for 7).
 - **P2, beside the Avatar benchmark (sitting `oftrace1`, one launch):** no relay 5335; the loop of
@@ -271,18 +272,70 @@ side.
   the engine's own flow is NOT valid as built: its 4 px exclusions around each edge remove exactly
   the bands where the crossfade fails.
 
-**What it changes.** The flow runs on a thread of its own, planned at least two presents ahead
-(15 ms to complete under load); the planner's horizon starts at the present after next. Each flow
+**The loop without its completion query (2026-10-24, sitting `oftrace2`, build `ofprobe5`, one
+launch, one run a row).** No relay 5321; `ofprobe:300` 5081 (-4.51%, against 4.39% in `oftrace1`);
+`ofprobenowait:300` 5130 (-3.59%). The probe's turns on the game's graphics engine fell from 177.6
+to 118.0 a second (about 3 to about 2 per flow) and the game's time off the engine for them from
+30.9 to 23.7 ms a second, so the query was one of the three turns. The same run overturns the
+reading above that the execute blocks: under the benchmark, without the query, `nvOFExecute`
+returned in 0.16 ms (median of the per-second medians; worst single 58 ms), so the 15.4 ms was the
+query waiting, not the execute. Idle in the sweep, the execute's return and the query's completion
+were the same; under load they are not. When a flow is done under load is therefore not measured,
+and a D3D11 query to find out costs a turn. No row closed the sitting with no relay, so the 4.51
+and 3.59 rest on the one opening baseline.
+
+**D3D12, CUDA and one direction (2026-10-24, sittings `oftrace3` and `oftrace4`, builds
+`ofprobe7` and `ofprobe8`, one launch each, one run a row).** The same loop on the engine's
+other interfaces, each checked exact on the generated frames before it loops:
+
+| loop | cost | probe turns a second | game off the engine | done after the call, under load |
+|---|---|---|---|---|
+| D3D11, no query (`oftrace2`) | -3.59% | 118.0 | 23.7 ms/s | not measured |
+| D3D12, both ways (`oftrace3`) | -3.61% | 119.8 | 23.5 ms/s | median 4.15 ms |
+| D3D12, both ways (`oftrace4`) | -3.68% | 119.9 | 23.9 ms/s | median 3.97 ms |
+| D3D12, forward only (`oftrace4`) | -3.40% | 119.9 | 23.8 ms/s | median 2.10 ms |
+| CUDA, both ways (`oftrace3`) | -6.47% | 305.3 | 44.9 ms/s | median 4.22 ms |
+
+Two turns a flow on the game's graphics engine is the same on D3D11 and D3D12 and with one
+direction or two, so the turns belong to each call into the engine, not to the API or the work;
+each costs the game about 0.2 ms. CUDA takes five and spins the CPU in its stream synchronize.
+The `oftrace4` no-relay rows read 5341 and 5361, so the forward-only row's 15 points are inside
+the drift. A GPU fault (driver events nvlddmkm 153, LiveKernelEvent 141 and 193) came the second
+the benchmark ended during the CUDA row of `oftrace3`; its cause is not known, and no D3D11 or
+D3D12 row has faulted.
+
+**A flow merges with a draw (2026-10-24, sitting `oftrace5`, build `ofprobe9`, one launch, one
+run a row; no relay 5338 and 5354).** On D3D11 without the query, at 60 a second:
+
+| loop | cost | turns a second | game off the engine |
+|---|---|---|---|
+| a full-screen draw alone, flushed | -1.83% | 59.8 (1 a draw) | 10.9 ms/s |
+| the flow alone, both ways | -3.61% | 118.3 (2 a flow) | 24.5 ms/s |
+| the flow alone, forward only | -3.31% | 119.9 (2 a flow) | 22.6 ms/s |
+| the draw, then the flow, same context | -3.65% | 118.4 (2 a tick) | 25.0 ms/s |
+
+A draw issued on the flow's context just before the execute rides in the flow's two turns. So
+a synthesized present, which draws its warp anyway, takes the flow for a later present for one
+turn more than the draw alone, about 0.23 ms of the game's time, where a flow on its own takes
+two. Forward only read 0.30 points cheaper here and 0.28 cheaper on D3D12 in `oftrace4`, each a
+single run inside a sitting whose no-relay rows differ by 16 and 20 points: not shown, cheap to
+run again with repeats.
+
+**What it changes.** The flow is planned ahead (the user, 2026-10-24); the planner's horizon
+starts at the present after next. Whether it also needs a thread of its own rested on the
+execute blocking 15 ms, which the 2026-10-24 run contradicts. Each flow
 costs about 3 turns on the game's engine, so `o` costs what its synthesized rate costs: about
 nothing at a locked 60 into 60, roughly 2% at a 90 fps source (an extrapolation from 4.4% at 60
-flows a second). Next measurements: the loop without the probe's own completion query (the call
-already blocks; one of the 3 turns may be that query), and the D3D12 and CUDA interfaces, which
-synchronize with fences, against the D3D11 turns.
+flows a second). Next measurement: the D3D12 and CUDA interfaces, which synchronize with fences,
+against the D3D11 loop's 2 turns a flow and 3.59%, each with a way to know when its flow is done.
 
 **The probe is built** (2026-10-23, `src/relay/FlowProbeMode.*`): the hidden mode `ofprobe` runs
 P1, P3 and P4 and the warp self-test of 6.3 and exits; `ofprobe:<s>` adds a loop of `<s>` seconds
 at 60 bidirectional flows a second for the P2 trace, and `ofprobedraw:<s>` the same loop with one
-full-screen draw before each flow, P2's positive control. Everything goes to the log on lines
+full-screen draw before each flow, P2's positive control. `ofprobenowait:<s>` (added 2026-10-24)
+is the loop without its own completion query after each execute: if the turns per flow drop, the
+query was one of them, and the time logged is the execute's return alone. Everything goes to the
+log on lines
 starting `ofprobe:`, with no popup at any outcome. Launch:
 `NvFBCR.exe -source 0 -target 1 -framerate ofprobe`. Each configuration's flow is checked against
 the generated frames' known motion (7, 3 px), so a fast configuration that is wrong shows as wrong.
@@ -358,14 +411,50 @@ Each row reads `fl=` and `sx=` censuses from the log and the summary lines of 4.
    its work is not on the game's graphics engine, each flow costs about 3 turns there. Not yet
    built by MSVC.
 3. The D3D11 backend: flow engine, flow cache, warp v2, fallbacks, logging; the D3D9 `o` removed.
+   Built 2026-10-24 (`src/relay/OpticalFlowWarp.*`, `D3D11Present.*`): `o` and `o:vsync` present
+   through the D3D11 backend (`o:<rate>` refused); the loop hands the path the brackets of the
+   next two presents (`IPresentPath::PlanAhead`) and the backend runs `FlowPlanner` as it was
+   tested; a planned flow is handed to the engine right after a present that draws, or alone when
+   the next present needs it; nothing waits on the CPU for a flow, the warp on the same context
+   reading the finished fields; a synthesized present without a flow draws the blend (`fl=miss`).
+   Input: luma drawn from every frame (both captures, any size; the draw rides the flow's turns);
+   `-xofdirect` hands `-wgc` frames at the output's size to the engine as they are (ABGR8), to be
+   benched against it (the user, 2026-10-24: "do both and bench them? I want whatever is more
+   performant"). Not yet: `pt=` as warp GPU time, the scene-cut fallback, the late-flow bound.
+   **First rows (2026-10-24, capped 90, frame generation off, one launch each).** `ofcap1`
+   (build `oflow1`): about 3,600 synthesized presents a row, every one warped with luma input
+   (`-wgc`: 3562 hit, 33 late, 3 own, 0 miss; NvFBC: 3649, 38, 2, 0); planned and unused about
+   5%. Against `b:vsync` in the same launch the game lost about 10 ms a second more to the relay
+   (`-wgc` 93.3 against 83.5, NvFBC 104.1 against 93.6). But under `-wgc` the flow handed over
+   right after a warp held that warp's copy-engine present: long present gaps 53 against the
+   blend's 17 (NvFBC 16 against 15), 443 with `-xofdirect`. **Fixed** in `oflow2`: with the copy
+   engine, planned flows go after the present. `ofcap2`: long gaps 22 against the blend's 20
+   (the old placement 1075 in the same launch), `-xofdirect` 16; game off the engine 96.8 ms/s
+   against the blend's 80.8, `-xofdirect` 99.4 (fewer relay turns, 86.5 against 97.1, but no
+   saving for the game).
+   **Scored, uncapped, frame generation off (`ofpts1`, `oflow2`):** the game ran 112 to 115 fps,
+   so about 1.3 synthesized presents a second; `o` cost 17 points more than `b` (4228, 4230
+   against 4244, 4247; no relay 4344, 4360) because 88% of planned flows went unused: the bare
+   gate predicted synthesis where the composite's band and the lock held passthrough. **Fixed**
+   in `oflow3`: Compose plans after its own decision, predicting each upcoming present with
+   `DecideComposite` on a copy of the state. `ofpts2`: `o` 4250, 4245 against `b` 4256, 4243 (no
+   relay 4378, 4356), unused 1 of 55; `-xofdirect` 4251, 4254 with 7 or 8 blends for want of a
+   flow per run. `ofcap3` (capped 90, `oflow3`): about 3,600 synthesized presents a row, 99%
+   warped from a flow planned ahead, 21 to 25 planned flows unused (`oflow1`: 130 to 199), long
+   present gaps equal to the blend's (19 against 18 with `-wgc`, 17 against 17 on NvFBC); the game
+   lost 12.7 ms/s more than with the blend under `-wgc` (91.3 against 78.6) and 10.8 more on
+   NvFBC (102.7 against 91.9), about 0.4 ms per synthesized present. Points at a 90 fps source
+   that is also GPU-bound are not measured (the game's 90 is a cap).
 4. The GPU self-test (6.3); the frame dump and the quality harness (6.4).
 5. The live rows (6.5), then a stream.
 
 ## 8. Decisions for the user
 
 1. Remove the D3D9 `o` (never run) in favour of the D3D11 one (recommended), or keep both.
+   Decided 2026-10-23: remove it.
 2. The flow ahead of the present (recommended) against flow for every captured pair (simpler,
    FFmpeg's way, but at 240 fps it would run 240 flows a second for presents that pass through).
+   Decided 2026-10-24: ahead.
 3. Grid and preset, after P3 and 6.4.
 4. Whether an AI interpolator is worth a live trial after 6.4 (RIFE through TensorRT, or Maxine
    VFG installed by hand), if the flow warp's artifacts are not acceptable.

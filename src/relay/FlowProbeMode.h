@@ -1,6 +1,7 @@
 #pragma once
 
 #include "IFrameCaptureMode.h"
+#include "LaunchOptions.h"
 
 // THE OPTICAL FLOW ENGINE PROBE (docs/optical-flow-interpolation-spec.md, 6.1). A hidden mode
 // that answers, on the machine it runs on, what the rebuilt optical-flow compositor assumes:
@@ -16,6 +17,19 @@
 //                        second, for a trace taken a fixed time into a benchmark
 //   ofprobedraw:<s>      as ofprobe:<s> with one full-screen draw before each flow: the trace's
 //                        positive control, a known turn on the graphics engine per flow
+//   ofprobenowait:<s>    as ofprobe:<s> without the loop's own completion query after each
+//                        execute: whether that query is one of the turns each flow takes on
+//                        the graphics engine. The time logged is the execute's return alone,
+//                        which under load comes well before the flow is done
+//   ofprobenowaitfwd:<s> as ofprobenowait:<s> with the forward flow alone
+//   ofprobedrawnowait:<s> as ofprobenowait:<s> with one full-screen draw on the same context
+//                        before each flow: whether the flow's turns and a draw's merge
+//   ofprobedrawonly:<s>  the draw alone at the same rate, flushed, no flow: the turns a draw
+//                        takes by itself
+//   ofprobe12:<s>        the same loop on the engine's D3D12 interface, frames and flow in D3D12
+//                        resources, completion read from a fence by the CPU
+//   ofprobe12fwd:<s>     as ofprobe12:<s> with the forward flow alone: whether each direction
+//                        is a turn of its own on the graphics engine
 //
 // Everything it finds goes to the log on lines starting "ofprobe:". It never shows a popup: an
 // unattended run would wait on one forever, and every outcome, an engine that is missing
@@ -26,7 +40,7 @@
 // is fast because it is wrong cannot pass for a fast one.
 class FlowProbeMode : public IFrameCaptureMode {
 public:
-    FlowProbeMode(int loopSeconds, bool drawControl);
+    FlowProbeMode(int loopSeconds, launch::ProbeLoop loop);
 
     UINT GetPresentationInterval() const override;
     MaybeFailure Setup(const RelayContext& ctx) override;
@@ -35,5 +49,5 @@ public:
 
 private:
     int m_loopSeconds;
-    bool m_drawControl;
+    launch::ProbeLoop m_loop;
 };

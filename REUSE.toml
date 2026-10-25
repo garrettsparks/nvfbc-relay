@@ -20,3 +20,9 @@ path = "third_party/nvof/nvOpticalFlowD3D11.h"
 precedence = "override"
 SPDX-FileCopyrightText = "2019-2023 NVIDIA Corporation"
 SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "third_party/nvof/nvOpticalFlowD3D12.h"
+precedence = "override"
+SPDX-FileCopyrightText = "2020-2023 NVIDIA Corporation"
+SPDX-License-Identifier = "MIT"
