@@ -171,8 +171,10 @@ private:
     // one the next present needs whether or not anything was drawn. afterPresent: the copy
     // engine's place for them, behind the present, where every planned flow goes.
     void SubmitPlanned(bool drew, bool afterPresent = false);
-    // A synthesized present's frame: the warp from the pair's flow, or the lerp when there is
-    // none. Sets exec (3 warp, 1 lerp), the cache slot it read (-1 for the lerp) and fl=.
+    // A synthesized present's frame: the warp from the pair's flow when it was handed over at an
+    // earlier present, or the lerp when it was not (it is handed over now, for later presents of
+    // the pair) or there is none. Sets exec (3 warp, 1 lerp), the cache slot it read (-1 for the
+    // lerp) and fl=.
     bool DrawSynthesis(const FrameBracket& bracket, float w, int* exec, int* flowSlot,
                        const char** flowLabel);
 

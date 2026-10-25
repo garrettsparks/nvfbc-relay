@@ -1,5 +1,6 @@
 #include "FlowProbeMode.h"
 #include "FlowWarpShader.h"
+#include "OpticalFlowWarp.h"
 #include "OutputWindow.h"
 #include <SimpleLogger.h>
 #include <d3d11.h>
@@ -526,6 +527,8 @@ bool MakeWarpRig(Device& d, WarpRig* rig) {
                        D3D11_BIND_RENDER_TARGET, &rig->target);
 }
 
+bool ReadTarget(Device& d, const Tex& target, std::vector<float>* out);
+
 // Draws the warp at w and returns the red channel of the result, row major.
 bool RunWarp(Device& d, WarpRig& rig, ID3D11ShaderResourceView* before,
              ID3D11ShaderResourceView* after, ID3D11ShaderResourceView* fwd,
@@ -557,15 +560,19 @@ bool RunWarp(Device& d, WarpRig& rig, ID3D11ShaderResourceView* before,
     d.ctx->PSSetShaderResources(0, 4, nulls);
     ID3D11RenderTargetView* noTarget = NULL;
     d.ctx->OMSetRenderTargets(1, &noTarget, NULL);
+    return ReadTarget(d, rig.target, out);
+}
 
+// The red channel of a float test-size render target, row major. Waits for the GPU.
+bool ReadTarget(Device& d, const Tex& target, std::vector<float>* out) {
     D3D11_TEXTURE2D_DESC td = {};
-    rig.target.tex->GetDesc(&td);
+    target.tex->GetDesc(&td);
     td.Usage = D3D11_USAGE_STAGING;
     td.BindFlags = 0;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     Tex staging;
     if (FAILED(d.dev->CreateTexture2D(&td, NULL, &staging.tex))) return false;
-    d.ctx->CopyResource(staging.tex, rig.target.tex);
+    d.ctx->CopyResource(staging.tex, target.tex);
     D3D11_MAPPED_SUBRESOURCE m = {};
     if (FAILED(d.ctx->Map(staging.tex, 0, D3D11_MAP_READ, 0, &m))) return false;
     out->resize((size_t)kTestW * kTestH);
@@ -620,8 +627,198 @@ float WorstAgainstReference(const std::vector<float>& gpu, const GreyFrame& a, c
     return worst;
 }
 
+// The compositor's own OpticalFlowWarp at the test frames' size, with the square frames it is
+// checked on: f0, the square moved right (f1) and moved left (f2), each a shader view named by a
+// stamp of its own, and a float target to draw into and read back.
+struct EngineRig {
+    OpticalFlowWarp warp;
+    GreyFrame f0, f1, f2;
+    Tex t0, t1, t2, target;
+    Srv s0, s1, s2;
+    ID3D11Query* event = NULL;
+    long long present = 0;
+    ~EngineRig() {
+        if (event) event->Release();
+    }
+    OpticalFlowWarp::Frame Frame(int i) const {
+        const Srv* views[3] = {&s0, &s1, &s2};
+        OpticalFlowWarp::Frame f;
+        f.ts = i + 1;
+        f.srv = views[i]->view;
+        return f;
+    }
+};
+
+bool MakeEngineRig(Device& d, EngineRig* r) {
+    r->f0 = SquareFrame(0, true);
+    r->f1 = SquareFrame(kSquareMove, true);
+    r->f2 = SquareFrame(-kSquareMove, true);
+    const GreyFrame* frames[3] = {&r->f0, &r->f1, &r->f2};
+    Tex* tex[3] = {&r->t0, &r->t1, &r->t2};
+    Srv* srv[3] = {&r->s0, &r->s1, &r->s2};
+    for (int i = 0; i < 3; i++) {
+        if (!MakeTexture(d.dev, kTestW, kTestH, DXGI_FORMAT_R8G8B8A8_UNORM,
+                         frames[i]->rgba.data(), kTestW * 4, D3D11_BIND_SHADER_RESOURCE, tex[i]) ||
+            FAILED(d.dev->CreateShaderResourceView(tex[i]->tex, NULL, &srv[i]->view))) {
+            return false;
+        }
+    }
+    D3D11_QUERY_DESC qd = {};
+    qd.Query = D3D11_QUERY_EVENT;
+    if (FAILED(d.dev->CreateQuery(&qd, &r->event))) return false;
+    return MakeTexture(d.dev, kTestW, kTestH, DXGI_FORMAT_R32G32B32A32_FLOAT, NULL, 0,
+                       D3D11_BIND_RENDER_TARGET, &r->target) &&
+           r->warp.Setup(d.dev, d.ctx, kTestW, kTestH);
+}
+
+// Hands the flow of frame a to frame b to the engine in slot 0, optionally waits for it, then
+// draws the warp at 0.5 over frames c and d and reads it back. The wait is the context's event and
+// then 50 ms more: the engine is a unit of its own, and whether a graphics event sees its work end
+// is part of what is being checked, so the reference does not rest on it alone.
+// How a check waits between handing a flow over and drawing its warp.
+enum class FlowWait {
+    None,        // not at all, trusting D3D11 to order the two
+    OnePresent,  // 17 ms, a present at 60, with no sync: what the compositor relies on
+    Long,        // the context's event, then 50 ms more: surely done
+};
+
+bool EngineWarp(Device& d, EngineRig& r, int a, int b, FlowWait wait, int c, int dd,
+                std::vector<float>* out) {
+    if (!r.warp.Flow(0, r.Frame(a), r.Frame(b), false)) return false;
+    if (wait == FlowWait::Long) {
+        if (!WaitIdle(d, r.event)) return false;
+        Sleep(50);
+    } else if (wait == FlowWait::OnePresent) {
+        // The compositor's next present pushes its work to the GPU; here a flush does.
+        d.ctx->Flush();
+        Sleep(17);
+    }
+    return r.warp.Warp(0, r.Frame(c).srv, r.Frame(dd).srv, 0.5f, r.target.rtv, ++r.present) &&
+           ReadTarget(d, r.target, out);
+}
+
+// The share of pixels that differ by more than 0.1: a pixel the warp took from the wrong place
+// differs by far more, and the engine's own small variations by far less.
+float DifferingShare(const std::vector<float>& a, const std::vector<float>& b) {
+    size_t n = 0, differ = 0;
+    for (size_t i = 0; i < a.size() && i < b.size(); i++, n++) {
+        if (std::fabs(a[i] - b[i]) > 0.1f) differ++;
+    }
+    return n ? (float)differ / (float)n : 0.0f;
+}
+
+// THE ORDERING CHECK: does a warp drawn a present after its flow was handed over read that flow?
+// D3D11 does not order a draw after the engine's work, so the compositor warps only from a flow
+// handed over at an earlier present and counts on the engine having finished it by then. Each
+// time the slot first holds the flow of the square moved right, finished; then the flow of the
+// square moved left is handed into the same slot and the warp of the left move drawn 17 ms later
+// with no sync (one present). Against it: the same warp drawn after a long wait (the reference),
+// the reference again (how far the engine's own runs differ), the warp drawn on the right move's
+// flow left in the slot (stale, the control: what reading the old flow looks like, which must be
+// far from the reference or the check cannot see a failure), and the warp drawn with no wait at
+// all (unwaited, a reading of what D3D11's ordering gives: the old flow, nearly always).
+struct OrderingResult {
+    bool ran = false;
+    float onePresent = 0.0f;  // share of pixels differing, one present later against the reference
+    float unwaited = 0.0f;    // the same, unwaited against the reference
+    float repeat = 0.0f;      // the same, the reference against itself
+    float stale = 0.0f;       // the same, stale against the reference
+    // The warp a present later differs from the reference no more than the reference from
+    // itself, give or take a tenth of the stale control's difference, and the control is far off.
+    bool Pass() const { return ran && onePresent <= repeat + 0.1f * stale && stale > 0.02f; }
+};
+
+OrderingResult OrderingCheck(Device& d, EngineRig& r) {
+    OrderingResult res;
+    std::vector<float> reference, again, stale, onePresent, unwaited;
+    if (!EngineWarp(d, r, 0, 2, FlowWait::Long, 0, 2, &reference) ||
+        !EngineWarp(d, r, 0, 2, FlowWait::Long, 0, 2, &again) ||
+        !EngineWarp(d, r, 0, 1, FlowWait::Long, 0, 2, &stale) ||
+        !EngineWarp(d, r, 0, 2, FlowWait::OnePresent, 0, 2, &onePresent) ||
+        !EngineWarp(d, r, 0, 1, FlowWait::Long, 0, 1, &unwaited) ||
+        !EngineWarp(d, r, 0, 2, FlowWait::None, 0, 2, &unwaited)) {
+        return res;
+    }
+    res.ran = true;
+    res.onePresent = DifferingShare(onePresent, reference);
+    res.unwaited = DifferingShare(unwaited, reference);
+    res.repeat = DifferingShare(again, reference);
+    res.stale = DifferingShare(stale, reference);
+    return res;
+}
+
+// The warp on the engine's own flow for the square moved right, at 0.5, against the truth (the
+// square half way) beside the crossfade, in the bands the square's edges sweep, where the
+// crossfade puts two half-strength squares and the warp has to move the edge, and elsewhere in
+// the square's rows. Only a pixel either side of each edge is left out, where sampling blurs both.
+void EngineReading(Device& d, EngineRig& r) {
+    std::vector<float> out;
+    if (!EngineWarp(d, r, 0, 1, FlowWait::Long, 0, 1, &out)) {
+        LOG("ofprobe: warp on engine flow: could not run");
+        return;
+    }
+    const int edges[] = {kSquareX0, kSquareX0 + kSquareMove / 2, kSquareX0 + kSquareMove,
+                         kSquareX1, kSquareX1 + kSquareMove / 2, kSquareX1 + kSquareMove};
+    double warpBand = 0.0, blendBand = 0.0, warpRest = 0.0, blendRest = 0.0;
+    int nBand = 0, nRest = 0;
+    for (int y = kSquareY0 + 4; y < kSquareY1 - 4; y++) {
+        for (int x = 8; x < kTestW - 8; x++) {
+            bool nearEdge = false;
+            for (int e : edges) {
+                if (x >= e - 1 && x <= e) nearEdge = true;
+            }
+            if (nearEdge) continue;
+            const bool band = (x >= kSquareX0 && x < kSquareX0 + kSquareMove) ||
+                              (x >= kSquareX1 && x < kSquareX1 + kSquareMove);
+            const float truth = InSquare(x, y, kSquareMove / 2) ? 0.95f : TestBackground(x, y);
+            const size_t i = (size_t)y * kTestW + x;
+            const double warpErr = std::fabs(out[i] - truth);
+            const double blendErr = std::fabs(0.5f * (r.f0.value[i] + r.f1.value[i]) - truth);
+            if (band) {
+                warpBand += warpErr;
+                blendBand += blendErr;
+                nBand++;
+            } else {
+                warpRest += warpErr;
+                blendRest += blendErr;
+                nRest++;
+            }
+        }
+    }
+    LOG("ofprobe: warp on engine flow (the compositor's OpticalFlowWarp, grid 4 MEDIUM): in the "
+        "bands the edges sweep, mean error %.4f against the truth, crossfade %.4f (%d pixels); "
+        "elsewhere %.4f, crossfade %.4f (%d pixels)", nBand ? warpBand / nBand : 0.0,
+        nBand ? blendBand / nBand : 0.0, nBand, nRest ? warpRest / nRest : 0.0,
+        nRest ? blendRest / nRest : 0.0, nRest);
+}
+
+// A tally of ordering checks, as shares of pixels differing by more than 0.1.
+struct OrderingTally {
+    int count = 0, ran = 0, failed = 0, unwaitedStale = 0;
+    float worstOnePresent = 0.0f, worstRepeat = 0.0f, leastStale = 1e9f;
+    void Run(Device& d, EngineRig& r) {
+        count++;
+        const OrderingResult res = OrderingCheck(d, r);
+        if (!res.ran) return;
+        ran++;
+        if (!res.Pass()) failed++;
+        if (res.unwaited > res.repeat + 0.1f * res.stale) unwaitedStale++;
+        worstOnePresent = std::max(worstOnePresent, res.onePresent);
+        worstRepeat = std::max(worstRepeat, res.repeat);
+        leastStale = std::min(leastStale, res.stale);
+    }
+    bool Passed() const { return count > 0 && ran == count && failed == 0; }
+    void Log(const char* label) const {
+        LOG("ofprobe: %s: %d of %d checks ran, %d failed; pixels differing by more than 0.1 "
+            "from the reference: warp a present later worst %.2f%%, the reference again worst "
+            "%.2f%%, the stale flow (control) at least %.2f%%; the warp with no wait read a "
+            "stale flow in %d", label, ran, count, failed, 100.0f * worstOnePresent,
+            100.0f * worstRepeat, ran ? 100.0f * leastStale : 0.0f, unwaitedStale);
+    }
+};
+
 // Runs the self-test and logs one line per check and a verdict.
-void WarpSelfTest(NV_OF_D3D11_API_FUNCTION_LIST& of, Device& d) {
+void WarpSelfTest(Device& d) {
     WarpRig rig;
     if (!MakeWarpRig(d, &rig)) {
         LOG("ofprobe: warp self-test: RESULT could not be set up");
@@ -699,87 +896,26 @@ void WarpSelfTest(NV_OF_D3D11_API_FUNCTION_LIST& of, Device& d) {
         "> 0.2)", worstWrong);
     LOG("ofprobe: warp self-test: RESULT %s", pass ? "PASS" : "FAIL");
 
-    // The warp on the engine's own flow for the same square, scored against the truth beside the
-    // crossfade, away from the square's edges. A reading, not a pass mark: the engine's flow is
-    // an estimate at its grid.
-    Tex g0, g1;
-    std::vector<unsigned char> grey0((size_t)kTestW * kTestH), grey1(grey0.size());
-    for (size_t i = 0; i < grey0.size(); i++) {
-        grey0[i] = f0.rgba[i * 4];
-        grey1[i] = f1.rgba[i * 4];
-    }
-    if (!MakeTexture(d.dev, kTestW, kTestH, DXGI_FORMAT_R8_UNORM, grey0.data(), kTestW,
-                     D3D11_BIND_SHADER_RESOURCE, &g0) ||
-        !MakeTexture(d.dev, kTestW, kTestH, DXGI_FORMAT_R8_UNORM, grey1.data(), kTestW,
-                     D3D11_BIND_SHADER_RESOURCE, &g1)) {
+    // The compositor's own OpticalFlowWarp on the engine's flow: how well it warps the square (a
+    // reading, not a pass mark: the engine's flow is an estimate at its grid), and the ordering
+    // check, a hundred times over.
+    EngineRig engine;
+    if (!MakeEngineRig(d, &engine)) {
+        LOG("ofprobe: warp on engine flow: RESULT the compositor's OpticalFlowWarp could not be "
+            "set up at the test size");
         return;
     }
-    for (int grid : {4, 2}) {
-        Config cfg = {NV_OF_BUFFER_FORMAT_GRAYSCALE8, DXGI_FORMAT_R8_UNORM, grid,
-                      NV_OF_PERF_LEVEL_SLOW, true, false};
-        Session s;
-        char label[64];
-        snprintf(label, sizeof(label), "warp on engine flow, grid %d", grid);
-        // The probe's sessions are full size; this one is the test frames' size.
-        s.of = &of;
-        if (of.nvCreateOpticalFlowD3D11(d.dev, d.ctx, &s.handle) != NV_OF_SUCCESS) continue;
-        NV_OF_INIT_PARAMS init = {};
-        init.width = kTestW;
-        init.height = kTestH;
-        init.outGridSize = (NV_OF_OUTPUT_VECTOR_GRID_SIZE)cfg.grid;
-        init.mode = NV_OF_MODE_OPTICALFLOW;
-        init.perfLevel = cfg.perf;
-        init.predDirection = NV_OF_PRED_DIRECTION_BOTH;
-        init.inputBufferFormat = cfg.input;
-        if (of.nvOFInit(s.handle, &init) != NV_OF_SUCCESS) {
-            LOG("ofprobe: %s: init refused at %dx%d", label, kTestW, kTestH);
-            continue;
-        }
-        const int cx = (kTestW + grid - 1) / grid, cy = (kTestH + grid - 1) / grid;
-        if (!MakeTexture(d.dev, cx, cy, DXGI_FORMAT_R16G16_SINT, NULL, 0,
-                         D3D11_BIND_SHADER_RESOURCE, &s.fwdTex) ||
-            !MakeTexture(d.dev, cx, cy, DXGI_FORMAT_R16G16_SINT, NULL, 0,
-                         D3D11_BIND_SHADER_RESOURCE, &s.bwdTex) ||
-            of.nvOFRegisterResourceD3D11(s.handle, g0.tex, &s.before) != NV_OF_SUCCESS ||
-            of.nvOFRegisterResourceD3D11(s.handle, g1.tex, &s.after) != NV_OF_SUCCESS ||
-            of.nvOFRegisterResourceD3D11(s.handle, s.fwdTex.tex, &s.fwd) != NV_OF_SUCCESS ||
-            of.nvOFRegisterResourceD3D11(s.handle, s.bwdTex.tex, &s.bwd) != NV_OF_SUCCESS ||
-            !Execute(s, false)) {
-            LOG("ofprobe: %s: could not run", label);
-            continue;
-        }
-        Srv fs, bs;
-        if (FAILED(d.dev->CreateShaderResourceView(s.fwdTex.tex, NULL, &fs.view)) ||
-            FAILED(d.dev->CreateShaderResourceView(s.bwdTex.tex, NULL, &bs.view)) ||
-            !RunWarp(d, rig, s0.view, s1.view, fs.view, bs.view, grid, 0.5f, &out)) {
-            continue;
-        }
-        double warpErr = 0.0, blendErr = 0.0;
-        int n = 0;
-        const int edges[] = {kSquareX0, kSquareX0 + kSquareMove / 2, kSquareX0 + kSquareMove,
-                             kSquareX1, kSquareX1 + kSquareMove / 2, kSquareX1 + kSquareMove};
-        for (int y = kSquareY0 + 4; y < kSquareY1 - 4; y++) {
-            for (int x = 8; x < kTestW - 8; x++) {
-                bool nearEdge = false;
-                for (int e : edges) {
-                    if (x >= e - 4 && x < e + 4) nearEdge = true;
-                }
-                if (nearEdge) continue;
-                const float truth = InSquare(x, y, kSquareMove / 2) ? 0.95f : TestBackground(x, y);
-                const size_t i = (size_t)y * kTestW + x;
-                warpErr += std::fabs(out[i] - truth);
-                blendErr += std::fabs(0.5f * (f0.value[i] + f1.value[i]) - truth);
-                n++;
-            }
-        }
-        LOG("ofprobe: %s: mean error %.4f against the truth, crossfade %.4f (%d pixels, 4 px "
-            "from each edge left out)", label, n ? warpErr / n : 0.0, n ? blendErr / n : 0.0, n);
-    }
+    EngineReading(d, engine);
+    OrderingTally tally;
+    for (int i = 0; i < 100; i++) tally.Run(d, engine);
+    tally.Log("ordering check (idle)");
+    LOG("ofprobe: ordering check: RESULT %s", tally.Passed() ? "PASS" : "FAIL");
 }
 
 }  // namespace
 
-FlowProbeMode::FlowProbeMode(int loopSeconds) : m_loopSeconds(loopSeconds) {}
+FlowProbeMode::FlowProbeMode(int loopSeconds, bool orderLoop)
+    : m_loopSeconds(loopSeconds), m_orderLoop(orderLoop) {}
 
 UINT FlowProbeMode::GetPresentationInterval() const { return D3DPRESENT_INTERVAL_IMMEDIATE; }
 
@@ -842,9 +978,44 @@ MaybeFailure FlowProbeMode::Run(RelayContext& /*ctx*/,
     if (flowFormat == DXGI_FORMAT_UNKNOWN) flowFormat = DXGI_FORMAT_R16G16_SINT;
     if (costFormat == DXGI_FORMAT_UNKNOWN) costFormat = DXGI_FORMAT_R8_UINT;
 
-    // The looping spellings go straight to the loop, so a trace taken a fixed time into a
+    // The ordering check repeated, a tally a second, for running beside a benchmark.
+    if (m_orderLoop) {
+        EngineRig engine;
+        if (!MakeEngineRig(d, &engine)) {
+            LOG("ofprobe: RESULT the compositor's OpticalFlowWarp could not be set up");
+            LOG("ofprobe: done");
+            return std::nullopt;
+        }
+        LOG("ofprobe: ordering loop: %d s, the ordering check repeated, a tally a second",
+            m_loopSeconds);
+        bool all = true;
+        for (int sec = 0; sec < m_loopSeconds; sec++) {
+            LARGE_INTEGER start, now, freq;
+            QueryPerformanceFrequency(&freq);
+            QueryPerformanceCounter(&start);
+            // About a second of checks, however long each takes under load.
+            OrderingTally tally;
+            do {
+                tally.Run(d, engine);
+                QueryPerformanceCounter(&now);
+            } while (now.QuadPart - start.QuadPart < freq.QuadPart && tally.count < 200);
+            char label[64];
+            snprintf(label, sizeof(label), "ordering loop second %d", sec + 1);
+            tally.Log(label);
+            all = tally.Passed() && all;
+            if (!PumpMessages()) {
+                LOG("ofprobe: the output window closed; stopping");
+                break;
+            }
+        }
+        LOG("ofprobe: ordering loop: RESULT %s", all ? "PASS" : "FAIL");
+        LOG("ofprobe: done");
+        return std::nullopt;
+    }
+
+    // The looping spelling goes straight to the loop, so a trace taken a fixed time into a
     // benchmark finds the loop and not the sweep; the plain spelling does the sweep alone.
-    if (m_loopSeconds <= 0) WarpSelfTest(of, d);
+    if (m_loopSeconds <= 0) WarpSelfTest(d);
 
     // The frames: grey pattern as luma, as RGBA (what ABGR8 names) and as BGRA (what WGC
     // delivers), each before and after the move.

@@ -220,7 +220,7 @@ inline const std::vector<UsageRow>& ModeRows() {
                            "as b:vsync", false, false},
         {"diag, diag:vsync", "", "Clock probes: DWM compose timing and the card's raster", false,
          false},
-        {"ofprobe, ofprobe:30", "",
+        {"ofprobe, ofprobe:30, ofprobeorder:30", "",
          "Optical flow engine probe: capabilities, cost and accuracy, then an optional loop "
          "for a GPU trace", false, false},
     };
@@ -545,6 +545,7 @@ struct ModeSpec {
     bool d3d11Present = false;   // the D3D11 flip-model swapchain rather than D3D9
     float framerate = 0.0f;
     int probeSeconds = 0;        // FlowProbe: the sustained loop's length; 0 = no loop
+    bool probeOrder = false;     // FlowProbe: the loop repeats the ordering check instead
 };
 
 inline char LowerAscii(char c) {
@@ -560,8 +561,9 @@ inline bool EqualsNoCase(const std::string& a, const char* b) {
     return true;
 }
 
-// The optical flow probe's spellings: "ofprobe", and "ofprobe:<seconds>" for its loop. The loop
-// length is a whole number of seconds, 1 to 3600.
+// The optical flow probe's spellings: "ofprobe", "ofprobe:<seconds>" for its flow loop, and
+// "ofprobeorder:<seconds>" for the ordering check repeated. The length is a whole number of
+// seconds, 1 to 3600.
 inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
     if (EqualsNoCase(modeStr, "ofprobe")) {
         s->kind = ModeKind::FlowProbe;
@@ -569,7 +571,9 @@ inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
     }
     const size_t colon = modeStr.find(':');
     if (colon == std::string::npos) return false;
-    if (!EqualsNoCase(modeStr.substr(0, colon), "ofprobe")) return false;
+    const std::string head = modeStr.substr(0, colon);
+    const bool order = EqualsNoCase(head, "ofprobeorder");
+    if (!order && !EqualsNoCase(head, "ofprobe")) return false;
     const std::string digits = modeStr.substr(colon + 1);
     if (digits.empty() || digits.size() > 4) return false;
     int seconds = 0;
@@ -580,6 +584,7 @@ inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
     if (seconds < 1 || seconds > 3600) return false;
     s->kind = ModeKind::FlowProbe;
     s->probeSeconds = seconds;
+    s->probeOrder = order;
     return true;
 }
 

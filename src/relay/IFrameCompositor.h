@@ -26,9 +26,10 @@ struct CompositeOutcome {
     int synthAge = -1;             // pta= field: how many presents ago the frame pt= timed was
                                    // drawn, when pt= is a GPU time read back later; -1 = no field
     const char* flowLabel = NULL;  // fl= field: how a synthesized present of the optical flow
-                                   // got its flow ("hit" handed over at an earlier present,
-                                   // "late" planned but handed over at this one, "own" not
-                                   // planned, "miss" no flow, the blend drawn); NULL = no field
+                                   // got its flow ("hit" handed over at an earlier present and
+                                   // warped; "late" planned but handed over at this one, "own"
+                                   // not planned, "miss" no flow, each drawn as the blend);
+                                   // NULL = no field
 };
 
 // Synthesis executor codes: what actually produced a present's pixels. One vocabulary

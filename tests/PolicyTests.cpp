@@ -5301,21 +5301,26 @@ static void test_launch_mode_parsing() {
     }
 
     // The optical flow probe: no loop, then each loop by its spelling; seconds 1 to 3600.
-    // The optical flow probe: no loop, or a loop of 1 to 3600 seconds. The experiments' spellings
-    // are gone and refused.
-    struct Probe { const char* text; int seconds; };
+    // The optical flow probe: no loop, the flow loop or the ordering check, 1 to 3600 seconds. The
+    // experiments' spellings are gone and refused.
+    struct Probe { const char* text; int seconds; bool order; };
     const Probe probes[] = {
-        {"ofprobe", 0},
-        {"OFPROBE", 0},
-        {"ofprobe:30", 30},
-        {"ofprobe:3600", 3600},
+        {"ofprobe", 0, false},
+        {"OFPROBE", 0, false},
+        {"ofprobe:30", 30, false},
+        {"ofprobe:3600", 3600, false},
+        {"ofprobeorder:30", 30, true},
+        {"OFPROBEORDER:3600", 3600, true},
     };
     for (const Probe& p : probes) {
         const launch::ModeSpec s = launch::ParseMode(p.text);
-        CHECK(s.kind == ModeKind::FlowProbe && s.probeSeconds == p.seconds,
-              "mode '%s' parsed as kind %d seconds %d", p.text, (int)s.kind, s.probeSeconds);
+        CHECK(s.kind == ModeKind::FlowProbe && s.probeSeconds == p.seconds &&
+                  s.probeOrder == p.order,
+              "mode '%s' parsed as kind %d seconds %d order %d", p.text, (int)s.kind,
+              s.probeSeconds, (int)s.probeOrder);
     }
     for (const char* bad : {"ofprobe:", "ofprobe:0", "ofprobe:3601", "ofprobe:1.5",
+                            "ofprobeorder", "ofprobeorder:", "ofprobeorder:0",
                             "ofprobedraw:30", "ofprobenowait:30", "ofprobe12:30",
                             "ofprobedrawonly:30", "ofprobecuda:30", "ofprobe:-5", "ofprobex:30"}) {
         CHECK(launch::ParseMode(bad).kind == ModeKind::Invalid, "mode '%s' must be refused", bad);

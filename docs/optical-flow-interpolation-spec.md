@@ -370,6 +370,22 @@ fail loudly when broken: two identical frames give the input back exactly; `w` =
 before frame bit for bit; a deliberately swapped flow sign makes the translation case miss by
 twice the motion.
 
+**The ordering check (2026-10-24, builds `oorder1` to `oorder4`).** The self-test now drives
+the compositor's own `OpticalFlowWarp` at the test size. On the engine's flow at grid 4 MEDIUM
+it warps the square with a mean error of 0.106 in the bands the edges sweep, against the
+crossfade's 0.333, and 0.005 elsewhere against 0.001 (the band scoring replaced the old
+comparison, which left those bands out). **D3D11 does not order a draw after the engine's
+work:** a warp drawn straight after handing its flow over read the slot's previous flow in 99 of
+100 checks idle, and an event query or a polled copy of one cell of each field did not wait for
+the engine either (89 of 100 still stale with the copy). Only time did: an event wait plus 50 ms
+gave a reference that matched itself exactly, and a warp drawn 17 ms (one present) after the
+flow with no sync matched it in 100 of 100 idle and in all 388 checks run beside the benchmark
+at frame generation 2X (`ofprobeorder:300`, sitting `oforder1`), while the warp with no wait read
+the stale flow in 215 of them. The test frames are 320x96; a full-size flow takes about 4 ms
+under load, its worst 69 ms. So the compositor warps only from a flow handed over at an earlier
+present, and the engine is to move to its D3D12 interface, whose fence says when a flow is done
+(the user, 2026-10-24).
+
 ### 6.4 Quality against ground truth (offline)
 
 A capture of real gameplay at 240 fps (the game display at 240 Hz, the game uncapped above that)

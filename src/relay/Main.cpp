@@ -54,7 +54,7 @@ IFrameCaptureMode* CreateCaptureMode(const std::string& modeText, const launch::
     case launch::ModeKind::Diag:
         return new DiagCaptureMode(spec.vsyncPresent);
     case launch::ModeKind::FlowProbe:
-        return new FlowProbeMode(spec.probeSeconds);
+        return new FlowProbeMode(spec.probeSeconds, spec.probeOrder);
     case launch::ModeKind::Timer:
         return new TimerCaptureMode(spec.framerate);
     case launch::ModeKind::Invalid:

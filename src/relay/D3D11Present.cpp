@@ -835,6 +835,7 @@ bool D3D11PresentBackend::DrawSynthesis(const FrameBracket& bracket, float w, in
     policy::FlowUse use = policy::FlowUse::Own;
     const int slot = m_planner.Use(pair, m_presents, &submitted, &use);
     bool ready = false;
+    bool handedNow = false;
     const char* label = "miss";
     long long* counter = NULL;
     if (slot >= 0) {
@@ -853,9 +854,15 @@ bool D3D11PresentBackend::DrawSynthesis(const FrameBracket& bracket, float w, in
             counter = &m_flowHit;
             ready = true;
         } else if (!p.failed) {
-            label = submitted ? "own" : "late";
-            counter = submitted ? &m_flowOwn : &m_flowLate;
-            ready = SubmitFlow(slot);
+            // Handed over now, the warp would read the slot's previous flow: D3D11 does not
+            // order a draw after the engine's work (the probe's ordering check). So this present
+            // draws the blend, and a later present of the same pair warps from the flow.
+            if (SubmitFlow(slot)) {
+                handedNow = true;
+                label = submitted ? "own" : "late";
+                if (submitted) m_flowOwn++;
+                else m_flowLate++;
+            }
         }
     }
     if (ready && m_flow->Warp(slot, SourceFor(bracket.beforeSlot), SourceFor(bracket.afterSlot),
@@ -866,8 +873,8 @@ bool D3D11PresentBackend::DrawSynthesis(const FrameBracket& bracket, float w, in
         *flowSlot = slot;
         return true;
     }
-    m_flowMiss++;
-    *flowLabel = "miss";
+    if (!handedNow) m_flowMiss++;
+    *flowLabel = label;
     *exec = kExecBlend;
     *flowSlot = -1;
     return Draw(bracket.beforeSlot, bracket.afterSlot, w);
@@ -1057,9 +1064,9 @@ void D3D11PresentBackend::LogSummary() const {
     if (!m_enabled) return;
     if (m_flow) {
         m_flow->LogSummary();
-        LOG("optical flow presents: %lld warped from a flow handed over earlier (fl=hit), %lld "
-            "planned but handed over at the present (fl=late), %lld not planned (fl=own), %lld "
-            "drew the blend for want of a flow (fl=miss); flows planned or handed over %lld, "
+        LOG("optical flow presents: %lld warped from a flow handed over earlier (fl=hit); the "
+            "blend drawn for %lld planned but handed over at the present (fl=late), %lld not "
+            "planned (fl=own) and %lld with no flow (fl=miss); flows planned or handed over %lld, "
             "planned and used %lld, planned and unused %lld; %lld rode a present's draw, %lld "
             "went alone, %lld went after a copy-engine present", m_flowHit, m_flowLate,
             m_flowOwn, m_flowMiss, m_planner.Flows(), m_planner.PredictedUsed(),

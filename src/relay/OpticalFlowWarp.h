@@ -17,8 +17,9 @@
 // The engine runs on its own hardware; what it costs the game is the turns its hand-off takes
 // on the game's graphics engine, two per flow, and a draw issued on the same context just before
 // a flow rides in those two (sittings oftrace2 to oftrace5). So the present hands each flow over
-// right after a draw of its own, and nothing waits for a flow on the CPU: a warp drawn later on
-// the same context reads the finished fields, D3D11 ordering the two.
+// right after a draw of its own, and nothing waits for a flow on the CPU. D3D11 gives no way to
+// know when the engine has finished a flow (see Warp), so a warp is drawn only from a flow handed
+// over at an earlier present, a flow taking about 4 ms under load against a present's 16.7.
 //
 // Each frame reaches the engine as 8-bit luma at the output's size, drawn from the frame the
 // present samples (an NvFBC ring slot or a WGC texture, of the output's size or not), once per
@@ -50,6 +51,10 @@ public:
     bool Flow(int slot, const Frame& before, const Frame& after, bool hints);
 
     // Draws the warp at w from slot's fields over rtv, sampling colour from before and after.
+    // Nothing in D3D11 orders this draw after the engine's work on the slot: the probe's ordering
+    // check found a warp drawn straight after its flow reading the slot's previous flow in 99 of
+    // 100 checks, and neither an event query nor a copy from the fields waits for the engine. The
+    // caller warps only from a flow handed over at an earlier present.
     // present numbers the present it is drawn for, for its GPU time (TakeWarpTime).
     bool Warp(int slot, ID3D11ShaderResourceView* before, ID3D11ShaderResourceView* after,
               float w, ID3D11RenderTargetView* rtv, long long present);
