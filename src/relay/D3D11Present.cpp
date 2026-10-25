@@ -706,6 +706,10 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome*
             out->synthesized = true;
             out->weightQ = (int)(d.weight * 15.0 + 0.5);
             out->opWeight = d.weight;
+            // Set here so a present that cannot draw still reports the blend it meant; the
+            // optical flow sets them again after drawing, the warp or the blend.
+            out->synthExec = SynthExecLabel(kExecBlend);
+            out->pixelExec = kExecBlend;
             break;
         default:
             // Hold / HoldComb: re-draw what the last present drew. The fallback chain covers
