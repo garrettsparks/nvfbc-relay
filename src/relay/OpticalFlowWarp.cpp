@@ -89,11 +89,13 @@ OpticalFlowWarp::~OpticalFlowWarp() {
     if (m_vs) m_vs->Release();
 }
 
-bool OpticalFlowWarp::Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int width, int height) {
+bool OpticalFlowWarp::Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int width, int height,
+                            UINT fieldBinds) {
     m_dev = dev;
     m_ctx = ctx;
     m_width = width;
     m_height = height;
+    m_fieldBinds = fieldBinds;
     m_cellsX = (width + kGrid - 1) / kGrid;
     m_cellsY = (height + kGrid - 1) / kGrid;
 
@@ -173,7 +175,9 @@ bool OpticalFlowWarp::MakeField(DXGI_FORMAT format, bool view, Field* out) {
     td.Format = format;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    // The render target flag is what makes D3D11 order a draw reading the field after the
+    // engine's work on it; the field is never drawn into.
+    td.BindFlags = m_fieldBinds;
     if (FAILED(m_dev->CreateTexture2D(&td, NULL, &out->texture)) ||
         (view && FAILED(m_dev->CreateShaderResourceView(out->texture, NULL, &out->srv)))) {
         LOGERR("OpticalFlowWarp: a flow field could not be created");

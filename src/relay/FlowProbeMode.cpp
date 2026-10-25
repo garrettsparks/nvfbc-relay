@@ -637,19 +637,22 @@ struct EngineRig {
     Srv s0, s1, s2;
     ID3D11Query* event = NULL;
     long long present = 0;
+    // Bumped to give the frames new stamps, so the next flow draws their luma again.
+    int generation = 0;
     ~EngineRig() {
         if (event) event->Release();
     }
     OpticalFlowWarp::Frame Frame(int i) const {
         const Srv* views[3] = {&s0, &s1, &s2};
         OpticalFlowWarp::Frame f;
-        f.ts = i + 1;
+        f.ts = i + 1 + 3 * (int64_t)generation;
         f.srv = views[i]->view;
         return f;
     }
 };
 
-bool MakeEngineRig(Device& d, EngineRig* r) {
+bool MakeEngineRig(Device& d, EngineRig* r,
+                   UINT fieldBinds = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET) {
     r->f0 = SquareFrame(0, true);
     r->f1 = SquareFrame(kSquareMove, true);
     r->f2 = SquareFrame(-kSquareMove, true);
@@ -668,13 +671,9 @@ bool MakeEngineRig(Device& d, EngineRig* r) {
     if (FAILED(d.dev->CreateQuery(&qd, &r->event))) return false;
     return MakeTexture(d.dev, kTestW, kTestH, DXGI_FORMAT_R32G32B32A32_FLOAT, NULL, 0,
                        D3D11_BIND_RENDER_TARGET, &r->target) &&
-           r->warp.Setup(d.dev, d.ctx, kTestW, kTestH);
+           r->warp.Setup(d.dev, d.ctx, kTestW, kTestH, fieldBinds);
 }
 
-// Hands the flow of frame a to frame b to the engine in slot 0, optionally waits for it, then
-// draws the warp at 0.5 over frames c and d and reads it back. The wait is the context's event and
-// then 50 ms more: the engine is a unit of its own, and whether a graphics event sees its work end
-// is part of what is being checked, so the reference does not rest on it alone.
 // How a check waits between handing a flow over and drawing its warp.
 enum class FlowWait {
     None,        // not at all, trusting D3D11 to order the two
@@ -682,9 +681,24 @@ enum class FlowWait {
     Long,        // the context's event, then 50 ms more: surely done
 };
 
+// Hands the flow of frame a to frame b to the engine in slot 0, optionally waits for it, then
+// draws the warp at 0.5 over frames c and d and reads it back. The long wait is the context's
+// event and then 50 ms more: the engine is a unit of its own, and whether a graphics event sees
+// its work end is part of what is being checked, so the reference does not rest on it alone.
+// fresh: the frames' luma drawn again just before the execute, as for every new frame in the
+// compositor. flowMs, when given, gets how long the flow call took to return.
 bool EngineWarp(Device& d, EngineRig& r, int a, int b, FlowWait wait, int c, int dd,
-                std::vector<float>* out) {
-    if (!r.warp.Flow(0, r.Frame(a), r.Frame(b), false)) return false;
+                std::vector<float>* out, bool fresh = false, double* flowMs = NULL) {
+    if (fresh) r.generation++;
+    LARGE_INTEGER c0, c1, freq;
+    QueryPerformanceCounter(&c0);
+    const bool flowed = r.warp.Flow(0, r.Frame(a), r.Frame(b), false);
+    QueryPerformanceCounter(&c1);
+    if (!flowed) return false;
+    if (flowMs) {
+        QueryPerformanceFrequency(&freq);
+        *flowMs = 1000.0 * (double)(c1.QuadPart - c0.QuadPart) / (double)freq.QuadPart;
+    }
     if (wait == FlowWait::Long) {
         if (!WaitIdle(d, r.event)) return false;
         Sleep(50);
@@ -707,25 +721,29 @@ float DifferingShare(const std::vector<float>& a, const std::vector<float>& b) {
     return n ? (float)differ / (float)n : 0.0f;
 }
 
-// THE ORDERING CHECK: does a warp drawn a present after its flow was handed over read that flow?
-// D3D11 does not order a draw after the engine's work, so the compositor warps only from a flow
-// handed over at an earlier present and counts on the engine having finished it by then. Each
-// time the slot first holds the flow of the square moved right, finished; then the flow of the
-// square moved left is handed into the same slot and the warp of the left move drawn 17 ms later
-// with no sync (one present). Against it: the same warp drawn after a long wait (the reference),
-// the reference again (how far the engine's own runs differ), the warp drawn on the right move's
-// flow left in the slot (stale, the control: what reading the old flow looks like, which must be
-// far from the reference or the check cannot see a failure), and the warp drawn with no wait at
-// all (unwaited, a reading of what D3D11's ordering gives: the old flow, nearly always).
+// THE ORDERING CHECK: does a warp read the flow handed over for it? The compositor warps from a
+// flow handed over at an earlier present, and D3D11 orders a draw reading a field after the
+// engine's work on it because the fields can be render targets. Each time the slot first holds
+// the flow of the square moved right, finished; then the flow of the square moved left is handed
+// into the same slot and the warp of the left move drawn 17 ms later with no sync (one present),
+// and again with no wait at all (unwaited: D3D11's ordering alone). Against them: the same warp
+// drawn after a long wait (the reference), the reference again (how far the engine's own runs
+// differ), and the warp drawn on the right move's flow left in the slot (stale, the control: what
+// reading the old flow looks like, which must be far from the reference or the check cannot see
+// a failure).
 struct OrderingResult {
     bool ran = false;
     float onePresent = 0.0f;  // share of pixels differing, one present later against the reference
     float unwaited = 0.0f;    // the same, unwaited against the reference
     float repeat = 0.0f;      // the same, the reference against itself
     float stale = 0.0f;       // the same, stale against the reference
-    // The warp a present later differs from the reference no more than the reference from
-    // itself, give or take a tenth of the stale control's difference, and the control is far off.
-    bool Pass() const { return ran && onePresent <= repeat + 0.1f * stale && stale > 0.02f; }
+    // The warps a present later and with no wait each differ from the reference no more than the
+    // reference from itself, give or take a tenth of the stale control's difference, and the
+    // control is far off.
+    bool Pass() const {
+        const float allowed = repeat + 0.1f * stale;
+        return ran && onePresent <= allowed && unwaited <= allowed && stale > 0.02f;
+    }
 };
 
 OrderingResult OrderingCheck(Device& d, EngineRig& r) {
@@ -816,6 +834,197 @@ struct OrderingTally {
             100.0f * worstRepeat, ran ? 100.0f * leastStale : 0.0f, unwaitedStale);
     }
 };
+
+// THE ORDERING LEGS: the no-wait warp in the ways the compositor hands flows over, on the
+// compositor's fields (render target and shader resource) and on fields of shader resource alone,
+// the control that must read the old flow. Every leg: the slot first holds the finished flow of
+// the square moved right, then the flow of the square moved left is handed over and its warp
+// drawn; the leg read a stale flow when its warp differs from the long-wait reference by more
+// than the reference differs from itself plus a tenth of the stale control's difference, the
+// ordering check's threshold. The swapped leg runs the same the other way round (left first,
+// then right), so a flaw tied to one direction would show. Controls: a present later must read
+// the new flow every time, and the stale control must be far off every round.
+struct OrderingLeg {
+    const char* name;
+    FlowWait wait;
+    bool fresh;
+    bool swapped;
+    int ran = 0, stale = 0;
+    std::vector<double> flowMs;
+};
+
+void OrderingLegs(Device& d, const char* rigName, UINT fieldBinds) {
+    EngineRig r;
+    if (!MakeEngineRig(d, &r, fieldBinds)) {
+        LOG("ofprobe: ordering legs, %s: could not be set up", rigName);
+        return;
+    }
+    OrderingLeg legs[] = {
+        {"a present later (control: must read the new flow)", FlowWait::OnePresent, false, false},
+        {"no wait", FlowWait::None, false, false},
+        {"no wait, luma drawn just before the execute", FlowWait::None, true, false},
+        {"no wait, directions swapped", FlowWait::None, false, true},
+    };
+    const int kRounds = 20;
+    int rounds = 0, controlFar = 0;
+    std::vector<float> reference, again, staleRight, reference2, staleLeft, leg;
+    for (int round = 0; round < kRounds; round++) {
+        // The references: the left move's warp and the right move's, each on a finished flow.
+        if (!EngineWarp(d, r, 0, 2, FlowWait::Long, 0, 2, &reference) ||
+            !EngineWarp(d, r, 0, 2, FlowWait::Long, 0, 2, &again) ||
+            !EngineWarp(d, r, 0, 1, FlowWait::Long, 0, 1, &reference2)) {
+            continue;
+        }
+        rounds++;
+        const float repeat = DifferingShare(again, reference);
+        float worstControl = 1.0f;
+        for (OrderingLeg& l : legs) {
+            // The stale flow into the slot, finished, its warp the stale control.
+            const int now = l.swapped ? 1 : 2;
+            const int old = l.swapped ? 2 : 1;
+            std::vector<float>& staleOut = l.swapped ? staleLeft : staleRight;
+            const std::vector<float>& ref = l.swapped ? reference2 : reference;
+            double ms = 0.0;
+            if (!EngineWarp(d, r, 0, old, FlowWait::Long, 0, now, &staleOut) ||
+                !EngineWarp(d, r, 0, now, l.wait, 0, now, &leg, l.fresh, &ms)) {
+                continue;
+            }
+            const float control = DifferingShare(staleOut, ref);
+            worstControl = std::min(worstControl, control);
+            l.ran++;
+            l.flowMs.push_back(ms);
+            if (DifferingShare(leg, ref) > repeat + 0.1f * control) l.stale++;
+        }
+        if (worstControl > 0.02f) controlFar++;
+    }
+    for (const OrderingLeg& l : legs) {
+        LOG("ofprobe: ordering legs, %s: %s: read a stale flow in %d of %d; flow call returned "
+            "p50 %.3f max %.3f ms", rigName, l.name, l.stale, l.ran, Percentile(l.flowMs, 0.5),
+            Percentile(l.flowMs, 1.0));
+    }
+    const bool controls = rounds == kRounds && controlFar == rounds && legs[0].ran == rounds &&
+                          legs[0].stale == 0;
+    LOG("ofprobe: ordering legs, %s: %d of %d rounds ran, stale control far off in %d; controls "
+        "%s", rigName, rounds, kRounds, controlFar,
+        controls ? "OK" : "FAILED (the legs above mean nothing)");
+}
+
+double MsSince(const LARGE_INTEGER& from) {
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    return 1000.0 * (double)(now.QuadPart - from.QuadPart) / (double)freq.QuadPart;
+}
+
+// Ends the event query now and waits until it reports done; the ms from `from` to then, or -1
+// after two seconds.
+double UntilEvent(Device& d, ID3D11Query* event, const LARGE_INTEGER& from) {
+    d.ctx->End(event);
+    BOOL done = FALSE;
+    while (d.ctx->GetData(event, &done, sizeof(done), 0) != S_OK || !done) {
+        if (MsSince(from) > 2000.0) return -1.0;
+        YieldProcessor();
+    }
+    return MsSince(from);
+}
+
+// THE FULL-SIZE TIMING: when is a flow done, as D3D11 sees it? The engine takes about 2.7 ms on a
+// 2560x1440 pair, long enough to tell a wait for it from none. Per set of field bind flags, 20
+// times each on an idle GPU, each flow handed over with nothing else in flight: how long after
+// the execute an event query ended after it reports done (it does not wait for the engine with
+// any flags); how long a copy of the forward field to staging and a blocking map take (ordered
+// after the engine on the compositor's fields, the reference; on fields of shader resource alone
+// the copy does not wait, the control); and a warp drawn straight after the execute: how long its
+// draw call and the flush after it take on the CPU (a driver waiting for the engine on the CPU
+// would show the engine's time here) and when an event ended after the warp reports done.
+void FlowTiming(Device& d, ID3D11Texture2D* before, ID3D11Texture2D* after, const char* rigName,
+                UINT fieldBinds) {
+    OpticalFlowWarp w;
+    Srv a, b;
+    Tex target, copy;
+    ID3D11Query* event = NULL;
+    D3D11_QUERY_DESC qd = {};
+    qd.Query = D3D11_QUERY_EVENT;
+    if (!w.Setup(d.dev, d.ctx, kWidth, kHeight, fieldBinds) ||
+        FAILED(d.dev->CreateShaderResourceView(before, NULL, &a.view)) ||
+        FAILED(d.dev->CreateShaderResourceView(after, NULL, &b.view)) ||
+        !MakeTexture(d.dev, kWidth, kHeight, DXGI_FORMAT_R8G8B8A8_UNORM, NULL, 0,
+                     D3D11_BIND_RENDER_TARGET, &target) ||
+        FAILED(d.dev->CreateQuery(&qd, &event))) {
+        LOG("ofprobe: full-size timing, %s: could not be set up", rigName);
+        return;
+    }
+    struct Release {
+        ID3D11Query* q;
+        ~Release() { q->Release(); }
+    } releaseEvent = {event};
+    D3D11_TEXTURE2D_DESC td = {};
+    w.ForwardField(0)->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    if (FAILED(d.dev->CreateTexture2D(&td, NULL, &copy.tex))) {
+        LOG("ofprobe: full-size timing, %s: no staging copy", rigName);
+        return;
+    }
+    OpticalFlowWarp::Frame fa, fb;
+    fa.ts = 1;
+    fa.srv = a.view;
+    fb.ts = 2;
+    fb.srv = b.view;
+    auto settle = [&]() {
+        WaitIdle(d, event);
+        Sleep(20);
+    };
+    // The first flow draws the two luma frames; every timed one after reuses them.
+    w.Flow(0, fa, fb, false);
+    settle();
+    std::vector<double> eventMs, copyMs, drawMs, flushMs, warpEventMs;
+    long long present = 0;
+    bool ok = true;
+    for (int i = 0; i < 20 && ok; i++) {
+        LARGE_INTEGER c0;
+        QueryPerformanceCounter(&c0);
+        ok = w.Flow(0, fa, fb, false);
+        const double ev = ok ? UntilEvent(d, event, c0) : -1.0;
+        settle();
+        if (ev >= 0.0) eventMs.push_back(ev);
+
+        QueryPerformanceCounter(&c0);
+        ok = ok && w.Flow(0, fa, fb, false);
+        d.ctx->CopyResource(copy.tex, w.ForwardField(0));
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        if (ok && SUCCEEDED(d.ctx->Map(copy.tex, 0, D3D11_MAP_READ, 0, &m))) {
+            copyMs.push_back(MsSince(c0));
+            d.ctx->Unmap(copy.tex, 0);
+        }
+        settle();
+
+        QueryPerformanceCounter(&c0);
+        ok = ok && w.Flow(0, fa, fb, false);
+        LARGE_INTEGER c1, c2;
+        QueryPerformanceCounter(&c1);
+        ok = ok && w.Warp(0, a.view, b.view, 0.5f, target.rtv, ++present);
+        drawMs.push_back(MsSince(c1));
+        QueryPerformanceCounter(&c2);
+        d.ctx->Flush();
+        flushMs.push_back(MsSince(c2));
+        const double wev = ok ? UntilEvent(d, event, c0) : -1.0;
+        if (wev >= 0.0) warpEventMs.push_back(wev);
+        settle();
+    }
+    LOG("ofprobe: full-size timing, %s: from the execute, an event after it done p50 %.3f min %.3f "
+        "max %.3f ms (%zu); a blocking copy and map of the field p50 %.3f min %.3f max %.3f ms "
+        "(%zu)", rigName, Percentile(eventMs, 0.5), Percentile(eventMs, 0.0),
+        Percentile(eventMs, 1.0), eventMs.size(), Percentile(copyMs, 0.5), Percentile(copyMs, 0.0),
+        Percentile(copyMs, 1.0), copyMs.size());
+    LOG("ofprobe: full-size timing, %s: a warp straight after the execute: draw call p50 %.3f "
+        "max %.3f ms, flush p50 %.3f max %.3f ms, an event after the warp done p50 %.3f min %.3f "
+        "max %.3f ms from the execute (%zu)", rigName, Percentile(drawMs, 0.5), Percentile(drawMs, 1.0),
+        Percentile(flushMs, 0.5), Percentile(flushMs, 1.0), Percentile(warpEventMs, 0.5),
+        Percentile(warpEventMs, 0.0), Percentile(warpEventMs, 1.0), warpEventMs.size());
+}
 
 // Runs the self-test and logs one line per check and a verdict.
 void WarpSelfTest(Device& d) {
@@ -910,6 +1119,11 @@ void WarpSelfTest(Device& d) {
     for (int i = 0; i < 100; i++) tally.Run(d, engine);
     tally.Log("ordering check (idle)");
     LOG("ofprobe: ordering check: RESULT %s", tally.Passed() ? "PASS" : "FAIL");
+
+    OrderingLegs(d, "the compositor's fields",
+                 D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+    OrderingLegs(d, "fields of shader resource alone (control: must read stale)",
+                 D3D11_BIND_SHADER_RESOURCE);
 }
 
 }  // namespace
@@ -1029,6 +1243,13 @@ MaybeFailure FlowProbeMode::Run(RelayContext& /*ctx*/,
         !MakeFrame(d.dev, pattern, kMoveX, kMoveY, DXGI_FORMAT_B8G8R8A8_UNORM, &bgraB)) {
         LOG("ofprobe: RESULT the generated frames could not be created");
         return std::nullopt;
+    }
+
+    if (m_loopSeconds <= 0) {
+        FlowTiming(d, rgbaA.tex, rgbaB.tex, "the compositor's fields",
+                   D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+        FlowTiming(d, rgbaA.tex, rgbaB.tex, "fields of shader resource alone (control)",
+                   D3D11_BIND_SHADER_RESOURCE);
     }
 
     ID3D11Query* event = NULL;

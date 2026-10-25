@@ -383,11 +383,38 @@ flow with no sync matched it in 100 of 100 idle and in all 388 checks run beside
 at frame generation 2X (`ofprobeorder:300`, sitting `oforder1`), while the warp with no wait read
 the stale flow in 215 of them. The test frames are 320x96; a full-size flow takes about 4 ms
 under load, its worst 69 ms. So the compositor warps only from a flow handed over at an earlier
-present. Open: NVIDIA's programming guide (chapter 5) gives D3D11 the same process as CUDA, with
+present. NVIDIA's programming guide (chapter 5) gives D3D11 the same process as CUDA, with
 explicit synchronization only for D3D12 and Vulkan, which implies the driver orders D3D11 work
-implicitly; and in the 10-23 sweep the execute blocked until done where the compositor's returns
-at once. So whether this is how the relay calls the engine is the next test, before the engine
-moves to its D3D12 interface, whose fence says when a flow is done (the user, 2026-10-24).
+implicitly, so how the relay called the engine was tested before any move to the D3D12
+interface.
+
+**It was the fields' bind flags (2026-10-24, builds `ofsync1` to `ofsync3`).** NVIDIA's D3D11
+sample runs a compute shader on a flow straight after the execute with no sync, and creates
+every engine buffer as render target, shader resource and unordered access. The relay's fields
+were shader resource only (its luma frames, the engine's input, were render targets from the
+start, which is why the engine always read the right frames). With the render target flag added
+to the fields, a warp drawn straight after its flow read the new flow in 20 of 20 checks in each
+of: the plain case, luma drawn just before the execute, the directions swapped, timing queries
+open around the execute; and a blocking copy and map of a field saw the new flow 20 of 20 (2 of
+20 without the flag). Unordered access alone changed nothing (19 to 20 of 20 stale). Controls
+held: a warp a present later read the new flow every time, the stale control was far off every
+round. At full size (2560x1440, idle, medians from the execute, 20 each):
+
+| fields | event query ended after the execute, done | warp straight after: draw call, flush | event after that warp, done |
+|---|---|---|---|
+| shader resource | 0.258 ms | 0.004 ms, 0.055 ms | 0.381 ms (read the old flow) |
+| + render target | 0.269 ms | 0.004 ms, 0.052 ms | 2.922 ms |
+
+So the order is kept on the GPU: a warp issued before its flow is done waits there for the
+engine, about the engine's whole time, and the CPU calls return at once. An event query ended
+right after the execute does not wait for the engine with either flag set, so D3D11 orders per
+resource and gives no way to ask whether a flow is done without waiting for it. Beside the
+benchmark at frame generation 2X (`ofprobeorder:300`, sitting `oforder2`, build `ofsync3`) the
+ordering check, now failing on a stale no-wait warp as well, passed 391 of 391, the warp with no
+wait reading the new flow in all of them (215 of 388 stale in `oforder1` without the flag). The
+fields now carry the render target flag; the compositor still warps only from a flow handed over at an
+earlier present, and a flow not done by then holds that present on the GPU instead of being read
+stale.
 
 ### 6.4 Quality against ground truth (offline)
 

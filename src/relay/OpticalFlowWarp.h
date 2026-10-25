@@ -17,10 +17,13 @@
 // The engine runs on its own hardware; what it costs the game is the turns its hand-off takes
 // on the game's graphics engine, two per flow, and a draw issued on the same context just before
 // a flow rides in those two (sittings oftrace2 to oftrace5). So the present hands each flow over
-// right after a draw of its own, and nothing waits for a flow on the CPU. As called here, D3D11
-// gives no sign of when the engine has finished a flow (see Warp), so a warp is drawn only from a
-// flow handed over at an earlier present, a flow taking about 4 ms under load against a
-// present's 16.7.
+// right after a draw of its own, and nothing waits for a flow on the CPU. D3D11 orders a draw
+// that reads a flow field after the engine's work on it only when the field can be a render
+// target, as NVIDIA's samples make the engine's buffers (see Warp); with shader resource alone a
+// warp read the slot's previous flow. Nothing in D3D11 says when a flow is done without waiting
+// for it, so a warp is drawn from a flow handed over at an earlier present, a flow taking about
+// 4 ms under load against a present's 16.7, and one not done by then holds that present on the
+// GPU rather than warp from the old flow.
 //
 // Each frame reaches the engine as 8-bit luma at the output's size, drawn from the frame the
 // present samples (an NvFBC ring slot or a WGC texture, of the output's size or not), once per
@@ -44,7 +47,10 @@ public:
     OpticalFlowWarp& operator=(const OpticalFlowWarp&) = delete;
 
     // Opens the engine on dev/ctx at the output's size and readies the shaders. Loud on failure.
-    bool Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int width, int height);
+    // fieldBinds: the flow fields' bind flags; the probe's ordering control passes shader
+    // resource alone.
+    bool Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int width, int height,
+               UINT fieldBinds = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
 
     // Hands the flow of before to after into cache slot `slot` to the engine. hints: the slot's
     // previous flow was the pair just before this one. False when it could not be handed over
@@ -52,11 +58,12 @@ public:
     bool Flow(int slot, const Frame& before, const Frame& after, bool hints);
 
     // Draws the warp at w from slot's fields over rtv, sampling colour from before and after.
-    // As this class calls the engine, D3D11 does not order this draw after the engine's work on
-    // the slot: the probe's ordering check found a warp drawn straight after its flow reading the
-    // slot's previous flow in 99 of 100 checks, and neither an event query nor a polled copy from
-    // the fields waited for the engine. The caller warps only from a flow handed over at an
-    // earlier present.
+    // D3D11 orders this draw after the engine's work on the slot because the fields can be render
+    // targets: the probe's ordering check, with fields of shader resource alone, found a warp
+    // drawn straight after its flow reading the slot's previous flow in 99 of 100 checks, and
+    // with the render target flag in none. The order holds on the GPU: a draw issued before the
+    // flow is done waits there for the engine, and the CPU call returns at once. An event query
+    // ended after the flow does not wait for the engine, so it cannot say when a flow is done.
     // present numbers the present it is drawn for, for its GPU time (TakeWarpTime).
     bool Warp(int slot, ID3D11ShaderResourceView* before, ID3D11ShaderResourceView* after,
               float w, ID3D11RenderTargetView* rtv, long long present);
@@ -67,6 +74,11 @@ public:
     // the newest one's microseconds and how many presents before present its warp was drawn.
     // Every result goes into the summary; the newest is returned.
     bool TakeWarpTime(long long present, long long* us, int* presentsAgo);
+
+    // The slot's forward field, for the probe to copy and read back.
+    ID3D11Texture2D* ForwardField(int slot) const {
+        return slot >= 0 && slot < policy::kFlowSlots ? m_slots[slot].fwd.texture : NULL;
+    }
 
     void LogSummary() const;
 
@@ -111,6 +123,7 @@ private:
     bool m_ready = false;
     int m_width = 0, m_height = 0;
     int m_cellsX = 0, m_cellsY = 0;
+    UINT m_fieldBinds = 0;
     ID3D11Device* m_dev = NULL;            // borrowed from the present
     ID3D11DeviceContext* m_ctx = NULL;     // borrowed from the present
 
