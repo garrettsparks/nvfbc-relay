@@ -121,7 +121,7 @@ UINT OutputBitsPerColor(IDXGIAdapter* adapter, HWND hwnd) {
 
 }  // namespace
 
-D3D11PresentBackend::D3D11PresentBackend(bool tint, bool interp)
+D3D11PresentBackend::D3D11PresentBackend(bool tint, bool interp, int blendShader)
     : m_enabled(false)
     , m_width(0), m_height(0), m_ringSlots(0)
     , m_cfg(NULL), m_tintRequested(tint)
@@ -136,6 +136,7 @@ D3D11PresentBackend::D3D11PresentBackend(bool tint, bool interp)
     , m_consecutiveWaitTimeouts(0), m_lastPresentHr(S_OK), m_presents(0)
 {
     m_interp = interp;
+    m_blendShader = blendShader;
     for (int i = 0; i < CaptureRing::RING_SIZE; i++) {
         m_ringAlias[i] = NULL;
         m_ringSrv[i] = NULL;
@@ -146,6 +147,7 @@ D3D11PresentBackend::D3D11PresentBackend(bool tint, bool interp)
 D3D11PresentBackend::~D3D11PresentBackend() {
     delete m_copyEngine;                // draws with this device, so goes first
     delete m_flow;                      // so does the optical flow
+    delete m_blend;                     // and -blend's shaders
     for (int i = 0; i < CaptureRing::RING_SIZE; i++) {
         if (m_ringSrv[i]) m_ringSrv[i]->Release();
         if (m_ringAlias[i]) m_ringAlias[i]->Release();
@@ -190,6 +192,10 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
             m_flowFailed = true;
             return false;
         }
+    }
+    if (m_blendShader >= 0) {
+        m_blend = new BlendShaders();
+        if (!m_blend->Setup(m_dev, m_ctx, m_blendShader, width, height)) return false;
     }
     if (mark) {
         m_marker.InitCounter(markFrames);
@@ -551,6 +557,10 @@ bool D3D11PresentBackend::Draw(int slotA, int slotB, float w) {
         m_ctx->PSSetShaderResources(0, 2, none);
         return drawn;
     }
+    if (m_blend && slotA != slotB) {
+        // -blend draws the synthesized frames; a frame shown as it is stays the plain draw.
+        return m_blend->Draw(srvs[0], srvs[1], w, m_rtv, m_presents);
+    }
     m_ctx->PSSetShader(m_ps, NULL, 0);
     m_ctx->PSSetShaderResources(0, 2, srvs);
     m_ctx->PSSetSamplers(0, 1, &m_sampler);
@@ -674,6 +684,7 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome*
     out->opWeight = 0.0;
     out->synthUs = -1;
     out->synthAge = -1;
+    out->panFollow = -1;
     out->synthExec = NULL;
     out->pixelExec = 0;
     // pt= and pta=: the GPU time of an earlier warp, read now that the GPU has it.
@@ -681,6 +692,14 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome*
         long long us = 0;
         int ago = 0;
         if (m_flow->TakeWarpTime(m_presents, &us, &ago)) {
+            out->synthUs = us;
+            out->synthAge = ago;
+        }
+    } else if (m_blend) {
+        long long us = 0;
+        int ago = 0;
+        if (m_blend->TakeTime(m_presents, &us, &ago, &out->panFollow, &out->panX, &out->panY,
+                              &out->panRatio)) {
             out->synthUs = us;
             out->synthAge = ago;
         }
@@ -858,9 +877,10 @@ bool D3D11PresentBackend::DrawSynthesis(const FrameBracket& bracket, float w, in
             counter = &m_flowHit;
             ready = true;
         } else if (!p.failed) {
-            // Handed over now, the warp would read the slot's previous flow: D3D11 does not
-            // order a draw after the engine's work (the probe's ordering check). So this present
-            // draws the blend, and a later present of the same pair warps from the flow.
+            // Handed over now, the warp would wait on the GPU for the engine to finish the flow
+            // (D3D11 orders it after the engine's work, see OpticalFlowWarp::Warp), holding this
+            // present. So this present draws the blend, and a later present of the same pair
+            // warps from the flow.
             if (SubmitFlow(slot)) {
                 handedNow = true;
                 label = submitted ? "own" : "late";
@@ -1066,6 +1086,7 @@ LONGLONG D3D11PresentBackend::Present(bool vsync) {
 
 void D3D11PresentBackend::LogSummary() const {
     if (!m_enabled) return;
+    if (m_blend) m_blend->LogSummary();
     if (m_flow) {
         m_flow->LogSummary();
         LOG("optical flow presents: %lld warped from a flow handed over earlier (fl=hit); the "

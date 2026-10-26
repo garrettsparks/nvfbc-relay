@@ -59,11 +59,21 @@ struct Options {
     bool copyEngine = true;         // -nocopyengine: with -wgc, a frame shown as it is is
                                     // copied by the copy engine and shown through the
                                     // composition swapchain (CopyEngineTarget)
+    int blendShader = -1;           // -blend <shader>: synthesized frames on the D3D11 present
+                                    // drawn with BlendShaderNames()[blendShader]; -1, not
+                                    // typed, the plain blend
 };
 
 // -wgcscale's filters by number, bilinear (0) the default. The names are OBS's.
 inline const char* const* WgcScaleNames() {
     static const char* const names[] = { "bilinear", "bicubic", "lanczos", NULL };
+    return names;
+}
+
+// -blend's shaders by number (BlendShaders::Shader): the blend in linear light, and the blend
+// that follows a camera pan. Without -blend the present draws the plain blend.
+inline const char* const* BlendShaderNames() {
+    static const char* const names[] = { "linear", "pan", NULL };
     return names;
 }
 
@@ -186,6 +196,9 @@ inline const std::vector<UsageRow>& OptionRows() {
                               "default a frame shown as it is is copied by a part of the "
                               "graphics card the game does not use, which costs the game less",
          false, false},
+        {"-blend", "pan", "With b:vsync, draw the in-between frames another way: linear (mixed "
+                          "in linear light) or pan (moved along with a camera pan). By default "
+                          "the two frames are simply mixed", false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
         {"-tint", "", "Border every synthesized frame", false, false},
@@ -356,6 +369,16 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
         else if (warning) *warning = "-wgcscale takes bilinear, bicubic or lanczos, not '" + v + "'";
         return 2;
     }
+    if (t == "-blend" && i + 1 < tokens.size()) {
+        const std::string& v = tokens[i + 1];
+        int found = -1;
+        for (int k = 0; BlendShaderNames()[k]; k++) {
+            if (v == BlendShaderNames()[k]) found = k;
+        }
+        if (found >= 0) o->blendShader = found;
+        else if (warning) *warning = "-blend takes linear or pan, not '" + v + "'";
+        return 2;
+    }
     if (t == "-lag" && i + 1 < tokens.size()) {
         const long v = std::strtol(tokens[i + 1].c_str(), NULL, 10);
         if (v >= 0 && v <= 200) o->extraLagMs = (unsigned int)v;
@@ -513,6 +536,7 @@ inline std::string FormatOptions(const Options& o) {
     if (o.wgcOpen != d.wgcOpen) add(o.wgcOpen ? "-wgcopen" : "-nowgcopen");
     if (o.wgcScale != d.wgcScale) add(std::string("-wgcscale ") + WgcScaleNames()[o.wgcScale]);
     if (!o.copyEngine) add("-nocopyengine");
+    if (o.blendShader >= 0) add(std::string("-blend ") + BlendShaderNames()[o.blendShader]);
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");

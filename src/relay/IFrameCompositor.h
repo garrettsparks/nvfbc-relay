@@ -30,6 +30,10 @@ struct CompositeOutcome {
                                    // warped; "late" planned but handed over at this one, "own"
                                    // not planned, "miss" no flow, each drawn as the blend);
                                    // NULL = no field
+    int panFollow = -1;            // ps= field, with pt= and pta=: the -blend pan shader's shift
+    float panX = 0.0f;             // for the draw pt= timed, followed or not: panX,panY pixels,
+    float panY = 0.0f;             // panRatio its match's cost over no shift's, y when
+    float panRatio = 0.0f;         // followed (1), n when not (0); -1 = no field
 };
 
 // Synthesis executor codes: what actually produced a present's pixels. One vocabulary

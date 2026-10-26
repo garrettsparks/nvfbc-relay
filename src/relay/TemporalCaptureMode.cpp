@@ -17,7 +17,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
                                          bool fgPhase, bool phaseKeep, unsigned int extraLagMs,
                                          bool d3d11Present, bool deferCopy, bool wgc,
                                          bool wgcDrop, bool wgcCursor, bool wgcOpen, int wgcScale,
-                                         bool wgcCopyEngine)
+                                         bool wgcCopyEngine, int blendShader)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_present(NULL)
@@ -53,8 +53,9 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     // Setup fills in before either reads it. Nothing touches a device here: the paths create
     // their resources in Setup, after the ring has started.
     if (d3d11Present) {
-        m_present = new D3D11PresentBackend(tint, compositor == kCompositorInterp);
+        m_present = new D3D11PresentBackend(tint, compositor == kCompositorInterp, blendShader);
     } else {
+        if (blendShader >= 0) LOG("-blend ignored: it draws on the D3D11 present only");
         IFrameCompositor* c;
         if (compositor == kCompositorBlend) {
             c = new BlendCompositor(&m_policyCfg, tint);
@@ -673,16 +674,23 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
                          (long long)(m_lockState.easeQpc * usPerTick));
             }
             // How the optical flow's synthesized present got its flow, then how many presents ago
-            // the warp pt= timed was drawn, last on the line.
-            char flowField[32] = "";
+            // the synthesis pt= timed was drawn, then the -blend pan shader's shift for that same
+            // draw, last on the line.
+            char flowField[64] = "";
             int nf = 0;
             if (outcome.flowLabel) {
                 nf = snprintf(flowField, sizeof(flowField), " fl=%s", outcome.flowLabel);
             }
             if (outcome.synthAge >= 0 && nf >= 0 && (size_t)nf < sizeof(flowField)) {
-                snprintf(flowField + nf, sizeof(flowField) - nf, " pta=%d", outcome.synthAge);
+                nf += snprintf(flowField + nf, sizeof(flowField) - nf, " pta=%d", outcome.synthAge);
             }
-            // blk= goes after the appended op/flip fields, followed only by ease=, fl= and pta=.
+            if (outcome.panFollow >= 0 && nf >= 0 && (size_t)nf < sizeof(flowField)) {
+                snprintf(flowField + nf, sizeof(flowField) - nf, " ps=%.1f,%.1f,%.2f,%s",
+                         (double)outcome.panX, (double)outcome.panY, (double)outcome.panRatio,
+                         outcome.panFollow ? "y" : "n");
+            }
+            // blk= goes after the appended op/flip fields, followed only by ease=, fl=, pta= and
+            // ps=.
             // The offline parsers match this line as a contiguous chain of named fields, so a
             // field inserted between two existing ones silently drops every field after it rather
             // than failing.

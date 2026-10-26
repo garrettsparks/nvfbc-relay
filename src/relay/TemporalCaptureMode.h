@@ -153,7 +153,7 @@ public:
                         unsigned int extraLagMs = 0, bool d3d11Present = false,
                         bool deferCopy = false, bool wgc = false, bool wgcDrop = true,
                         bool wgcCursor = true, bool wgcOpen = true, int wgcScale = 0,
-                        bool wgcCopyEngine = true);
+                        bool wgcCopyEngine = true, int blendShader = -1);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

@@ -1,4 +1,5 @@
 #include "FlowProbeMode.h"
+#include "BlendShaders.h"
 #include "FlowWarpShader.h"
 #include "OpticalFlowWarp.h"
 #include "OutputWindow.h"
@@ -1026,6 +1027,356 @@ void FlowTiming(Device& d, ID3D11Texture2D* before, ID3D11Texture2D* after, cons
         Percentile(warpEventMs, 0.0), Percentile(warpEventMs, 1.0), warpEventMs.size());
 }
 
+// ---------------------------------------------------------------------------------
+// THE BLEND SHADERS (-blend): each against the truth on a generated pan, then its GPU time.
+// ---------------------------------------------------------------------------------
+
+// The pan from the first frame to the second, in pixels, and the static overlay over both.
+const int kPanX = 37, kPanY = -12;
+const int kHudX0 = 200, kHudX1 = 900, kHudY0 = 1150, kHudY1 = 1300;
+
+bool InHud(int x, int y, int grow) {
+    return x >= kHudX0 - grow && x < kHudX1 + grow && y >= kHudY0 - grow && y < kHudY1 + grow;
+}
+
+// The pattern moved by (dx, dy) as grey BGRA, with the overlay (bright and dark stripes 6 pixels
+// wide) drawn over it when overlay is set.
+std::vector<unsigned char> PanFrame(const std::vector<float>& pattern, int dx, int dy,
+                                    bool overlay) {
+    std::vector<unsigned char> bytes = FrameBytes(pattern, dx, dy, 4);
+    if (!overlay) return bytes;
+    for (int y = kHudY0; y < kHudY1; y++) {
+        for (int x = kHudX0; x < kHudX1; x++) {
+            unsigned char* p = &bytes[((size_t)y * kWidth + x) * 4];
+            p[0] = p[1] = p[2] = ((x / 6) % 2 == 0) ? 230 : 25;
+        }
+    }
+    return bytes;
+}
+
+// A grey frame's value at (u, v) in texel-centre coordinates, as the GPU's bilinear clamp
+// sampler reads it, on 0..1.
+float GreyAt(const std::vector<unsigned char>& bytes, float u, float v) {
+    auto at = [&](int x, int y) {
+        x = std::min(std::max(x, 0), kWidth - 1);
+        y = std::min(std::max(y, 0), kHeight - 1);
+        return bytes[((size_t)y * kWidth + x) * 4] / 255.0f;
+    };
+    const float fu = std::floor(u), fv = std::floor(v);
+    const int x = (int)fu, y = (int)fv;
+    const float tx = u - fu, ty = v - fv;
+    const float top = at(x, y) + (at(x + 1, y) - at(x, y)) * tx;
+    const float bottom = at(x, y + 1) + (at(x + 1, y + 1) - at(x, y + 1)) * tx;
+    return top + (bottom - top) * ty;
+}
+
+// x to the power p / q for x in 0..1, by Newton's method on the q-th root of x^p, in plain
+// arithmetic so the reference adds no import of its own to the relay.
+double PowRatio(double x, int p, int q) {
+    double v = 1.0;
+    for (int k = 0; k < p; k++) v *= x;
+    if (v <= 0.0) return 0.0;
+    double y = 1.0;
+    for (int it = 0; it < 400; it++) {
+        double yq1 = 1.0;
+        for (int k = 0; k < q - 1; k++) yq1 *= y;
+        const double next = ((q - 1) * y + v / yq1) / q;
+        if (std::fabs(next - y) < 1e-14) return next;
+        y = next;
+    }
+    return y;
+}
+
+// sRGB's curve each way (2.4 = 12 / 5).
+double SrgbToLinear(double c) {
+    return c <= 0.04045 ? c / 12.92 : PowRatio((c + 0.055) / 1.055, 12, 5);
+}
+
+double LinearToSrgb(double c) {
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * PowRatio(c, 5, 12) - 0.055;
+}
+
+// The red channel of a full-size float render target, row major. Waits for the GPU.
+bool ReadFull(Device& d, ID3D11Texture2D* target, std::vector<float>* out) {
+    D3D11_TEXTURE2D_DESC td = {};
+    target->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    Tex staging;
+    if (FAILED(d.dev->CreateTexture2D(&td, NULL, &staging.tex))) return false;
+    d.ctx->CopyResource(staging.tex, target);
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (FAILED(d.ctx->Map(staging.tex, 0, D3D11_MAP_READ, 0, &m))) return false;
+    out->resize((size_t)kWidth * kHeight);
+    for (int y = 0; y < kHeight; y++) {
+        const float* row = (const float*)((const unsigned char*)m.pData + (size_t)y * m.RowPitch);
+        for (int x = 0; x < kWidth; x++) (*out)[(size_t)y * kWidth + x] = row[4 * x];
+    }
+    d.ctx->Unmap(staging.tex, 0);
+    return true;
+}
+
+// The shift BlendShaders holds: x, y, whether it is followed, its match's cost over no shift's.
+// Waits.
+bool ReadShift(Device& d, BlendShaders& bs, float out[4]) {
+    D3D11_TEXTURE2D_DESC td = {};
+    bs.ShiftTexture()->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    Tex staging;
+    if (FAILED(d.dev->CreateTexture2D(&td, NULL, &staging.tex))) return false;
+    d.ctx->CopyResource(staging.tex, bs.ShiftTexture());
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (FAILED(d.ctx->Map(staging.tex, 0, D3D11_MAP_READ, 0, &m))) return false;
+    memcpy(out, m.pData, 4 * sizeof(float));
+    d.ctx->Unmap(staging.tex, 0);
+    return true;
+}
+
+// Every shader draws the frame halfway between a frame and the same pattern panned by
+// (kPanX, kPanY), the overlay still in both. The truth is the pattern moved half way with the
+// overlay where it was. Scored by the mean difference from it over the background (the overlay
+// grown by 40 pixels and a 48-pixel border left out) and inside the overlay (shrunk by 4).
+// Passes: the pan shader finds the pan within three quarters of a pixel, cuts the background's
+// error to a quarter of the plain blend's or less and keeps the overlay's within 0.01 of it;
+// linear matches the linear-light mix computed here within 0.004 everywhere. Controls, each
+// required: the pan shader with the pan's sign turned round (forced) must do no better than
+// three quarters of the plain blend; two identical frames must not be followed; and the plain
+// blend must differ from the linear-light mix (mean over 0.005), or the linear check could not
+// tell them apart. The pattern turned upside down as the second frame (a cut) is a reading.
+// Then each shader's GPU time at full size into an 8-bit target, estimate and blend apart.
+void BlendShaderTest(Device& d, const std::vector<float>& pattern) {
+    const std::vector<unsigned char> bare = PanFrame(pattern, 0, 0, false);
+    const std::vector<unsigned char> a = PanFrame(pattern, 0, 0, true);
+    const std::vector<unsigned char> b = PanFrame(pattern, kPanX, kPanY, true);
+    std::vector<unsigned char> cut(a.size());
+    for (int y = 0; y < kHeight; y++) {
+        memcpy(&cut[(size_t)y * kWidth * 4], &bare[(size_t)(kHeight - 1 - y) * kWidth * 4],
+               (size_t)kWidth * 4);
+    }
+    Tex ta, tb, tcut, target, target8;
+    Srv sa, sb, scut;
+    if (!MakeTexture(d.dev, kWidth, kHeight, DXGI_FORMAT_B8G8R8A8_UNORM, a.data(), kWidth * 4,
+                     D3D11_BIND_SHADER_RESOURCE, &ta) ||
+        !MakeTexture(d.dev, kWidth, kHeight, DXGI_FORMAT_B8G8R8A8_UNORM, b.data(), kWidth * 4,
+                     D3D11_BIND_SHADER_RESOURCE, &tb) ||
+        !MakeTexture(d.dev, kWidth, kHeight, DXGI_FORMAT_B8G8R8A8_UNORM, cut.data(), kWidth * 4,
+                     D3D11_BIND_SHADER_RESOURCE, &tcut) ||
+        FAILED(d.dev->CreateShaderResourceView(ta.tex, NULL, &sa.view)) ||
+        FAILED(d.dev->CreateShaderResourceView(tb.tex, NULL, &sb.view)) ||
+        FAILED(d.dev->CreateShaderResourceView(tcut.tex, NULL, &scut.view)) ||
+        !MakeTexture(d.dev, kWidth, kHeight, DXGI_FORMAT_R32G32B32A32_FLOAT, NULL, 0,
+                     D3D11_BIND_RENDER_TARGET, &target) ||
+        !MakeTexture(d.dev, kWidth, kHeight, DXGI_FORMAT_B8G8R8A8_UNORM, NULL, 0,
+                     D3D11_BIND_RENDER_TARGET, &target8)) {
+        LOG("ofprobe: blend shaders: RESULT the test frames could not be created");
+        return;
+    }
+
+    const float w = 0.5f;
+    // The linear-light mix of two 8-bit values, each pair worked out once.
+    std::vector<float> mixOf(256 * 256, -1.0f);
+    auto linearMix = [&](unsigned char va, unsigned char vb) {
+        float& m = mixOf[(size_t)va * 256 + vb];
+        if (m < 0.0f) {
+            const double la = SrgbToLinear(va / 255.0), lb = SrgbToLinear(vb / 255.0);
+            m = (float)LinearToSrgb(la + (lb - la) * w);
+        }
+        return m;
+    };
+    std::vector<float> panTruth((size_t)kWidth * kHeight), linTruth(panTruth.size());
+    for (int y = 0; y < kHeight; y++) {
+        for (int x = 0; x < kWidth; x++) {
+            const size_t i = (size_t)y * kWidth + x;
+            panTruth[i] = InHud(x, y, 0) ? a[i * 4] / 255.0f
+                                         : GreyAt(bare, x - w * kPanX, y - w * kPanY);
+            linTruth[i] = linearMix(a[i * 4], b[i * 4]);
+        }
+    }
+    auto score = [&](const std::vector<float>& out, const std::vector<float>& truth,
+                     double* background, double* overlay, double* worst) {
+        double bg = 0.0, hud = 0.0, top = 0.0;
+        long long nBg = 0, nHud = 0;
+        for (int y = 0; y < kHeight; y++) {
+            for (int x = 0; x < kWidth; x++) {
+                const size_t i = (size_t)y * kWidth + x;
+                const double e = std::fabs(out[i] - truth[i]);
+                top = std::max(top, e);
+                if (InHud(x, y, -4)) {
+                    hud += e;
+                    nHud++;
+                } else if (!InHud(x, y, 40) && x >= 48 && x < kWidth - 48 && y >= 48 &&
+                           y < kHeight - 48) {
+                    bg += e;
+                    nBg++;
+                }
+            }
+        }
+        *background = nBg ? bg / nBg : 0.0;
+        *overlay = nHud ? hud / nHud : 0.0;
+        if (worst) *worst = top;
+    };
+
+    bool pass = true;
+    double plainBg = 0.0, plainHud = 0.0;
+    std::vector<float> out;
+    // Plain first: the others are scored against it.
+    const int kShaders[] = {BlendShaders::Plain, BlendShaders::Linear, BlendShaders::Pan};
+    for (int shader : kShaders) {
+        const char* name = BlendShaders::Name(shader);
+        BlendShaders bs;
+        if (!bs.Setup(d.dev, d.ctx, shader, kWidth, kHeight)) {
+            LOG("ofprobe: blend shaders: %s: could not be set up", name);
+            pass = false;
+            continue;
+        }
+        const bool pan = shader == BlendShaders::Pan;
+        float shift[4] = {};
+        if (!bs.Estimate(sa.view, sb.view) || !ReadShift(d, bs, shift) ||
+            !bs.Blend(sa.view, sb.view, w, target.rtv) || !ReadFull(d, target.tex, &out)) {
+            LOG("ofprobe: blend shaders: %s: could not be drawn", name);
+            pass = false;
+            continue;
+        }
+        double bg = 0.0, hud = 0.0;
+        score(out, panTruth, &bg, &hud, NULL);
+        if (shader == BlendShaders::Plain) {
+            plainBg = bg;
+            plainHud = hud;
+            double linBg = 0.0, linHud = 0.0;
+            score(out, linTruth, &linBg, &linHud, NULL);
+            const bool control = linBg > 0.005;
+            pass = pass && control;
+            LOG("ofprobe: blend shaders: plain: background %.4f, overlay %.4f from the truth; "
+                "against the linear-light mix %.4f (control: must be > 0.005)", bg, hud, linBg);
+        } else if (shader == BlendShaders::Linear) {
+            double linBg = 0.0, linHud = 0.0, worst = 0.0;
+            score(out, linTruth, &linBg, &linHud, &worst);
+            const bool ok = worst < 0.004;
+            pass = pass && ok;
+            LOG("ofprobe: blend shaders: linear: background %.4f, overlay %.4f from the truth "
+                "(plain %.4f, %.4f); against the linear-light mix worst %.4f (want < 0.004)",
+                bg, hud, plainBg, plainHud, worst);
+        } else if (pan) {
+            const float ex = shift[0] - kPanX, ey = shift[1] - kPanY;
+            const bool found = shift[2] > 0.5f && std::sqrt(ex * ex + ey * ey) < 0.75f;
+            const bool better = bg <= 0.25 * plainBg && hud <= plainHud + 0.01;
+            // Controls: the pan's sign turned round, and two identical frames.
+            bs.ForceShift(-(float)kPanX, -(float)kPanY);
+            double wrongBg = 0.0, wrongHud = 0.0;
+            bool wrong = bs.Blend(sa.view, sb.view, w, target.rtv) && ReadFull(d, target.tex, &out);
+            if (wrong) score(out, panTruth, &wrongBg, &wrongHud, NULL);
+            wrong = wrong && wrongBg >= 0.75 * plainBg;
+            float same[4] = {}, cutShift[4] = {};
+            const bool still = bs.Estimate(sa.view, sa.view) && ReadShift(d, bs, same) &&
+                               same[2] < 0.5f;
+            bs.Estimate(sa.view, scut.view);
+            ReadShift(d, bs, cutShift);
+            pass = pass && found && better && wrong && still;
+            LOG("ofprobe: blend shaders: %s: found (%.2f, %.2f) for (%d, %d), followed %s, match "
+                "over no shift %.2f (want within 0.75 px, followed); background %.4f, overlay "
+                "%.4f from the "
+                "truth (plain %.4f, %.4f; want <= a quarter of plain, overlay within 0.01)",
+                name, shift[0], shift[1], kPanX, kPanY, shift[2] > 0.5f ? "yes" : "no",
+                shift[3], bg, hud, plainBg, plainHud);
+            LOG("ofprobe: blend shaders: %s controls: the pan's sign turned round, background "
+                "%.4f (must be >= 0.75 x plain); two identical frames followed %s (must be no); "
+                "a cut found (%.2f, %.2f) followed %s, match over no shift %.2f (a reading)",
+                name, wrongBg,
+                still ? "no" : "YES", cutShift[0], cutShift[1], cutShift[2] > 0.5f ? "yes" : "no",
+                cutShift[3]);
+        }
+    }
+    LOG("ofprobe: blend shaders: RESULT %s", pass ? "PASS" : "FAIL");
+
+    // The GPU time of each at full size into an 8-bit target, the estimate and the blend apart.
+    ID3D11Query* disjoint = NULL;
+    ID3D11Query* stamps[3] = {NULL, NULL, NULL};
+    ID3D11Query* event = NULL;
+    D3D11_QUERY_DESC qd = {};
+    qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+    d.dev->CreateQuery(&qd, &disjoint);
+    qd.Query = D3D11_QUERY_TIMESTAMP;
+    for (ID3D11Query*& q : stamps) d.dev->CreateQuery(&qd, &q);
+    qd.Query = D3D11_QUERY_EVENT;
+    d.dev->CreateQuery(&qd, &event);
+    struct Release {
+        ID3D11Query* q[5];
+        ~Release() {
+            for (ID3D11Query* x : q) {
+                if (x) x->Release();
+            }
+        }
+    } release = {{disjoint, stamps[0], stamps[1], stamps[2], event}};
+    // The pan estimate's own steps, timed between its stamps.
+    ID3D11Query* steps[BlendShaders::kSteps] = {};
+    for (ID3D11Query*& q : steps) {
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        d.dev->CreateQuery(&qd, &q);
+    }
+    struct ReleaseSteps {
+        ID3D11Query** q;
+        ~ReleaseSteps() {
+            for (int k = 0; k < BlendShaders::kSteps; k++) {
+                if (q[k]) q[k]->Release();
+            }
+        }
+    } releaseSteps = {steps};
+    if (!disjoint || !stamps[0] || !stamps[1] || !stamps[2] || !event || !steps[0] ||
+        !steps[1] || !steps[2] || !steps[3]) {
+        LOG("ofprobe: blend shaders: the timing queries could not be created");
+        return;
+    }
+    for (int shader : kShaders) {
+        BlendShaders bs;
+        if (!bs.Setup(d.dev, d.ctx, shader, kWidth, kHeight)) continue;
+        const bool pan = shader == BlendShaders::Pan;
+        if (pan) bs.SetStepStamps(steps);
+        std::vector<double> estimateMs, blendMs;
+        std::vector<double> stepMs[BlendShaders::kSteps];
+        for (int i = 0; i < 55; i++) {
+            d.ctx->Begin(disjoint);
+            d.ctx->End(stamps[0]);
+            bs.Estimate(sa.view, sb.view);
+            d.ctx->End(stamps[1]);
+            bs.Blend(sa.view, sb.view, w, target8.rtv);
+            d.ctx->End(stamps[2]);
+            d.ctx->End(disjoint);
+            if (!WaitIdle(d, event)) break;
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+            UINT64 t[3] = {};
+            while (d.ctx->GetData(disjoint, &dj, sizeof(dj), 0) != S_OK) YieldProcessor();
+            for (int k = 0; k < 3; k++) d.ctx->GetData(stamps[k], &t[k], sizeof(t[k]), 0);
+            if (i < 5 || dj.Disjoint || dj.Frequency == 0 || t[1] < t[0] || t[2] < t[1]) continue;
+            estimateMs.push_back(1000.0 * (double)(t[1] - t[0]) / (double)dj.Frequency);
+            blendMs.push_back(1000.0 * (double)(t[2] - t[1]) / (double)dj.Frequency);
+            if (pan) {
+                UINT64 prev = t[0];
+                for (int k = 0; k < BlendShaders::kSteps; k++) {
+                    UINT64 at = 0;
+                    d.ctx->GetData(steps[k], &at, sizeof(at), 0);
+                    stepMs[k].push_back(at >= prev ? 1000.0 * (double)(at - prev) /
+                                                         (double)dj.Frequency
+                                                   : 0.0);
+                    prev = at;
+                }
+            }
+        }
+        LOG("ofprobe: blend shaders: %s GPU time at %dx%d (idle, %zu draws): estimate p50 %.3f "
+            "max %.3f ms, blend p50 %.3f max %.3f ms", BlendShaders::Name(shader), kWidth,
+            kHeight, blendMs.size(), Percentile(estimateMs, 0.5), Percentile(estimateMs, 1.0),
+            Percentile(blendMs, 0.5), Percentile(blendMs, 1.0));
+        if (pan) {
+            LOG("ofprobe: blend shaders: %s estimate steps p50: frames shrunk %.3f, coarse %.3f, "
+                "1/4 step %.3f, full-size step %.3f ms", BlendShaders::Name(shader),
+                Percentile(stepMs[0], 0.5), Percentile(stepMs[1], 0.5),
+                Percentile(stepMs[2], 0.5), Percentile(stepMs[3], 0.5));
+        }
+    }
+}
+
 // Runs the self-test and logs one line per check and a verdict.
 void WarpSelfTest(Device& d) {
     WarpRig rig;
@@ -1250,6 +1601,7 @@ MaybeFailure FlowProbeMode::Run(RelayContext& /*ctx*/,
                    D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
         FlowTiming(d, rgbaA.tex, rgbaB.tex, "fields of shader resource alone (control)",
                    D3D11_BIND_SHADER_RESOURCE);
+        BlendShaderTest(d, pattern);
     }
 
     ID3D11Query* event = NULL;

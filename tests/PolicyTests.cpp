@@ -4976,7 +4976,7 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs &&
            a.deferCopy == b.deferCopy && a.wgc == b.wgc && a.wgcDrop == b.wgcDrop &&
            a.wgcCursor == b.wgcCursor && a.wgcOpen == b.wgcOpen && a.wgcScale == b.wgcScale &&
-           a.copyEngine == b.copyEngine;
+           a.copyEngine == b.copyEngine && a.blendShader == b.blendShader;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
@@ -5006,6 +5006,7 @@ static void test_launch_defaults() {
     CHECK(o.copyEngine, "the copy-engine present must default on");
     CHECK(o.wgcScale == 0 && !std::strcmp(launch::WgcScaleNames()[o.wgcScale], "bilinear"),
           "WGC's scaling must default to bilinear, got %d", o.wgcScale);
+    CHECK(o.blendShader == -1, "-blend must default to not typed, got %d", o.blendShader);
     CHECK(CountSwitchesOn(o) == 7 && o.markFrames == 0,
           "exactly the lock, flip timing, late-batch correction, the deferred ring copy, "
           "leaving out pointer frames, the pointer in the WGC picture and the WGC frame pool on "
@@ -5224,6 +5225,33 @@ static void test_launch_option_parsing() {
               "-wgcscale bilinear must set the default back");
         t = launch::SplitTokens("-wgcscale");
         CHECK(launch::ApplyOption(t, 0, &x, &w) == 0, "-wgcscale with no value must be unknown");
+    }
+
+    // -blend takes a shader by name and sets only its own field; any other word, plain
+    // included (the default has no spelling), is consumed, ignored and reported.
+    {
+        for (int k = 0; launch::BlendShaderNames()[k]; k++) {
+            launch::Options x;
+            std::string w;
+            const std::vector<std::string> t = {"-blend", launch::BlendShaderNames()[k]};
+            CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.blendShader == k && w.empty(),
+                  "-blend %s must be accepted", launch::BlendShaderNames()[k]);
+            x.blendShader = -1;
+            CHECK(SameOptions(x, launch::Options()), "-blend %s must change nothing else",
+                  launch::BlendShaderNames()[k]);
+        }
+        launch::Options x;
+        std::string w;
+        std::vector<std::string> t = launch::SplitTokens("-blend pan -blend plain");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && launch::ApplyOption(t, 2, &x, &w) == 2 &&
+                  !std::strcmp(launch::BlendShaderNames()[x.blendShader], "pan") &&
+                  w == "-blend takes linear or pan, not 'plain'",
+              "-blend plain must be consumed, ignored and reported, got '%s'", w.c_str());
+        t = launch::SplitTokens("-blend");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 0, "-blend with no value must be unknown");
+        // The experiment's old spelling is not an option.
+        t = launch::SplitTokens("-xblend pan");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 0, "-xblend must not be recognized");
     }
 
     // Flags match exactly: case and spelling variants are unknown, and consume nothing. The
@@ -5498,6 +5526,10 @@ static void test_launch_relaunch_round_trip() {
         "-wgc -wgcscale bilinear -lag 60",
         "-wgc -nocopyengine",
         "-wgc -nocopyengine -wgcscale lanczos -src 60",
+        "-wgc -blend linear",
+        "-blend linear -src 90",
+        "-wgc -blend pan -src 90 -mark 5400",
+        "-blend linear -blend pan -lag 60",
     };
     for (const char* text : launches) {
         launch::Options typed = ParseOptionString(text, nullptr, nullptr);

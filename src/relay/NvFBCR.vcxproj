@@ -56,7 +56,7 @@
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <OmitFramePointers>true</OmitFramePointers>
-      <PreprocessorDefinitions>WIN32;_CRT_SECURE_NO_WARNINGS;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -81,7 +81,7 @@
       <Optimization>Disabled</Optimization>
       <OmitFramePointers>false</OmitFramePointers>
       <WholeProgramOptimization>false</WholeProgramOptimization>
-      <PreprocessorDefinitions>WIN32;_CRT_SECURE_NO_WARNINGS;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NOMINMAX;_CRT_SECURE_NO_WARNINGS;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -106,6 +106,7 @@
   <ItemGroup>
     <ClCompile Include="..\core\TemporalPolicy.cpp" />
     <ClCompile Include="BlendRenderer.cpp" />
+    <ClCompile Include="BlendShaders.cpp" />
     <ClCompile Include="CaptureRing.cpp" />
     <ClCompile Include="CopyEnginePresent.cpp" />
     <ClCompile Include="D3D11Present.cpp" />
@@ -139,6 +140,7 @@
     <ClInclude Include="..\core\LaunchOptions.h" />
     <ClInclude Include="..\core\TemporalPolicy.h" />
     <ClInclude Include="BlendRenderer.h" />
+    <ClInclude Include="BlendShaders.h" />
     <ClInclude Include="CaptureRing.h" />
     <ClInclude Include="CopyEnginePresent.h" />
     <ClInclude Include="D3D11Present.h" />

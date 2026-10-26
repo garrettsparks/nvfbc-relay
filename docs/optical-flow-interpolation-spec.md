@@ -411,8 +411,17 @@ right after the execute does not wait for the engine with either flag set, so D3
 resource and gives no way to ask whether a flow is done without waiting for it. Beside the
 benchmark at frame generation 2X (`ofprobeorder:300`, sitting `oforder2`, build `ofsync3`) the
 ordering check, now failing on a stale no-wait warp as well, passed 391 of 391, the warp with no
-wait reading the new flow in all of them (215 of 388 stale in `oforder1` without the flag). The
-fields now carry the render target flag; the compositor still warps only from a flow handed over at an
+wait reading the new flow in all of them (215 of 388 stale in `oforder1` without the flag). Its
+cost, each sitting in one launch, rows in the order without, with, with, without (`oflow7`
+against `ofsync3`): at a source capped at 90 (sitting `ofcap4`, `o:vsync -src 90 -wgc`, about
+3,600 warps a row, traces) the relay held the game's graphics engine 89.4, 91.0, 88.9 and 88.1
+times a second for 28.3, 27.6, 29.1 and 26.3 ms/s, and the game lost 52.4, 51.6, 56.0 and 52.1
+ms/s to stretches the relay was in: no turn added and no difference beyond the rows' spread.
+Present gaps over 25 ms were 28, 17, 24 and 20 and `fl=late` 34, 29, 32 and 34, so no present
+was seen held by the wait. Uncapped at about 115 fps (sitting `ofpts3`, `o:vsync -wgc`, about 50
+flows a row) the scores were 4267, 4255, 4262 and 4269 against 4360 and 4380 with no relay; the
+flag's rows read 9.5 points lower, within the spread of earlier pairs (`ofpts2`), and 50 flows a
+row leave no means for the flag to cost that. The fields now carry the render target flag; the compositor still warps only from a flow handed over at an
 earlier present, and a flow not done by then holds that present on the GPU instead of being read
 stale.
 

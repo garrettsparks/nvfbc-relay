@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "IPresentPath.h"
+#include "BlendShaders.h"
 #include "FlowPlan.h"
 #include "FrameMarker.h"
 #include "OpticalFlowWarp.h"
@@ -70,8 +71,9 @@ class CopyEngineTarget;
 class D3D11PresentBackend : public IPresentPath {
 public:
     // tint is accepted so the mode string's options parse the same on either path; this
-    // path has no tint pass and says so at Setup. interp selects the optical flow.
-    D3D11PresentBackend(bool tint, bool interp);
+    // path has no tint pass and says so at Setup. interp selects the optical flow. blendShader
+    // is -blend's shader (BlendShaders::Shader), -1 for the present's own blend.
+    D3D11PresentBackend(bool tint, bool interp, int blendShader = -1);
     ~D3D11PresentBackend();
 
     D3D11PresentBackend(const D3D11PresentBackend&) = delete;
@@ -255,6 +257,11 @@ private:
     // A held warp draws again from the same flow while its cache slot still holds that pair.
     int m_lastFlowSlot = -1;
     policy::FlowPair m_lastFlowPair;
+
+    // -blend: the shader for a synthesized frame at the output's size, timed in pt=; NULL
+    // without -blend, when the present draws the blend of its own.
+    int m_blendShader = -1;
+    BlendShaders* m_blend = NULL;
 
     // The optical flow (o): NULL on the blend pipeline.
     bool m_interp = false;
