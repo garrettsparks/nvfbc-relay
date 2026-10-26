@@ -16,7 +16,7 @@ Two rows of the plan are user-reported rather than measured here: the exe starte
 `NvOFFRUC.dll` and no `cudart64_110.dll` beside it (all three captures above were taken that way,
 which is the validation of `2ec96a7`), and `b:flip` exited with the usage list.
 
-The Get Medieval gameplay capture landed the same night and is section 7: `Get_Medieval_2026-09-16_0`
+The KCD gameplay capture landed the same night and is section 7: `Get_Medieval_2026-09-16_0`
 (`b:vsync -src 60 -lock -lag 75 -etw -dejit -mark 7200`), 190100 presents over 52.8 minutes. It is
 the capture that tests the re-engage window in its target regime, which Avatar cannot.
 
@@ -98,7 +98,7 @@ blend at 25 us/present) occurs nowhere in 49000 presents.
 only arm where half a comb exceeds the passthrough threshold, which needs a source near the sink
 rate: B sits at 1:1 with the lock engaged 98.5% of in-band presents, and C is a 2:1 whose 25
 transitions are the fade re-seeds. Avatar's benchmark never runs the case the window exists for, a
-game drifting off 60 fps and settling again. Get Medieval is that case (its 09-13 log carried worst
+game drifting off 60 fps and settling again. KCD is that case (its 09-13 log carried worst
 run 226 at 60 Hz replay), so the window stands unconfirmed in the field until that capture.
 
 ## 3. The two pins
@@ -185,8 +185,8 @@ one downstream duplicate in 18446 frames, 0.005%, against 2.54% on `Get_Medieval
 2.74% on `Get_Medieval_2026-09-14_0`. Zero presents went missing from any of the three files.
 
 This is evidence about the chain, not about the relay: the same OBS and capture-card path that
-duplicated 2.5% of Get Medieval frames duplicated 0.005% of Avatar's. Whatever produces the Get
-Medieval duplicates is not a property of this build, and the pending gameplay capture should be read
+duplicated 2.5% of KCD frames duplicated 0.005% of Avatar's. Whatever produces the KCD
+duplicates is not a property of this build, and the pending gameplay capture should be read
 with that in mind.
 
 Marker offsets (log time of the first decoded counter, which is video frame 0 of each recording):
@@ -232,13 +232,13 @@ mechanism was not chased in this pass.
 | `b:flip` refused with usage | user-reported |
 | `no after-frame` logs per episode | CONFIRMED in code and in the log, up to 1.6 s episodes |
 | re-engage window causes no regression | CONFIRMED on 49000 presents, 46 re-engages, no run >= 50 |
-| re-engage window fixes the long runs | CONFIRMED in the field on Get Medieval: worst run 226 -> 65, runs >= 50 13 -> 4, re-engages followed by a 50+ run 3 of 46 -> 1 of 17 (section 7) |
+| re-engage window fixes the long runs | CONFIRMED in the field on KCD: worst run 226 -> 65, runs >= 50 13 -> 4, re-engages followed by a 50+ run 3 of 46 -> 1 of 17 (section 7) |
 | `avatar_60x2_vsync_steady` pin (0 synth, 0 repeats) | HOLDS |
 | `avatar_30x1_vsync_steady` pin (strict alternation) | HOLDS |
-| video duplicates are downstream | supported again: 1 dupe in 18446 frames on the same chain that gave 2.5% on Get Medieval |
+| video duplicates are downstream | supported again: 1 dupe in 18446 frames on the same chain that gave 2.5% on KCD |
 | the replay model tracks this capture | YES once the window clears its cold start; the 200-present warmup is too short at a 0.3 s fade margin, which is a model limit worth remembering when any future fixture is cut |
 
-## 7. Get Medieval, 2026-09-16: the gameplay capture
+## 7. KCD, 2026-09-16: the gameplay capture
 
 `Get_Medieval_2026-09-16_0.log` plus the stream-side video. 190100 presents over 52.8 min, ring 32,
 marker on the first 7200 presents. The video is HEVC 2560x1440 at 60 fps, 185221 frames over

@@ -120,8 +120,8 @@ rate from row 2's log (`pdt=`) in hand.
 - **Benchmark score and the CSV's GPU time** - the only things that measure cost to the game.
   Not the CSV's Fps column: under in-game frame generation it reports the displayed rate.
   Everything else is supporting.
-- **`flush=` in the log** - GPU contention on the capture side. Runs 86-97 us p50 on the Get
-  Medieval captures; if it climbs under Avatar the flush is contending, and if it climbs
+- **`flush=` in the log** - GPU contention on the capture side. Runs 86-97 us p50 on the KCD
+  captures; if it climbs under Avatar the flush is contending, and if it climbs
   *further* at row 4 that is the VRAM answer.
 - **`jit=` / `pdt=`** - whether the relay still hits its own deadlines under load. A relay that
   stays perfect while the game drops is the expected shape of a GPU-contention cost.

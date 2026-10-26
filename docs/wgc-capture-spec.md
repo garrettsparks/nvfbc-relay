@@ -253,7 +253,7 @@ section 9.1 and in `session-kickoff-performance-pass-7.md`.
 
 ## 4. The first stream (2026-10-11)
 
-Get Medieval (KCD at 60 fps with Smooth Motion x2), 2h34m, the CI build of `e79a362`, mode line
+KCD (60 fps with Smooth Motion x2), 2h34m, the CI build of `e79a362`, mode line
 `-mark 5400 -wgc`, driver 610.88. The log is `Get Medieval 2026-10-11 0.log` in the analysis
 root. Everything below is on the stretch the stream's video shows, relay time 51.4 to 9292.4 s,
 lined up by the 2,340 marked frames of its opening (2,282 of them within 0.37 ms at the 90th
@@ -585,7 +585,7 @@ members; what label a notification or an overlay drawn over the game gets; any o
 
 ### 5.10 The first stream with the pointer's frames left out (2026-10-12)
 
-Get Medieval, 31 minutes, the CI build of `407caaf`, typed at the prompt with the frame marker on
+KCD, 31 minutes, the CI build of `407caaf`, typed at the prompt with the frame marker on
 for the first 5400 presents and `-wgc`. The log is `Get Medieval 2026-10-12 0.log` in the
 analysis root. The video pairs with it at log time = video time + 45.155 s, from 2,716 marked
 frames within 0.45 ms (p90), and everything below is on the stretch the video shows, relay time
@@ -618,7 +618,7 @@ frames within 0.45 ms (p90), and everything below is on the stretch the video sh
   streams. The holds all fall in 12 of the 32 minutes, the ones where the game's own request
   rate dipped, and the game stalled for 100 ms or more 68 times an hour here against 23 on
   2026-10-08. The marked opening had 2 freezes in motion, both the game's.
-- **It joined the replay corpus** as `gm_60x2_gameplay_2026_10_12_0.trace`, cut at 1908.0 s where
+- **It joined the replay corpus** as `kcd_60x2_gameplay_2026_10_12_0.trace`, cut at 1908.0 s where
   the video's last 16 s show a menu: no run out of the regime, and the replay matches the field
   (synth 0.5% against 0.5%, worst run 20 against 20 at the same present, pull wraps 29 against
   29, the one lock release at the same present).
@@ -740,7 +740,7 @@ stream's stretch.
   pointer moving in a menu over the two streams.
 - **No game frame was lost**, and lone singles came at the 2026-10-12 rate.
 - **The lock released 45 times, all in 60 fps seconds, and the replay puts them there too.**
-  Stream 0 joined the corpus as `gm_60x2_gameplay_2026_10_13_0.trace` (cut at 4213.0 s), and its
+  Stream 0 joined the corpus as `kcd_60x2_gameplay_2026_10_13_0.trace` (cut at 4213.0 s), and its
   replay releases the lock 24 times at the same moments as the field. So the releases come
   from the frames' arrival times and the policy's answer to them. 27 of the 45 come 0.2 to
   0.4 s after a capture gap of 25 to 50 ms; 3 fall in or beside a menu. Across streams, gaps of
@@ -902,8 +902,8 @@ over the stretch each video shows.
   old (it reads as a freeze or a small jerk), and anything in still footage.
 - **Lock releases fell** from about 21 an hour to 4.5 and 9.0. Stream 1's six follow capture
   gaps of 29 to 41 ms by 0.2 to 1.3 s. Not read further; the content differs from 2026-10-13's.
-- **Both joined the corpus** as `gm_60x2_gameplay_2026_10_14_0.trace` (25.4 min, log 105.0 to
-  1628.4 s) and `gm_60x2_gameplay_2026_10_14_1.trace` (39.1 min, 91.0 to 2439.6 s), each cut to
+- **Both joined the corpus** as `kcd_60x2_gameplay_2026_10_14_0.trace` (25.4 min, log 105.0 to
+  1628.4 s) and `kcd_60x2_gameplay_2026_10_14_1.trace` (39.1 min, 91.0 to 2439.6 s), each cut to
   gameplay; their replays release the lock at the same moments as the field.
 
 ### 5.15 The sitting of 2026-10-15: the default beside OBS's game capture

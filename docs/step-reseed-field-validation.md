@@ -302,7 +302,7 @@ incomplete.
 ### 2.6 The third log, replayed after the decision
 
 The revert was already committed when a 90-minute capture on the reverted policy arrived
-(`Get_Medieval_2026-09-17_1`, now `gm_60x2_gameplay_0917_1.trace`). Because its field ran without
+(`Get_Medieval_2026-09-17_1`, now `kcd_60x2_gameplay_0917_1.trace`). Because its field ran without
 the rule, the OFF arm of the same paired replay is the fidelity control here (it reproduces the field:
 eight runs of 50 or more against eight, worst 63 against 62) and the ON arm shows what the rule would
 have done on a third log it had never seen. Same tally on all three:
@@ -382,15 +382,15 @@ tail size, and which side of it to be on is a product decision, not a measuremen
 and the code of `2ee7c67` (its two docs were kept), and the release proceeds on the `79f33e9` policy,
 which `docs/capture-and-lock-field-validation.md` already validates and whose worst case is bounded
 by the transient's own length. The rule's benefit is real and is not thrown away: the three fixtures
-now in the corpus cover both regimes (transients on `gm_60x2_gameplay_0917`, sustained steps on
-`gm_60x2_gameplay_0917_1` and the hour fixture), so a seventh candidate with an undo path can be
+now in the corpus cover both regimes (transients on `kcd_60x2_gameplay_0917`, sustained steps on
+`kcd_60x2_gameplay_0917_1` and the hour fixture), so a seventh candidate with an undo path can be
 measured against all of them in replay before a capture is spent. If the frequency side of the trade
 is preferred for the release instead, reinstating the rule means moving `max_worst_run` on both
 09-17 fixtures with the reason written in (112 on the first, 67 on the second) and accepting that
 the third log's result is replay, not field.
 
 **Two things worth keeping from this.** The 09-17 gameplay fixture is the corpus member that would
-have caught it, and it is now in the tree as `samples/NvFBC/NvFBCR/testdata/gm_60x2_gameplay_0917.trace`
+have caught it, and it is now in the tree as `samples/NvFBC/NvFBCR/testdata/kcd_60x2_gameplay_0917.trace`
 with its index entry: 108241 presents, bounds `max_worst_run 40`, `max_long_runs 0`,
 `max_synth_pct 0.9`, `min_reseeds 34`, measured on the reverted policy. Verified both ways: the suite
 passes at 44 fixtures with the rule reverted, and fails three assertions on this fixture with the rule

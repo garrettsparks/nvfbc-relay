@@ -64,6 +64,9 @@ static const int kRingSlots = 8;
 static const int kShipRingMin = 16;   // CaptureRing's kDefaultRingSlots
 static const int kShipRingMax = 32;   // CaptureRing's RING_SIZE
 
+// A present with no forced target (SimParams::forcedTargets).
+static const int64_t kNotForced = INT64_MIN;
+
 // Deterministic LCG so every run exercises identical timelines. Every suite RESEEDS it
 // (SeedRng, called from Simulate and from the suites that draw directly), so suites are
 // independent of each other and of their order in main(). Without that the stream position
@@ -127,6 +130,20 @@ struct SimResult {
     std::vector<char> starved;
     // Copies handed to the GPU and not waited for (SimParams::deferNoWait).
     long long deferNotWaitedFor = 0;
+    // What UpdateLookahead was handed on each present inside SimParams' record window, and what
+    // it returned: the state is taken before the call, so the call can be made again (at
+    // another target, say a live capture's) and land on the same decision.
+    struct LookaheadInput {
+        size_t present = 0;
+        int64_t target = 0;
+        policy::RecentFrames frames;
+        PhaseLockState lock;
+        policy::PhaseLookahead lookahead;
+        bool resumedFromStall = false;
+        policy::LookaheadEvent event = policy::LookaheadEvent::None;
+    };
+    std::vector<LookaheadInput> lookaheadInputs;
+    PolicyConfig lookaheadCfg;
 };
 
 struct SimParams {
@@ -226,6 +243,17 @@ struct SimParams {
     // sink under in-game frame generation, four times it on a composed desktop), or the
     // declared rate under a timer present. The two coincide only at 1x.
     int64_t sinkPeriod = 16667;
+    // Keep the lookahead's inputs (SimResult::lookaheadInputs) for presents whose present time
+    // falls in [from, to), in microseconds. Off when to <= from. For the tools that compare a
+    // replay with a live capture present by present; no check in this file sets it.
+    int64_t recordLookaheadFrom = 0;
+    int64_t recordLookaheadTo = 0;
+    // A live capture's target for each present (kNotForced where it has none). The run takes it
+    // in place of its own, after any lookahead move lands, and sets its pull to match: the
+    // decisions then come from the capture's timeline instead of the replay's own pull, which
+    // drifts tens of microseconds from the capture's over a stream. For the tools that compare a
+    // replay with a live capture; no check in this file sets it.
+    std::vector<int64_t> forcedTargets;
 };
 
 // True for a present whose target still carried part of a wrap's ease: the lock had wrapped and
@@ -451,6 +479,12 @@ static SimResult Simulate(const SimParams& p) {
         const int64_t moved = policy::ApplyLookahead(lookahead, lock, cfg, target);
         target -= moved;
         r.rephased.push_back(moved != 0);
+        // A live capture's own target for this present, when the run is forced onto it: the
+        // pull is set to match, so every decision below is made from the capture's timeline.
+        if ((size_t)(k - 1) < p.forcedTargets.size() && p.forcedTargets[(size_t)(k - 1)] != kNotForced) {
+            target = p.forcedTargets[(size_t)(k - 1)];
+            lock.pullQpc = deadline - lag - lock.easeQpc - target;
+        }
 
         // Stage 6, the same sequence production runs before its bracket read: measure each
         // batch's delivery lateness against its stride-anchored flip, gate on lock calm
@@ -567,8 +601,23 @@ static SimResult Simulate(const SimParams& p) {
                     if (rf.nAt == policy::RecentFrames::kMaxAt) break;
                 }
             }
+            const bool record = deadline >= p.recordLookaheadFrom && deadline < p.recordLookaheadTo;
+            SimResult::LookaheadInput in;
+            if (record) {
+                in.present = (size_t)(k - 1);
+                in.target = target;
+                in.frames = rf;
+                in.lock = lock;
+                in.lookahead = lookahead;
+                in.resumedFromStall = resumedFromStall;
+            }
             const policy::LookaheadEvent ev =
                 policy::UpdateLookahead(lookahead, lock, cfg, target, rf, resumedFromStall);
+            if (record) {
+                in.event = ev;
+                r.lookaheadInputs.push_back(in);
+                r.lookaheadCfg = cfg;
+            }
             if (ev == policy::LookaheadEvent::Planned) r.lookaheadPlanned++;
             if (ev == policy::LookaheadEvent::Cancelled) r.lookaheadCancelled++;
             if (ev == policy::LookaheadEvent::PlannedLate) r.lookaheadLate++;

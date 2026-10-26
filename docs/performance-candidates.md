@@ -268,13 +268,13 @@ deferral blended 39, 64 and 37 times and the rows without it 31, 45 and 78. With
 wake late and none after a grab timeout. Over each whole log 1 or 2 refreshes showed no new
 frame, with the deferral and without it.
 
-The stream ran the same night: 136 minutes of Get Medieval with Smooth Motion x2 on the CI build
+The stream ran the same night: 136 minutes of KCD with Smooth Motion x2 on the CI build
 of `b043b35`, the deferral on by default. That build also has the full-size grab and the 1x1 back
 buffers, so it was not the deferral alone. Of 971,591 stored wakes, 492,591 waited (50.7%):
 476,493 were never copied, 16,098 were copied a wake late, and none were copied after a grab
 timeout. Smooth Motion skips more copies than the benchmark's DLSS did (49% never copied, where
 the benchmark had 36%) and copies fewer late (1.7%, where it had 5%). Replayed from the capture
-(`gm_60x2_gameplay_2026_10_08_0.trace`, cut to the 136.4 minutes its video shows), the deferral
+(`kcd_60x2_gameplay_2026_10_08_0.trace`, cut to the 136.4 minutes its video shows), the deferral
 waits on 489,413, never copies 473,413 and copies 16,000 late; the log's totals also cover the
 68 seconds outside the cut, where 7,107 more wakes were stored. Nothing downstream got worse.
 Compared with the four streams before it (2026-09-30 to 2026-10-07, all without the deferral),

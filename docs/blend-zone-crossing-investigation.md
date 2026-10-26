@@ -75,7 +75,7 @@ new offset before re-seeding, which is the same shape of confirmation the re-eng
 
 ## Kill criteria, to be applied in replay before any capture
 
-1. Long runs must fall on the Get Medieval logs (worst run and count of runs >= 50).
+1. Long runs must fall on the KCD logs (worst run and count of runs >= 50).
 2. Total blend share must not rise on any fixture or log.
 3. The 59:60 rows must not move: `avatar_59x1_vsync_*`, `avatar_59at60_vsync_*`, `avatar_59x2_vsync_*`
    run the genuine sweep at 44-45% synth and carry `min_synth_pct` floors. A rule that fires through
@@ -100,7 +100,7 @@ variant fails 37 assertions and is worse where it matters:
 | KCD 60x2 map cycles, post-convergence-window | synth 3.4%, runs>=50 0, worst 34 | synth 3.6%, runs>=50 1, worst 59 |
 | KCD 60x2 join events | synth 4.9%, runs>=50 0, worst 49 | synth 5.1%, runs>=50 1, worst 73 |
 | KCD 60x1 FG off | synth 6.2%, runs>=50 1, worst 65 | synth 6.2%, runs>=50 1, worst 72 |
-| Get Medieval gameplay hour | synth 0.5%, runs>=50 1, worst 50 | synth 0.5%, runs>=50 2, worst 52 |
+| KCD gameplay hour | synth 0.5%, runs>=50 1, worst 50 | synth 0.5%, runs>=50 2, worst 52 |
 | Avatar 60x2 vsync bench | synth 1.7%, runs>=50 1, worst 55 | synth 1.9%, runs>=50 1, worst 73 |
 | Avatar 60x1 vsync bench | synth 2.8%, runs>=50 2, worst 143 | synth 3.6%, runs>=50 3, worst 143 |
 | the 59:60 rows (six fixtures) | 43.5-45.1% synth | 43.7-45.3% synth, unchanged in kind |
@@ -167,7 +167,7 @@ keeps the lock engaged, and lets the existing convergence window close the offse
 
 | fixture | fires | effect |
 |---|---|---|
-| `gm_60x2_gameplay_hour` | 10 | runs >= 50: 1 -> 0, worst 50 -> 45, synth 0.5 -> 0.4% |
+| `kcd_60x2_gameplay_hour` | 10 | runs >= 50: 1 -> 0, worst 50 -> 45, synth 0.5 -> 0.4% |
 | `avatar_60x2_vsync_steady` | 2 | runs >= 50: 1 -> 0, worst 55 -> 23, synth 1.7 -> 1.1% |
 | `avatar_60x1_vsync_bench` | 4 | runs >= 50: 2 -> 1, synth 2.8 -> 1.9% |
 | `avatar_60x3_vsync_bench` | 2 | runs >= 50: 1 -> 0, worst 74 -> 26 |
@@ -202,7 +202,7 @@ comb/4 (3.3 to 4.2 ms of error). The map-cycle event is the same SIZE as the dis
 catching, so this knob cannot separate them, and the direction tolerance barely matters. All eight
 59:60 sweep rows fire zero times at every point tested, so the regime gate holds throughout.
 
-At the green point the rule still fires on four fixtures (6 on the Get Medieval hour, 3 on Avatar
+At the green point the rule still fires on four fixtures (6 on the KCD hour, 3 on Avatar
 60x1, 1 each on Avatar 60x2 steady and 60x3) and lowers synth share on all of them, but only removes
 long runs on the first two.
 
@@ -256,7 +256,7 @@ describes `79f33e9`, which is still what the repo would tag if this change is dr
 ### Superseded: two ways forward, when the rule still had a misfire
 
 1. **The green point (comb/4).** Suite passes with no bound moved and no new capture needed. It
-   removes a long run on the 69-minute Get Medieval capture (worst 50 -> 44) and one of two on Avatar
+   removes a long run on the 69-minute KCD capture (worst 50 -> 44) and one of two on Avatar
    60x1, and trims synth share on four fixtures. Modest, and it ships clean.
 2. **The bigger win (comb/8 or comb/5)**, which additionally removes Avatar 60x2 steady's 55-present
    run (-> 23) and Avatar 60x3's 74 (-> 26), but needs either one fixture's bound moved on the user's
@@ -302,7 +302,7 @@ policy, replayed with the rule on): the rule removes eleven of eighteen runs >= 
 112 with a mechanism ceiling near 170 presents. So the two-log "no net benefit" reading was not
 general: the rule trades FREQUENCY for TAIL SIZE. The revert stands for the release on the tail-risk
 ground, and the benefit is the case for the seventh candidate below, which the three fixtures now in
-the corpus (transients on `gm_60x2_gameplay_0917`, sustained steps on `gm_60x2_gameplay_0917_1` and
+the corpus (transients on `kcd_60x2_gameplay_0917`, sustained steps on `kcd_60x2_gameplay_0917_1` and
 the hour) can gate in replay before a capture is spent.
 
 The reason is a design property rather than a tuning error. Any confirmation short enough to save

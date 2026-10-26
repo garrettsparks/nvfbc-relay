@@ -1,7 +1,7 @@
 # nvfbc-relay policy replay fixture
-# Get Medieval (KCD), 49 min of real streamed gameplay, b:vsync on the defaults (source rate not declared, 60 assumed; comb lock, 75 ms extra lag, flip timing and dejitter on) 2026-10-01, build 0bdf404 (phase-step lookahead with late moves and the refusal); cut to the stretch the stream's video shows, 45.0 s to 2962.6 s
+# KCD, 49 min of real streamed gameplay, b:vsync on the defaults (source rate not declared, 60 assumed; comb lock, 75 ms extra lag, flip timing and dejitter on) 2026-10-01, build 0bdf404 (phase-step lookahead with late moves and the refusal); cut to the stretch the stream's video shows, 45.0 s to 2962.6 s
 # units: microseconds. first value absolute, rest are deltas.
-description Get Medieval (KCD), 49 min of real streamed gameplay, b:vsync on the defaults (source rate not declared, 60 assumed; comb lock, 75 ms extra lag, flip timing and dejitter on) 2026-10-01, build 0bdf404 (phase-step lookahead with late moves and the refusal); cut to the stretch the stream's video shows, 45.0 s to 2962.6 s
+description KCD, 49 min of real streamed gameplay, b:vsync on the defaults (source rate not declared, 60 assumed; comb lock, 75 ms extra lag, flip timing and dejitter on) 2026-10-01, build 0bdf404 (phase-step lookahead with late moves and the refusal); cut to the stretch the stream's video shows, 45.0 s to 2962.6 s
 # What the RELAY did on this capture. The replay model is only trustworthy
 # for a configuration where it reproduces these; the test checks that.
 field_worst_run 36

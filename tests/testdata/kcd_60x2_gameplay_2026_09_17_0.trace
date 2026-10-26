@@ -1,7 +1,7 @@
 # nvfbc-relay policy replay fixture
-# Get Medieval, 30 min of real streamed gameplay, b:vsync -src 60 -lock -lag 75 -etw -dejit 2026-09-17; captured on the step re-seed build, desktop trimmed off both ends
+# KCD, 30 min of real streamed gameplay, b:vsync -src 60 -lock -lag 75 -etw -dejit 2026-09-17; captured on the step re-seed build, desktop trimmed off both ends
 # units: microseconds. first value absolute, rest are deltas.
-description Get Medieval, 30 min of real streamed gameplay, b:vsync -src 60 -lock -lag 75 -etw -dejit 2026-09-17; captured on the step re-seed build, desktop trimmed off both ends
+description KCD, 30 min of real streamed gameplay, b:vsync -src 60 -lock -lag 75 -etw -dejit 2026-09-17; captured on the step re-seed build, desktop trimmed off both ends
 # What the RELAY did on this capture. The replay model is only trustworthy
 # for a configuration where it reproduces these; the test checks that.
 field_worst_run 100

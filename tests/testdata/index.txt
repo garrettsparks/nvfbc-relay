@@ -28,21 +28,21 @@ kcd_60x2_dejit_event.trace
 # bursts. It is the only fixture long enough to measure the isolated-blend rate at all
 # (75 removals, 73 of them single-frame events), and the only one carrying the once-per-
 # second NvFBC delivery hitch that produces half of them.
-gm_60x2_gameplay_hour.trace
+kcd_60x2_gameplay_hour.trace
 # The same content on the D3D11 flip-model present, and the only fixture carrying a phase
 # TRANSIENT: the source jumps its phase 6 to 7 ms for about 0.65 s and then puts it back,
 # four times in half an hour. That shape is what defeated the step re-seed rule on hardware
 # after 43 fixtures called it clean, so this file is the gate for any future rule that acts
 # on a phase step. Its field numbers were recorded under that rule and its bounds under the
 # policy without it; the fixture header explains why those two lines disagree.
-gm_60x2_gameplay_2026_09_17_0.trace
+kcd_60x2_gameplay_2026_09_17_0.trace
 # The same content and present path again, 90 minutes of it, captured AFTER that rule was
-# reverted: the only Get Medieval fixture running the policy the tree ships, so its field and
+# reverted: the only KCD fixture running the policy the tree ships, so its field and
 # replay lines are comparable and agree (on the dejitter arm, which is how it ran, 8 long runs
 # each and worst 62 against 62). It is the
 # fidelity anchor for b:vsync gameplay and the widest sample of the residual blend-zone class,
 # which is why it earns its 12 MB. Its header explains both.
-gm_60x2_gameplay_2026_09_17_1.trace
+kcd_60x2_gameplay_2026_09_17_1.trace
 # The same content, policy and present path, 61 minutes streamed on 2026-09-22. It carries the
 # residual blend-zone class at the highest rate yet seen: 10 runs >= 50 in an hour against
 # 2026_09_17_1's 8 in 90 minutes, all after the lock released at a small source hitch and re-engaged
@@ -52,7 +52,7 @@ gm_60x2_gameplay_2026_09_17_1.trace
 # through the real lock reproduces the field lock state on 99.8% of presents, so the releases
 # follow from this capture timeline itself. Why this timeline releases so much more often is
 # still unexplained, which is the reason to gate on it.
-gm_60x2_gameplay_2026_09_22_0.trace
+kcd_60x2_gameplay_2026_09_22_0.trace
 # The same game and present path, two short local recordings from 2026-09-23 kept for the LOCK
 # WRAP: the pull is held in [0, comb) with a band either side, and a pull that wanders across a
 # band's edge wraps a whole comb, which re-presents one frame (wrapping up) or skips one
@@ -71,7 +71,7 @@ kcd_60x2_lockwrap_hitch_2026_09_23_0.trace
 # for, since the custom mode fixes it, but the card fell back to it without anyone changing a
 # setting, so the fixture pins how the relay behaves there: one wrap per beat, no back and forth,
 # no long blend runs.
-gm_60x2_card5995_2026_09_24_0.trace
+kcd_60x2_card5995_2026_09_24_0.trace
 # FROM HERE, WHOLE STREAMS. Each fixture above was added for one regime. The ones below are
 # captures added as they come, each cut to the span its video shows, so that a change to the
 # relay is replayed against as much real play as there is. Their bounds sit at what the replay
@@ -81,82 +81,87 @@ gm_60x2_card5995_2026_09_24_0.trace
 # late moves and the refusal: its field numbers come from that older rule and match the replay arm
 # that runs it, while its bounds measure the tree's policy. The calmest of these streams: 179
 # hitches an hour, no lock release, a worst blend run of 12.
-gm_60x2_gameplay_2026_09_29_0.trace
+kcd_60x2_gameplay_2026_09_29_0.trace
 # 64 minutes of the 2026-09-30 stream, on the policy the tree runs. Its dice game (about 291 s to
 # 519 s) holds the two longest blend runs, which late moves cut: without them the replay reads a
 # worst run of 62 and two runs of 50 or more, against 38 and none.
-gm_60x2_gameplay_2026_09_30_0.trace
+kcd_60x2_gameplay_2026_09_30_0.trace
 # 49 minutes of the 2026-10-01 stream, on the phase-step lookahead with late moves and the
 # refusal. Eight of its minutes are the dice game, where the game hitches
 # once every 4.31 s and the source phase steps at most of them: 48 of the capture's 66 lookahead
 # moves, all 5 lock releases and the worst blend run are there. The rest is dialog, fades and
 # walking, with the stalls and repeats that come with scene changes.
-gm_60x2_gameplay_2026_10_01_1.trace
+kcd_60x2_gameplay_2026_10_01_1.trace
 # 98 minutes of the 2026-10-06 stream, the longest of these, on the same policy as 2026-10-01.
 # Its 10 lock releases fall between 873 s and 2957 s, five of them with no hitch of 20 ms or more
 # in the 10 s before. Its dice game (5697 s to 5797 s) steps the source phase back and forth every
 # 3 to 4 s with almost no hitches: 22 of the 83 lookahead moves, 19 of them reversed by the next.
-gm_60x2_gameplay_2026_10_06_0.trace
+kcd_60x2_gameplay_2026_10_06_0.trace
 # 52 minutes of the 2026-10-07 stream, on the same policy: 172 hitches and 28 stalls an hour.
 # All 7 lock releases and 26 of its 33 lookahead moves fall in the first 28 minutes, with the
 # worst blend run (37) at a scene change into a trade screen, right after two releases 8 presents
 # apart. Its dice game hitches every 4.31 s in two short stretches, 13 hitches in all.
-gm_60x2_gameplay_2026_10_07_0.trace
+kcd_60x2_gameplay_2026_10_07_0.trace
 # 136 minutes of the 2026-10-08 stream, the longest of these, on the same policy and the first
 # on the build that grabs at full size: 131 hitches and 23 stalls an hour. 35 of its 72
 # lookahead moves fall in the first 16 minutes, 21 of them in a dice game that hitches every
 # 4.3 s. All 7 lock releases come 0.2 to 0.3 s after a hitch of about 30 ms, and the worst blend
 # run (35) runs through the first. A second dice game, 10 minutes long, has no hitch at all.
-gm_60x2_gameplay_2026_10_08_0.trace
+kcd_60x2_gameplay_2026_10_08_0.trace
 # 31 minutes of the 2026-10-12 stream, the first captured through Windows.Graphics.Capture, with
 # the frames a moving mouse pointer brings left out before the ring: 178 hitches and 68 stalls an
 # hour. Eight times a burst with two stalls of 337 to 440 ms is followed 7 to 21 s later by one
 # stall of 190 to 280 ms. One lock release, at 735 s right after two pull wraps 0.25 s apart.
 # The worst blend run (20) starts as a burst of 7 hitches and 3 stalls ends.
-gm_60x2_gameplay_2026_10_12_0.trace
+kcd_60x2_gameplay_2026_10_12_0.trace
 # 69 minutes of the first 2026-10-13 stream, through Windows.Graphics.Capture with the mouse
 # pointer in the picture: 302 hitches and 56 stalls an hour, no periodic stretch. 24 lock
 # releases (21 an hour); 13 come 0.2 to 0.4 s after a hitch of 26 to 48 ms, and the worst blend
 # run (44) is one of them. Menus with the pointer moving held 60 pairs a second.
-gm_60x2_gameplay_2026_10_13_0.trace
+kcd_60x2_gameplay_2026_10_13_0.trace
 # 25 minutes of the first 2026-10-14 stream, through Windows.Graphics.Capture with the frame
 # pool on a device of its own (-wgcopen): 269 hitches and 57 stalls an hour, no periodic
 # stretch. Two lock releases, one 0.63 s after a hitch of 47 ms and one with no gap before it.
 # The worst blend run (16) sits in a burst of 14 hitches and a 266 ms stall.
-gm_60x2_gameplay_2026_10_14_0.trace
+kcd_60x2_gameplay_2026_10_14_0.trace
 # 39 minutes of the second 2026-10-14 stream, captured as the first: 173 hitches and 34 stalls
 # an hour, much of it the dice game and a trader's inventory. 6 lock releases (9 an hour), each
 # 0.2 to 1.3 s after a hitch of 29 to 41 ms, three of them within a second; the worst blend run
 # (35) is the first.
-gm_60x2_gameplay_2026_10_14_1.trace
+kcd_60x2_gameplay_2026_10_14_1.trace
 # 82 minutes of the 2026-10-21 stream, through Windows.Graphics.Capture with the pool on its own
 # device and the small-change frames left out by a threshold sized from the game's own frames:
 # 398 hitches and 102 stalls an hour, the most of any stream here, in 131 bursts. 14 lock
 # releases (10 an hour), 7 of them with no hitch in the 3 s before, four within 6.6 s at 2528 s
 # to 2535 s. The worst blend run (42) is the last release, 0.25 s after a 41 ms hitch.
-gm_60x2_gameplay_2026_10_21_0.trace
+kcd_60x2_gameplay_2026_10_21_0.trace
 # 91 minutes of the second 2026-10-21 stream, captured as the first and the first presented
 # through the GPU's copy engine (327017 of 329945 presents copied): 203 hitches and 41 stalls an
 # hour, much of it dialog and cutscenes. 7 lock releases (5 an hour), each within 0.45 s of a
 # burst of hitches; the worst blend run (40) is one of two releases inside a burst with a 184 ms
 # stall.
-gm_60x2_gameplay_2026_10_21_1.trace
+kcd_60x2_gameplay_2026_10_21_1.trace
 # 37 minutes of the first 2026-10-22 stream, through NvFBC on the defaults: 410 hitches and 54
 # stalls an hour. It holds a scripted horseback chase with 58 hitches in 4 s and the present
 # blocked 33 times, kept as a pathological case. 5 lock releases; the replay's worst blend run
 # (30) is at a pull wrap after a hitch burst where the field's ran 14, the one number outside the
 # fidelity limits.
-gm_60x2_gameplay_2026_10_22_0.trace
+kcd_60x2_gameplay_2026_10_22_0.trace
 # 73 minutes of the second 2026-10-22 stream, through Windows.Graphics.Capture and the GPU's copy
 # engine (263209 of 266632 presents copied): 512 hitches and 48 stalls an hour, the most hitches
 # of any stream here. 4 lock releases at the same moments in the field and on the replay; the
 # replay's worst blend run (22) follows a burst with 3 stalls where the field's ran 14.
-gm_60x2_gameplay_2026_10_22_1.trace
+kcd_60x2_gameplay_2026_10_22_1.trace
 # 78 minutes of the 2026-10-23 stream, through Windows.Graphics.Capture and the GPU's copy engine
 # (283366 of 286737 presents copied): 352 hitches and 82 stalls an hour. 7 lock releases at the
 # same moments in the field and on the replay, one of them with no hitch in the 29 s before; the
 # worst blend run (31, the same in both) starts at a release just after a 144 ms stall.
-gm_60x2_gameplay_2026_10_23_0.trace
+kcd_60x2_gameplay_2026_10_23_0.trace
+# 133 minutes of the 2026-10-25 stream, the longest here, through NvFBC on the defaults with the
+# blends drawn by the pan shader: 367 hitches and 80 stalls an hour in 212 bursts. 9 lock
+# releases in the field, 7 of them at the same moments on the replay; the worst blend run (34,
+# the same in both) sits beside the release at 4808.01 s.
+kcd_60x2_gameplay_2026_10_25_0.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions

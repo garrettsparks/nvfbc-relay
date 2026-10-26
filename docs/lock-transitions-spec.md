@@ -46,7 +46,7 @@ previous real frame, and a stall re-seed that had cut a phase-step run short did
 luck around the weakness step 3 addresses, but a held-out regression is the signal to stop, so
 step 1 uses comb/8.
 
-Step 1 also adds `gm_60x2_card5995_0924`, 30 minutes of the 09-24 stream with the capture card at
+Step 1 also adds `kcd_60x2_card5995_0924`, 30 minutes of the 09-24 stream with the capture card at
 59.95 Hz, where every wrap is forced.
 
 ## 3. Step 2: easing a wrap (implemented)
@@ -150,7 +150,7 @@ A scratch sweep of N in {8, 12, 16, 24, 32} on the corpus and on the held-out lo
   frame pair and the two runs part by microseconds from there. The dejitter diff skips presents
   inside a ramp in either arm.
 - **Corpus bounds re-set,** each with the reason in the fixture: `kcd_60x2_join_events` worst
-  run 50 to 51 (a wrap at the tail of a run, eased one present longer), `gm_60x2_card5995_0924`
+  run 50 to 51 (a wrap at the tail of a run, eased one present longer), `kcd_60x2_card5995_0924`
   synth 1.2% to 1.7% (the forced wraps now blend), `avatar_60x2_subgen_bench` re-seeds 13 to 12
   (two borderline re-seeds, identical blends around them), and the lock-wrap fixtures' wrap
   bounds tightened to 1 and 4 (step 1's gain).
