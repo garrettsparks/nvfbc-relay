@@ -56,12 +56,6 @@ inline bool FlowHintsUsable(const FlowPair& previous, const FlowPair& next) {
 
 const int kFlowSlots = 4;
 
-// How a synthesized present got its flow, for the log's fl= field.
-enum class FlowUse : int {
-    Hit = 0,   // flowed ahead, on the prediction of an earlier present
-    Own = 1,   // not predicted: this present submitted it
-};
-
 // The cache of flow fields. A slot's contents (the GPU textures) belong to the caller; the
 // planner only says which slot holds which pair and which slot a new pair goes in.
 class FlowPlanner {
@@ -91,34 +85,27 @@ public:
             }
             const int slot = Take(present);
             if (slot < 0) break;
-            Fill(slot, pair, present, true);
+            Fill(slot, pair, present);
             outSlots[out++] = slot;
         }
         return out;
     }
 
-    // At a synthesized present: the slot to read for pair. Returns the slot and sets
-    // *submitted when the pair was not cached and the caller must flow it into that slot now
-    // (a missed prediction). Returns -1 only when every slot is in use at this present.
-    int Use(const FlowPair& pair, int64_t present, bool* submitted, FlowUse* use) {
-        int slot = Find(pair);
-        *submitted = false;
-        if (slot >= 0) {
-            Slot& s = m_slots[slot];
-            *use = s.predicted ? FlowUse::Hit : FlowUse::Own;
-            if (!s.used && s.predicted) m_predictedUsed++;
-            if (!s.used && !s.predicted) m_ownFlows++;
-            s.used = true;
-            s.lastTouch = present;
-            return slot;
+    // At a synthesized present: the slot holding pair's flow, or -1 when no prediction named
+    // the pair. An unpredicted pair is drawn as the blend and flows nothing. Its flow could not
+    // be warped at this present without waiting on the engine, and a later present of the same
+    // pair is named by the plan made at this one, so a flow started here would only add engine
+    // work beside the blend.
+    int Use(const FlowPair& pair, int64_t present) {
+        const int slot = Find(pair);
+        if (slot < 0) {
+            m_unpredicted++;
+            return -1;
         }
-        slot = Take(present);
-        if (slot < 0) return -1;
-        Fill(slot, pair, present, false);
-        m_slots[slot].used = true;
-        m_ownFlows++;
-        *submitted = true;
-        *use = FlowUse::Own;
+        Slot& s = m_slots[slot];
+        if (!s.used) m_predictedUsed++;
+        s.used = true;
+        s.lastTouch = present;
         return slot;
     }
 
@@ -131,13 +118,12 @@ public:
     long long Flows() const { return m_flows; }
     long long PredictedUsed() const { return m_predictedUsed; }
     long long PredictedUnused() const { return m_predictedUnused; }
-    long long OwnFlows() const { return m_ownFlows; }
+    long long Unpredicted() const { return m_unpredicted; }
 
 private:
     struct Slot {
         FlowPair pair;
         bool valid = false;
-        bool predicted = false;  // flowed on a prediction rather than by the present using it
         bool used = false;
         int64_t lastTouch = 0;
     };
@@ -154,11 +140,10 @@ private:
         return best;
     }
 
-    void Fill(int slot, const FlowPair& pair, int64_t present, bool predicted) {
+    void Fill(int slot, const FlowPair& pair, int64_t present) {
         Slot& s = m_slots[slot];
         s.pair = pair;
         s.valid = true;
-        s.predicted = predicted;
         s.used = false;
         s.lastTouch = present;
         m_flows++;
@@ -166,7 +151,7 @@ private:
 
     void Evict(int slot) {
         Slot& s = m_slots[slot];
-        if (s.valid && s.predicted && !s.used) m_predictedUnused++;
+        if (s.valid && !s.used) m_predictedUnused++;
         s = Slot();
     }
 
@@ -174,7 +159,7 @@ private:
     long long m_flows = 0;
     long long m_predictedUsed = 0;
     long long m_predictedUnused = 0;
-    long long m_ownFlows = 0;
+    long long m_unpredicted = 0;
 };
 
 }  // namespace policy

@@ -138,10 +138,14 @@ the present thread only draws the warp.
 - **Cache:** flow fields keyed by the pair's two capture stamps, a handful of slots (four is
   enough for a two-to-three-present horizon), least recently used out. A 60 into 60 hole, where
   consecutive presents share one pair, computes its flow once.
-- **Late or missing flow:** if the predicted pair was wrong (a stall, a lock move, a late frame)
-  the present submits the flow itself and waits a bounded time on an event query; past the bound
-  it draws the blend for that present (`sx=blend`, the existing fallback marker), never a repeat
-  (a blend is always better than a repeat or a skip).
+- **Late or missing flow:** a present draws the blend (`sx=blend`, the existing fallback marker),
+  never a repeat (a blend is always better than a repeat or a skip), and never waits on the
+  engine. A planned flow not yet handed over is handed over at that present for the presents of
+  the same pair after it (`fl=late`). A pair no prediction named (a stall, a lock move, a late
+  frame) flows nothing (`fl=own`): the plan made at that present names the pair for any later
+  present that brackets it, so a flow started there would be engine work beside the blend and
+  nothing else. In the field it was exactly that: 0 of 108 such flows on two streams
+  (2026-10-26 and 10-27) were ever warped from, while all 189 `late` flows were.
 - **Never for pass-through:** a present predicted to pass through costs no flow. At a locked 60
   into 60 the mode therefore costs almost nothing over `b:vsync`; at 240 into 60 nearly nothing.
 - The prediction is pure code in `src/core` (it needs the ring's stamps, the next targets and the
@@ -207,8 +211,9 @@ one frame and is clamped.
   pair's flow cached, a held synthesized frame is one more warp draw, no new flow and no snapshot.
 - The temporal line keeps `op=` `bw=` `sx=` (`flow-warp`, `blend`, `none`) and `pt=`; `pt=` becomes
   the warp's GPU time from a timestamp query pair, not CPU submission time. New fields at the end
-  only: `fl=` the flow's state for this present (`hit` cached, `own` submitted here, `late`
-  waited, `miss` fell back). Summary lines: flows run, predicted and used, predicted and unused,
+  only: `fl=` the flow's state for this present (`hit` cached, `late` planned and handed over
+  here, `own` not planned and nothing flowed, `miss` the flow failed; all but `hit` draw the
+  blend). Summary lines: flows run, predicted and used, predicted and unused,
   missed; the flow engine's GPU time per execute (p50/p99/max); the warp's.
 - Marker: compositor ID 3, executor 3 on flow-warp presents and 1 on fallback blends, as today.
 
@@ -345,8 +350,9 @@ the generated frames' known motion (7, 3 px), so a fast configuration that is wr
 - The flow prediction: synthetic timelines for 90 into 60 (every other present predicted, each
   pair flowed exactly once), a locked 60 into 60 with injected holes (one flow per hole, reused by
   the hole's presents), 240 into 60 (no flows), a stall (predictions dropped, no flow for frames
-  that never come), a lock move (a mispredicted pair counts as unused, the present's own pair
-  flows). Exact counts pinned.
+  that never come; the first present after it flows nothing and the rest share one planned
+  flow), a lock move (a mispredicted pair counts as unused, the present's own pair flows
+  nothing). Exact counts pinned.
 - The warp math reference: uniform translation reproduced to under 0.01 px at every `w`;
   endpoints at `w` 0 and 1; the static guard on a static region over moving flow; the consistency
   fallback on an occluding square; NaN-free on zero and maximum flow.

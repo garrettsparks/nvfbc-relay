@@ -5916,12 +5916,11 @@ static void test_lock_anchor_and_comb() {
 
 struct FlowPlanRun {
     int synths = 0;
-    int ownPresents = 0;          // synthesized presents that had to flow their own pair
-    int slotRefusals = 0;         // synthesized presents that found no slot
+    int ownPresents = 0;          // synthesized presents whose pair no prediction named
     long long flows = 0;
     long long predictedUsed = 0;
     long long predictedUnused = 0;
-    long long ownFlows = 0;
+    long long unpredicted = 0;
 };
 
 // Drives the planner as the present loop does: frames are in the ring once their stamp has
@@ -5939,11 +5938,7 @@ static FlowPlanRun RunFlowPlan(const std::vector<int64_t>& stamps, int64_t prese
         policy::FlowPair pair;
         if (policy::PredictSynthPair(stamps.data(), n, now - lag, gate, &pair)) {
             r.synths++;
-            bool submitted = false;
-            policy::FlowUse use = policy::FlowUse::Hit;
-            const int slot = planner.Use(pair, k, &submitted, &use);
-            if (slot < 0) r.slotRefusals++;
-            if (use == policy::FlowUse::Own) r.ownPresents++;
+            if (planner.Use(pair, k) < 0) r.ownPresents++;
         }
         // Only presents the run will reach, so a pair is never counted unused for want of a
         // present after the last.
@@ -5959,7 +5954,7 @@ static FlowPlanRun RunFlowPlan(const std::vector<int64_t>& stamps, int64_t prese
     r.flows = planner.Flows();
     r.predictedUsed = planner.PredictedUsed();
     r.predictedUnused = planner.PredictedUnused();
-    r.ownFlows = planner.OwnFlows();
+    r.unpredicted = planner.Unpredicted();
     return r;
 }
 
@@ -5977,11 +5972,11 @@ static void test_flow_plan() {
     {
         const int64_t gate = policy::PassthroughThreshold(11111, kPresent);
         const FlowPlanRun r = RunFlowPlan(EvenStamps(11111, 1000), kPresent, kLag, 0, 600, 3, gate);
-        CHECK(r.synths == 300 && r.flows == 300 && r.predictedUsed == 300 && r.ownFlows == 0 &&
-                  r.predictedUnused == 0 && r.slotRefusals == 0,
-              "90 into 60: %d synths, %lld flows, %lld predicted and used, %lld own, %lld "
-              "unused, %d refused (want 300, 300, 300, 0, 0, 0)", r.synths, r.flows,
-              r.predictedUsed, r.ownFlows, r.predictedUnused, r.slotRefusals);
+        CHECK(r.synths == 300 && r.flows == 300 && r.predictedUsed == 300 &&
+                  r.unpredicted == 0 && r.predictedUnused == 0,
+              "90 into 60: %d synths, %lld flows, %lld predicted and used, %lld unpredicted, "
+              "%lld unused (want 300, 300, 300, 0, 0)", r.synths, r.flows, r.predictedUsed,
+              r.unpredicted, r.predictedUnused);
     }
     // A locked 60 into 60 with a one-frame hole and a two-frame hole: three presents
     // synthesize, the two of the long hole from one pair, so two flows, both planned.
@@ -5993,11 +5988,11 @@ static void test_flow_plan() {
         }
         const int64_t gate = policy::PassthroughThreshold(kPresent, kPresent);
         const FlowPlanRun r = RunFlowPlan(s, kPresent, kLag, 1000, 380, 3, gate);
-        CHECK(r.synths == 3 && r.flows == 2 && r.predictedUsed == 2 && r.ownFlows == 0 &&
+        CHECK(r.synths == 3 && r.flows == 2 && r.predictedUsed == 2 && r.unpredicted == 0 &&
                   r.predictedUnused == 0,
-              "60 into 60 with holes: %d synths, %lld flows, %lld predicted and used, %lld own, "
-              "%lld unused (want 3, 2, 2, 0, 0)", r.synths, r.flows, r.predictedUsed,
-              r.ownFlows, r.predictedUnused);
+              "60 into 60 with holes: %d synths, %lld flows, %lld predicted and used, %lld "
+              "unpredicted, %lld unused (want 3, 2, 2, 0, 0)", r.synths, r.flows,
+              r.predictedUsed, r.unpredicted, r.predictedUnused);
     }
     // 240 into 60: a real frame is always inside the gate, so nothing flows.
     {
@@ -6009,7 +6004,8 @@ static void test_flow_plan() {
     // A stall of 19 missing frames: the presents inside it see no after frame until the
     // resume frame arrives, then the five whose targets still sit in the gap synthesize from
     // the one pair across it. The first of them could not have been planned (the resume frame
-    // arrived after the present before it), so it flows its own pair and the rest reuse it.
+    // arrived after the present before it), so it is drawn as the blend and flows nothing; the
+    // plan made at that present names the pair for the other four, which warp from one flow.
     {
         std::vector<int64_t> s;
         for (int i = 0; i < 500; i++) {
@@ -6018,14 +6014,14 @@ static void test_flow_plan() {
         }
         const int64_t gate = policy::PassthroughThreshold(kPresent, kPresent);
         const FlowPlanRun r = RunFlowPlan(s, kPresent, kLag, 1000, 480, 3, gate);
-        CHECK(r.synths == 5 && r.flows == 1 && r.ownFlows == 1 && r.predictedUsed == 0 &&
-                  r.ownPresents == 5 && r.predictedUnused == 0,
-              "stall: %d synths, %lld flows, %lld own flows, %lld predicted and used, %d own "
-              "presents, %lld unused (want 5, 1, 1, 0, 5, 0)", r.synths, r.flows, r.ownFlows,
+        CHECK(r.synths == 5 && r.flows == 1 && r.unpredicted == 1 && r.predictedUsed == 1 &&
+                  r.ownPresents == 1 && r.predictedUnused == 0,
+              "stall: %d synths, %lld flows, %lld unpredicted, %lld predicted and used, %d own "
+              "presents, %lld unused (want 5, 1, 1, 1, 1, 0)", r.synths, r.flows, r.unpredicted,
               r.predictedUsed, r.ownPresents, r.predictedUnused);
     }
-    // A mispredicted pair (the lock moved the target) is flowed by the present that needs it,
-    // and the predicted one is counted unused once it leaves the cache.
+    // A mispredicted pair (the lock moved the target) flows nothing at the present that needs
+    // it, and the predicted one is counted unused once it leaves the cache.
     {
         const int64_t stamps[] = {0, 16667, 33333, 50000, 66667, 83333, 100000, 116667};
         const int64_t gate = 4166;
@@ -6038,17 +6034,14 @@ static void test_flow_plan() {
         CHECK(policy::PredictSynthPair(stamps, 8, 25000, gate, &actual) &&
                   actual.beforeTs == 16667 && actual.afterTs == 33333,
               "the moved target must bracket (16667, 33333)");
-        bool submitted = false;
-        policy::FlowUse use = policy::FlowUse::Hit;
-        p.Use(actual, 11, &submitted, &use);
-        CHECK(submitted && use == policy::FlowUse::Own, "a mispredicted pair must flow at its "
-              "own present");
+        CHECK(p.Use(actual, 11) < 0 && p.Flows() == 1,
+              "a mispredicted pair must flow nothing at its own present");
         // Four more pairs push the unused one out of the four slots.
         const int64_t later[] = {41667, 58333, 75000, 91667};
         p.Plan(stamps, 8, later, 4, gate, 12, slots, policy::kFlowSlots);
-        CHECK(p.PredictedUnused() == 1 && p.OwnFlows() == 1 && p.Flows() == 6,
-              "after eviction: %lld unused, %lld own, %lld flows (want 1, 1, 6)",
-              p.PredictedUnused(), p.OwnFlows(), p.Flows());
+        CHECK(p.PredictedUnused() == 1 && p.Unpredicted() == 1 && p.Flows() == 5,
+              "after eviction: %lld unused, %lld unpredicted, %lld flows (want 1, 1, 5)",
+              p.PredictedUnused(), p.Unpredicted(), p.Flows());
         // Every slot was touched at present 12, so a fifth pair planned at 12 finds no slot.
         const int64_t fifth[] = {108333};
         CHECK(p.Plan(stamps, 8, fifth, 1, gate, 12, slots, policy::kFlowSlots) == 0,

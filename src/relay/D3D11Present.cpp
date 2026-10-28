@@ -854,17 +854,16 @@ bool D3D11PresentBackend::DrawSynthesis(const FrameBracket& bracket, float w, in
     policy::FlowPair pair;
     pair.beforeTs = bracket.info.beforeTs;
     pair.afterTs = bracket.info.afterTs;
-    bool submitted = false;
-    policy::FlowUse use = policy::FlowUse::Own;
-    const int slot = m_planner.Use(pair, m_presents, &submitted, &use);
+    // A pair no prediction named has no slot: it is drawn as the blend and flows nothing.
+    const int slot = m_planner.Use(pair, m_presents);
     bool ready = false;
     bool handedNow = false;
-    const char* label = "miss";
+    const char* label = slot < 0 ? "own" : "miss";
     long long* counter = NULL;
     if (slot >= 0) {
         PlannedFlow& p = m_planned[slot];
-        if (submitted || !policy::SamePair(p.pair, pair)) {
-            // Not planned (or planned from other frames): this present hands it over itself.
+        if (!policy::SamePair(p.pair, pair)) {
+            // Planned from other frames: this present hands it over itself.
             p.pair = pair;
             p.beforeSlot = bracket.beforeSlot;
             p.afterSlot = bracket.afterSlot;
@@ -883,9 +882,8 @@ bool D3D11PresentBackend::DrawSynthesis(const FrameBracket& bracket, float w, in
             // warps from the flow.
             if (SubmitFlow(slot)) {
                 handedNow = true;
-                label = submitted ? "own" : "late";
-                if (submitted) m_flowOwn++;
-                else m_flowLate++;
+                label = "late";
+                m_flowLate++;
             }
         }
     }
@@ -897,7 +895,8 @@ bool D3D11PresentBackend::DrawSynthesis(const FrameBracket& bracket, float w, in
         *flowSlot = slot;
         return true;
     }
-    if (!handedNow) m_flowMiss++;
+    if (slot < 0) m_flowOwn++;
+    else if (!handedNow) m_flowMiss++;
     *flowLabel = label;
     *exec = kExecBlend;
     *flowSlot = -1;

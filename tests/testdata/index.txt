@@ -162,6 +162,19 @@ kcd_60x2_gameplay_2026_10_23_0.trace
 # releases in the field, 7 of them at the same moments on the replay; the worst blend run (34,
 # the same in both) sits beside the release at 4808.01 s.
 kcd_60x2_gameplay_2026_10_25_0.trace
+# 63 minutes of the first 2026-10-26 stream, through Windows.Graphics.Capture with the blends
+# drawn in linear light: 571 hitches and 115 stalls an hour in 122 bursts. 3 lock releases, the
+# same 3 on the replay; worst blend run 17 in both.
+kcd_60x2_gameplay_2026_10_26_0.trace
+# 44 minutes of the second 2026-10-26 stream, the first with o:vsync (optical flow warps for the
+# synthesized presents), through NvFBC: 650 hitches and 147 stalls an hour, ending on 3.5 minutes
+# of the dice game. 3 lock releases in the field, the same 3 plus one more (1686.35 s) on the
+# replay; worst blend run 17 in both.
+kcd_60x2_gameplay_2026_10_26_1.trace
+# 17.5 minutes of the 2026-10-27 stream, o:vsync through Windows.Graphics.Capture: 356 hitches
+# and 62 stalls an hour in 35 bursts. 12 lock releases, 8 of them in 13 s of steady 26 ms hitches
+# on the walk out of a barn, where the worst blend run (38) also sits; all 12 match the replay.
+kcd_60x2_gameplay_2026_10_27_0.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions

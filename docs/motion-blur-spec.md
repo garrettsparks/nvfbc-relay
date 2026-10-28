@@ -97,8 +97,12 @@ way. The frame marker is burned after the blur, so it stays sharp and decodable.
 - **Accumulation** reads two to four full frames per present, a bandwidth pass, expected well
   under a millisecond at 1440p (not measured).
 - **Flow blur** needs a flow field for every present's bracket, not only for synthesized ones:
-  about 60 flows a second at a 60 fps source, on the flow engine (whose cost and whether it runs
-  apart from the game's shader cores is the open premise of the interpolation spec, P2). The gather
+  about 60 flows a second at a 60 fps source. The 5080's flow engine runs apart from the game's
+  graphics engine (2026-10-23 `ofprobe4`, about 2.7 ms a pair at grid 4); what the game pays is
+  turns on its graphics engine, 2 per flow call (2026-10-24 `oftrace2` to `oftrace4`). A draw on
+  the flow's D3D11 context rides in those same 2 turns (`oftrace5`: draw alone 1 turn, 1.83%; flow
+  alone 3.61%; both together 3.65%, at 60 a second). Since blur already makes every present a draw,
+  the flow adds about 1 turn per present on top, roughly 1.8% at 60 a second. The gather
   at 15 taps: Guertin et al. measured 2 to 5 ms at 1080p on a 2013 GPU; today's should be several
   times faster (a guess).
 
