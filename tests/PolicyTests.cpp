@@ -13,6 +13,7 @@
 // All synthetic tests run in the microsecond domain; the policy is unit-agnostic.
 
 #include "TemporalPolicy.h"
+#include "PresentStep.h"
 #include "LaunchOptions.h"
 #include "FlowPlan.h"
 #include "FlowWarpMath.h"
@@ -83,9 +84,9 @@ static int64_t JitterUs(int64_t amplitude) {
 
 // ---------------------------------------------------------------------------------
 // Synthetic timeline simulator: source arrivals at srcPeriod (+jitter), present
-// deadlines at presentPeriod, static lag sized as production does. Mirrors the Run()
-// wiring: pulled target -> bracket -> UpdatePhaseLock (complete brackets only) ->
-// SelectFrame. Records everything the invariants need.
+// deadlines at presentPeriod, static lag sized as production does. Each present runs
+// policy::StepPresent (PresentStep.h) over the replay's model of the capture ring.
+// Records everything the invariants need.
 // ---------------------------------------------------------------------------------
 
 struct SimResult {
@@ -284,6 +285,109 @@ static policy::DeferLimits SizedDeferLimits(int64_t lag, int64_t srcPeriod, int6
                                    policy::kDeferWaitLeastMs * 1000);
 }
 
+// The replay's capture ring, as the present step reads it. Slot i is wake i: its stamp, whether
+// keep-real left it valid, and when its pixels are in the ring. The caller sets the window for
+// each present: the wakes published by the deadline, the last ringSlots of them, and the
+// batches opened. Retracted slots still occupy their ring position (the write counter
+// advanced), so the window is ringSlots WAKES wide while only the surviving members are
+// eligible.
+struct ReplayRing : policy::IRingView {
+    const std::vector<int64_t>* stamps = nullptr;
+    const std::vector<char>* valid = nullptr;
+    const std::vector<int64_t>* visibleAt = nullptr;
+    const std::vector<int64_t>* batchStart = nullptr;
+    const std::vector<size_t>* batchFirst = nullptr;
+    bool haveFlushes = false;
+    int64_t deadline = 0;
+    size_t published = 0;
+    size_t oldest = 0;
+    long long opens = 0;
+    // Set by the bracket read: the nearest frame on either side of the target had arrived and
+    // survived keep-real but was still waiting to be copied, so the bracket had to use an older
+    // or a newer one.
+    mutable bool starved = false;
+
+    // Nearest valid slot on each side of the target, which is what production's ring scan
+    // returns. When everything visible is newer than the target there is no before-frame and
+    // the nearest-after is the oldest visible slot, the same result the production scan gives
+    // while the display is pinned at the ring's tail.
+    void FindBracket(int64_t target, const policy::StampOverlay* overlay,
+                     BracketInfo* out) const override {
+        BracketInfo b;
+        bool hiddenBefore = false, hiddenAfter = false;
+        int64_t hiddenBeforeTs = 0, hiddenAfterTs = 0;
+        for (size_t i = oldest; i < published; i++) {
+            if (!(*valid)[i]) continue;
+            int64_t ts = (*stamps)[i];
+            if (overlay) ts -= overlay->CorrectionFor(ts);
+            // A frame still waiting to be copied is not in the ring yet. Its stamp is kept
+            // aside to tell afterwards whether the bracket would have used it.
+            if ((*visibleAt)[i] > deadline) {
+                if (ts <= target) {
+                    if (!hiddenBefore || ts > hiddenBeforeTs) { hiddenBefore = true; hiddenBeforeTs = ts; }
+                } else {
+                    if (!hiddenAfter || ts < hiddenAfterTs) { hiddenAfter = true; hiddenAfterTs = ts; }
+                }
+                continue;
+            }
+            if (ts <= target) {
+                if (!b.hasBefore || ts > b.beforeTs) { b.hasBefore = true; b.beforeTs = ts; }
+            } else {
+                if (!b.hasAfter || ts < b.afterTs) { b.hasAfter = true; b.afterTs = ts; }
+            }
+        }
+        starved = (hiddenBefore && (!b.hasBefore || hiddenBeforeTs > b.beforeTs)) ||
+                  (hiddenAfter && (!b.hasAfter || hiddenAfterTs < b.afterTs));
+        if (b.hasBefore) b.beforeDiff = target - b.beforeTs;
+        if (b.hasAfter) b.afterDiff = b.afterTs - target;
+        *out = b;
+    }
+
+    // The frames around the target, read as production's ring reads them: newest first,
+    // dejitter corrections applied, the ring's write index as the sequence. A member keep-real
+    // retracts is in production's ring until the wake that retracts it is published, waiting
+    // for its copy or not, and ReadRecentFrames counts it there: the newest frames include its
+    // batch a wake early. Only with flush times: without them the run cannot tell whether the
+    // member was in the ring yet, and counting it early lost a recorded 36-present run on a
+    // 2026-10-01 capture that the flush times bring back.
+    void ReadRecentFrames(int64_t target, const policy::StampOverlay* overlay,
+                          policy::RecentFrames* out) const override {
+        policy::RecentFrames rf;
+        for (size_t i = published; i-- > oldest;) {
+            if (!(*valid)[i] && (i + 1 < published || !haveFlushes)) continue;
+            int64_t ts = (*stamps)[i];
+            if (overlay) ts -= overlay->CorrectionFor(ts);
+            if (ts > target) {
+                if (rf.nAhead < policy::RecentFrames::kMaxAhead) {
+                    rf.aheadTs[rf.nAhead] = ts;
+                    rf.aheadSeq[rf.nAhead] = (long long)i;
+                    rf.nAhead++;
+                }
+            } else {
+                rf.atTs[rf.nAt++] = ts;
+                if (rf.nAt == policy::RecentFrames::kMaxAt) break;
+            }
+        }
+        *out = rf;
+    }
+
+    // A batch is a maximal run of equal batch starts; batchFirst holds each one's first slot.
+    long long BatchOpens() const override { return opens; }
+    int64_t BatchStartAt(long long i) const override { return (*batchStart)[(*batchFirst)[(size_t)i]]; }
+    // The replay keeps every batch; its history never laps.
+    long long BatchHistory() const override { return INT64_MAX; }
+};
+
+// The replay's lateness source: the fixture's head-0 flips, fed into the history as they
+// became known.
+struct ReplayLateness : policy::ILatenessSource {
+    const policy::FlipHistory* flips = nullptr;
+    int64_t cadenceWindow = 0;
+    policy::LateCorrection MeasureLateness(int64_t batchStart, policy::AnchorChain& chain) override {
+        return policy::MeasureLateness(*flips, 0, batchStart, chain, cadenceWindow);
+    }
+};
+
 static SimResult Simulate(const SimParams& p) {
     SeedRng();   // each simulation owns its jitter stream; see kRngSeed
     PolicyConfig cfg;
@@ -393,23 +497,21 @@ static SimResult Simulate(const SimParams& p) {
     // members published after their batch was measured inherit it by lookup.
     const bool flipDejitter = p.flipDejitter && !p.flipDisplay.empty() && !p.flipKnown.empty();
     policy::FlipHistory fliph;
-    policy::AnchorChain chain;
-    policy::StampOverlay overlay;
     size_t nextFlip = 0;
-    int64_t maxTarget = INT64_MIN;
-    const int64_t kCadenceWindowUs = 200000;   // production's m_flipCadenceWindowQpc
+    ReplayLateness lateness;
+    lateness.flips = &fliph;
+    lateness.cadenceWindow = 200000;   // production's m_flipCadenceWindowQpc
     // First slot index of each batch, in arrival order (a batch is a maximal run of equal
     // batchStart) - the sim's stand-in for the ring's batch-start history.
     std::vector<size_t> batchFirst;
     for (size_t i = 0; i < arrivals.size(); i++) {
         if (i == 0 || batchStart[i] != batchStart[i - 1]) batchFirst.push_back(i);
     }
-    size_t nextBatch = 0;
 
+    policy::PresentStepState step;
+    // A composite run records the nearest pick beside its decision, from its own selection
+    // memory; the step runs only the decision the mode makes.
     SelectionState sel;
-    PhaseLockState lock;
-    policy::PhaseLookahead lookahead;
-    policy::CompositeState comp;
     SimResult r;
     // When each slot's pixels are in the ring: at its own arrival, unless the capture loop
     // left the frame waiting. Then it is when the loop copies it, which production's
@@ -465,17 +567,21 @@ static SimResult Simulate(const SimParams& p) {
             visibleAt[(size_t)pendingIdx] = arrivals[(size_t)pendingIdx] + waitLimit;
         }
     }
+    ReplayRing ring;
+    ring.stamps = &stamps;
+    ring.valid = &valid;
+    ring.visibleAt = &visibleAt;
+    ring.batchStart = &batchStart;
+    ring.batchFirst = &batchFirst;
+    ring.haveFlushes = haveFlushes;
     size_t published = 0;
     int64_t prevPull = 0;
-    policy::PresentHistory presentHist;
     const int64_t presentCount =
         p.explicitPresents.empty() ? p.presents : (int64_t)p.explicitPresents.size();
     for (int64_t k = 1; k <= presentCount; k++) {
         const int64_t deadline = p.explicitPresents.empty()
                                      ? k * p.presentPeriod
                                      : p.explicitPresents[(size_t)(k - 1)];
-        int64_t target = deadline - (lag + lock.pullQpc + lock.easeQpc);
-        const int64_t meanPresent = policy::RecordPresent(presentHist, deadline);
 
         // Frames visible to the bracket: arrived by pick time (the ring can't contain
         // the future) AND still inside the ring window (each publish evicts the slot
@@ -485,29 +591,17 @@ static SimResult Simulate(const SimParams& p) {
         // arrived yet: those presents must hold, not synthesize) and for underruns
         // (a lag past the ring window loses the before-frame entirely).
         while (published < arrivals.size() && publishAt[published] <= deadline) published++;
-        const size_t oldest =
-            published > (size_t)p.ringSlots ? published - (size_t)p.ringSlots : 0;
-
-        // Phase-step lookahead, in production's order: a planned move lands before anything
-        // reads the target, on the present whose target reaches the step's first frame.
-        const int64_t moved = policy::ApplyLookahead(lookahead, lock, cfg, target);
-        target -= moved;
-        r.rephased.push_back(moved != 0);
-        // A live capture's own target for this present, when the run is forced onto it: the
-        // pull is set to match, so every decision below is made from the capture's timeline.
-        if ((size_t)(k - 1) < p.forcedTargets.size() && p.forcedTargets[(size_t)(k - 1)] != kNotForced) {
-            target = p.forcedTargets[(size_t)(k - 1)];
-            lock.pullQpc = deadline - lag - lock.easeQpc - target;
+        ring.deadline = deadline;
+        ring.published = published;
+        ring.oldest = published > (size_t)p.ringSlots ? published - (size_t)p.ringSlots : 0;
+        // A batch opens for the stage-6 walk once its first wake is published.
+        ring.opens = step.nextBatch;
+        while ((size_t)ring.opens < batchFirst.size() &&
+               publishAt[batchFirst[(size_t)ring.opens]] <= deadline) {
+            ring.opens++;
         }
-
-        // Stage 6, the same sequence production runs before its bracket read: measure each
-        // batch's delivery lateness against its stride-anchored flip, gate on lock calm
-        // and THE COHERENCE RULE (both the batch stamp and its corrected value strictly
-        // newer than the newest target the policy has seen), insert survivors into the
-        // overlay. A blocked batch keeps today's late stamp - that is the entire
-        // degradation path, no separate fallback exists.
+        // Flips enter the history when they became KNOWN, never when they happened.
         if (flipDejitter) {
-            if (target > maxTarget) maxTarget = target;
             while (nextFlip < p.flipDisplay.size() && p.flipKnown[nextFlip] <= deadline) {
                 policy::Flip f;
                 f.displayTs = p.flipDisplay[nextFlip];
@@ -516,139 +610,64 @@ static SimResult Simulate(const SimParams& p) {
                 fliph.Add(f);
                 nextFlip++;
             }
-            while (nextBatch < batchFirst.size() &&
-                   publishAt[batchFirst[nextBatch]] <= deadline) {
-                const int64_t bs = batchStart[batchFirst[nextBatch]];
-                const policy::LateCorrection lc =
-                    policy::MeasureLateness(fliph, 0, bs, chain, kCadenceWindowUs);
-                // Data in flight: stop and retry this batch next present (the chain is
-                // order-dependent, so later batches wait behind it).
-                if (lc.dataPending) break;
-                r.measuredBatches++;
-                if (chain.valid) r.anchoredBatches++;
-                const bool lockCalm = (lock.stallRun == 0 && lock.recoverRun == 0);
-                if (lc.correctionTicks != 0) {
-                    r.lateBatches++;
-                    if (!lockCalm) {
-                        r.lockDeclinedBatches++;
-                    } else if (bs <= maxTarget || bs - lc.correctionTicks <= maxTarget) {
-                        r.fenceBlockedBatches++;
-                    } else {
-                        overlay.Insert(bs, lc.correctionTicks);
-                        r.correctedBatches++;
-                    }
-                }
-                nextBatch++;
-            }
         }
 
-        // Nearest valid slot on each side of the target, which is what production's
-        // ring scan returns. Retracted slots still occupy their ring position (the
-        // write counter advanced), so the window is p.ringSlots WAKES wide while only
-        // the surviving members are eligible. When everything visible is newer than
-        // the target there is no before-frame and the nearest-after is the oldest
-        // visible slot, the same result the production scan gives while the display
-        // is pinned at the ring's tail.
-        BracketInfo b;
-        bool hiddenBefore = false, hiddenAfter = false;
-        int64_t hiddenBeforeTs = 0, hiddenAfterTs = 0;
-        for (size_t i = oldest; i < published; i++) {
-            if (!valid[i]) continue;
-            int64_t ts = stamps[i];
-            if (flipDejitter) ts -= overlay.CorrectionFor(ts);
-            // A frame still waiting to be copied is not in the ring yet. Its stamp is kept
-            // aside to tell afterwards whether the bracket would have used it.
-            if (visibleAt[i] > deadline) {
-                if (ts <= target) {
-                    if (!hiddenBefore || ts > hiddenBeforeTs) { hiddenBefore = true; hiddenBeforeTs = ts; }
-                } else {
-                    if (!hiddenAfter || ts < hiddenAfterTs) { hiddenAfter = true; hiddenAfterTs = ts; }
-                }
-                continue;
-            }
-            if (ts <= target) {
-                if (!b.hasBefore || ts > b.beforeTs) { b.hasBefore = true; b.beforeTs = ts; }
-            } else {
-                if (!b.hasAfter || ts < b.afterTs) { b.hasAfter = true; b.afterTs = ts; }
-            }
+        // A live capture's own target for this present, when the run is forced onto it: the
+        // step sets the pull to match, so every decision is made from the capture's timeline.
+        policy::PresentStepHooks hooks;
+        if ((size_t)(k - 1) < p.forcedTargets.size() && p.forcedTargets[(size_t)(k - 1)] != kNotForced) {
+            hooks.forceTarget = true;
+            hooks.forcedTarget = p.forcedTargets[(size_t)(k - 1)];
         }
-        const bool starvedNow =
-            (hiddenBefore && (!b.hasBefore || hiddenBeforeTs > b.beforeTs)) ||
-            (hiddenAfter && (!b.hasAfter || hiddenAfterTs < b.afterTs));
-        if (starvedNow) r.deferStarvedPresents++;
-        if (p.deferCopy) r.starved.push_back(starvedNow);
-        if (b.hasBefore) b.beforeDiff = target - b.beforeTs;
-        if (b.hasAfter) b.afterDiff = b.afterTs - target;
+        const policy::PresentStepResult res = policy::StepPresent(
+            step, cfg, ring, flipDejitter ? &lateness : nullptr, deadline, lag, &hooks);
+        const BracketInfo& b = res.bracket;
+        const PhaseLockState& lock = step.lock;
 
-        // Mirrors Run()'s lock wiring, INCLUDING the stall-run counter that arms the
-        // re-seed: the trigger is part of the behavior under test, so the simulator has
-        // to drive it the same way production does rather than assume the flag.
-        bool resumedFromStall = false;
-        if (cfg.combQpc > 0) {
-            resumedFromStall = policy::UpdateStallRun(lock, cfg, b);
-            if (!policy::BracketIsStalled(b, cfg)) {
-                policy::UpdatePhaseLock(lock, cfg, b.beforeDiff, resumedFromStall,
-                                        b.hasAfter ? b.afterDiff : -1);
-                if (lock.pullQpc - prevPull > cfg.combQpc / 2 ||
-                    prevPull - lock.pullQpc > cfg.combQpc / 2) {
-                    r.wraps++;
-                    r.wrapAt.push_back((size_t)(k - 1));
-                }
-                prevPull = lock.pullQpc;
+        r.rephased.push_back(res.rephase != 0);
+        r.measuredBatches += res.dejitMeasured;
+        r.anchoredBatches += res.dejitAnchored;
+        r.lateBatches += res.dejitLate;
+        r.lockDeclinedBatches += res.dejitLockDeclined;
+        r.fenceBlockedBatches += res.dejitFenceBlocked;
+        r.correctedBatches += res.dejitCorrected;
+        if (ring.starved) r.deferStarvedPresents++;
+        if (p.deferCopy) r.starved.push_back(ring.starved);
+        if (res.lockUpdated) {
+            if (lock.pullQpc - prevPull > cfg.combQpc / 2 ||
+                prevPull - lock.pullQpc > cfg.combQpc / 2) {
+                r.wraps++;
+                r.wrapAt.push_back((size_t)(k - 1));
             }
-            if (resumedFromStall) policy::ArmResumeGuardExemption(lock, cfg, meanPresent);
-            // The frames around the target, read as production's ring reads them: newest
-            // first, dejitter corrections applied, the ring's write index as the sequence.
-            // A member keep-real retracts is in production's ring until the wake that
-            // retracts it is published, waiting for its copy or not, and ReadRecentFrames
-            // counts it there: the newest frames include its batch a wake early. Only with
-            // flush times: without them the run cannot tell whether the member was in the
-            // ring yet, and counting it early lost a recorded 36-present run on a 2026-10-01
-            // capture that the flush times bring back.
-            policy::RecentFrames rf;
-            for (size_t i = published; i-- > oldest;) {
-                if (!valid[i] && (i + 1 < published || !haveFlushes)) continue;
-                int64_t ts = stamps[i];
-                if (flipDejitter) ts -= overlay.CorrectionFor(ts);
-                if (ts > target) {
-                    if (rf.nAhead < policy::RecentFrames::kMaxAhead) {
-                        rf.aheadTs[rf.nAhead] = ts;
-                        rf.aheadSeq[rf.nAhead] = (long long)i;
-                        rf.nAhead++;
-                    }
-                } else {
-                    rf.atTs[rf.nAt++] = ts;
-                    if (rf.nAt == policy::RecentFrames::kMaxAt) break;
-                }
-            }
-            const bool record = deadline >= p.recordLookaheadFrom && deadline < p.recordLookaheadTo;
+            prevPull = lock.pullQpc;
+        }
+        const bool record = deadline >= p.recordLookaheadFrom && deadline < p.recordLookaheadTo;
+        if (record && hooks.lookaheadRan) {
             SimResult::LookaheadInput in;
-            if (record) {
-                in.present = (size_t)(k - 1);
-                in.target = target;
-                in.frames = rf;
-                in.lock = lock;
-                in.lookahead = lookahead;
-                in.resumedFromStall = resumedFromStall;
-            }
-            const policy::LookaheadEvent ev =
-                policy::UpdateLookahead(lookahead, lock, cfg, target, rf, resumedFromStall);
-            if (record) {
-                in.event = ev;
-                r.lookaheadInputs.push_back(in);
-                r.lookaheadCfg = cfg;
-            }
-            if (ev == policy::LookaheadEvent::Planned) r.lookaheadPlanned++;
-            if (ev == policy::LookaheadEvent::Cancelled) r.lookaheadCancelled++;
-            if (ev == policy::LookaheadEvent::PlannedLate) r.lookaheadLate++;
-            if (ev == policy::LookaheadEvent::Refused) r.lookaheadRefused++;
+            in.present = (size_t)(k - 1);
+            in.target = res.target;
+            in.frames = hooks.frames;
+            in.lock = hooks.lock;
+            in.lookahead = hooks.lookahead;
+            in.resumedFromStall = res.resumedFromStall;
+            in.event = res.lookaheadEvent;
+            r.lookaheadInputs.push_back(in);
+            r.lookaheadCfg = cfg;
         }
-        b.toothGuardExempt = policy::ConsumeGuardExemption(lock);
-        r.snapped.push_back(resumedFromStall);
+        if (res.lookaheadEvent == policy::LookaheadEvent::Planned) r.lookaheadPlanned++;
+        if (res.lookaheadEvent == policy::LookaheadEvent::Cancelled) r.lookaheadCancelled++;
+        if (res.lookaheadEvent == policy::LookaheadEvent::PlannedLate) r.lookaheadLate++;
+        if (res.lookaheadEvent == policy::LookaheadEvent::Refused) r.lookaheadRefused++;
+        r.snapped.push_back(res.resumedFromStall);
         r.span.push_back((b.hasBefore && b.hasAfter) ? (b.afterTs - b.beforeTs) : -1);
 
-        r.picks.push_back(policy::SelectFrame(b, sel, cfg));
-        r.shownTs.push_back(sel.lastShownTs);
+        if (cfg.passthroughQpc > 0) {
+            r.picks.push_back(policy::SelectFrame(b, sel, cfg));
+            r.shownTs.push_back(sel.lastShownTs);
+        } else {
+            r.picks.push_back(res.pick);
+            r.shownTs.push_back(step.sel.lastShownTs);
+        }
         r.pull.push_back(lock.pullQpc);
         r.ease.push_back(lock.easeQpc);
         r.engaged.push_back(lock.engaged);
@@ -659,10 +678,9 @@ static SimResult Simulate(const SimParams& p) {
         if (b.hasAfter && (md < 0 || b.afterDiff < md)) md = b.afterDiff;
         r.minDiff.push_back(md);
         if (cfg.passthroughQpc > 0) {
-            const policy::CompositeDecision cd = policy::DecideComposite(b, comp, cfg);
-            r.ops.push_back(cd.op);
-            r.weights.push_back(cd.weight);
-            r.outTs.push_back(comp.lastOutputTs);
+            r.ops.push_back(res.decision.op);
+            r.weights.push_back(res.decision.weight);
+            r.outTs.push_back(step.comp.lastOutputTs);
         }
     }
     return r;

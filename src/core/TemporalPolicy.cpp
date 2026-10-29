@@ -1,4 +1,5 @@
 #include "TemporalPolicy.h"
+#include "PresentStep.h"
 
 #include <algorithm>
 
@@ -1300,6 +1301,110 @@ bool IsPointerFrame(PointerDropState& s, int64_t area, int64_t now, int64_t forg
         return false;
     }
     return area * kPointerDropRatio < s.largestArea;
+}
+
+PresentStepResult StepPresent(PresentStepState& s, const PolicyConfig& cfg, const IRingView& ring,
+                              ILatenessSource* lateness, int64_t deadline, int64_t bracketingLag,
+                              PresentStepHooks* hooks) {
+    PresentStepResult r;
+    if (hooks) hooks->lookaheadRan = false;
+    r.meanPresent = RecordPresent(s.presentHist, deadline);
+    // The pull is extra lag, set from the previous present's bracket; the ease is what is left
+    // of a wrap the target is still crossing.
+    int64_t target = deadline - (bracketingLag + s.lock.pullQpc + s.lock.easeQpc);
+    // A phase step seen in the ring lands here, before anything reads the target, on the
+    // present whose target reaches the step's first frame.
+    r.rephase = ApplyLookahead(s.lookahead, s.lock, cfg, target);
+    target -= r.rephase;
+    if (hooks && hooks->forceTarget) {
+        target = hooks->forcedTarget;
+        s.lock.pullQpc = deadline - bracketingLag - s.lock.easeQpc - target;
+    }
+    r.target = target;
+
+    // Stage 6: settle delivery-lateness corrections before the bracket reads the ring. Batches
+    // are measured strictly in order (the anchor chain is sequential). The fence, the newest
+    // target consumed, is the coherence rule: a correction that would land at or behind it is
+    // refused for good. Lock calm keeps stamps still while the lock rides out or converges
+    // from a stall.
+    if (lateness) {
+        if (target > s.maxTarget) s.maxTarget = target;
+        const bool lockCalm = s.lock.stallRun == 0 && s.lock.recoverRun == 0;
+        const long long opens = ring.BatchOpens();
+        if (opens - s.nextBatch > ring.BatchHistory() - 8) {
+            // The walk was pinned (flip data outage, long stall) and the history lapped. Skip
+            // forward and drop the chain: its stride does not span the gap.
+            r.dejitSkipped = (opens - 8) - s.nextBatch;
+            s.nextBatch = opens - 8;
+            s.chain = AnchorChain();
+        }
+        while (s.nextBatch < opens) {
+            const int64_t bs = ring.BatchStartAt(s.nextBatch);
+            const LateCorrection lc = lateness->MeasureLateness(bs, s.chain);
+            // Flip data still in flight: retry this batch next present.
+            if (lc.dataPending) break;
+            r.dejitMeasured++;
+            if (s.chain.valid) r.dejitAnchored++;
+            if (lc.correctionTicks != 0) {
+                r.dejitLate++;
+                DejitVerdict verdict;
+                if (!lockCalm) {
+                    r.dejitLockDeclined++;
+                    verdict = DejitVerdict::LockDeclined;
+                } else if (bs <= s.maxTarget || bs - lc.correctionTicks <= s.maxTarget) {
+                    r.dejitFenceBlocked++;
+                    verdict = DejitVerdict::FenceBlocked;
+                } else {
+                    s.overlay.Insert(bs, lc.correctionTicks);
+                    r.dejitCorrected++;
+                    verdict = DejitVerdict::Corrected;
+                }
+                if (r.nLateBatches < PresentStepResult::kMaxLateBatches) {
+                    LateBatch& lb = r.lateBatches[r.nLateBatches++];
+                    lb.batchStart = bs;
+                    lb.correction = lc.correctionTicks;
+                    lb.verdict = verdict;
+                }
+            }
+            s.nextBatch++;
+        }
+    }
+
+    ring.FindBracket(target, &s.overlay, &r.bracket);
+
+    // The comb lock steps for the next present on a complete bracket only: across a stall the
+    // pull freezes rather than integrating a one-sided error.
+    if (cfg.combQpc > 0) {
+        r.resumedFromStall = UpdateStallRun(s.lock, cfg, r.bracket);
+        if (!BracketIsStalled(r.bracket, cfg)) {
+            UpdatePhaseLock(s.lock, cfg, r.bracket.beforeDiff, r.resumedFromStall,
+                            r.bracket.hasAfter ? r.bracket.afterDiff : -1);
+            r.lockUpdated = true;
+        }
+        if (r.resumedFromStall) ArmResumeGuardExemption(s.lock, cfg, r.meanPresent);
+        if (cfg.phaseLookahead) {
+            RecentFrames rf;
+            ring.ReadRecentFrames(target, &s.overlay, &rf);
+            if (hooks) {
+                hooks->lookaheadRan = true;
+                hooks->frames = rf;
+                hooks->lock = s.lock;
+                hooks->lookahead = s.lookahead;
+            }
+            r.lookaheadEvent =
+                UpdateLookahead(s.lookahead, s.lock, cfg, target, rf, r.resumedFromStall);
+            r.lookaheadSize = s.lookahead.size;
+            r.lookaheadFirstTs = s.lookahead.firstTs;
+        }
+    }
+    r.bracket.toothGuardExempt = ConsumeGuardExemption(s.lock);
+
+    if (cfg.passthroughQpc > 0) {
+        r.decision = DecideComposite(r.bracket, s.comp, cfg);
+    } else {
+        r.pick = SelectFrame(r.bracket, s.sel, cfg);
+    }
+    return r;
 }
 
 }  // namespace policy
