@@ -111,4 +111,15 @@ PresentStepResult StepPresent(PresentStepState& s, const PolicyConfig& cfg, cons
                               ILatenessSource* lateness, int64_t deadline, int64_t bracketingLag,
                               PresentStepHooks* hooks = nullptr);
 
+// The next count presents as the step will decide them, from the ring as it is now: a copy of
+// the state stepped once per present, at deadlines presentPeriod apart after deadline (this
+// present's). No stage-6 walk: its chain is sequential state that must not advance on a copy,
+// and a correction it would find lands one present later at most. out[j] is present j + 1's
+// result: its target, bracket and decision. The flow planner flows the pairs of the ones that
+// synthesize. What it cannot know is a frame that has not arrived yet, a correction made in
+// between, and the deadline's jitter (docs/present-step-spec.md, 3.4).
+void PlanNextPresents(const PresentStepState& s, const PolicyConfig& cfg, const IRingView& ring,
+                      int64_t deadline, int64_t presentPeriod, int64_t bracketingLag, int count,
+                      PresentStepResult* out);
+
 }  // namespace policy

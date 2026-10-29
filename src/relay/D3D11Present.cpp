@@ -124,7 +124,7 @@ UINT OutputBitsPerColor(IDXGIAdapter* adapter, HWND hwnd) {
 D3D11PresentBackend::D3D11PresentBackend(bool tint, bool interp, int blendShader)
     : m_enabled(false)
     , m_width(0), m_height(0), m_ringSlots(0)
-    , m_cfg(NULL), m_tintRequested(tint)
+    , m_tintRequested(tint)
     , m_dev(NULL), m_ctx(NULL), m_swapChain(NULL), m_swapChainMedia(NULL), m_frameWait(NULL)
     , m_rtv(NULL)
     , m_vs(NULL), m_ps(NULL), m_markerPs(NULL), m_cb(NULL), m_sampler(NULL)
@@ -167,7 +167,7 @@ D3D11PresentBackend::~D3D11PresentBackend() {
 }
 
 bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
-                                const policy::PolicyConfig* cfg, bool mark,
+                                const policy::PolicyConfig* /*cfg*/, bool mark,
                                 unsigned int markFrames, LARGE_INTEGER /*baseQpc*/,
                                 LONGLONG /*freqQpc*/) {
     const HWND hwnd = ctx.outputWindow;
@@ -175,7 +175,6 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
     const int height = ctx.height;
     m_width = width;
     m_height = height;
-    m_cfg = cfg;
     if (m_tintRequested) LOG("-tint ignored: the D3D11 present path has no tint pass");
     m_wgc = ring->WgcRequested();
     if (!CreateDeviceAndSwapChain(hwnd, width, height, m_wgc && ring->WgcCopyEngine(),
@@ -905,16 +904,16 @@ bool D3D11PresentBackend::DrawSynthesis(const FrameBracket& bracket, float w, in
 
 // Kept until Compose plans the flows.
 void D3D11PresentBackend::PlanAhead(const FrameBracket* upcoming, const LONGLONG* targets,
-                                    int count, const policy::CompositeState& decided) {
+                                    const bool* synthesizes, int count) {
     m_aheadCount = 0;
     if (!m_flow || count <= 0) return;
     if (count > kFlowLookahead) count = kFlowLookahead;
     for (int j = 0; j < count; j++) {
         m_ahead[j] = upcoming[j];
         m_aheadTargets[j] = targets[j];
+        m_aheadSynth[j] = synthesizes[j];
     }
     m_aheadCount = count;
-    m_aheadState = decided;
 }
 
 void D3D11PresentBackend::PlanFlows() {
@@ -938,11 +937,12 @@ void D3D11PresentBackend::PlanFlows() {
         }
         stamps[i] = ts;
     };
-    // Which upcoming presents synthesize, by the present's own decision run on a copy of its
-    // state, present after present: the stickiness band and the tooth guard predict as they will
-    // decide. The plain passthrough gate alone predicted a synthesis for 88% of flows that never
-    // came at a 115 fps source (sitting ofpts1), the band holding those presents on real frames.
-    policy::CompositeState ahead = m_aheadState;
+    // Which upcoming presents synthesize is the step's own answer, run ahead on a copy of its
+    // state (PlanAhead): the stickiness band, the tooth guard, the lock's ease and a lookahead
+    // move predict as they will decide. The plain passthrough gate alone predicted a synthesis
+    // for 88% of flows that never came at a 115 fps source (sitting ofpts1), the band holding
+    // those presents on real frames; a target guessed one period on, ignoring the ease, missed
+    // about half of the presents that synthesized with no flow (2026-10-27).
     int64_t tg[kFlowLookahead];
     int forPresent[kFlowLookahead];
     int synth = 0;
@@ -950,9 +950,7 @@ void D3D11PresentBackend::PlanFlows() {
         if (!upcoming[j].info.hasBefore || !upcoming[j].info.hasAfter) continue;
         add(upcoming[j].info.beforeTs);
         add(upcoming[j].info.afterTs);
-        const policy::CompositeDecision d =
-            policy::DecideComposite(upcoming[j].info, ahead, *m_cfg);
-        if (d.op != policy::CompositeOp::Synthesize) continue;
+        if (!m_aheadSynth[j]) continue;
         tg[synth] = targets[j];
         forPresent[synth] = j;
         synth++;

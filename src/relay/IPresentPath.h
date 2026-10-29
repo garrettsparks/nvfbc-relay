@@ -52,11 +52,11 @@ public:
     // is given the brackets of that many upcoming presents before each Compose.
     virtual int LookaheadPresents() const { return 0; }
 
-    // The brackets the next count presents would have, upcoming[i] at targets[i], nearest
-    // first, read from the ring as this present's bracket was, and the composite state this
-    // present's decision left, which a prediction of the next decisions starts from.
+    // The next count presents as the policy step will decide them (policy::PlanNextPresents),
+    // nearest first: upcoming[i] the bracket present i + 1 will read at targets[i], and
+    // synthesizes[i] whether it will synthesize.
     virtual void PlanAhead(const FrameBracket* /*upcoming*/, const LONGLONG* /*targets*/,
-                           int /*count*/, const policy::CompositeState& /*decided*/) {}
+                           const bool* /*synthesizes*/, int /*count*/) {}
 
     // Draw this present's decision (step.pick for the nearest selection, step.decision for
     // the synthesizing compositors) onto this path's own target.

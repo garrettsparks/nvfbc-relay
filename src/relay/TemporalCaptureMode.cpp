@@ -12,13 +12,17 @@
 static const int kTelemetryPeriodPresents = 600;
 
 // The capture ring as the policy step reads it. The step sees the bracket's stamps and diffs;
-// the present path needs the slots and surfaces too, so the last bracket read is kept whole.
+// the present path needs the slots and surfaces too, so the last brackets read are kept whole,
+// by the target each was read at: this present's, and the planned presents' after it.
 class CaptureRingView : public policy::IRingView {
 public:
     explicit CaptureRingView(const CaptureRing& ring) : m_ring(ring) {}
     void FindBracket(int64_t target, const policy::StampOverlay* overlay,
                      policy::BracketInfo* out) const override {
         m_ring.FindBracket(target, overlay, &m_last);
+        m_reads[m_nextRead].target = target;
+        m_reads[m_nextRead].bracket = m_last;
+        m_nextRead = (m_nextRead + 1) % kReads;
         *out = m_last.info;
     }
     void ReadRecentFrames(int64_t target, const policy::StampOverlay* overlay,
@@ -30,10 +34,25 @@ public:
     long long BatchHistory() const override { return CaptureRing::kBatchHistory; }
     // The whole bracket of the step's read, slots and surfaces included.
     const FrameBracket& LastBracket() const { return m_last; }
+    // The whole bracket of the newest read at target (a planned present's), or NULL.
+    const FrameBracket* BracketAt(int64_t target) const {
+        for (int k = 1; k <= kReads; k++) {
+            const Read& r = m_reads[(m_nextRead - k + kReads) % kReads];
+            if (r.target == target) return &r.bracket;
+        }
+        return NULL;
+    }
 
 private:
+    static const int kReads = 8;
+    struct Read {
+        int64_t target = INT64_MIN;
+        FrameBracket bracket;
+    };
     const CaptureRing& m_ring;
     mutable FrameBracket m_last;
+    mutable Read m_reads[kReads];
+    mutable int m_nextRead = 0;
 };
 
 // Stage 6's lateness source: the ETW consumer's flips on the source display (head 0).
@@ -544,20 +563,28 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
         // burns the marker over it (once per present, repeats included: the counter
         // identifies presented frames, not source frames; before the present stamp so
         // jit/pdt absorb its cost) and shows it. This loop owns the timing and the log.
-        // A path that plans ahead (the optical flow) sees the brackets of the next presents
-        // first, read the way this one was, at targets one present period apart, with the
-        // composite state this present's decision left.
+        // A path that plans ahead (the optical flow) is told the next presents as the step
+        // will decide them: a copy of the step state stepped at deadlines one present period
+        // on, so the plan sees the lock's ease, a lookahead move and the tooth guard as those
+        // presents will.
         const int ahead = m_present->LookaheadPresents();
         if (ahead > 0) {
             static const int kMaxAhead = 4;
+            policy::PresentStepResult planned[kMaxAhead];
             FrameBracket upcoming[kMaxAhead];
             LONGLONG targets[kMaxAhead];
+            bool synthesizes[kMaxAhead];
             const int n = ahead < kMaxAhead ? ahead : kMaxAhead;
+            policy::PlanNextPresents(m_step, m_policyCfg, ringView, deadline,
+                                     m_scheduler.PeriodQpc(), m_bracketingDelayQpc, n, planned);
             for (int j = 0; j < n; j++) {
-                targets[j] = target + (LONGLONG)(j + 1) * m_scheduler.PeriodQpc();
-                m_ring.FindBracket(targets[j], m_dejitter ? &m_step.overlay : NULL, &upcoming[j]);
+                targets[j] = planned[j].target;
+                const FrameBracket* read = ringView.BracketAt(targets[j]);
+                upcoming[j] = read ? *read : FrameBracket{};
+                upcoming[j].info = planned[j].bracket;
+                synthesizes[j] = planned[j].decision.op == policy::CompositeOp::Synthesize;
             }
-            m_present->PlanAhead(upcoming, targets, n, m_step.comp);
+            m_present->PlanAhead(upcoming, targets, synthesizes, n);
         }
 
         CompositeOutcome outcome;

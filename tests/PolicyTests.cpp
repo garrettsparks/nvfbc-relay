@@ -145,6 +145,14 @@ struct SimResult {
     };
     std::vector<LookaheadInput> lookaheadInputs;
     PolicyConfig lookaheadCfg;
+    // The flow planner (SimParams::planAhead), present by present: whether a present
+    // synthesized, and whether the planner's cache held its pair when it was used (the relay's
+    // fl= hit, late or miss; not held is fl=own), with the plans made by the step run ahead
+    // (policy::PlanNextPresents) and by the rule before it (a target guessed one present period
+    // on per present, the composite decision alone on a copy of its state).
+    std::vector<char> planSynth;
+    std::vector<char> planNamedByStep;
+    std::vector<char> planNamedByGuess;
 };
 
 struct SimParams {
@@ -254,6 +262,9 @@ struct SimParams {
     // replay with a live capture present by present; no check in this file sets it.
     int64_t recordLookaheadFrom = 0;
     int64_t recordLookaheadTo = 0;
+    // Run the optical flow's planner beside the replay, two presents ahead as the relay plans,
+    // both ways (SimResult::planSynth and the named counts). Synthesizing runs only.
+    bool planAhead = false;
     // A live capture's target for each present (kNotForced where it has none). The run takes it
     // in place of its own, after any lookahead move lands, and sets its pull to match: the
     // decisions then come from the capture's timeline instead of the replay's own pull, which
@@ -574,6 +585,40 @@ static SimResult Simulate(const SimParams& p) {
     ring.batchStart = &batchStart;
     ring.batchFirst = &batchFirst;
     ring.haveFlushes = haveFlushes;
+    // The flow planner (SimParams::planAhead), one per rule, driven as D3D11PresentBackend drives
+    // its own: two presents ahead (its kFlowLookahead), the next presents planned before this
+    // one's pair is used, the same four-slot cache.
+    static const int kPlanAhead = 2;
+    policy::FlowPlanner plannerByStep, plannerByGuess;
+    // PlanFlows: the upcoming brackets' stamps, ascending, each once, and the targets of those
+    // that will synthesize, handed to the planner.
+    auto planFlows = [&](policy::FlowPlanner& planner, const BracketInfo* upcoming,
+                         const int64_t* targets, const bool* synthesizes, int64_t present) {
+        int64_t stamps[2 * kPlanAhead];
+        int n = 0;
+        auto add = [&](int64_t ts) {
+            for (int q = 0; q < n; q++) {
+                if (stamps[q] == ts) return;
+            }
+            int q = n++;
+            while (q > 0 && stamps[q - 1] > ts) {
+                stamps[q] = stamps[q - 1];
+                q--;
+            }
+            stamps[q] = ts;
+        };
+        int64_t tg[kPlanAhead];
+        int synth = 0;
+        for (int j = 0; j < kPlanAhead; j++) {
+            if (!upcoming[j].hasBefore || !upcoming[j].hasAfter) continue;
+            add(upcoming[j].beforeTs);
+            add(upcoming[j].afterTs);
+            if (synthesizes[j]) tg[synth++] = targets[j];
+        }
+        if (synth == 0) return;
+        int planned[kPlanAhead];
+        planner.Plan(stamps, n, tg, synth, 0, present, planned, kPlanAhead);
+    };
     size_t published = 0;
     int64_t prevPull = 0;
     const int64_t presentCount =
@@ -681,6 +726,51 @@ static SimResult Simulate(const SimParams& p) {
             r.ops.push_back(res.decision.op);
             r.weights.push_back(res.decision.weight);
             r.outTs.push_back(step.comp.lastOutputTs);
+        }
+
+        // The flow planner, both ways: plan the next two presents from the ring as it is now,
+        // then, if this present synthesizes, whether its pair was planned (the relay's fl=
+        // hit, late or miss) or not (fl=own).
+        if (p.planAhead && cfg.passthroughQpc > 0) {
+            const int64_t present = k - 1;
+            BracketInfo upcoming[kPlanAhead];
+            int64_t targets[kPlanAhead];
+            bool synthesizes[kPlanAhead];
+            // The step run ahead on a copy of its state, as the relay plans.
+            policy::PresentStepResult planned[kPlanAhead];
+            policy::PlanNextPresents(step, cfg, ring, deadline, p.presentPeriod, lag, kPlanAhead,
+                                     planned);
+            for (int j = 0; j < kPlanAhead; j++) {
+                upcoming[j] = planned[j].bracket;
+                targets[j] = planned[j].target;
+                synthesizes[j] = planned[j].decision.op == policy::CompositeOp::Synthesize;
+            }
+            planFlows(plannerByStep, upcoming, targets, synthesizes, present);
+            // The rule before it: targets one present period on per present, the composite
+            // decision alone on a copy of its state, incomplete brackets skipped.
+            policy::CompositeState guess = step.comp;
+            for (int j = 0; j < kPlanAhead; j++) {
+                targets[j] = res.target + (j + 1) * p.presentPeriod;
+                ring.FindBracket(targets[j], flipDejitter ? &step.overlay : nullptr, &upcoming[j]);
+                synthesizes[j] = false;
+                if (!upcoming[j].hasBefore || !upcoming[j].hasAfter) continue;
+                synthesizes[j] = policy::DecideComposite(upcoming[j], guess, cfg).op ==
+                                 policy::CompositeOp::Synthesize;
+            }
+            planFlows(plannerByGuess, upcoming, targets, synthesizes, present);
+
+            const bool synth = res.decision.op == policy::CompositeOp::Synthesize;
+            bool byStep = false, byGuess = false;
+            if (synth) {
+                policy::FlowPair pair;
+                pair.beforeTs = b.beforeTs;
+                pair.afterTs = b.afterTs;
+                byStep = plannerByStep.Use(pair, present) >= 0;
+                byGuess = plannerByGuess.Use(pair, present) >= 0;
+            }
+            r.planSynth.push_back(synth);
+            r.planNamedByStep.push_back(byStep);
+            r.planNamedByGuess.push_back(byGuess);
         }
     }
     return r;
@@ -3392,7 +3482,10 @@ static void test_replay_capture_corpus() {
         // lookahead off, as the relay's compositor setup does.
         const bool nearest = fx.compositor == "nearest";
         if (nearest) p.passthroughQpc = 0;
-        const SimResult r = Simulate(p);
+        // The flow planner runs beside this replay only; the other arms below copy p.
+        SimParams pPlan = p;
+        pPlan.planAhead = !nearest;
+        const SimResult r = Simulate(pPlan);
 
         // Must match mktrace.py's WARMUP: the lock starts cold here where the relay had
         // been running for minutes, so the head of a replay is a window artifact.
@@ -3448,6 +3541,28 @@ static void test_replay_capture_corpus() {
                         fx.fieldSynthPct, fx.fieldLongRuns, fx.fieldWorstRun);
             if (fx.fieldPullWraps >= 0) std::printf(", pull wraps %d", fx.fieldPullWraps);
             std::printf("\n");
+        }
+        // The optical flow's planner on this capture: of the presents that synthesized, how many
+        // found their pair planned (the relay's fl= hit, late or miss; the rest are fl=own), with
+        // the step run ahead against the target guessed one period on (the rule before it).
+        {
+            int planSynth = 0, byStep = 0, byGuess = 0;
+            for (size_t i = kWarmup; i < r.planSynth.size(); i++) {
+                planSynth += r.planSynth[i];
+                byStep += r.planNamedByStep[i];
+                byGuess += r.planNamedByGuess[i];
+            }
+            const double den = planSynth > 0 ? (double)planSynth : 1.0;
+            std::printf("    planner: %d synthesized, pair planned by the step %d (%.1f%%), "
+                        "by a guessed target %d (%.1f%%)\n",
+                        planSynth, byStep, 100.0 * byStep / den, byGuess, 100.0 * byGuess / den);
+            // The suite-wide bound: planning with the present's own step never plans fewer of
+            // the pairs used than the rule it replaced (2026-10-28: at or above it on every
+            // fixture), which stays here as the control a regression is measured against.
+            CHECK(byStep >= byGuess,
+                  "[%s] the flow planner planned %d of %d synthesized presents' pairs, fewer "
+                  "than the %d a target guessed one present period on planned",
+                  fx.description.c_str(), byStep, planSynth, byGuess);
         }
 
         if (fx.maxWorstRun < 0) {

@@ -1407,4 +1407,14 @@ PresentStepResult StepPresent(PresentStepState& s, const PolicyConfig& cfg, cons
     return r;
 }
 
+void PlanNextPresents(const PresentStepState& s, const PolicyConfig& cfg, const IRingView& ring,
+                      int64_t deadline, int64_t presentPeriod, int64_t bracketingLag, int count,
+                      PresentStepResult* out) {
+    PresentStepState ahead = s;
+    for (int j = 0; j < count; j++) {
+        out[j] = StepPresent(ahead, cfg, ring, nullptr, deadline + (j + 1) * presentPeriod,
+                             bracketingLag);
+    }
+}
+
 }  // namespace policy

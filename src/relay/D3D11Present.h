@@ -53,8 +53,8 @@ class CopyEngineTarget;
 // exactly as it is for the D3D9 present device.
 //
 // DRAWS THE STEP'S DECISION. The composite decision is the policy step's, on the mode's one
-// state; this backend draws it. The flow planner predicts the next decisions on a copy of
-// the state this present's decision left (PlanAhead).
+// state; this backend draws it. The flow planner flows the pairs of the next presents the
+// step, run ahead on a copy of that state, says will synthesize (PlanAhead).
 //
 // BLEND OR OPTICAL FLOW. This backend is the blend pipeline (b, b:vsync) or, with interp, the
 // optical flow interpolation (o, o:vsync): the same decision, holds and passthrough, with a
@@ -90,8 +90,8 @@ public:
 
     // With the optical flow: two presents ahead, the horizon the flow planner was built for.
     int LookaheadPresents() const override { return m_flow ? kFlowLookahead : 0; }
-    void PlanAhead(const FrameBracket* upcoming, const LONGLONG* targets, int count,
-                   const policy::CompositeState& decided) override;
+    void PlanAhead(const FrameBracket* upcoming, const LONGLONG* targets,
+                   const bool* synthesizes, int count) override;
 
     // Draw the step's decision onto the current back buffer. Fills out exactly as the D3D9
     // synthesizing compositor would, so the temporal log line reads the same.
@@ -167,7 +167,7 @@ private:
     void SamplePresentationPath();
     // The optical flow's view of a ring slot: its stamp and the view to sample.
     OpticalFlowWarp::Frame FlowFrame(int slot, int64_t ts);
-    // Plans the flows of the brackets PlanAhead kept, by the decision each would get.
+    // Plans the flows of the brackets PlanAhead kept that will synthesize.
     void PlanFlows();
     // Hands cache slot's planned pair to the engine. False leaves it planned.
     bool SubmitFlow(int cacheSlot);
@@ -203,7 +203,6 @@ private:
     int m_width, m_height;
     int m_ringSlots;
 
-    const policy::PolicyConfig* m_cfg;   // for the flow planner's prediction of the next decisions
     bool m_tintRequested;
 
     ID3D11Device* m_dev;
@@ -282,12 +281,12 @@ private:
         long long needBy = 0;
     };
     PlannedFlow m_planned[policy::kFlowSlots];
-    // The upcoming brackets PlanAhead handed in, planned in Compose, and the composite state
-    // this present's decision left, which the prediction of the next decisions starts from.
+    // The upcoming presents PlanAhead handed in, planned in Compose: each one's bracket, its
+    // target and whether the step will synthesize it.
     FrameBracket m_ahead[kFlowLookahead];
     LONGLONG m_aheadTargets[kFlowLookahead] = {};
+    bool m_aheadSynth[kFlowLookahead] = {};
     int m_aheadCount = 0;
-    policy::CompositeState m_aheadState;
     // The pair handed over last, for the engine's temporal hints.
     policy::FlowPair m_lastHanded;
     bool m_haveLastHanded = false;
