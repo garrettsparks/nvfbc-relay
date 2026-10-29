@@ -63,6 +63,15 @@ PULL = re.compile(r"\bpull=(-?\d+)us")
 # stores nothing. A log without it came from a loop that stored the timeout's re-delivered
 # picture as a new frame, and the fixture says so, so the replay can remove those wakes.
 SKIPS_COPIES = "timeout stores nothing"
+# The compositor the relay ran, from its mode name: "Temporal (...)" is the nearest selection,
+# "Temporal blend (...)" and "Temporal interp (...)" synthesize. It decides which policy the
+# replay runs: the nearest selection has no passthrough gate and no lookahead.
+MODE = re.compile(r"Capture mode: Temporal(?: (blend|interp))? \(")
+# A nearest present that shows the last frame again; the replay counts the same.
+REPEAT = "pick=repeat"
+# Every nearest pick, for the census the replay prints beside its own.
+PICK = re.compile(r"\bpick=([a-z-]+)")
+PICKS = ["before", "before-adv", "after", "after-adv", "repeat", "none"]
 WARMUP = 200          # must match the test: skips the lock's cold-start acquisition
 
 def main():
@@ -84,7 +93,8 @@ def main():
         print(__doc__); return 2
     src, out = argv[0], argv[1]
     desc = argv[2] if len(argv) > 2 else os.path.basename(src)
-    arr, flushes, pres, synth = [], [], [], []
+    arr, flushes, pres, synth, repeat, picks = [], [], [], [], [], []
+    compositor = ""
     have_flush = True
     # Head 0 only: head 1 is the relay's own output, which no pairing rule reads. Kept in
     # DELIVERY order rather than sorted by scanout time, because the replay has to model
@@ -111,6 +121,10 @@ def main():
                 else:
                     have_flush = False
             continue
+        m = MODE.search(line)
+        if m:
+            compositor = m.group(1) or "nearest"
+            continue
         m = SRC.search(line)
         if m:
             src_hint = float(m.group(1))
@@ -128,6 +142,9 @@ def main():
             if keep(v):
                 pres.append(v)
                 synth.append("op=synth" in line)
+                repeat.append(REPEAT in line)
+                mp = PICK.search(line)
+                picks.append(mp.group(1) if mp else "none")
                 m = PULL.search(line)
                 pulls.append(int(m.group(1)) if m else 0)
             continue
@@ -158,6 +175,8 @@ def main():
             run = 0
     if run >= 50: longRuns += 1
     pct = 100.0 * nsynth / max(1, len(synth) - WARMUP)
+    repeats = sum(repeat[WARMUP:])
+    census = [picks[WARMUP:].count(k) for k in PICKS]
     wraps = -1
     if comb > 0:
         wraps = sum(1 for i in range(max(1, WARMUP), len(pulls))
@@ -175,10 +194,16 @@ def main():
         f.write(f"field_worst_run {worst}\n")
         f.write(f"field_long_runs {longRuns}\n")
         f.write(f"field_synth_pct {pct:.1f}\n")
+        if compositor == "nearest":
+            f.write(f"field_repeats {repeats}\n")
+            f.write(f"# Picks past the warmup: {', '.join(PICKS)}.\n")
+            f.write(f"field_picks {' '.join(str(c) for c in census)}\n")
         if wraps >= 0:
             f.write(f"field_pull_wraps {wraps}\n")
         if src_hint > 0:
             f.write(f"src_hint {src_hint:.1f}\n")
+        if compositor:
+            f.write(f"compositor {compositor}\n")
         if extra_lag_ms > 0:
             f.write(f"extra_lag_ms {extra_lag_ms}\n")
         if not skips_copies:
@@ -200,8 +225,10 @@ def main():
     print(f"{out}: {len(arr)} arrivals, {len(pres)} presents, "
           f"{len(flips)} head-0 flips{'' if have_lag and flips else ' (no lag= in log)'}, "
           f"{os.path.getsize(out)/1e6:.2f} MB")
+    print(f"  compositor {compositor or 'not in the log'}")
     print(f"  field behaviour past warmup {WARMUP}: synth {pct:.1f}%, "
           f"runs>=50 {longRuns}, worst {worst}"
+          f"{f', repeats {repeats}' if compositor == 'nearest' else ''}"
           f"{f', pull wraps {wraps}' if wraps >= 0 else ''}")
     if not skips_copies:
         print("  capture loop stored grab-timeout copies: wrote regrab_copies 1")

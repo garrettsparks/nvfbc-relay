@@ -2698,6 +2698,17 @@ struct TraceFixture {
     // The bound is optional: -1 leaves a fixture ungated on it.
     int fieldPullWraps = -1;
     int maxPullWraps = -1;
+    // The compositor the relay ran: "nearest", "blend" or "interp" (mktrace.py reads it from
+    // the mode name). Absent means a synthesizing one, which every fixture recorded before the
+    // field existed ran. A nearest capture replays the selection the relay ran there, with no
+    // passthrough gate and no lookahead, and is measured by its repeats instead of its blends:
+    // presents that show the last frame again, in the field (pick=repeat) and in the replay.
+    std::string compositor;
+    int fieldRepeats = -1;
+    int maxRepeats = -1;
+    // A nearest capture's picks past the warmup, in kPickCensus order (field_picks), printed
+    // beside the replay's: repeats alone cannot see a pick moving from one side to the other.
+    std::vector<int> fieldPicks;
     // Pairing gates, overridable per fixture because the defaults encode the x2 walks:
     // 98% placed assumes the flip grid never pauses, but with frame generation OFF a
     // stalled game stops presenting and the grid stops WITH it, so its transition batches
@@ -2756,6 +2767,16 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
             num(&n); out->fieldPullWraps = (int)n;
         }
         else if (std::strcmp(tag, "max_pull_wraps") == 0)   { num(&n); out->maxPullWraps = (int)n; }
+        else if (std::strcmp(tag, "compositor") == 0)       { rest_of_line(&out->compositor); }
+        else if (std::strcmp(tag, "field_repeats") == 0)    { num(&n); out->fieldRepeats = (int)n; }
+        else if (std::strcmp(tag, "max_repeats") == 0)      { num(&n); out->maxRepeats = (int)n; }
+        else if (std::strcmp(tag, "field_picks") == 0) {
+            out->fieldPicks.clear();
+            for (int i = 0; i < 6 && ok; i++) {
+                num(&n);
+                out->fieldPicks.push_back((int)n);
+            }
+        }
         else if (std::strcmp(tag, "src_hint") == 0)         { dbl(&out->srcHint); }
         else if (std::strcmp(tag, "extra_lag_ms") == 0)     { num(&n); out->extraLagMs = (int)n; }
         else if (std::strcmp(tag, "rotation_inert") == 0)   { num(&n); out->rotationInert = n != 0; }
@@ -3102,6 +3123,151 @@ static void ReportPairing(const TraceFixture& fx, int64_t lagFloor, int64_t batc
           "conclusion no longer holds", fx.path.c_str(), ahead, total, fx.maxAheadPct);
 }
 
+// What each present showed: the frame a nearest replay picked, or the composite's output.
+static const std::vector<int64_t>& ShownContent(const TraceFixture& fx, const SimResult& r) {
+    return fx.compositor == "nearest" ? r.shownTs : r.outTs;
+}
+
+// Presents past the warmup on which a nearest replay showed the last frame again.
+static int CountRepeats(const SimResult& r, size_t warmup) {
+    int repeats = 0;
+    for (size_t i = warmup; i < r.picks.size(); i++) {
+        if (r.picks[i] == Pick::Repeat) repeats++;
+    }
+    return repeats;
+}
+
+// THE DEFERRED RING COPY: the same capture replayed with the deferral the relay runs by default.
+// Both arms run the capture's production configuration (the dejitter correction where the
+// fixture has flips) and differ only in when a waiting frame's slot can be seen. Every present
+// must show what it shows without the deferral: a waiting frame that a present needed turns a
+// blend into a repeat. On a fixture whose lag has no room for a wait the deferral is off and
+// nothing waits. What this cannot show is the capture loop reaching its next grab sooner: these
+// wake times were recorded by a loop that copied and waited on every wake.
+static void CheckDeferredCopy(const TraceFixture& fx, const SimParams& p, size_t warmup) {
+    SimParams pd = p;
+    if (!fx.flipDisplay.empty() && !fx.flipKnown.empty()) {
+        pd.flipDisplay = fx.flipDisplay;
+        pd.flipKnown = fx.flipKnown;
+        pd.flipDejitter = true;
+    }
+    const SimResult rb = Simulate(pd);
+    pd.deferCopy = true;
+    const SimResult rd = Simulate(pd);
+    const std::vector<int64_t>& shownB = ShownContent(fx, rb);
+    const std::vector<int64_t>& shownD = ShownContent(fx, rd);
+    int differs = 0;
+    for (size_t i = warmup; i < shownB.size() && i < shownD.size(); i++) {
+        if (shownB[i] != shownD[i]) differs++;
+    }
+    const policy::DeferLimits limits =
+        SizedDeferLimits(BracketingLag(pd), pd.srcPeriod, pd.sinkPeriod);
+    if (limits.maxWaitTicks > 0) {
+        std::printf("    deferred copy: wait at most %.1f ms, after a gap of at most "
+                    "%.1f ms;", limits.maxWaitTicks / 1000.0,
+                    limits.maxGapTicks / 1000.0);
+    } else {
+        std::printf("    deferred copy: off, the lag is too short;");
+    }
+    std::printf(" %lld waited: %lld never copied, %lld copied a wake late, %lld at the "
+                "wait limit; content differs on %d presents\n",
+                rd.deferredWakes, rd.deferNeverCopied, rd.deferCopiedLate,
+                rd.deferCopiedAtLimit, differs);
+    CHECK(differs == 0 && rd.deferStarvedPresents == 0,
+          "[%s] the deferred ring copy changed %d presents, and %lld needed a frame "
+          "still waiting",
+          fx.description.c_str(), differs, rd.deferStarvedPresents);
+
+    // NO COPY WAITED FOR, as the NvFBC source runs with the deferral: every copy is handed to
+    // the GPU and its slot turned on at the next wake, the latest the loop finds it done. Past
+    // the replay's cold start it must change nothing either. (The very first frame of a capture
+    // has no gap before it and waits, which the first presents notice.)
+    if (limits.maxWaitTicks > 0) {
+        pd.deferNoWait = true;
+        const SimResult rn = Simulate(pd);
+        const std::vector<int64_t>& shownN = ShownContent(fx, rn);
+        int differsNoWait = 0, starvedNoWait = 0;
+        for (size_t i = warmup; i < shownB.size() && i < shownN.size(); i++) {
+            if (shownB[i] != shownN[i]) differsNoWait++;
+            if (i < rn.starved.size() && rn.starved[i]) starvedNoWait++;
+        }
+        std::printf("    no copy waited for: %lld copies handed over and not waited "
+                    "for; content differs on %d presents\n",
+                    rn.deferNotWaitedFor, differsNoWait);
+        CHECK(differsNoWait == 0 && starvedNoWait == 0,
+              "[%s] leaving the copies unwaited changed %d presents, and %d past the "
+              "cold start needed a frame not yet copied",
+              fx.description.c_str(), differsNoWait, starvedNoWait);
+    }
+}
+
+// A nearest capture's gate: repeats, re-seeds and pull wraps against its bounds, and the
+// dejitter arm, which must not add repeats past the bound or stop anchoring.
+static void CheckNearestFixture(const TraceFixture& fx, const SimParams& p, const SimResult& r,
+                                size_t warmup, int reseeds, int pullWraps) {
+    const int repeats = CountRepeats(r, warmup);
+    const double spanStart = fx.presents.empty() ? 0.0 : fx.presents.front() / 1e6;
+    const double spanEnd = fx.presents.empty() ? 0.0 : fx.presents.back() / 1e6;
+    std::printf("  corpus [%s]\n"
+                "    window: log t %.1fs..%.1fs (%.1f min, %zu presents)\n"
+                "    replay: nearest, repeats %d, re-seeds %d, pull wraps %d\n",
+                fx.description.empty() ? fx.path.c_str() : fx.description.c_str(),
+                spanStart, spanEnd, (spanEnd - spanStart) / 60.0, fx.presents.size(),
+                repeats, reseeds, pullWraps);
+    std::printf("    field : nearest, repeats %d", fx.fieldRepeats);
+    if (fx.fieldPullWraps >= 0) std::printf(", pull wraps %d", fx.fieldPullWraps);
+    std::printf("\n");
+    // The pick census, in mktrace.py's field_picks order.
+    static const Pick kPickCensus[6] = {Pick::Before, Pick::BeforeAdv, Pick::After,
+                                        Pick::AfterAdv, Pick::Repeat, Pick::None};
+    std::printf("    picks :");
+    for (int k = 0; k < 6; k++) {
+        int replayCount = 0;
+        for (size_t i = warmup; i < r.picks.size(); i++) {
+            if (r.picks[i] == kPickCensus[k]) replayCount++;
+        }
+        std::printf(" %s %d", policy::PickLabel(kPickCensus[k]), replayCount);
+        if ((size_t)k < fx.fieldPicks.size()) std::printf(" (field %d)", fx.fieldPicks[(size_t)k]);
+        std::printf("%s", k < 5 ? "," : "\n");
+    }
+    if (fx.maxRepeats < 0) {
+        CHECK(false,
+              "fixture %s has no bounds. Compare the replay line above against the field "
+              "line; if they agree, paste:\n"
+              "        max_repeats %d\n        min_reseeds %d\n        max_pull_wraps %d",
+              fx.path.c_str(), repeats, (int)(reseeds * 0.97), pullWraps);
+        return;
+    }
+    CHECK(repeats <= fx.maxRepeats, "[%s] repeats grew to %d (bound %d)",
+          fx.description.c_str(), repeats, fx.maxRepeats);
+    CHECK(reseeds >= fx.minReseeds, "[%s] re-seeds fell to %d (bound %d)",
+          fx.description.c_str(), reseeds, fx.minReseeds);
+    if (fx.maxPullWraps >= 0) {
+        CHECK(pullWraps <= fx.maxPullWraps, "[%s] pull wraps grew to %d (bound %d)",
+              fx.description.c_str(), pullWraps, fx.maxPullWraps);
+    }
+    if (!fx.flipDisplay.empty() && !fx.flipKnown.empty()) {
+        SimParams p6 = p;
+        p6.flipDisplay = fx.flipDisplay;
+        p6.flipKnown = fx.flipKnown;
+        p6.flipDejitter = true;
+        const SimResult r6 = Simulate(p6);
+        const int repeats6 = CountRepeats(r6, warmup);
+        std::printf("    stage6 dejitter: repeats %d; batches %lld anchored %lld late %lld "
+                    "corrected %lld fence-blocked %lld lock-declined %lld\n",
+                    repeats6, r6.measuredBatches, r6.anchoredBatches, r6.lateBatches,
+                    r6.correctedBatches, r6.fenceBlockedBatches, r6.lockDeclinedBatches);
+        CHECK(repeats6 <= fx.maxRepeats,
+              "[%s] DEJITTERED repeats %d exceed the fixture bound %d",
+              fx.description.c_str(), repeats6, fx.maxRepeats);
+        CHECK(r6.anchoredBatches * 100 >= r6.measuredBatches * 95,
+              "[%s] only %lld of %lld batches anchored: the stride chain is not "
+              "holding on this capture",
+              fx.description.c_str(), r6.anchoredBatches, r6.measuredBatches);
+    }
+    CheckDeferredCopy(fx, p, warmup);
+}
+
 static void test_replay_capture_corpus() {
     const std::vector<std::string> paths = FixturePaths();
     // Loud, never a skip: a corpus gate that quietly vanishes leaves the suite green
@@ -3222,6 +3388,10 @@ static void test_replay_capture_corpus() {
         p.explicitArrivals = fx.arrivals;
         p.explicitFlushes = fx.flushes;
         p.explicitPresents = fx.presents;
+        // A nearest capture ran the selection: no passthrough gate, which also leaves the
+        // lookahead off, as the relay's compositor setup does.
+        const bool nearest = fx.compositor == "nearest";
+        if (nearest) p.passthroughQpc = 0;
         const SimResult r = Simulate(p);
 
         // Must match mktrace.py's WARMUP: the lock starts cold here where the relay had
@@ -3239,7 +3409,6 @@ static void test_replay_capture_corpus() {
         }
         if (run >= 50) longRuns++;
         for (size_t i = kWarmup; i < r.snapped.size(); i++) if (r.snapped[i]) reseeds++;
-        const double synthPct = 100.0 * synth / (double)(r.ops.size() - kWarmup);
         // Counted from the pull after each present, the same series the log prints as pull=,
         // so a stall re-seed that moves the phase that far counts here as it does in the field.
         int pullWraps = 0;
@@ -3247,6 +3416,11 @@ static void test_replay_capture_corpus() {
             const int64_t d = r.pull[i] - r.pull[i - 1];
             if (d > p.combQpc / 2 || -d > p.combQpc / 2) pullWraps++;
         }
+        if (nearest) {
+            CheckNearestFixture(fx, p, r, kWarmup, reseeds, pullWraps);
+            continue;
+        }
+        const double synthPct = 100.0 * synth / (double)(r.ops.size() - kWarmup);
 
         // The fixture's own time window, printed because every wrong verdict this project has
         // reached came from comparing two populations windowed differently. Twice it was a
@@ -3403,68 +3577,7 @@ static void test_replay_capture_corpus() {
             }
         }
 
-        // THE DEFERRED RING COPY: the same capture replayed with the deferral the relay runs
-        // by default. Both arms run the capture's production configuration (the dejitter
-        // correction where the fixture has flips) and differ only in when a waiting frame's
-        // slot can be seen. Every present must show what it shows without the deferral: a
-        // waiting frame that a present needed turns a blend into a repeat. On a fixture whose
-        // lag has no room for a wait the deferral is off and nothing waits. What this cannot
-        // show is the capture loop reaching its next grab sooner: these wake times were
-        // recorded by a loop that copied and waited on every wake.
-        {
-            SimParams pd = p;
-            if (!fx.flipDisplay.empty() && !fx.flipKnown.empty()) {
-                pd.flipDisplay = fx.flipDisplay;
-                pd.flipKnown = fx.flipKnown;
-                pd.flipDejitter = true;
-            }
-            const SimResult rb = Simulate(pd);
-            pd.deferCopy = true;
-            const SimResult rd = Simulate(pd);
-            int differs = 0;
-            for (size_t i = kWarmup; i < rb.outTs.size() && i < rd.outTs.size(); i++) {
-                if (rb.outTs[i] != rd.outTs[i]) differs++;
-            }
-            const policy::DeferLimits limits =
-                SizedDeferLimits(BracketingLag(pd), pd.srcPeriod, pd.sinkPeriod);
-            if (limits.maxWaitTicks > 0) {
-                std::printf("    deferred copy: wait at most %.1f ms, after a gap of at most "
-                            "%.1f ms;", limits.maxWaitTicks / 1000.0,
-                            limits.maxGapTicks / 1000.0);
-            } else {
-                std::printf("    deferred copy: off, the lag is too short;");
-            }
-            std::printf(" %lld waited: %lld never copied, %lld copied a wake late, %lld at the "
-                        "wait limit; content differs on %d presents\n",
-                        rd.deferredWakes, rd.deferNeverCopied, rd.deferCopiedLate,
-                        rd.deferCopiedAtLimit, differs);
-            CHECK(differs == 0 && rd.deferStarvedPresents == 0,
-                  "[%s] the deferred ring copy changed %d presents, and %lld needed a frame "
-                  "still waiting",
-                  fx.description.c_str(), differs, rd.deferStarvedPresents);
-
-            // NO COPY WAITED FOR, as the NvFBC source runs with the deferral: every copy is
-            // handed to the GPU and its slot turned on at the next wake, the latest the loop
-            // finds it done. Past the replay's cold start it must change nothing either. (The
-            // very first frame of a capture has no gap before it and waits, which the first
-            // presents notice.)
-            if (limits.maxWaitTicks > 0) {
-                pd.deferNoWait = true;
-                const SimResult rn = Simulate(pd);
-                int differsNoWait = 0, starvedNoWait = 0;
-                for (size_t i = kWarmup; i < rb.outTs.size() && i < rn.outTs.size(); i++) {
-                    if (rb.outTs[i] != rn.outTs[i]) differsNoWait++;
-                    if (i < rn.starved.size() && rn.starved[i]) starvedNoWait++;
-                }
-                std::printf("    no copy waited for: %lld copies handed over and not waited "
-                            "for; content differs on %d presents\n",
-                            rn.deferNotWaitedFor, differsNoWait);
-                CHECK(differsNoWait == 0 && starvedNoWait == 0,
-                      "[%s] leaving the copies unwaited changed %d presents, and %d past the "
-                      "cold start needed a frame not yet copied",
-                      fx.description.c_str(), differsNoWait, starvedNoWait);
-            }
-        }
+        CheckDeferredCopy(fx, p, kWarmup);
     }
 }
 
