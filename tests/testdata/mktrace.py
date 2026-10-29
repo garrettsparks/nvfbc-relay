@@ -38,6 +38,9 @@ every bound in the fixture and gates nothing anyone plays through.
 import re, sys, os
 
 CAP  = re.compile(r"capture #\d+ arr=(\d+)us")
+# The wake's copy and GPU flush, on the same line. The capture loop publishes the slot only
+# after it, so a present whose deadline falls inside the flush reads the ring without the frame.
+FLUSH = re.compile(r"\bflush=(\d+)us")
 PRE  = re.compile(r"temporal dl=(-?\d+)us")
 # lag= is optional: logs recorded before it existed still carry usable scanout times, they
 # just cannot say when the relay could first have known them.
@@ -81,7 +84,8 @@ def main():
         print(__doc__); return 2
     src, out = argv[0], argv[1]
     desc = argv[2] if len(argv) > 2 else os.path.basename(src)
-    arr, pres, synth = [], [], []
+    arr, flushes, pres, synth = [], [], [], []
+    have_flush = True
     # Head 0 only: head 1 is the relay's own output, which no pairing rule reads. Kept in
     # DELIVERY order rather than sorted by scanout time, because the replay has to model
     # when each flip became knowable, and sorting would erase that.
@@ -99,7 +103,13 @@ def main():
         m = CAP.search(line)
         if m:
             v = int(m.group(1))
-            if keep(v): arr.append(v)
+            if keep(v):
+                arr.append(v)
+                mf = FLUSH.search(line)
+                if mf:
+                    flushes.append(int(mf.group(1)))
+                else:
+                    have_flush = False
             continue
         m = SRC.search(line)
         if m:
@@ -176,6 +186,9 @@ def main():
             f.write("# frame; the loader removes those wakes so the replay runs the loop that skips them.\n")
             f.write("regrab_copies 1\n")
         f.write(f"arrivals {len(arr)}\n{enc(arr)}\n")
+        if have_flush and len(flushes) == len(arr):
+            f.write("# Each wake's copy and flush, raw: the ring publishes the frame after it.\n")
+            f.write(f"flushes {len(flushes)}\n{' '.join(str(v) for v in flushes)}\n")
         f.write(f"presents {len(pres)}\n{enc(pres)}\n")
         if flips:
             f.write("# Head-0 scanout times in delivery order, and how long after each flip\n")

@@ -179,6 +179,11 @@ struct SimParams {
     // captured one carries whatever the hardware actually did, including transients
     // nobody has characterized. srcPeriod still sizes lag, threshold and comb.
     std::vector<int64_t> explicitArrivals;
+    // Non-empty (one per explicit arrival): how long each wake's copy and GPU flush took. The
+    // capture loop publishes a slot, and opens its batch for the stage-6 walk, only after
+    // both, so a present whose deadline falls inside a flush reads the ring without that
+    // frame. Empty publishes every wake at its arrival.
+    std::vector<int64_t> explicitFlushes;
     // Non-empty: use these present deadlines instead of a uniform grid. The relay's
     // present clock is DWM's, which skews against the source clock by tens of us per
     // present; the comb lock exists to track exactly that, so a synthetic grid removes
@@ -339,15 +344,24 @@ static SimResult Simulate(const SimParams& p) {
             t += step;
         }
     }
+    std::vector<int64_t> flushes(arrivals.size(), 0);
+    const bool haveFlushes =
+        !p.explicitArrivals.empty() && p.explicitFlushes.size() == arrivals.size();
+    if (haveFlushes) flushes = p.explicitFlushes;
     if (!p.drops.empty()) {
-        std::vector<int64_t> kept;
+        std::vector<int64_t> kept, keptFlushes;
         size_t di = 0;
         for (size_t i = 0; i < arrivals.size(); i++) {
             if (di < p.drops.size() && (int64_t)i == p.drops[di]) { di++; continue; }
             kept.push_back(arrivals[i]);
+            keptFlushes.push_back(flushes[i]);
         }
         arrivals.swap(kept);
+        flushes.swap(keptFlushes);
     }
+    // When each wake is in the ring: after its copy and flush.
+    std::vector<int64_t> publishAt(arrivals.size());
+    for (size_t i = 0; i < arrivals.size(); i++) publishAt[i] = arrivals[i] + flushes[i];
 
     // Fold the wake list through the REAL batch-collapse before any bracket sees it.
     // The ring publishes one slot per wake and retracts the generated member, so the
@@ -470,7 +484,7 @@ static SimResult Simulate(const SimParams& p) {
         // for hole recovery depth (a widened bracket's after endpoint may not have
         // arrived yet: those presents must hold, not synthesize) and for underruns
         // (a lag past the ring window loses the before-frame entirely).
-        while (published < arrivals.size() && arrivals[published] <= deadline) published++;
+        while (published < arrivals.size() && publishAt[published] <= deadline) published++;
         const size_t oldest =
             published > (size_t)p.ringSlots ? published - (size_t)p.ringSlots : 0;
 
@@ -503,7 +517,7 @@ static SimResult Simulate(const SimParams& p) {
                 nextFlip++;
             }
             while (nextBatch < batchFirst.size() &&
-                   arrivals[batchFirst[nextBatch]] <= deadline) {
+                   publishAt[batchFirst[nextBatch]] <= deadline) {
                 const int64_t bs = batchStart[batchFirst[nextBatch]];
                 const policy::LateCorrection lc =
                     policy::MeasureLateness(fliph, 0, bs, chain, kCadenceWindowUs);
@@ -585,9 +599,15 @@ static SimResult Simulate(const SimParams& p) {
             if (resumedFromStall) policy::ArmResumeGuardExemption(lock, cfg, meanPresent);
             // The frames around the target, read as production's ring reads them: newest
             // first, dejitter corrections applied, the ring's write index as the sequence.
+            // A member keep-real retracts is in production's ring until the wake that
+            // retracts it is published, waiting for its copy or not, and ReadRecentFrames
+            // counts it there: the newest frames include its batch a wake early. Only with
+            // flush times: without them the run cannot tell whether the member was in the
+            // ring yet, and counting it early lost a recorded 36-present run on a 2026-10-01
+            // capture that the flush times bring back.
             policy::RecentFrames rf;
             for (size_t i = published; i-- > oldest;) {
-                if (!valid[i]) continue;
+                if (!valid[i] && (i + 1 < published || !haveFlushes)) continue;
                 int64_t ts = stamps[i];
                 if (flipDejitter) ts -= overlay.CorrectionFor(ts);
                 if (ts > target) {
@@ -2613,6 +2633,9 @@ struct TraceFixture {
     std::string name;
     std::string description;
     std::vector<int64_t> arrivals;
+    // Each wake's copy and flush time, one per arrival; empty for a fixture built before
+    // mktrace.py recorded it, which then publishes every wake at its arrival.
+    std::vector<int64_t> flushes;
     std::vector<int64_t> presents;
     // Head-0 scanout times in DELIVERY order, and the instant each first became knowable
     // to the relay. Both empty for a fixture built from a log with no ETW; flipKnown alone
@@ -2762,13 +2785,27 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
             // coherence rule a timeline that is wrong only in its tail.
             if (out->flipKnown.size() != out->flipDisplay.size()) ok = false;
         }
+        else if (std::strcmp(tag, "flushes") == 0) {
+            // Raw, not delta-encoded: small values with no trend.
+            num(&n);
+            if (!ok) break;
+            out->flushes.clear();
+            out->flushes.reserve((size_t)n);
+            for (long long i = 0; i < n; i++) {
+                long long v = 0;
+                if (std::fscanf(f, "%lld", &v) != 1) { ok = false; break; }
+                out->flushes.push_back(v);
+            }
+        }
         if (!ok) break;
     }
     std::fclose(f);
+    // A flush stream that does not line up with its arrivals is malformed, as the flip delays are.
+    if (!out->flushes.empty() && out->flushes.size() != out->arrivals.size()) ok = false;
     if (ok && out->regrabCopies) {
         // Each gap is measured from the previous WAKE, kept or not: consecutive copies each
         // land one timeout after the one before, whatever was kept.
-        std::vector<int64_t> kept;
+        std::vector<int64_t> kept, keptFlushes;
         kept.reserve(out->arrivals.size());
         for (size_t i = 0; i < out->arrivals.size(); i++) {
             const int64_t gap = (i > 0) ? out->arrivals[i] - out->arrivals[i - 1] : 0;
@@ -2777,8 +2814,10 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
                 continue;
             }
             kept.push_back(out->arrivals[i]);
+            if (!out->flushes.empty()) keptFlushes.push_back(out->flushes[i]);
         }
         out->arrivals.swap(kept);
+        out->flushes.swap(keptFlushes);
     }
     return ok && !out->arrivals.empty() && !out->presents.empty();
 }
@@ -3163,6 +3202,7 @@ static void test_replay_capture_corpus() {
         // and a quarter of one fixture's genuine hole covers demoted - which is why the
         // guard measures target advance instead.
         p.explicitArrivals = fx.arrivals;
+        p.explicitFlushes = fx.flushes;
         p.explicitPresents = fx.presents;
         const SimResult r = Simulate(p);
 
