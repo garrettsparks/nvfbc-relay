@@ -4,6 +4,7 @@
 #include "PresentScheduler.h"
 #include "CaptureRing.h"
 #include "TemporalPolicy.h"
+#include "PresentStep.h"
 #include "EtwConsumer.h"
 
 // Defined in IPresentPath.h, which this header deliberately does not pull in: only the
@@ -27,9 +28,10 @@ class IPresentPath;
 //                      copies one real frame; blend lerps the pair; interp motion-compensates
 //                      the pair), the marker, the swapchain and its statistics. This loop
 //                      never asks which path it is driving.
-//   This mode        - each present: aim a content target lagged a fixed bracketing delay
-//                      behind, bracket it in the ring, hand the bracket to the present path,
-//                      log the line.
+//   This mode        - each present: run the policy step (policy::StepPresent: the target
+//                      lagged a fixed bracketing delay behind, the lock, the lookahead, stage
+//                      6, the bracket and the decision), hand the bracket and the decision to
+//                      the present path, log the line.
 
 // Which compositor the mode letter selected (t nearest, b blend, o interp).
 enum CompositorKind {
@@ -53,9 +55,11 @@ private:
     LONGLONG m_bracketingDelayQpc;  // present-target lag; static: max(present period, 1.25 x assumed source period)
     LONGLONG m_assumedSrcPeriodQpc; // declared/default source period the lag was sized for
     policy::PolicyConfig m_policyCfg;    // stickiness band, comb spacing (0 = lock off), pull slew, passthrough gate
-    policy::PhaseLockState m_lockState;  // comb-lock pull/EMAs/gate (pure policy state)
-    policy::PhaseLookahead m_lookahead;  // a phase step seen in the ring, waiting for the target
-    policy::PresentHistory m_presentHist;  // recent present times, for the guard's resume exemption
+    // Every piece of policy state that crosses presents: the lock, the lookahead, the
+    // decision's memory (selection or composite), the stage-6 overlay, chain, cursor and fence,
+    // and the recent present times. policy::StepPresent advances it once per present; the
+    // present path executes the decision it returns and holds no policy state of its own.
+    policy::PresentStepState m_step;
     // THE PRESENT PATH. Owned. Constructed with the mode, before any device exists, so main
     // can ask whether the output window belongs to it before creating the D3D9 device; its
     // device work happens in Setup, after the ring has started. The compositor lives behind
@@ -81,8 +85,8 @@ private:
     // the phantom-blend fix). Requires -etw with the join on AND the comb lock configured
     // (the calm gate reads lock state; without a lock it would be vacuously open, running
     // corrections straight through the stall recoveries it exists to protect). Corrections
-    // live in the overlay, never in the slots; off, FindBracket takes the exact pre-stage-6
-    // read path.
+    // live in the overlay, never in the slots; off, the overlay stays empty and every stamp
+    // reads as captured.
     bool m_dejitter;
     bool m_fgPhase;                 // -fgphase: per-batch content-phase instrument (ring-side)
     bool m_phaseKeep;               // -phasekeep: phase-aware keep-real (needs -etw with the join)
@@ -117,10 +121,6 @@ private:
     bool m_wgcCopyEngine;
     bool m_phaseKeepRequested;     // asked for, so an unmet prerequisite can say so once
     char m_modeName[64];            // GetModeName: the compositor kind and the present path
-    policy::AnchorChain m_anchorChain;   // stride continuity for the correction's anchoring
-    policy::StampOverlay m_overlay;      // present-thread-owned; FindBracket reads through it
-    long long m_nextBatch = 0;           // cursor into the ring's batch-start history
-    LONGLONG m_maxTargetQpc = 0;         // newest target consumed; the coherence-rule fence
     long long m_noAfterRun = 0;          // consecutive presents with no after-frame; logged per run
     // Session telemetry, all logged at exit: without the blocked counts, a live A/B cannot
     // distinguish "no late deliveries" from "corrections measured and discarded".

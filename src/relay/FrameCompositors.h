@@ -4,40 +4,35 @@
 #include "BlendRenderer.h"
 #include "TemporalPolicy.h"
 
-// Nearest-frame composition: SelectFrame picks one real ring frame (or a repeat) and it
-// is copied to the backbuffer sharp. This is the pre-blend present path unchanged, moved
-// behind the compositor seam.
+// Nearest-frame composition: the step's selection picks one real ring frame (or a repeat)
+// and it is copied to the backbuffer sharp.
 class NearestCompositor : public IFrameCompositor {
 public:
-    // cfg is borrowed from the owning mode and must outlive the compositor.
-    explicit NearestCompositor(const policy::PolicyConfig* cfg);
+    NearestCompositor();
 
     virtual bool Setup(IDirect3DDevice9Ex* device, int width, int height) override;
     virtual int Id() const override;
-    virtual void Compose(const FrameBracket& bracket, IDirect3DSurface9* backbuffer,
-                         CompositeOutcome* out) override;
+    virtual void Compose(const FrameBracket& bracket, const policy::PresentStepResult& step,
+                         IDirect3DSurface9* backbuffer, CompositeOutcome* out) override;
 
 private:
-    const policy::PolicyConfig* m_cfg;
-    policy::SelectionState m_selState;
     IDirect3DDevice9Ex* m_device;
     RECT m_rect;
     IDirect3DSurface9* m_lastShownSurface;  // ring alias (borrowed); what Repeat re-presents
 };
 
-// Shared executor for the synthesizing compositors. DecideComposite's passthrough,
-// hold, snapshot, and side/monotone bookkeeping are identical whatever renders the
-// synthesized frame; subclasses provide only the synthesis draw. Synthesized output
-// exists only on the backbuffer and in the private hold snapshot; ring frames are
-// never written.
+// Shared executor for the synthesizing compositors. The passthrough, hold and snapshot
+// handling of the step's composite decision is identical whatever renders the synthesized
+// frame; subclasses provide only the synthesis draw. Synthesized output exists only on the
+// backbuffer and in the private hold snapshot; ring frames are never written.
 class SynthCompositorBase : public IFrameCompositor {
 public:
-    explicit SynthCompositorBase(const policy::PolicyConfig* cfg);
+    SynthCompositorBase();
     virtual ~SynthCompositorBase();
 
     virtual bool Setup(IDirect3DDevice9Ex* device, int width, int height) override;
-    virtual void Compose(const FrameBracket& bracket, IDirect3DSurface9* backbuffer,
-                         CompositeOutcome* out) override;
+    virtual void Compose(const FrameBracket& bracket, const policy::PresentStepResult& step,
+                         IDirect3DSurface9* backbuffer, CompositeOutcome* out) override;
 
 protected:
     // Device resources beyond the shared hold surface; called from Setup.
@@ -50,8 +45,6 @@ protected:
     virtual bool RenderSynthesis(const FrameBracket& bracket, double weight,
                                  IDirect3DSurface9* backbuffer) = 0;
 
-    const policy::PolicyConfig* m_cfg;
-    policy::CompositeState m_compState;
     IDirect3DDevice9Ex* m_device;
     RECT m_rect;
     IDirect3DSurface9* m_holdSurface;   // owned render target: snapshot of the last synthesis
@@ -66,7 +59,7 @@ class BlendCompositor : public SynthCompositorBase {
 public:
     // tint: debug only, stamps a border on every synthesized frame so blends are visible
     // at playback speed. It rides the existing lerp pass and never touches passthroughs.
-    explicit BlendCompositor(const policy::PolicyConfig* cfg, bool tint = false);
+    explicit BlendCompositor(bool tint = false);
     virtual int Id() const override;
 
 protected:

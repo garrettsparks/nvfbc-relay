@@ -11,6 +11,54 @@
 // the log quiet, frequent enough that a wrong -src is caught within the first minute.
 static const int kTelemetryPeriodPresents = 600;
 
+// The capture ring as the policy step reads it. The step sees the bracket's stamps and diffs;
+// the present path needs the slots and surfaces too, so the last bracket read is kept whole.
+class CaptureRingView : public policy::IRingView {
+public:
+    explicit CaptureRingView(const CaptureRing& ring) : m_ring(ring) {}
+    void FindBracket(int64_t target, const policy::StampOverlay* overlay,
+                     policy::BracketInfo* out) const override {
+        m_ring.FindBracket(target, overlay, &m_last);
+        *out = m_last.info;
+    }
+    void ReadRecentFrames(int64_t target, const policy::StampOverlay* overlay,
+                          policy::RecentFrames* out) const override {
+        m_ring.ReadRecentFrames(target, overlay, out);
+    }
+    long long BatchOpens() const override { return m_ring.BatchOpens(); }
+    int64_t BatchStartAt(long long i) const override { return m_ring.BatchStartAt(i); }
+    long long BatchHistory() const override { return CaptureRing::kBatchHistory; }
+    // The whole bracket of the step's read, slots and surfaces included.
+    const FrameBracket& LastBracket() const { return m_last; }
+
+private:
+    const CaptureRing& m_ring;
+    mutable FrameBracket m_last;
+};
+
+// Stage 6's lateness source: the ETW consumer's flips on the source display (head 0).
+class EtwLatenessSource : public policy::ILatenessSource {
+public:
+    EtwLatenessSource(const EtwFlipConsumer& etw, int64_t cadenceWindow)
+        : m_etw(etw), m_cadenceWindow(cadenceWindow) {}
+    policy::LateCorrection MeasureLateness(int64_t batchStart,
+                                           policy::AnchorChain& chain) override {
+        return m_etw.MeasureLateness(0, batchStart, chain, m_cadenceWindow);
+    }
+
+private:
+    const EtwFlipConsumer& m_etw;
+    int64_t m_cadenceWindow;
+};
+
+static const char* DejitVerdictLabel(policy::DejitVerdict v) {
+    switch (v) {
+        case policy::DejitVerdict::LockDeclined: return "lock-declined";
+        case policy::DejitVerdict::FenceBlocked: return "fence-blocked";
+        default:                                 return "corrected";
+    }
+}
+
 TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, float srcRateHint, bool lock,
                                          CompositorKind compositor, bool mark, unsigned int markFrames,
                                          bool tint, bool etw, bool noJoin, bool dejitter,
@@ -49,18 +97,18 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
 
     // The one place that knows there are two present paths. The D3D11 backend IS the blend
     // pipeline, or the optical flow, and brings its own compositor; the D3D9 path hosts the
-    // blend or nearest IFrameCompositor the mode letter selected. Both take &m_policyCfg, which
-    // Setup fills in before either reads it. Nothing touches a device here: the paths create
-    // their resources in Setup, after the ring has started.
+    // blend or nearest IFrameCompositor the mode letter selected. Neither decides: they draw
+    // the policy step's decision. Nothing touches a device here: the paths create their
+    // resources in Setup, after the ring has started.
     if (d3d11Present) {
         m_present = new D3D11PresentBackend(tint, compositor == kCompositorInterp, blendShader);
     } else {
         if (blendShader >= 0) LOG("-blend ignored: it draws on the D3D11 present only");
         IFrameCompositor* c;
         if (compositor == kCompositorBlend) {
-            c = new BlendCompositor(&m_policyCfg, tint);
+            c = new BlendCompositor(tint);
         } else {
-            c = new NearestCompositor(&m_policyCfg);
+            c = new NearestCompositor();
         }
         m_present = new D3D9PresentPath(c);
     }
@@ -409,6 +457,8 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
 
     MaybeFailure ended;
     LONGLONG lastPresentQpc = 0;
+    CaptureRingView ringView(m_ring);
+    EtwLatenessSource lateness(m_etwConsumer, m_flipCadenceWindowQpc);
     m_scheduler.Seed();
 
     while (TRUE)
@@ -438,126 +488,65 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
             m_scheduler.WaitUntilDeadline();
             deadline = m_scheduler.Deadline();
         }
-        const LONGLONG meanPresentQpc = policy::RecordPresent(m_presentHist, deadline);
-        // Comb lock applies the pull as extra lag; zero when disabled or disengaged. The
-        // pull was computed from LAST present's bracket (closed loop, one-present latency
-        // in the control path - negligible at 25 us/present slew). The ease is what is left of
-        // a wrap the target is still crossing.
-        LONGLONG target =
-            deadline - (m_bracketingDelayQpc + m_lockState.pullQpc + m_lockState.easeQpc);
-        // A phase step seen in the ring lands here, before anything reads the target, on the
-        // present whose target reaches the step's first frame.
-        const LONGLONG rephase =
-            policy::ApplyLookahead(m_lookahead, m_lockState, m_policyCfg, target);
-        if (rephase != 0) {
-            target -= rephase;
+        // THE POLICY STEP (policy::StepPresent, in src/core, the code the replay runs): the
+        // target behind the deadline by the lag, the comb lock's pull and a wrap's ease; a
+        // planned phase-step move landing; stage 6 settling delivery-lateness corrections
+        // before the bracket reads the ring (the walk consumes the ring's batch-start history,
+        // never slot fields, which the capture thread owns); the bracket; the lock's update
+        // for the next present; the lookahead; the tooth guard's exemption; the decision. The
+        // step returns what happened, and the lines below log it in the order it happened.
+        // Stage 6 runs only with -dejit; the overlay it fills is empty otherwise.
+        const policy::PresentStepResult step =
+            policy::StepPresent(m_step, m_policyCfg, ringView, m_dejitter ? &lateness : NULL,
+                                deadline, m_bracketingDelayQpc);
+        const LONGLONG target = step.target;
+        if (step.rephase != 0) {
             LOG("rephase: pull moved %+lld us onto a phase step",
-                (long long)(rephase * usPerTick));
+                (long long)(step.rephase * usPerTick));
         }
-
-        // Stage 6: settle delivery-lateness corrections BEFORE the bracket reads the ring.
-        // The walk consumes the ring's batch-start history (never slot fields, which the
-        // capture thread owns), measures each batch against the flip grid, and inserts
-        // accepted corrections into the overlay FindBracket reads through. The fence (the
-        // newest target ever consumed) is the coherence rule - once a correction would
-        // land at or behind it, the batch keeps its late stamp forever - and lock calm
-        // keeps stamps still while the phase lock is riding out or converging from a
-        // stall. Every verdict is counted; late-but-blocked is logged, because a capture
-        // where corrections were measured and discarded must not read as one with no
-        // late deliveries.
-        if (m_dejitter) {
-            if (target > m_maxTargetQpc) m_maxTargetQpc = target;
-            const bool lockCalm =
-                (m_lockState.stallRun == 0 && m_lockState.recoverRun == 0);
-            const long long opens = m_ring.BatchOpens();
-            if (opens - m_nextBatch > CaptureRing::kBatchHistory - 8) {
-                // The walk was pinned (ETW outage, long stall) and the history lapped.
-                // Skip forward and drop the chain: its stride does not span the gap.
-                m_dejitSkipped += (opens - 8) - m_nextBatch;
-                m_nextBatch = opens - 8;
-                m_anchorChain = policy::AnchorChain();
-            }
-            while (m_nextBatch < opens) {
-                const LONGLONG bs = m_ring.BatchStartAt(m_nextBatch);
-                const policy::LateCorrection lc = m_etwConsumer.MeasureLateness(
-                    0, bs, m_anchorChain, m_flipCadenceWindowQpc);
-                // Flip data still in flight: retry THIS batch next present (the chain is
-                // sequential, so later batches wait behind it).
-                if (lc.dataPending) break;
-                m_dejitMeasured++;
-                if (lc.correctionTicks != 0) {
-                    m_dejitLate++;
-                    const char* verdict;
-                    if (!lockCalm) {
-                        m_dejitLockDeclined++;
-                        verdict = "lock-declined";
-                    } else if (bs <= m_maxTargetQpc ||
-                               bs - lc.correctionTicks <= m_maxTargetQpc) {
-                        m_dejitFenceBlocked++;
-                        verdict = "fence-blocked";
-                    } else {
-                        m_overlay.Insert(bs, lc.correctionTicks);
-                        m_dejitCorrected++;
-                        verdict = "corrected";
-                    }
-                    LOG("dejit: batch arr=%lldus late by %lldus, %s",
-                        (long long)((bs - m_baseQpc.QuadPart) * usPerTick),
-                        (long long)(lc.correctionTicks * usPerTick), verdict);
-                }
-                m_nextBatch++;
-            }
+        // Every stage-6 verdict is counted; late-but-blocked is logged, because a capture
+        // where corrections were measured and discarded must not read as one with no late
+        // deliveries.
+        m_dejitSkipped += step.dejitSkipped;
+        m_dejitMeasured += step.dejitMeasured;
+        m_dejitLate += step.dejitLate;
+        m_dejitLockDeclined += step.dejitLockDeclined;
+        m_dejitFenceBlocked += step.dejitFenceBlocked;
+        m_dejitCorrected += step.dejitCorrected;
+        for (int i = 0; i < step.nLateBatches; i++) {
+            const policy::LateBatch& lb = step.lateBatches[i];
+            LOG("dejit: batch arr=%lldus late by %lldus, %s",
+                (long long)((lb.batchStart - m_baseQpc.QuadPart) * usPerTick),
+                (long long)(lb.correction * usPerTick), DejitVerdictLabel(lb.verdict));
         }
-
-        FrameBracket bracket;
-        m_ring.FindBracket(target, m_dejitter ? &m_overlay : NULL, &bracket);
-
-        // Update the comb-lock pull for the next present. Skipped when the bracket is
-        // incomplete (startup, stalls): the pull freezes rather than integrating on a
-        // one-sided error, and the frozen value stays bounded by construction.
-        if (m_policyCfg.combQpc > 0) {
-            const bool resumedFromStall =
-                policy::UpdateStallRun(m_lockState, m_policyCfg, bracket.info);
-            if (!policy::BracketIsStalled(bracket.info, m_policyCfg)) {
-                policy::UpdatePhaseLock(m_lockState, m_policyCfg, bracket.info.beforeDiff,
-                                        resumedFromStall,
-                                        bracket.info.hasAfter ? bracket.info.afterDiff : -1);
-            }
-            if (resumedFromStall) {
-                policy::ArmResumeGuardExemption(m_lockState, m_policyCfg, meanPresentQpc);
-            }
-            if (m_policyCfg.phaseLookahead) {
-                policy::RecentFrames recent;
-                m_ring.ReadRecentFrames(target, m_dejitter ? &m_overlay : NULL, &recent);
-                const policy::LookaheadEvent ev = policy::UpdateLookahead(
-                    m_lookahead, m_lockState, m_policyCfg, target, recent, resumedFromStall);
-                if (ev == policy::LookaheadEvent::Planned) {
-                    LOG("rephase: step of %+lld us seen in the ring, first frame %lld us ahead "
-                        "of the target",
-                        (long long)(m_lookahead.size * usPerTick),
-                        (long long)((m_lookahead.firstTs - target) * usPerTick));
-                } else if (ev == policy::LookaheadEvent::Cancelled) {
-                    LOG("rephase: cancelled, the newest frames went back before the step");
-                } else if (ev == policy::LookaheadEvent::PlannedLate) {
-                    LOG("rephase: late step of %+lld us, the target already sits on it",
-                        (long long)(m_lookahead.size * usPerTick));
-                } else if (ev == policy::LookaheadEvent::Refused) {
-                    LOG("rephase: refused a step of %+lld us, first frame only %lld us ahead of "
-                        "the target",
-                        (long long)(m_lookahead.size * usPerTick),
-                        (long long)((m_lookahead.firstTs - target) * usPerTick));
-                }
-            }
+        if (step.lookaheadEvent == policy::LookaheadEvent::Planned) {
+            LOG("rephase: step of %+lld us seen in the ring, first frame %lld us ahead "
+                "of the target",
+                (long long)(step.lookaheadSize * usPerTick),
+                (long long)((step.lookaheadFirstTs - target) * usPerTick));
+        } else if (step.lookaheadEvent == policy::LookaheadEvent::Cancelled) {
+            LOG("rephase: cancelled, the newest frames went back before the step");
+        } else if (step.lookaheadEvent == policy::LookaheadEvent::PlannedLate) {
+            LOG("rephase: late step of %+lld us, the target already sits on it",
+                (long long)(step.lookaheadSize * usPerTick));
+        } else if (step.lookaheadEvent == policy::LookaheadEvent::Refused) {
+            LOG("rephase: refused a step of %+lld us, first frame only %lld us ahead of "
+                "the target",
+                (long long)(step.lookaheadSize * usPerTick),
+                (long long)((step.lookaheadFirstTs - target) * usPerTick));
         }
-        bracket.info.toothGuardExempt = policy::ConsumeGuardExemption(m_lockState);
+        // The ring's whole bracket, with the step's view of it (the guard's exemption).
+        FrameBracket bracket = ringView.LastBracket();
+        bracket.info = step.bracket;
 
-        // The DECISION is pure policy (selection or composite, in TemporalPolicy.cpp with
+        // The DECISION was the step's (selection or composite, in TemporalPolicy.cpp with
         // the mechanism rationale); the present path executes it onto its own target,
         // burns the marker over it (once per present, repeats included: the counter
         // identifies presented frames, not source frames; before the present stamp so
-        // jit/pdt absorb its cost) and shows it. This loop owns the timing, the bracket,
-        // the lock and the log.
+        // jit/pdt absorb its cost) and shows it. This loop owns the timing and the log.
         // A path that plans ahead (the optical flow) sees the brackets of the next presents
-        // first, read the way this one was, at targets one present period apart.
+        // first, read the way this one was, at targets one present period apart, with the
+        // composite state this present's decision left.
         const int ahead = m_present->LookaheadPresents();
         if (ahead > 0) {
             static const int kMaxAhead = 4;
@@ -566,13 +555,13 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
             const int n = ahead < kMaxAhead ? ahead : kMaxAhead;
             for (int j = 0; j < n; j++) {
                 targets[j] = target + (LONGLONG)(j + 1) * m_scheduler.PeriodQpc();
-                m_ring.FindBracket(targets[j], m_dejitter ? &m_overlay : NULL, &upcoming[j]);
+                m_ring.FindBracket(targets[j], m_dejitter ? &m_step.overlay : NULL, &upcoming[j]);
             }
-            m_present->PlanAhead(upcoming, targets, n);
+            m_present->PlanAhead(upcoming, targets, n, m_step.comp);
         }
 
         CompositeOutcome outcome;
-        m_present->Compose(bracket, &outcome);
+        m_present->Compose(bracket, step, &outcome);
         const long long markN = m_present->BurnMarker(outcome);
         LARGE_INTEGER beforePresent;
         QueryPerformanceCounter(&beforePresent);
@@ -599,7 +588,7 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
             // weight); nearest lines carry no new fields.
             int lkField = -1;
             if (m_policyCfg.combQpc > 0) {
-                lkField = m_lockState.engaged ? 1 : 0;
+                lkField = m_step.lock.engaged ? 1 : 0;
             }
             // Where the shown frame actually scanned out, when ETW is running. Diagnostic:
             // nothing above this point consulted it, and the selection that produced this
@@ -669,9 +658,9 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
             // The ease left after this present's lock update, printed only while a wrap is being
             // crossed, like pull= beside it.
             char easeField[32] = "";
-            if (m_lockState.easeQpc != 0) {
+            if (m_step.lock.easeQpc != 0) {
                 snprintf(easeField, sizeof(easeField), " ease=%lldus",
-                         (long long)(m_lockState.easeQpc * usPerTick));
+                         (long long)(m_step.lock.easeQpc * usPerTick));
             }
             // How the optical flow's synthesized present got its flow, then how many presents ago
             // the synthesis pt= timed was drawn, then the -blend pan shader's shift for that same
@@ -703,7 +692,7 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
                 (long long)((beforePresent.QuadPart - deadline) * usPerTick),
                 (long long)(presentDelta * usPerTick),
                 lagUs,
-                (long long)(m_lockState.pullQpc * usPerTick),
+                (long long)(m_step.lock.pullQpc * usPerTick),
                 lkField,
                 markN,
                 opFields,

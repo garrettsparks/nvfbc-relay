@@ -76,7 +76,8 @@ bool D3D9PresentPath::Setup(const RelayContext& ctx, CaptureRing* ring,
     return true;
 }
 
-void D3D9PresentPath::Compose(const FrameBracket& bracket, CompositeOutcome* out) {
+void D3D9PresentPath::Compose(const FrameBracket& bracket, const policy::PresentStepResult& step,
+                              CompositeOutcome* out) {
     // The back buffer is acquired PER PRESENT, never cached. Under D3DSWAPEFFECT_DISCARD
     // back buffer 0 is the same surface every time and this is a no-op, but under FLIPEX
     // the runtime rotates which handle is the back buffer at presentation time, so a cached
@@ -99,7 +100,7 @@ void D3D9PresentPath::Compose(const FrameBracket& bracket, CompositeOutcome* out
     }
     m_presentTarget = m_backbuffer ? m_backbuffer : m_fallbackBackbuffer;
 
-    m_compositor->Compose(bracket, m_presentTarget, out);
+    m_compositor->Compose(bracket, step, m_presentTarget, out);
 }
 
 long long D3D9PresentPath::BurnMarker(const CompositeOutcome& out) {

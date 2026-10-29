@@ -3,9 +3,10 @@
 #include <windows.h>
 #include <d3d9.h>
 #include "CaptureRing.h"
+#include "PresentStep.h"
 
 // What the compositor produced this present, for the temporal log line and the frame
-// marker. The composition DECISION itself is pure policy (TemporalPolicy.h); a
+// marker. The composition DECISION itself is pure policy (the step, PresentStep.h); a
 // compositor only executes it and reports what it did.
 struct CompositeOutcome {
     const char* pickLabel;   // the line's pick= field ("none" when selection did not run)
@@ -61,9 +62,10 @@ public:
     virtual bool OnCaptureStarted(CaptureRing*, LARGE_INTEGER /*baseQpc*/,
                                   LONGLONG /*freqQpc*/) { return true; }
 
-    // Compose this present's output onto the backbuffer and fill the outcome. When
-    // nothing is presentable yet (startup, before any frame exists) the backbuffer is
-    // left untouched and the outcome still describes the decision.
-    virtual void Compose(const FrameBracket& bracket, IDirect3DSurface9* backbuffer,
-                         CompositeOutcome* out) = 0;
+    // Compose this present's output onto the backbuffer as the policy step decided it
+    // (step.pick for the nearest selection, step.decision for the synthesizing compositors)
+    // and fill the outcome. When nothing is presentable yet (startup, before any frame
+    // exists) the backbuffer is left untouched and the outcome still describes the decision.
+    virtual void Compose(const FrameBracket& bracket, const policy::PresentStepResult& step,
+                         IDirect3DSurface9* backbuffer, CompositeOutcome* out) = 0;
 };

@@ -7,6 +7,7 @@
 #include "IFrameCompositor.h"
 #include "RelayContext.h"
 #include "TemporalPolicy.h"
+#include "PresentStep.h"
 
 // THE PRESENT PATH: everything between the bracket the present loop found and the frame
 // reaching the output window. One implementation per swapchain: the D3D9 device's own
@@ -16,11 +17,11 @@
 // The loop in TemporalCaptureMode owns the timing, the bracket, the comb lock and the log
 // line, and never asks which of the two it is driving.
 //
-// Each implementation owns exactly one policy::CompositeState, because DecideComposite
-// mutates the state it is handed (both Schmitt bands, the last output and target stamps)
-// and two deciders on one present would fight over it. The D3D9 path reaches its state
-// through the IFrameCompositor it hosts; the D3D11 path is the blend pipeline and decides
-// for itself.
+// No path decides. The present's decision, selection or composite, is made by the policy
+// step (policy::StepPresent) on the mode's one PresentStepState, so the decision a path
+// executes, the one the flow planner predicts from and the one the replay tests all come
+// from the same state. A path executes the decision and keeps only what drawing needs (the
+// surface a repeat or hold re-presents).
 //
 // Call order per present: WaitForFrame, Compose, BurnMarker, Present. The pacing wait sits
 // in WHICHEVER call blocks for that path: the D3D11 path blocks in WaitForFrame, on the
@@ -52,12 +53,15 @@ public:
     virtual int LookaheadPresents() const { return 0; }
 
     // The brackets the next count presents would have, upcoming[i] at targets[i], nearest
-    // first, read from the ring as this present's bracket was.
+    // first, read from the ring as this present's bracket was, and the composite state this
+    // present's decision left, which a prediction of the next decisions starts from.
     virtual void PlanAhead(const FrameBracket* /*upcoming*/, const LONGLONG* /*targets*/,
-                           int /*count*/) {}
+                           int /*count*/, const policy::CompositeState& /*decided*/) {}
 
-    // Decide this present and draw it onto this path's own target.
-    virtual void Compose(const FrameBracket& bracket, CompositeOutcome* out) = 0;
+    // Draw this present's decision (step.pick for the nearest selection, step.decision for
+    // the synthesizing compositors) onto this path's own target.
+    virtual void Compose(const FrameBracket& bracket, const policy::PresentStepResult& step,
+                         CompositeOutcome* out) = 0;
 
     // Burn the frame marker over the composed output. Returns the counter burned (mark= on
     // the temporal line), or -1 when the marker is off.

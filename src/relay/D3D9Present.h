@@ -33,7 +33,8 @@ public:
     // Present reports how long it blocked.
     bool WaitForFrame() override { return true; }
 
-    void Compose(const FrameBracket& bracket, CompositeOutcome* out) override;
+    void Compose(const FrameBracket& bracket, const policy::PresentStepResult& step,
+                 CompositeOutcome* out) override;
     long long BurnMarker(const CompositeOutcome& out) override;
     LONGLONG Present(bool vsync) override;
 

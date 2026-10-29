@@ -14,9 +14,8 @@ const char* SynthExecLabel(int code) {
 // NearestCompositor
 // ---------------------------------------------------------------------------------
 
-NearestCompositor::NearestCompositor(const policy::PolicyConfig* cfg)
-    : m_cfg(cfg)
-    , m_device(NULL)
+NearestCompositor::NearestCompositor()
+    : m_device(NULL)
     , m_lastShownSurface(NULL)
 {
     m_rect.left = m_rect.top = m_rect.right = m_rect.bottom = 0;
@@ -35,9 +34,9 @@ int NearestCompositor::Id() const {
     return 0;
 }
 
-void NearestCompositor::Compose(const FrameBracket& bracket, IDirect3DSurface9* backbuffer,
-                                CompositeOutcome* out) {
-    const policy::Pick pick = policy::SelectFrame(bracket.info, m_selState, *m_cfg);
+void NearestCompositor::Compose(const FrameBracket& bracket, const policy::PresentStepResult& step,
+                                IDirect3DSurface9* backbuffer, CompositeOutcome* out) {
+    const policy::Pick pick = step.pick;
 
     IDirect3DSurface9* chosen = NULL;
     switch (pick) {
@@ -81,9 +80,8 @@ void NearestCompositor::Compose(const FrameBracket& bracket, IDirect3DSurface9* 
 // SynthCompositorBase
 // ---------------------------------------------------------------------------------
 
-SynthCompositorBase::SynthCompositorBase(const policy::PolicyConfig* cfg)
-    : m_cfg(cfg)
-    , m_device(NULL)
+SynthCompositorBase::SynthCompositorBase()
+    : m_device(NULL)
     , m_holdSurface(NULL)
     , m_lastOutput(NULL)
     , m_lastOutputExec(0)
@@ -121,10 +119,10 @@ bool SynthCompositorBase::Setup(IDirect3DDevice9Ex* device, int width, int heigh
     return true;
 }
 
-void SynthCompositorBase::Compose(const FrameBracket& bracket, IDirect3DSurface9* backbuffer,
-                                  CompositeOutcome* out) {
-    const policy::CompositeDecision d =
-        policy::DecideComposite(bracket.info, m_compState, *m_cfg);
+void SynthCompositorBase::Compose(const FrameBracket& bracket,
+                                  const policy::PresentStepResult& step,
+                                  IDirect3DSurface9* backbuffer, CompositeOutcome* out) {
+    const policy::CompositeDecision& d = step.decision;
 
     out->pickLabel = policy::PickLabel(policy::Pick::None);
     out->opLabel = policy::CompositeLabel(d.op);
@@ -202,8 +200,8 @@ void SynthCompositorBase::Compose(const FrameBracket& bracket, IDirect3DSurface9
 // BlendCompositor
 // ---------------------------------------------------------------------------------
 
-BlendCompositor::BlendCompositor(const policy::PolicyConfig* cfg, bool tint)
-    : SynthCompositorBase(cfg)
+BlendCompositor::BlendCompositor(bool tint)
+    : SynthCompositorBase()
     , m_tint(tint)
 {
 }

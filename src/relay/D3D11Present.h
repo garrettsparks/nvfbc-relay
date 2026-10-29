@@ -52,9 +52,9 @@ class CopyEngineTarget;
 // event query before publishing a slot, so a published slot is GPU-complete for this device
 // exactly as it is for the D3D9 present device.
 //
-// OWNS ITS OWN COMPOSITE STATE. DecideComposite mutates the state it is handed (both Schmitt
-// bands, the last output and target stamps), so the D3D9 compositor and this backend must
-// never both decide the same present; a mode runs exactly one present path.
+// DRAWS THE STEP'S DECISION. The composite decision is the policy step's, on the mode's one
+// state; this backend draws it. The flow planner predicts the next decisions on a copy of
+// the state this present's decision left (PlanAhead).
 //
 // BLEND OR OPTICAL FLOW. This backend is the blend pipeline (b, b:vsync) or, with interp, the
 // optical flow interpolation (o, o:vsync): the same decision, holds and passthrough, with a
@@ -90,11 +90,13 @@ public:
 
     // With the optical flow: two presents ahead, the horizon the flow planner was built for.
     int LookaheadPresents() const override { return m_flow ? kFlowLookahead : 0; }
-    void PlanAhead(const FrameBracket* upcoming, const LONGLONG* targets, int count) override;
+    void PlanAhead(const FrameBracket* upcoming, const LONGLONG* targets, int count,
+                   const policy::CompositeState& decided) override;
 
-    // Decide this present and draw it onto the current back buffer. Fills out exactly as
-    // the D3D9 synthesizing compositor would, so the temporal log line reads the same.
-    void Compose(const FrameBracket& bracket, CompositeOutcome* out) override;
+    // Draw the step's decision onto the current back buffer. Fills out exactly as the D3D9
+    // synthesizing compositor would, so the temporal log line reads the same.
+    void Compose(const FrameBracket& bracket, const policy::PresentStepResult& step,
+                 CompositeOutcome* out) override;
 
     // Burn the frame marker over the composed back buffer. Returns the counter burned
     // (mark= on the temporal line), or -1 when the marker is off.
@@ -201,8 +203,7 @@ private:
     int m_width, m_height;
     int m_ringSlots;
 
-    const policy::PolicyConfig* m_cfg;
-    policy::CompositeState m_compState;
+    const policy::PolicyConfig* m_cfg;   // for the flow planner's prediction of the next decisions
     bool m_tintRequested;
 
     ID3D11Device* m_dev;
@@ -281,10 +282,12 @@ private:
         long long needBy = 0;
     };
     PlannedFlow m_planned[policy::kFlowSlots];
-    // The upcoming brackets PlanAhead handed in, planned once Compose has decided this present.
+    // The upcoming brackets PlanAhead handed in, planned in Compose, and the composite state
+    // this present's decision left, which the prediction of the next decisions starts from.
     FrameBracket m_ahead[kFlowLookahead];
     LONGLONG m_aheadTargets[kFlowLookahead] = {};
     int m_aheadCount = 0;
+    policy::CompositeState m_aheadState;
     // The pair handed over last, for the engine's temporal hints.
     policy::FlowPair m_lastHanded;
     bool m_haveLastHanded = false;

@@ -670,9 +670,9 @@ void D3D11PresentBackend::SampleStats() {
     }
 }
 
-void D3D11PresentBackend::Compose(const FrameBracket& bracket, CompositeOutcome* out) {
-    const policy::CompositeDecision d =
-        policy::DecideComposite(bracket.info, m_compState, *m_cfg);
+void D3D11PresentBackend::Compose(const FrameBracket& bracket,
+                                  const policy::PresentStepResult& step, CompositeOutcome* out) {
+    const policy::CompositeDecision& d = step.decision;
     // The flows of the next presents, predicted from the state this decision left.
     if (m_flow) PlanFlows();
 
@@ -903,9 +903,9 @@ bool D3D11PresentBackend::DrawSynthesis(const FrameBracket& bracket, float w, in
     return Draw(bracket.beforeSlot, bracket.afterSlot, w);
 }
 
-// Kept until Compose has made this present's decision, which the prediction starts from.
+// Kept until Compose plans the flows.
 void D3D11PresentBackend::PlanAhead(const FrameBracket* upcoming, const LONGLONG* targets,
-                                    int count) {
+                                    int count, const policy::CompositeState& decided) {
     m_aheadCount = 0;
     if (!m_flow || count <= 0) return;
     if (count > kFlowLookahead) count = kFlowLookahead;
@@ -914,6 +914,7 @@ void D3D11PresentBackend::PlanAhead(const FrameBracket* upcoming, const LONGLONG
         m_aheadTargets[j] = targets[j];
     }
     m_aheadCount = count;
+    m_aheadState = decided;
 }
 
 void D3D11PresentBackend::PlanFlows() {
@@ -941,7 +942,7 @@ void D3D11PresentBackend::PlanFlows() {
     // state, present after present: the stickiness band and the tooth guard predict as they will
     // decide. The plain passthrough gate alone predicted a synthesis for 88% of flows that never
     // came at a 115 fps source (sitting ofpts1), the band holding those presents on real frames.
-    policy::CompositeState ahead = m_compState;
+    policy::CompositeState ahead = m_aheadState;
     int64_t tg[kFlowLookahead];
     int forPresent[kFlowLookahead];
     int synth = 0;
