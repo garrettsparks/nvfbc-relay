@@ -42,6 +42,12 @@ public:
     // exists because NvFBC, the ring and its aliases are D3D9 objects.
     virtual bool PresentsViaD3D11() const { return false; }
 
+    // Whether that D3D11 present goes through the composition swapchain (CopyEngineTarget)
+    // rather than a flip-model one: for -wgc's copy engine, and for every mode on a timer. Its
+    // output window then has no redirection bitmap, since DirectComposition gives it all its
+    // content.
+    virtual bool PresentsThroughComposition() const { return false; }
+
     // Sets up mode-specific resources once the present device and the startup session exist.
     virtual MaybeFailure Setup(const RelayContext& ctx) = 0;
 

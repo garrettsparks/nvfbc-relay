@@ -62,6 +62,14 @@ const char* kMarkerPsFmt =
     "  return white ? float4(1, 1, 1, 1) : float4(0, 0, 0, 1);\n"
     "}\n";
 
+// -tint's border: the viewport is one strip of the border, so the shader only paints it, in the
+// colour the constant buffer carries (DrawTint).
+const char* kTintPs =
+    "cbuffer Params : register(b0) { float4 color; };\n"
+    "float4 main(float4 pos : SV_Position) : SV_Target {\n"
+    "  return float4(color.rgb, 1);\n"
+    "}\n";
+
 bool Compile(const char* src, const char* name, const char* profile, ID3DBlob** out) {
     ID3DBlob* err = NULL;
     const HRESULT hr = D3DCompile(src, strlen(src), name, NULL, NULL, "main", profile, 0, 0,
@@ -121,7 +129,8 @@ UINT OutputBitsPerColor(IDXGIAdapter* adapter, HWND hwnd) {
 
 }  // namespace
 
-D3D11PresentBackend::D3D11PresentBackend(bool tint, bool interp, int blendShader)
+D3D11PresentBackend::D3D11PresentBackend(bool tint, bool interp, int blendShader, bool nearest,
+                                         bool timer, bool copyEngine)
     : m_enabled(false)
     , m_width(0), m_height(0), m_ringSlots(0)
     , m_tintRequested(tint)
@@ -135,7 +144,13 @@ D3D11PresentBackend::D3D11PresentBackend(bool tint, bool interp, int blendShader
     , m_presentFailures(0), m_drawFailures(0), m_waitTimeouts(0)
     , m_consecutiveWaitTimeouts(0), m_lastPresentHr(S_OK), m_presents(0)
 {
+    m_nearest = nearest;
+    m_timer = timer;
+    m_copies = copyEngine;
+    m_composition = timer || copyEngine;
     m_interp = interp;
+    snprintf(m_name, sizeof(m_name), "D3D11 %s present%s",
+             m_composition ? "composition" : "flip-model", interp ? ", optical flow" : "");
     m_blendShader = blendShader;
     for (int i = 0; i < CaptureRing::RING_SIZE; i++) {
         m_ringAlias[i] = NULL;
@@ -156,6 +171,7 @@ D3D11PresentBackend::~D3D11PresentBackend() {
     if (m_sampler) m_sampler->Release();
     if (m_cb) m_cb->Release();
     if (m_markerPs) m_markerPs->Release();
+    if (m_tintPs) m_tintPs->Release();
     if (m_ps) m_ps->Release();
     if (m_vs) m_vs->Release();
     if (m_rtv) m_rtv->Release();
@@ -175,10 +191,12 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
     const int height = ctx.height;
     m_width = width;
     m_height = height;
-    if (m_tintRequested) LOG("-tint ignored: the D3D11 present path has no tint pass");
+    if (m_tintRequested) {
+        LOG("Debug tint ON (-tint): every frame that is not one real frame carries a border, "
+            "1.5%% of each edge: red a blend, green a flow warp, blue a hold of either");
+    }
     m_wgc = ring->WgcRequested();
-    if (!CreateDeviceAndSwapChain(hwnd, width, height, m_wgc && ring->WgcCopyEngine(),
-                                  ctx.sinkRefreshHz)) {
+    if (!CreateDeviceAndSwapChain(hwnd, width, height, m_composition, ctx.sinkRefreshHz)) {
         return false;
     }
     if (!OpenRingAliases(ring)) return false;
@@ -192,7 +210,10 @@ bool D3D11PresentBackend::Setup(const RelayContext& ctx, CaptureRing* ring,
             return false;
         }
     }
-    if (m_blendShader >= 0) {
+    // The nearest selection never synthesizes, so -blend has nothing to draw there.
+    if (m_nearest && m_blendShader >= 0) {
+        LOG("-blend ignored: the nearest selection draws no in-between frames");
+    } else if (m_blendShader >= 0) {
         m_blend = new BlendShaders();
         if (!m_blend->Setup(m_dev, m_ctx, m_blendShader, width, height)) return false;
     }
@@ -267,7 +288,10 @@ bool D3D11PresentBackend::CreateDeviceAndSwapChain(HWND hwnd, int width, int hei
         adapter->Release();
         dxgiDev->Release();
         m_copyEngine = new CopyEngineTarget();
-        if (!m_copyEngine->Setup(m_dev, m_ctx, hwnd, width, height, formats[0], sinkRefreshHz)) {
+        // A timer's present gets a third buffer, so a frame that takes over a refresh to reach
+        // the display under a GPU-bound game does not hold the next timer present for its buffer.
+        if (!m_copyEngine->Setup(m_dev, m_ctx, hwnd, width, height, formats[0], sinkRefreshHz,
+                                 m_timer ? 3 : 2)) {
             m_copyEngineFailed = true;
             return false;
         }
@@ -412,6 +436,18 @@ bool D3D11PresentBackend::CreatePipeline() {
         return false;
     }
 
+    if (m_tintRequested) {
+        ID3DBlob* tintBlob = NULL;
+        if (!Compile(kTintPs, "D3D11PresentTintPS", "ps_5_0", &tintBlob)) return false;
+        hr = m_dev->CreatePixelShader(tintBlob->GetBufferPointer(), tintBlob->GetBufferSize(),
+                                      NULL, &m_tintPs);
+        tintBlob->Release();
+        if (FAILED(hr)) {
+            LOGERR("D3D11Present: tint shader creation failed (0x%08x)", hr);
+            return false;
+        }
+    }
+
     D3D11_BUFFER_DESC bd;
     ZeroMemory(&bd, sizeof(bd));
     bd.ByteWidth = 16;                       // one 16-byte register, the constant-buffer minimum
@@ -506,7 +542,7 @@ ID3D11ShaderResourceView* D3D11PresentBackend::SourceFor(int slot) {
 // frame of another size than the output. The marker does not decide it: a copied present gets
 // its strip from the copy engine as well (BurnMarker).
 ID3D11Texture2D* D3D11PresentBackend::CopySourceFor(int slot) {
-    if (!m_ring || NeedsScaling(slot)) return NULL;
+    if (!m_copies || !m_ring || NeedsScaling(slot)) return NULL;
     ID3D11Texture2D* texture = m_ring->WgcTexture(slot);
     return texture && m_copyEngine->CanCopy(texture) ? texture : NULL;
 }
@@ -603,6 +639,54 @@ bool D3D11PresentBackend::DrawMarker(const bool cells[FrameMarker::kCells]) {
     m_ctx->PSSetConstantBuffers(0, 1, &m_cb);
     m_ctx->Draw(3, 0);
     return true;
+}
+
+void D3D11PresentBackend::DrawTint(int exec, bool hold) {
+    if (!m_rtv) return;
+    // The colour says what made the pixels: blue a hold of a synthesized frame, green the flow
+    // warp, red the blend (the D3D9 tint's colour, and what any other executor gets).
+    float color[3] = {1.0f, 0.0f, 0.0f};
+    if (hold) {
+        color[0] = 0.0f;
+        color[2] = 1.0f;
+    } else if (exec == kExecWarp) {
+        color[0] = 0.0f;
+        color[1] = 1.0f;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (FAILED(m_ctx->Map(m_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return;
+    float* p = (float*)mapped.pData;
+    p[0] = color[0]; p[1] = color[1]; p[2] = color[2]; p[3] = 1.0f;
+    m_ctx->Unmap(m_cb, 0);
+    m_ctx->PSSetConstantBuffers(0, 1, &m_cb);
+    // 1.5% of each edge, as the D3D9 tint: the top and bottom strips across the whole width, the
+    // left and right ones between them. Each strip is a viewport the triangle fills.
+    const float bw = (float)(int)(m_width * 0.015f + 0.5f);
+    const float bh = (float)(int)(m_height * 0.015f + 0.5f);
+    const float w = (float)m_width;
+    const float h = (float)m_height;
+    const float strips[4][4] = {
+        {0.0f, 0.0f, w, bh},
+        {0.0f, h - bh, w, bh},
+        {0.0f, bh, bw, h - 2.0f * bh},
+        {w - bw, bh, bw, h - 2.0f * bh},
+    };
+    m_ctx->OMSetRenderTargets(1, &m_rtv, NULL);
+    m_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_ctx->IASetInputLayout(NULL);
+    m_ctx->VSSetShader(m_vs, NULL, 0);
+    m_ctx->PSSetShader(m_tintPs, NULL, 0);
+    for (const auto& s : strips) {
+        D3D11_VIEWPORT vp;
+        vp.TopLeftX = s[0];
+        vp.TopLeftY = s[1];
+        vp.Width = s[2];
+        vp.Height = s[3];
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        m_ctx->RSSetViewports(1, &vp);
+        m_ctx->Draw(3, 0);
+    }
 }
 
 void D3D11PresentBackend::SamplePresentationPath() {
@@ -707,44 +791,76 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket,
     int slotA = -1, slotB = -1;
     float w = 0.0f;
     int exec = 0;
-    switch (d.op) {
-        case policy::CompositeOp::PassthroughBefore:
-            slotA = slotB = bracket.beforeSlot;
-            break;
-        case policy::CompositeOp::PassthroughAfter:
-            slotA = slotB = bracket.afterSlot;
-            out->weightQ = 15;
-            out->opWeight = 1.0;
-            break;
-        case policy::CompositeOp::Synthesize:
-            slotA = bracket.beforeSlot;
-            slotB = bracket.afterSlot;
-            w = (float)d.weight;
-            exec = kExecBlend;
-            out->synthesized = true;
-            out->weightQ = (int)(d.weight * 15.0 + 0.5);
-            out->opWeight = d.weight;
-            // Set here so a present that cannot draw still reports the blend it meant; the
-            // optical flow sets them again after drawing, the warp or the blend.
-            out->synthExec = SynthExecLabel(kExecBlend);
-            out->pixelExec = kExecBlend;
-            break;
-        default:
-            // Hold / HoldComb: re-draw what the last present drew. The fallback chain covers
-            // startup, before anything has been output.
-            if (m_haveLast) {
-                slotA = m_lastSlotA;
-                slotB = m_lastSlotB;
-                w = m_lastWeight;
-                exec = m_lastExec;
-            } else if (bracket.info.hasBefore) {
+    if (m_nearest) {
+        // The step's selection, drawn as the D3D9 NearestCompositor copied it, with the same
+        // outcome fields, so the line keeps pick= and no op= and the marker's pick cells read
+        // the same. A repeat re-draws the last frame SHOWN, which is not always the bracket's
+        // before-frame (after an after-pick the target can still trail it); the fallback chain
+        // covers startup, before anything has been shown.
+        const policy::Pick pick = step.pick;
+        out->pickLabel = policy::PickLabel(pick);
+        out->opLabel = NULL;
+        out->pickCode = (int)pick;
+        out->weightQ = bracket.info.hasBefore ? (int)(bracket.weight * 15.0 + 0.5) : 0;
+        switch (pick) {
+            case policy::Pick::Before:
+            case policy::Pick::BeforeAdv:
                 slotA = slotB = bracket.beforeSlot;
-            } else if (bracket.info.hasAfter) {
+                break;
+            case policy::Pick::After:
+            case policy::Pick::AfterAdv:
                 slotA = slotB = bracket.afterSlot;
-            }
-            out->synthesized = exec != 0;
-            out->pixelExec = exec;
-            break;
+                break;
+            default:
+                if (m_haveLast) {
+                    slotA = slotB = m_lastSlotA;
+                } else if (bracket.info.hasBefore) {
+                    slotA = slotB = bracket.beforeSlot;
+                } else if (bracket.info.hasAfter) {
+                    slotA = slotB = bracket.afterSlot;
+                }
+                break;
+        }
+    } else {
+        switch (d.op) {
+            case policy::CompositeOp::PassthroughBefore:
+                slotA = slotB = bracket.beforeSlot;
+                break;
+            case policy::CompositeOp::PassthroughAfter:
+                slotA = slotB = bracket.afterSlot;
+                out->weightQ = 15;
+                out->opWeight = 1.0;
+                break;
+            case policy::CompositeOp::Synthesize:
+                slotA = bracket.beforeSlot;
+                slotB = bracket.afterSlot;
+                w = (float)d.weight;
+                exec = kExecBlend;
+                out->synthesized = true;
+                out->weightQ = (int)(d.weight * 15.0 + 0.5);
+                out->opWeight = d.weight;
+                // Set here so a present that cannot draw still reports the blend it meant; the
+                // optical flow sets them again after drawing, the warp or the blend.
+                out->synthExec = SynthExecLabel(kExecBlend);
+                out->pixelExec = kExecBlend;
+                break;
+            default:
+                // Hold / HoldComb: re-draw what the last present drew. The fallback chain covers
+                // startup, before anything has been output.
+                if (m_haveLast) {
+                    slotA = m_lastSlotA;
+                    slotB = m_lastSlotB;
+                    w = m_lastWeight;
+                    exec = m_lastExec;
+                } else if (bracket.info.hasBefore) {
+                    slotA = slotB = bracket.beforeSlot;
+                } else if (bracket.info.hasAfter) {
+                    slotA = slotB = bracket.afterSlot;
+                }
+                out->synthesized = exec != 0;
+                out->pixelExec = exec;
+                break;
+        }
     }
 
     // Acquired even when there is nothing to draw, so the marker lands on THIS present's
@@ -794,6 +910,11 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket,
                    m_drawFailures);
         }
         return;
+    }
+    // -tint marks every frame whose pixels are not one real frame, a hold of one included, as
+    // the D3D9 blend's held snapshot carries its border. A copied present is always one real frame.
+    if (m_tintPs && exec != 0 && !m_copySource) {
+        DrawTint(exec, d.op != policy::CompositeOp::Synthesize);
     }
     m_lastSlotA = slotA;
     m_lastSlotB = slotB;
@@ -984,9 +1105,11 @@ long long D3D11PresentBackend::BurnMarker(const CompositeOutcome& out) {
     if (!m_mark) return -1;
     unsigned int burned = 0;
     bool cells[FrameMarker::kCells];
-    if (!m_marker.Next(out.pickCode, out.weightQ, out.synthesized,
-                       m_interp ? kCompositorIdFlow : kCompositorIdBlend, out.pixelExec, &burned,
-                       cells)) {
+    int compositorId = kCompositorIdBlend;
+    if (m_nearest) compositorId = kCompositorIdNearest;
+    else if (m_interp) compositorId = kCompositorIdFlow;
+    if (!m_marker.Next(out.pickCode, out.weightQ, out.synthesized, compositorId, out.pixelExec,
+                       &burned, cells)) {
         return burned;
     }
     // A present the copy engine copies gets its strip copied in after the frame, so a marked
@@ -1048,7 +1171,7 @@ bool D3D11PresentBackend::SwapChainStalled() const {
     return m_copyEngineLost || m_consecutiveWaitTimeouts >= kStallTimeouts;
 }
 
-LONGLONG D3D11PresentBackend::Present(bool vsync) {
+LONGLONG D3D11PresentBackend::Present() {
     if (!m_enabled) return 0;
     if (m_copyEngine) {
         // Always on a vblank: the presentation manager has no tearing present.
@@ -1063,8 +1186,9 @@ LONGLONG D3D11PresentBackend::Present(bool vsync) {
     }
     // Queues the frame; WaitForFrame already made the room, so this returns promptly and
     // reports no pacing block. Sync interval 1 puts the flip on a vblank. Under independent
-    // flip that vblank is the sink's, which is the entire point of this backend.
-    const HRESULT hr = m_swapChain->Present(vsync ? 1 : 0, 0);
+    // flip that vblank is the sink's, which is the point of the :vsync modes, the only ones on
+    // this swapchain (a timer presents through the composition swapchain).
+    const HRESULT hr = m_swapChain->Present(1, 0);
     m_presents++;
     const bool bad = FAILED(hr) || hr == DXGI_STATUS_OCCLUDED;
     if (bad) m_presentFailures++;

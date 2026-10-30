@@ -56,24 +56,38 @@ class CopyEngineTarget;
 // state; this backend draws it. The flow planner flows the pairs of the next presents the
 // step, run ahead on a copy of that state, says will synthesize (PlanAhead).
 //
-// BLEND OR OPTICAL FLOW. This backend is the blend pipeline (b, b:vsync) or, with interp, the
-// optical flow interpolation (o, o:vsync): the same decision, holds and passthrough, with a
-// synthesized present drawn as the flow warp (OpticalFlowWarp) where the blend would draw the
-// lerp, and the lerp in its place when there is no flow for it. Each pair a present is
+// NEAREST, BLEND OR OPTICAL FLOW. This backend is the nearest selection (t), the blend pipeline
+// (b) or, with interp, the optical flow interpolation (o). The nearest selection draws the one
+// real frame the step picked, or the last one shown again for a repeat, exactly as the D3D9
+// NearestCompositor copied it. The blend and the flow share the decision, holds and passthrough,
+// with a synthesized present drawn as the flow warp (OpticalFlowWarp) where the blend would draw
+// the lerp, and the lerp in its place when there is no flow for it. Each pair a present is
 // predicted to synthesize is flowed ahead (policy::FlowPlanner), handed to the engine right
 // after a present that draws, where its turns on the game's graphics engine take the draw's
-// with them. Nearest is not ported.
+// with them.
+//
+// VBLANK OR TIMER. The loop's pacing (Pacing.h) waits on the output's vblank through
+// WaitForFrame, or on a timer and then WaitForFrame for room; Present takes the sync interval
+// that goes with it.
 //
 // WITH -wgc THE SWAPCHAIN IS A CopyEngineTarget (unless -nocopyengine): the same decision and
 // draw, into its buffers, except that a present showing one WGC frame as it is (no blend, no
 // scaling) is copied on the copy engine, its marker strip with it, and so takes no turn on the
-// game's graphics engine.
+// game's graphics engine. A MODE ON A TIMER presents through the same target whatever the
+// capture, drawing where it does not copy: the flip-model swapchain's frame-latency wait held
+// the loop until the card's vblank, so the timer decided nothing there (2026-10-29).
 class D3D11PresentBackend : public IPresentPath {
 public:
-    // tint is accepted so the mode string's options parse the same on either path; this
-    // path has no tint pass and says so at Setup. interp selects the optical flow. blendShader
-    // is -blend's shader (BlendShaders::Shader), -1 for the present's own blend.
-    D3D11PresentBackend(bool tint, bool interp, int blendShader = -1);
+    // tint is -tint: a border over 1.5% of each edge of every frame whose pixels are not one real
+    // frame, red for a blend (as the D3D9 blend draws it), green for a flow warp, blue for a hold
+    // of either. interp
+    // selects the optical flow, nearest the
+    // nearest selection. blendShader is -blend's shader (BlendShaders::Shader), -1 for the
+    // present's own blend. timer is a mode on a timer; copyEngine is -wgc with the copy engine
+    // on. Either puts the present on the copy engine's composition swapchain (three buffers for
+    // a timer, two otherwise); frames are copied there only with copyEngine, drawn otherwise.
+    D3D11PresentBackend(bool tint, bool interp, int blendShader = -1, bool nearest = false,
+                        bool timer = false, bool copyEngine = false);
     ~D3D11PresentBackend();
 
     D3D11PresentBackend(const D3D11PresentBackend&) = delete;
@@ -115,19 +129,20 @@ public:
     bool SwapChainStalled() const override;
 
     // Queue the drawn back buffer. Does not block: WaitForFrame already made room, so the
-    // pacing block reported here is 0. vsync selects sync interval 1 so the flip lands on a
-    // vblank rather than tearing.
-    LONGLONG Present(bool vsync) override;
+    // pacing block reported here is 0. The flip-model swapchain presents with sync interval 1,
+    // on the next vblank; the composition swapchain always presents on a vblank.
+    LONGLONG Present() override;
 
     // Whole-run present statistics; safe to call when disabled.
     void LogSummary() const override;
 
-    const char* Name() const override {
-        return m_interp ? "D3D11 flip-model present, optical flow" : "D3D11 flip-model present";
-    }
+    const char* Name() const override { return m_name; }
     const char* RefusalAdvice() const override {
         if (m_flowFailed) {
             return "To use the blend instead, type b:vsync at the mode prompt.";
+        }
+        if (m_copyEngineFailed && m_timer) {
+            return "To start with the older output method, add -d3d9 to the launch options.";
         }
         if (m_copyEngineFailed) {
             return "To start with the older output method, add -nocopyengine to the launch "
@@ -136,6 +151,7 @@ public:
         return "To try the older output method, type b:dwm at the mode prompt.";
     }
     bool OwnsOutputWindow() const override { return true; }
+    bool UsesComposition() const override { return m_composition; }
 
     bool Enabled() const { return m_enabled; }
 
@@ -163,6 +179,10 @@ private:
     // pool on this device; one view is made per pool texture the first time it is seen.
     ID3D11ShaderResourceView* SourceFor(int slot);
     bool DrawMarker(const bool cells[FrameMarker::kCells]);
+    // -tint: the border over the current target, drawn after whatever drew a synthesized frame
+    // (the blend, a -blend shader, the scaler or the warp), so one pass serves all four. exec is
+    // the executor code of the pixels; hold is a hold re-drawing a synthesized frame.
+    void DrawTint(int exec, bool hold);
     void SampleStats();
     void SamplePresentationPath();
     // The optical flow's view of a ring slot: its stamp and the view to sample.
@@ -190,7 +210,9 @@ private:
     // a mode change or an alt-tab, and it bounds how long a dead run can sit unnoticed.
     static const int kStallTimeouts = 5000 / kWaitTimeoutMs;
 
-    // Marker compositor-ID cell: the blend pipeline, or the optical flow.
+    // Marker compositor-ID cell: the nearest selection, the blend pipeline, or the optical flow,
+    // as the D3D9 compositors number them.
+    static const int kCompositorIdNearest = 0;
     static const int kCompositorIdBlend = 1;
     static const int kCompositorIdFlow = 3;
     // Synthesis executor codes: the lerp, matching the D3D9 blend compositor's, and the warp.
@@ -227,6 +249,13 @@ private:
     // WGC texture this present copies (NULL when it drew), and whether its setup failed, which
     // changes what the refusal tells the user.
     CopyEngineTarget* m_copyEngine = NULL;
+    // A timer's present goes through that target whatever the capture, as does -wgc's with the
+    // copy engine (m_composition, from the constructor); a frame is copied on the copy engine
+    // only in the second case (m_copies). The name says which target and compositor this is.
+    bool m_timer = false;
+    bool m_copies = false;
+    bool m_composition = false;
+    char m_name[64] = "";
     ID3D11Texture2D* m_copySource = NULL;
     bool m_copyEngineLost = false;
     bool m_copyEngineFailed = false;
@@ -242,6 +271,7 @@ private:
     ID3D11VertexShader* m_vs;
     ID3D11PixelShader* m_ps;
     ID3D11PixelShader* m_markerPs;
+    ID3D11PixelShader* m_tintPs = NULL;     // -tint's border colour; NULL without -tint
     ID3D11Buffer* m_cb;                 // one float4 for the lerp, one uint4 of marker cells
     ID3D11SamplerState* m_sampler;
 
@@ -262,6 +292,9 @@ private:
     // without -blend, when the present draws the blend of its own.
     int m_blendShader = -1;
     BlendShaders* m_blend = NULL;
+
+    // The nearest selection (t): one real frame per present, never a synthesized one.
+    bool m_nearest = false;
 
     // The optical flow (o): NULL on the blend pipeline.
     bool m_interp = false;

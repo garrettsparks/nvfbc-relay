@@ -175,6 +175,11 @@ kcd_60x2_gameplay_2026_10_26_1.trace
 # and 62 stalls an hour in 35 bursts. 12 lock releases, 8 of them in 13 s of steady 26 ms hitches
 # on the walk out of a barn, where the worst blend run (38) also sits; all 12 match the replay.
 kcd_60x2_gameplay_2026_10_27_0.trace
+# 71 minutes of the 2026-10-28 stream, o:vsync through Windows.Graphics.Capture on the build
+# that plans the optical flow by running the present step ahead: 278 hitches and 60 stalls an
+# hour in 119 bursts. 23 lock releases, 6 of them in 7 s of hitches at 1478 s; all 23 match the
+# replay. The field planned every one of its 2160 synthesized presents.
+kcd_60x2_ovsync_2026_10_28_3.trace
 # The modes off the D3D11 present, one marked 5-minute local recording each (2026-10-28), walking
 # and turning in an open field. t:dwm runs the nearest selection on DWM's compose tick: no
 # passthrough gate, no lookahead, measured by repeats. b:60 blends on a 60 fps timer, b:dwm on

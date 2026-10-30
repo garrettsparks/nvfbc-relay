@@ -124,6 +124,7 @@
     <ClCompile Include="OpticalFlowWarp.cpp" />
     <ClCompile Include="NvFBCSession.cpp" />
     <ClCompile Include="OutputWindow.cpp" />
+    <ClCompile Include="Pacing.cpp" />
     <ClCompile Include="PresentScheduler.cpp" />
     <ClCompile Include="Prompts.cpp" />
     <ClCompile Include="TemporalCaptureMode.cpp" />
@@ -160,6 +161,7 @@
     <ClInclude Include="NvFBCSession.h" />
     <ClInclude Include="OpticalFlowWarp.h" />
     <ClInclude Include="OutputWindow.h" />
+    <ClInclude Include="Pacing.h" />
     <ClInclude Include="PresentScheduler.h" />
     <ClInclude Include="Prompts.h" />
     <ClInclude Include="RelayContext.h" />

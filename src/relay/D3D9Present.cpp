@@ -112,11 +112,11 @@ long long D3D9PresentPath::BurnMarker(const CompositeOutcome& out) {
                                     out.synthesized, m_compositor->Id(), out.pixelExec);
 }
 
-LONGLONG D3D9PresentPath::Present(bool /*vsync*/) {
-    // The presentation interval is fixed at device creation (GetPresentationInterval), so
-    // the vsync flag is decided there: under INTERVAL_ONE this present blocks until DWM's
-    // next compose (source clock on a composed desktop; card clock under a fullscreen game)
-    // and IS the frame-pacing wait; under IMMEDIATE it returns at once.
+LONGLONG D3D9PresentPath::Present() {
+    // The presentation interval is fixed at device creation (GetPresentationInterval): under
+    // INTERVAL_ONE this present blocks until DWM's next compose (source clock on a composed
+    // desktop; card clock under a fullscreen game) and IS the frame-pacing wait; under
+    // IMMEDIATE it returns at once.
     //
     // dwFlags is 0 and must stay 0. It is NOT a presentation interval: the only legal
     // values are D3DPRESENT_DONOTWAIT and D3DPRESENT_LINEAR_CONTENT, and the interval is

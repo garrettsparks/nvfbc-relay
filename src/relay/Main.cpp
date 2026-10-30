@@ -65,12 +65,17 @@ IFrameCaptureMode* CreateCaptureMode(const std::string& modeText, const launch::
     CompositorKind compositor = kCompositorNearest;
     if (spec.compositor == launch::Compositor::Blend) compositor = kCompositorBlend;
     else if (spec.compositor == launch::Compositor::Interp) compositor = kCompositorInterp;
+    const bool d3d9 = launch::MovesToD3D9(spec, o.d3d9);
+    if (o.d3d9 && !d3d9) {
+        LOG("-d3d9 ignored: it moves only the timer modes of t and b; the DWM modes are on the "
+            "D3D9 present already, and this mode has only the D3D11 one");
+    }
     return new TemporalCaptureMode(spec.framerate, spec.vsyncPresent, o.srcRateHint, o.lock,
                                    compositor, o.mark, o.markFrames, o.tint, o.etw, o.noJoin,
                                    o.dejitter, o.fgPhase, o.phaseKeep, o.extraLagMs,
-                                   spec.d3d11Present, o.deferCopy, o.wgc, o.wgcDrop,
+                                   spec.d3d11Present && !d3d9, o.deferCopy, o.wgc, o.wgcDrop,
                                    o.wgcCursor, o.wgcOpen, o.wgcScale, o.copyEngine,
-                                   o.blendShader);
+                                   o.blendShader, o.tightWait);
 }
 
 // Takes the named lock that keeps a second relay from starting. Two relays cannot share NvFBC,
@@ -131,17 +136,18 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
     // FLIPEX device on its hidden host would only add a way for creation to fail. The modes that
     // grab straight into the back buffer fetch it once at startup, and flip mode rotates it.
     if (options.flipEx && r.mode->PresentsViaD3D11()) {
-        LOG("-flipex ignored: b:vsync presents through its own D3D11 swapchain");
+        LOG("-flipex ignored: this mode presents through its own D3D11 swapchain");
         options.flipEx = false;
     } else if (options.flipEx && !r.mode->PresentsOnTargetAdapter()) {
         LOG("-flipex ignored: this mode grabs into a back buffer fetched once, which flip mode "
             "rotates");
         options.flipEx = false;
     }
-    // WGC's frame pool lives on the D3D11 present's device, which only b:vsync has.
+    // WGC's frame pool lives on the D3D11 present's device, which the modes on the D3D9 present
+    // (vsync, a bare number, diag, and the moved modes under -d3d9) do not have.
     if (options.wgc && !r.mode->PresentsViaD3D11()) {
-        LOG("-wgc ignored: capture through Windows.Graphics.Capture needs b:vsync; capturing "
-            "with NvFBC");
+        LOG("-wgc ignored: capture through Windows.Graphics.Capture needs a mode on the D3D11 "
+            "present; capturing with NvFBC");
         options.wgc = false;
     }
     LOG("Source display: [%u] %s (%s)", source.adapter, source.Name().c_str(),
@@ -178,9 +184,9 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
     ctx.flipEx = options.flipEx;
     LOG("Buffer size: %dx%d", ctx.width, ctx.height);
 
-    // The copy engine copies WGC's frames, so only a -wgc launch presents through it, and its
-    // output window has no redirection bitmap: DirectComposition gives it all its content.
-    const bool copyEngine = r.mode->PresentsViaD3D11() && options.wgc && options.copyEngine;
+    // The composition swapchain (the copy engine's, and every timer mode's) has an output window
+    // with no redirection bitmap: DirectComposition gives it all its content.
+    const bool copyEngine = r.mode->PresentsThroughComposition();
     if (MaybeFailure f = CreateOutputWindows(instance, showCommand, target,
                                              r.mode->PresentsViaD3D11(), copyEngine,
                                              &r.windows)) {

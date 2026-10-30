@@ -7,27 +7,25 @@
 #include "PresentStep.h"
 #include "EtwConsumer.h"
 
-// Defined in IPresentPath.h, which this header deliberately does not pull in: only the
-// implementation needs the concrete present paths.
+// Defined in IPresentPath.h and Pacing.h, which this header deliberately does not pull in: only
+// the implementation needs the concrete present paths and pacings.
 class IPresentPath;
+class IPacing;
 
 // Temporal capture mode: frame selection and composition for smooth fixed-rate capture of
 // a (possibly variable-rate) source.
 //
 // Composition of the shared pieces plus a trivial selection step:
 //   CaptureRing      - capture thread fills a ring with source frames stamped at arrival.
-//   Present timing   - two options (the <selection>:<present> framework's present axis):
-//                      timer  (t:60)    - PresentScheduler's absolute-QPC deadline drives it.
-//                      vsync  (t:dwm)   - the present path's own blocking wait drives it, and
-//                                         which clock that is belongs to the path: DWM's
-//                                         compose clock on the D3D9 swapchain (regime-
-//                                         dependent: the source display's rate on a composed
-//                                         desktop, card-locked 60 Hz under a fullscreen game),
-//                                         the SINK's vblank on the D3D11 flip-model swapchain.
+//   Pacing           - the clock each present waits on (Pacing.h, the <selection>:<present>
+//                      framework's present axis): the output's vblank (b:vsync), DWM's compose
+//                      clock (t:dwm, b:dwm) or a QPC timer (t:60). This loop never asks which.
 //   Present path     - everything from the bracket to the screen: the compositor (nearest
 //                      copies one real frame; blend lerps the pair; interp motion-compensates
-//                      the pair), the marker, the swapchain and its statistics. This loop
-//                      never asks which path it is driving.
+//                      the pair), the marker, the swapchain and its statistics. The D3D11
+//                      present carries the vblank and timer modes, the D3D9 one the DWM modes
+//                      (and the timer modes under -d3d9). This loop never asks which path it is
+//                      driving.
 //   This mode        - each present: run the policy step (policy::StepPresent: the target
 //                      lagged a fixed bracketing delay behind, the lock, the lookahead, stage
 //                      6, the bracket and the decision), hand the bracket and the decision to
@@ -65,12 +63,16 @@ private:
     // device work happens in Setup, after the ring has started. The compositor lives behind
     // it, so this class holds no compositor of its own.
     IPresentPath* m_present;
+    // THE PACING. Owned. Chosen with the present path, since which clocks a path can wait on is
+    // the path's: the output's vblank is the D3D11 present's wait, DWM's compose clock the D3D9
+    // present's blocking present.
+    IPacing* m_pacing;
     int m_telemetryCountdown;       // presents until the next estimator-vs-assumption audit
     CompositorKind m_compositorKind;
     bool m_lock;                    // the comb lock unless -nolock; -src or the assumed 60
     bool m_mark;                    // -mark: burn the frame-counter marker (debug); default off
     unsigned int m_markFrames;      // -mark N: burn only the first N presents; 0 = all (unset)
-    bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: the path's blocking present (t:dwm, b:vsync)
+    bool m_vsyncPresent;            // false: QPC-timer present (t:60); true: a display's clock (t:dwm, b:vsync)
     LARGE_INTEGER m_baseQpc;        // logging time origin
     float m_targetFramerate;
     float m_srcRateHint;            // declared source fps (-src); 0 = unset, assume >= 60
@@ -120,7 +122,7 @@ private:
     // engine (CopyEngineTarget).
     bool m_wgcCopyEngine;
     bool m_phaseKeepRequested;     // asked for, so an unmet prerequisite can say so once
-    char m_modeName[64];            // GetModeName: the compositor kind and the present path
+    char m_modeName[160];           // GetModeName: the compositor kind, the present path, the pacing
     long long m_noAfterRun = 0;          // consecutive presents with no after-frame; logged per run
     // Session telemetry, all logged at exit: without the blocked counts, a live A/B cannot
     // distinguish "no late deliveries" from "corrections measured and discarded".
@@ -142,9 +144,10 @@ private:
     LONGLONG LagForSourcePeriod(LONGLONG srcPeriodQpc) const;
 
 public:
-    // d3d11Present selects the D3D11 flip-model present path, which carries the blend and the
-    // optical flow interp; the parser pairs it with kCompositorBlend and kCompositorInterp, and
-    // the interp with nothing else.
+    // d3d11Present selects the D3D11 present path, which carries every compositor;
+    // without it the D3D9 path carries the nearest selection or the blend, never the interp, and
+    // a vsync present there paces on DWM's compose clock. tightWait is the timer's tight wait
+    // (PresentScheduler).
     TemporalCaptureMode(float framerate, bool vsyncPresent = false, float srcRateHint = 0.0f,
                         bool lock = false, CompositorKind compositor = kCompositorNearest,
                         bool mark = false, unsigned int markFrames = 0, bool tint = false,
@@ -153,7 +156,7 @@ public:
                         unsigned int extraLagMs = 0, bool d3d11Present = false,
                         bool deferCopy = false, bool wgc = false, bool wgcDrop = true,
                         bool wgcCursor = true, bool wgcOpen = true, int wgcScale = 0,
-                        bool wgcCopyEngine = true, int blendShader = -1);
+                        bool wgcCopyEngine = true, int blendShader = -1, bool tightWait = true);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;
@@ -163,6 +166,8 @@ public:
     virtual bool PresentsOnTargetAdapter() const override { return true; }
     // A property of the chosen present path, not of the mode.
     virtual bool PresentsViaD3D11() const override;
+    // Also the chosen present path's: -wgc with the copy engine, or a timer, on the D3D11 present.
+    virtual bool PresentsThroughComposition() const override;
     virtual MaybeFailure Setup(const RelayContext& ctx) override;
     virtual MaybeFailure Run(RelayContext& ctx,
                              NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) override;

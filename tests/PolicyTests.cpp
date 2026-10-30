@@ -5300,7 +5300,7 @@ static launch::Options ParseOptionString(const char* text, std::vector<std::stri
 static int CountSwitchesOn(const launch::Options& o) {
     return (int)o.lock + (int)o.tint + (int)o.etw + (int)o.noJoin + (int)o.dejitter +
            (int)o.fgPhase + (int)o.phaseKeep + (int)o.flipEx + (int)o.mark + (int)o.deferCopy +
-           (int)o.wgc + (int)o.wgcDrop + (int)o.wgcCursor + (int)o.wgcOpen;
+           (int)o.wgc + (int)o.wgcDrop + (int)o.wgcCursor + (int)o.wgcOpen + (int)o.d3d9;
 }
 
 static bool SameOptions(const launch::Options& a, const launch::Options& b) {
@@ -5311,7 +5311,8 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.markFrames == b.markFrames && a.extraLagMs == b.extraLagMs &&
            a.deferCopy == b.deferCopy && a.wgc == b.wgc && a.wgcDrop == b.wgcDrop &&
            a.wgcCursor == b.wgcCursor && a.wgcOpen == b.wgcOpen && a.wgcScale == b.wgcScale &&
-           a.copyEngine == b.copyEngine && a.blendShader == b.blendShader;
+           a.copyEngine == b.copyEngine && a.blendShader == b.blendShader &&
+           a.tightWait == b.tightWait && a.d3d9 == b.d3d9;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
@@ -5319,7 +5320,7 @@ static launch::Options SwitchesAt(bool on) {
     launch::Options o;
     o.lock = o.tint = o.etw = o.noJoin = o.dejitter = on;
     o.fgPhase = o.phaseKeep = o.flipEx = o.mark = o.deferCopy = o.wgc = o.wgcDrop = on;
-    o.wgcCursor = o.wgcOpen = on;
+    o.wgcCursor = o.wgcOpen = o.d3d9 = on;
     o.dejitterRequested = on;
     return o;
 }
@@ -5342,6 +5343,8 @@ static void test_launch_defaults() {
     CHECK(o.wgcScale == 0 && !std::strcmp(launch::WgcScaleNames()[o.wgcScale], "bilinear"),
           "WGC's scaling must default to bilinear, got %d", o.wgcScale);
     CHECK(o.blendShader == -1, "-blend must default to not typed, got %d", o.blendShader);
+    CHECK(o.tightWait, "the tight wait of the timer modes must default on");
+    CHECK(!o.d3d9, "the moved modes must default to the D3D11 present");
     CHECK(CountSwitchesOn(o) == 7 && o.markFrames == 0,
           "exactly the lock, flip timing, late-batch correction, the deferred ring copy, "
           "leaving out pointer frames, the pointer in the WGC picture and the WGC frame pool on "
@@ -5385,12 +5388,26 @@ static void test_launch_option_parsing() {
     unknown.clear();
     o = ParseOptionString(
         "-nolock -noetw -nodejit -lag 0 -nodefercopy -nowgcdrop -nowgccursor -nowgcopen "
-        "-nocopyengine",
+        "-nocopyengine -notightwait",
         &warnings, &unknown);
     CHECK(!o.lock && !o.etw && !o.dejitter && o.extraLagMs == 0 && !o.deferCopy &&
-              !o.wgcDrop && !o.wgcCursor && !o.wgcOpen && !o.copyEngine &&
+              !o.wgcDrop && !o.wgcCursor && !o.wgcOpen && !o.copyEngine && !o.tightWait &&
               CountSwitchesOn(o) == 0,
           "the opt-outs must turn every default off");
+
+    // -notightwait has no positive spelling either, like -nocopyengine below.
+    {
+        launch::Options x;
+        std::string w;
+        const std::vector<std::string> t = {"-notightwait"};
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 1 && !x.tightWait && w.empty(),
+              "-notightwait must clear the tight wait and consume one token");
+        x.tightWait = true;
+        CHECK(SameOptions(x, launch::Options()), "-notightwait must change nothing else");
+        const std::vector<std::string> on = {"-tightwait"};
+        CHECK(launch::ApplyOption(on, 0, &x, &w) == 0,
+              "-tightwait must be unknown: the tight wait is on unless turned off");
+    }
 
     // -nocopyengine has no positive spelling (no launch string ever named one): it clears
     // only its own field, and a launch that does not name it keeps the default.
@@ -5419,6 +5436,7 @@ static void test_launch_option_parsing() {
         {"-mark", &launch::Options::mark},         {"-defercopy", &launch::Options::deferCopy},
         {"-wgc", &launch::Options::wgc},           {"-wgcdrop", &launch::Options::wgcDrop},
         {"-wgccursor", &launch::Options::wgcCursor}, {"-wgcopen", &launch::Options::wgcOpen},
+        {"-d3d9", &launch::Options::d3d9},
     };
     for (const Switch& s : switches) {
         launch::Options x = SwitchesAt(false);
@@ -5444,7 +5462,7 @@ static void test_launch_option_parsing() {
         const std::vector<std::string> t = {s.flag};
         std::string w;
         const size_t n = launch::ApplyOption(t, 0, &x, &w);
-        CHECK(n == 1 && !(x.*(s.field)) && CountSwitchesOn(x) == 13 && w.empty(),
+        CHECK(n == 1 && !(x.*(s.field)) && CountSwitchesOn(x) == 14 && w.empty(),
               "%s must clear exactly its own switch and consume one token", s.flag);
     }
 
@@ -5615,52 +5633,72 @@ static void test_launch_mode_parsing() {
         ModeKind kind;
         Compositor compositor;
         bool vsyncPresent;
+        bool dwmClock;
         bool d3d11Present;
         float framerate;
     };
     const Case cases[] = {
         // A blank answer is the release path, b:vsync; the original mode needs its name.
-        {"",           ModeKind::Temporal, Compositor::Blend,   true,  true,  60.0f},
-        {"vsync",      ModeKind::Vsync,    Compositor::Nearest, false, false, 0.0f},
-        {"VSync",      ModeKind::Vsync,    Compositor::Nearest, false, false, 0.0f},
+        {"",           ModeKind::Temporal, Compositor::Blend,   true,  false, true,  60.0f},
+        {"vsync",      ModeKind::Vsync,    Compositor::Nearest, false, false, false, 0.0f},
+        {"VSync",      ModeKind::Vsync,    Compositor::Nearest, false, false, false, 0.0f},
         // The blend on the D3D11 flip-model swapchain, presenting on the sink's vblank.
-        {"b",          ModeKind::Temporal, Compositor::Blend,   true,  true,  60.0f},
-        {"b:vsync",    ModeKind::Temporal, Compositor::Blend,   true,  true,  60.0f},
-        {"B:VSYNC",    ModeKind::Temporal, Compositor::Blend,   true,  true,  60.0f},
-        // The same blend on the D3D9 swapchain, on DWM's compose clock.
-        {"b:dwm",      ModeKind::Temporal, Compositor::Blend,   true,  false, 60.0f},
-        {"t",          ModeKind::Temporal, Compositor::Nearest, true,  false, 60.0f},
-        {"t:dwm",      ModeKind::Temporal, Compositor::Nearest, true,  false, 60.0f},
-        {"T:DWM",      ModeKind::Temporal, Compositor::Nearest, true,  false, 60.0f},
+        {"b",          ModeKind::Temporal, Compositor::Blend,   true,  false, true,  60.0f},
+        {"b:vsync",    ModeKind::Temporal, Compositor::Blend,   true,  false, true,  60.0f},
+        {"B:VSYNC",    ModeKind::Temporal, Compositor::Blend,   true,  false, true,  60.0f},
+        // The same blend and the nearest selection on DWM's compose clock, on the D3D9 present.
+        {"b:dwm",      ModeKind::Temporal, Compositor::Blend,   true,  true,  false, 60.0f},
+        {"t",          ModeKind::Temporal, Compositor::Nearest, true,  true,  false, 60.0f},
+        {"t:dwm",      ModeKind::Temporal, Compositor::Nearest, true,  true,  false, 60.0f},
+        {"T:DWM",      ModeKind::Temporal, Compositor::Nearest, true,  true,  false, 60.0f},
         // The optical flow interpolation, on the D3D11 flip-model swapchain like b:vsync.
-        {"o",          ModeKind::Temporal, Compositor::Interp,  true,  true,  60.0f},
-        {"o:vsync",    ModeKind::Temporal, Compositor::Interp,  true,  true,  60.0f},
-        {"O:VSYNC",    ModeKind::Temporal, Compositor::Interp,  true,  true,  60.0f},
-        // X:<fps> presents on a QPC timer at that rate, on the D3D9 swapchain.
-        {"b:60",       ModeKind::Temporal, Compositor::Blend,   false, false, 60.0f},
-        {"t:59.94",    ModeKind::Temporal, Compositor::Nearest, false, false, 59.94f},
-        {"diag",       ModeKind::Diag,     Compositor::Nearest, false, false, 0.0f},
-        {"diag:vsync", ModeKind::Diag,     Compositor::Nearest, true,  false, 0.0f},
-        {"60",         ModeKind::Timer,    Compositor::Nearest, false, false, 60.0f},
-        {"59.94",      ModeKind::Timer,    Compositor::Nearest, false, false, 59.94f},
+        {"o",          ModeKind::Temporal, Compositor::Interp,  true,  false, true,  60.0f},
+        {"o:vsync",    ModeKind::Temporal, Compositor::Interp,  true,  false, true,  60.0f},
+        {"O:VSYNC",    ModeKind::Temporal, Compositor::Interp,  true,  false, true,  60.0f},
+        // X:<fps> presents on a QPC timer at that rate, on the D3D11 present.
+        {"b:60",       ModeKind::Temporal, Compositor::Blend,   false, false, true,  60.0f},
+        {"t:59.94",    ModeKind::Temporal, Compositor::Nearest, false, false, true,  59.94f},
+        {"o:60",       ModeKind::Temporal, Compositor::Interp,  false, false, true,  60.0f},
+        {"O:120",      ModeKind::Temporal, Compositor::Interp,  false, false, true,  120.0f},
+        {"diag",       ModeKind::Diag,     Compositor::Nearest, false, false, false, 0.0f},
+        {"diag:vsync", ModeKind::Diag,     Compositor::Nearest, true,  false, false, 0.0f},
+        {"60",         ModeKind::Timer,    Compositor::Nearest, false, false, false, 60.0f},
+        {"59.94",      ModeKind::Timer,    Compositor::Nearest, false, false, false, 59.94f},
     };
     for (const Case& c : cases) {
         const launch::ModeSpec s = launch::ParseMode(c.text);
         CHECK(s.kind == c.kind && s.compositor == c.compositor &&
-                  s.vsyncPresent == c.vsyncPresent && s.d3d11Present == c.d3d11Present &&
-                  s.framerate == c.framerate,
-              "mode '%s' parsed as kind %d compositor %d vsync %d d3d11 %d fps %.2f", c.text,
-              (int)s.kind, (int)s.compositor, (int)s.vsyncPresent, (int)s.d3d11Present,
-              s.framerate);
+                  s.vsyncPresent == c.vsyncPresent && s.dwmClock == c.dwmClock &&
+                  s.d3d11Present == c.d3d11Present && s.framerate == c.framerate,
+              "mode '%s' parsed as kind %d compositor %d vsync %d dwm %d d3d11 %d fps %.2f",
+              c.text, (int)s.kind, (int)s.compositor, (int)s.vsyncPresent, (int)s.dwmClock,
+              (int)s.d3d11Present, s.framerate);
     }
 
     // Everything else is refused, including the retired b:flip spelling, t:vsync (frame selection
-    // has no path on the sink's vblank yet, and the name waits for one), o on a timer or on DWM's
-    // clock (the optical flow interpolation has only the D3D11 present), and rates outside
-    // (0, 1000].
+    // on the sink's vblank, the name kept for when someone asks for it), o:dwm (the optical flow
+    // on DWM's clock, likewise), and rates outside (0, 1000].
     for (const char* bad : {"b:", "b:abc", "b:flip", "t:vsync", "b:0", "0", "1001", "x:60", "abc",
-                            "d:60", "o:120", "o:60", "o:dwm"}) {
+                            "d:60", "o:dwm", "o:0", "o:1001", "o:abc"}) {
         CHECK(launch::ParseMode(bad).kind == ModeKind::Invalid, "mode '%s' must be refused", bad);
+    }
+
+    // -d3d9 puts back on the D3D9 swapchain exactly the timer modes that ran there before the
+    // move. The modes on the output's vblank and the optical flow stay on the D3D11 present, the
+    // DWM modes are on the D3D9 one already, and nothing moves without the option.
+    struct Move { const char* text; bool moves; };
+    const Move moves[] = {
+        {"t:59.94", true}, {"b:60", true}, {"t", false}, {"t:dwm", false}, {"b:dwm", false},
+        {"", false}, {"b", false}, {"b:vsync", false}, {"o", false}, {"o:vsync", false},
+        {"o:60", false}, {"vsync", false}, {"60", false}, {"diag", false},
+    };
+    for (const Move& m : moves) {
+        const launch::ModeSpec s = launch::ParseMode(m.text);
+        CHECK(launch::MovesToD3D9(s, true) == m.moves,
+              "-d3d9 must %s mode '%s' to the D3D9 present", m.moves ? "move" : "leave",
+              m.text);
+        CHECK(!launch::MovesToD3D9(s, false),
+              "mode '%s' must stay where it is without -d3d9", m.text);
     }
 
     // The optical flow probe: no loop, then each loop by its spelling; seconds 1 to 3600.
@@ -5865,6 +5903,9 @@ static void test_launch_relaunch_round_trip() {
         "-blend linear -src 90",
         "-wgc -blend pan -src 90 -mark 5400",
         "-blend linear -blend pan -lag 60",
+        "-notightwait",
+        "-d3d9 -notightwait -tint",
+        "-wgc -d3d9",
     };
     for (const char* text : launches) {
         launch::Options typed = ParseOptionString(text, nullptr, nullptr);

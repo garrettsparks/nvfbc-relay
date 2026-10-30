@@ -38,7 +38,7 @@ CopyEngineTarget::~CopyEngineTarget() {
         }
     }
     for (auto& source : m_sources) Release(source.second);
-    for (int i = 0; i < kBuffers; i++) {
+    for (int i = 0; i < kMaxBuffers; i++) {
         Release(m_stripUpload[i]);
         Release(m_buffer12[i]);
         Release(m_rtv[i]);
@@ -58,7 +58,7 @@ CopyEngineTarget::~CopyEngineTarget() {
     Release(m_manager);
     if (m_surfaceHandle) CloseHandle(m_surfaceHandle);
     Release(m_list);
-    for (int i = 0; i < kBuffers; i++) Release(m_alloc[i]);
+    for (int i = 0; i < kMaxBuffers; i++) Release(m_alloc[i]);
     Release(m_copyQueue);
     Release(m_d3d12);
     Release(m_presentContext);
@@ -68,7 +68,9 @@ CopyEngineTarget::~CopyEngineTarget() {
 
 bool CopyEngineTarget::Setup(ID3D11Device* drawDevice, ID3D11DeviceContext* drawContext,
                              HWND hwnd, int width, int height, DXGI_FORMAT format,
-                             int sinkRefreshHz) {
+                             int sinkRefreshHz, int buffers) {
+    m_buffers = buffers < 2 ? 2 : buffers;
+    if (m_buffers > kMaxBuffers) m_buffers = kMaxBuffers;
     m_width = width;
     m_height = height;
     m_format = format;
@@ -89,7 +91,7 @@ bool CopyEngineTarget::Setup(ID3D11Device* drawDevice, ID3D11DeviceContext* draw
     if (!CreateMarkerUploads()) return false;
     LOG("Copy engine: presents through the composition swapchain, %d buffers %dx%d; a present "
         "of one frame as it is is copied on the D3D12 copy queue, any other is drawn",
-        kBuffers, width, height);
+        m_buffers, width, height);
     return true;
 }
 
@@ -134,7 +136,7 @@ bool CopyEngineTarget::CreateDevices(ID3D11Device* drawDevice) {
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
     hr = m_d3d12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void**)&m_copyQueue);
-    for (int i = 0; i < kBuffers && SUCCEEDED(hr); i++) {
+    for (int i = 0; i < m_buffers && SUCCEEDED(hr); i++) {
         hr = m_d3d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY,
                                              __uuidof(ID3D12CommandAllocator), (void**)&m_alloc[i]);
     }
@@ -209,7 +211,7 @@ bool CopyEngineTarget::CreateBuffers(HWND hwnd, DXGI_FORMAT format) {
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
     td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
                    D3D11_RESOURCE_MISC_SHARED_DISPLAYABLE;
-    for (int i = 0; i < kBuffers && SUCCEEDED(hr); i++) {
+    for (int i = 0; i < m_buffers && SUCCEEDED(hr); i++) {
         hr = m_presentDevice->CreateTexture2D(&td, NULL, &m_buffer[i]);
         if (SUCCEEDED(hr)) {
             hr = m_manager->AddBufferFromResource(m_buffer[i], &m_presentationBuffer[i]);
@@ -346,7 +348,7 @@ bool CopyEngineTarget::CreateMarkerUploads() {
     bd.SampleDesc.Count = 1;
     bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     HRESULT hr = S_OK;
-    for (int i = 0; i < kBuffers && SUCCEEDED(hr); i++) {
+    for (int i = 0; i < m_buffers && SUCCEEDED(hr); i++) {
         hr = m_d3d12->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &bd,
                                               D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                                               __uuidof(ID3D12Resource), (void**)&m_stripUpload[i]);
@@ -528,7 +530,7 @@ bool CopyEngineTarget::PresentDrawn() {
 bool CopyEngineTarget::Present() {
     m_surface->SetBuffer(m_presentationBuffer[m_next]);
     const HRESULT hr = m_manager->Present();
-    m_next = (m_next + 1) % kBuffers;
+    m_next = (m_next + 1) % m_buffers;
     DrainStatistics();
     if (FAILED(hr)) {
         if (m_presentFailures++ == 0) LOGERR("Copy engine: Present failed (0x%08lx)", hr);

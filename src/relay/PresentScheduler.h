@@ -12,12 +12,18 @@
 // Usage:
 //   Setup(framerate) once; Seed() at the start of the loop; then per present:
 //   WaitUntilDeadline(); <do work + PresentEx>; Advance();
+//
+// The tight wait (SetTightWait, off unless a mode asks for it): the timer is set to about 1 ms
+// before the deadline and the rest is waited out watching QPC, yielding the core between reads.
+// The timer alone woke a median 0.32 ms late and up to 2.2 ms (b:60, 2026-10-28); the spin's
+// wake is a few QPC reads late, for up to about 1 ms of one core per present.
 class PresentScheduler {
 private:
     HANDLE m_timer;
     LARGE_INTEGER m_freq;         // QPC frequency (ticks/sec)
     LONGLONG m_periodQpc;         // target frame interval in QPC ticks
     LARGE_INTEGER m_nextPresent;  // absolute QPC deadline for the next present
+    bool m_tight;                 // the timer to about 1 ms early, then a spin on QPC
 
 public:
     PresentScheduler();
@@ -29,6 +35,9 @@ public:
 
     // Create the high-res timer and compute the period from the target framerate.
     bool Setup(float framerate);
+
+    // The tight wait for every WaitUntilDeadline from here on.
+    void SetTightWait(bool on) { m_tight = on; }
 
     // Anchor the first deadline one period from now.
     void Seed();

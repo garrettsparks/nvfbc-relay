@@ -4,6 +4,7 @@
 PresentScheduler::PresentScheduler()
     : m_timer(NULL)
     , m_periodQpc(0)
+    , m_tight(false)
 {
     m_freq.QuadPart = 0;
     m_nextPresent.QuadPart = 0;
@@ -46,12 +47,20 @@ void PresentScheduler::WaitUntilDeadline() {
         m_nextPresent.QuadPart = now.QuadPart;
     }
 
+    // The tight wait leaves its last millisecond to the spin below.
+    const LONGLONG lead = m_tight ? m_freq.QuadPart / 1000 : 0;
     LONGLONG ticksUntilPresent = m_nextPresent.QuadPart - now.QuadPart;
-    if (ticksUntilPresent > 0) {
+    if (ticksUntilPresent > lead) {
         LARGE_INTEGER due;
-        due.QuadPart = -(ticksUntilPresent * 10000000 / m_freq.QuadPart);  // 100ns units, relative
+        due.QuadPart = -((ticksUntilPresent - lead) * 10000000 / m_freq.QuadPart);  // 100ns units, relative
         SetWaitableTimer(m_timer, &due, 0, NULL, NULL, FALSE);
         WaitForSingleObject(m_timer, INFINITE);
+    }
+    if (!m_tight) return;
+    QueryPerformanceCounter(&now);
+    while (now.QuadPart < m_nextPresent.QuadPart) {
+        SwitchToThread();
+        QueryPerformanceCounter(&now);
     }
 }
 

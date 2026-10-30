@@ -2,6 +2,7 @@
 #include "FrameCompositors.h"
 #include "D3D9Present.h"
 #include "D3D11Present.h"
+#include "Pacing.h"
 #include "NvFBCSession.h"
 #include "OutputWindow.h"
 #include <SimpleLogger.h>
@@ -84,10 +85,11 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
                                          bool fgPhase, bool phaseKeep, unsigned int extraLagMs,
                                          bool d3d11Present, bool deferCopy, bool wgc,
                                          bool wgcDrop, bool wgcCursor, bool wgcOpen, int wgcScale,
-                                         bool wgcCopyEngine, int blendShader)
+                                         bool wgcCopyEngine, int blendShader, bool tightWait)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_present(NULL)
+    , m_pacing(NULL)
     , m_telemetryCountdown(0)
     , m_compositorKind(compositor)
     , m_lock(lock)
@@ -114,13 +116,21 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
 {
     m_baseQpc.QuadPart = 0;
 
-    // The one place that knows there are two present paths. The D3D11 backend IS the blend
-    // pipeline, or the optical flow, and brings its own compositor; the D3D9 path hosts the
-    // blend or nearest IFrameCompositor the mode letter selected. Neither decides: they draw
-    // the policy step's decision. Nothing touches a device here: the paths create their
-    // resources in Setup, after the ring has started.
+    // The one place that knows there are two present paths. The D3D11 backend draws every
+    // compositor itself (the nearest frame, the blend, the optical flow) for the vblank and timer
+    // modes; the D3D9 path, for the DWM modes (and the timer modes under -d3d9), hosts the blend
+    // or nearest IFrameCompositor the mode letter selected. Neither decides: they draw the policy
+    // step's decision. Nothing touches a device here: the paths create their resources in Setup,
+    // after the ring has started.
     if (d3d11Present) {
-        m_present = new D3D11PresentBackend(tint, compositor == kCompositorInterp, blendShader);
+        // A timer present goes through the composition swapchain with a third buffer: on the
+        // flip-model one the frame-latency wait held the loop until the card's vblank, and the
+        // timer decided nothing (rig, 2026-10-29: in game b:60 waited 16.6 ms for room after
+        // every wake); with two buffers the composition swapchain did the same under Pandora's
+        // load; with three the timer kept its time (0 presents held).
+        m_present = new D3D11PresentBackend(tint, compositor == kCompositorInterp, blendShader,
+                                            compositor == kCompositorNearest, !vsyncPresent,
+                                            m_wgc && wgcCopyEngine);
     } else {
         if (blendShader >= 0) LOG("-blend ignored: it draws on the D3D11 present only");
         IFrameCompositor* c;
@@ -131,10 +141,19 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
         }
         m_present = new D3D9PresentPath(c);
     }
+    // The clock: a timer, or the present path's own wait (the output's vblank on the D3D11
+    // present, DWM's compose clock in the D3D9 one's blocking present).
+    if (!vsyncPresent) {
+        m_pacing = new TimerPacing(&m_scheduler, tightWait);
+    } else {
+        m_pacing = new PathPacing(d3d11Present);
+    }
+    // mktrace.py reads the compositor from the "Temporal[ blend| interp] (" prefix.
     const char* kindName = "Temporal";
     if (compositor == kCompositorInterp) kindName = "Temporal interp";
     else if (compositor == kCompositorBlend) kindName = "Temporal blend";
-    snprintf(m_modeName, sizeof(m_modeName), "%s (%s)", kindName, m_present->Name());
+    snprintf(m_modeName, sizeof(m_modeName), "%s (%s, paced by %s)", kindName, m_present->Name(),
+             m_pacing->Name());
 }
 
 TemporalCaptureMode::~TemporalCaptureMode() {
@@ -144,11 +163,16 @@ TemporalCaptureMode::~TemporalCaptureMode() {
         m_etwConsumer.LogSummary();
         m_etwConsumer.Stop();
     }
+    delete m_pacing;
     delete m_present;
 }
 
 bool TemporalCaptureMode::PresentsViaD3D11() const {
     return m_present->OwnsOutputWindow();
+}
+
+bool TemporalCaptureMode::PresentsThroughComposition() const {
+    return m_present->UsesComposition();
 }
 
 LONGLONG TemporalCaptureMode::LagForSourcePeriod(LONGLONG srcPeriodQpc) const {
@@ -259,8 +283,8 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
     // comfortably above jitter, well below any source period we target (4.17 ms at 240 Hz).
     m_policyCfg.stickinessQpc = m_scheduler.Freq() / 1000;
 
-    LOG("Temporal mode initialized - %s present (%.2f fps nominal), nearest-frame selection + hysteresis",
-        m_vsyncPresent ? "vsync/vblank" : "QPC-timer", m_targetFramerate);
+    LOG("Temporal mode initialized - paced by %s (%.2f fps nominal), nearest-frame selection + hysteresis",
+        m_pacing->Name(), m_targetFramerate);
     if (m_srcRateHint <= 0.0f) {
         LOGERR("Source rate NOT DECLARED: %.1f fps ASSUMED. The lag below is sized for it, and so "
                "are the comb lock and the passthrough threshold wherever they run. Declare -src "
@@ -478,35 +502,23 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
     LONGLONG lastPresentQpc = 0;
     CaptureRingView ringView(m_ring);
     EtwLatenessSource lateness(m_etwConsumer, m_flipCadenceWindowQpc);
-    m_scheduler.Seed();
+    m_pacing->Start();
 
     while (TRUE)
     {
-        // Present timing. Timer mode waits on the absolute-QPC deadline. Vsync mode lets the
-        // present path's own blocking wait be the pacing, and anchors the target to "now"
-        // (just after the previous frame was consumed) so selection runs on that path's
-        // clock rather than QPC: DWM's compose tick on the D3D9 swapchain (regime-dependent:
-        // the source display's rate on a composed desktop, card-locked 60 Hz under a
-        // fullscreen game on the source), the sink's vblank on the flip-model swapchain.
-        LONGLONG deadline;
-        // How long this present's pacing wait blocked (blk= on the line). A vsync present
-        // that is doing its job spends nearly the whole period waiting; one that returns at
-        // once is not pacing anything, and pdt alone cannot tell those apart. A path that
-        // paces BEFORE the decision blocks in WaitForFrame and is measured here; one that
-        // paces in the present itself returns at once here and reports the block from
-        // Present, so the sum is the whole wait either way.
+        // Present timing (Pacing.h). The timer waits on the absolute-QPC deadline and hands it
+        // to the step. A display's clock (the output's vblank, DWM's compose) anchors the target
+        // to "now", just after the clock ticked, so selection runs on that clock rather than
+        // QPC.
+        //
+        // How long this present's pacing wait blocked on a display's clock (blk= on the line).
+        // A vsync present that is doing its job spends nearly the whole period waiting; one that
+        // returns at once is not pacing anything, and pdt alone cannot tell those apart. A clock
+        // waited on BEFORE the decision is measured by the pacing; the D3D9 present, which
+        // paces in the present itself, reports the block from Present, so the sum is the whole
+        // wait either way.
         LONGLONG blockTicks = 0;
-        if (m_vsyncPresent) {
-            LARGE_INTEGER waitStart, now;
-            QueryPerformanceCounter(&waitStart);
-            m_present->WaitForFrame();
-            QueryPerformanceCounter(&now);
-            blockTicks = now.QuadPart - waitStart.QuadPart;
-            deadline = now.QuadPart;
-        } else {
-            m_scheduler.WaitUntilDeadline();
-            deadline = m_scheduler.Deadline();
-        }
+        const LONGLONG deadline = m_pacing->Wait(m_present, &blockTicks);
         // THE POLICY STEP (policy::StepPresent, in src/core, the code the replay runs): the
         // target behind the deadline by the lag, the comb lock's pull and a wrap's ease; a
         // planned phase-step move landing; stage 6 settling delivery-lateness corrections
@@ -592,7 +604,7 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
         const long long markN = m_present->BurnMarker(outcome);
         LARGE_INTEGER beforePresent;
         QueryPerformanceCounter(&beforePresent);
-        blockTicks += m_present->Present(m_vsyncPresent);
+        blockTicks += m_present->Present();
 
         // Inter-present interval (should hold steady at the present period if the scheduler works).
         LONGLONG presentDelta = (lastPresentQpc != 0) ? (beforePresent.QuadPart - lastPresentQpc) : 0;
@@ -766,7 +778,7 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
             }
         }
 
-        if (!m_vsyncPresent) m_scheduler.Advance();   // vsync paces via the blocking present
+        m_pacing->Advance();
 
         if (!PumpMessages()) break;
         if (m_ring.HasStopped()) {
@@ -788,6 +800,7 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
     }
 
     m_present->LogSummary();
+    m_pacing->LogSummary();
 
     if (m_phaseKeep) {
         // Without the flipped count, a live A/B cannot tell "the rotation was read and no

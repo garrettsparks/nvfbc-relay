@@ -10,12 +10,12 @@
 #include "PresentStep.h"
 
 // THE PRESENT PATH: everything between the bracket the present loop found and the frame
-// reaching the output window. One implementation per swapchain: the D3D9 device's own
-// swapchain, whose windowed INTERVAL_ONE present blocks on DWM's compose clock
-// (D3D9PresentPath), and a DXGI flip-model swapchain on the output window, paced by the
-// sink's own vblank once Windows promotes it to independent flip (D3D11PresentBackend).
-// The loop in TemporalCaptureMode owns the timing, the bracket, the comb lock and the log
-// line, and never asks which of the two it is driving.
+// reaching the output window. One implementation per swapchain: the D3D11 present on the output
+// window, for the vblank and timer modes (D3D11PresentBackend), and the D3D9 device's own
+// swapchain, whose windowed INTERVAL_ONE present blocks on DWM's compose clock, for the DWM
+// modes (D3D9PresentPath). The loop in TemporalCaptureMode owns the timing
+// (through its pacing, Pacing.h), the bracket, the comb lock and the log line, and never asks
+// which of the two it is driving.
 //
 // No path decides. The present's decision, selection or composite, is made by the policy
 // step (policy::StepPresent) on the mode's one PresentStepState, so the decision a path
@@ -23,12 +23,13 @@
 // from the same state. A path executes the decision and keeps only what drawing needs (the
 // surface a repeat or hold re-presents).
 //
-// Call order per present: WaitForFrame, Compose, BurnMarker, Present. The pacing wait sits
-// in WHICHEVER call blocks for that path: the D3D11 path blocks in WaitForFrame, on the
-// swapchain's waitable object and before the decision, and its Present returns at once;
-// the D3D9 path's WaitForFrame returns at once and its INTERVAL_ONE PresentEx is the wait.
-// The loop measures the first around the call and takes the second from Present's return
-// value, so blk= on the temporal line is the whole pacing block whichever path ran.
+// Call order per present: WaitForFrame (from the pacing, after its own clock), Compose,
+// BurnMarker, Present. A display's clock blocks in WHICHEVER call waits on it for that path:
+// the D3D11 path blocks in WaitForFrame, on the swapchain's waitable object and before the
+// decision, and its Present returns at once; the D3D9 path's WaitForFrame returns at once and
+// its INTERVAL_ONE PresentEx is the wait. The pacing measures the first and the loop takes the
+// second from Present's return value, so blk= on the temporal line is the whole block whichever
+// path ran.
 class IPresentPath {
 public:
     virtual ~IPresentPath() {}
@@ -69,7 +70,8 @@ public:
 
     // Show the composed frame. Returns the QPC ticks the call blocked as a pacing wait: the
     // D3D9 vsync present blocks here; a path that already waited in WaitForFrame returns 0.
-    virtual LONGLONG Present(bool vsync) = 0;
+    // Every present lands on a vblank: no path tears.
+    virtual LONGLONG Present() = 0;
 
     // True once this path's swapchain has stopped retiring frames for good. The caller must
     // stop the mode: nothing recovers from here, and a loop left turning holds the capture
@@ -90,4 +92,8 @@ public:
     // allows one swapchain per window and no second API on it, so main then hosts the D3D9
     // devices (the present device, and the ring's capture device) on a hidden window.
     virtual bool OwnsOutputWindow() const = 0;
+
+    // True when this path presents through the composition swapchain (CopyEngineTarget), whose
+    // output window has no redirection bitmap. Known from construction, before any device.
+    virtual bool UsesComposition() const { return false; }
 };

@@ -1,8 +1,9 @@
 #pragma once
 
-// Windows.Graphics.Capture (WGC) as the ring's capture source, asked for with -wgc on b:vsync. A
-// WGC session delivers the source display's frames into a frame pool, and every frame the ring
-// stores stays in the pool for as long as its slot names it. The pool is on a device of its
+// Windows.Graphics.Capture (WGC) as the ring's capture source, asked for with -wgc on a mode of
+// the D3D11 present. A WGC session delivers the source display's frames into a frame pool, and
+// every frame the ring stores stays in the pool for as long as its slot names it. The pool is on
+// a device of its
 // own, made on the D3D11 present's adapter, and the present opens each of its textures through
 // a shared handle and samples it there. With -nowgcopen, or where a device of its own does not
 // work, the pool is on the present's device and the present samples it directly. Either way no

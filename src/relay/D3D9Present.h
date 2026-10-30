@@ -11,8 +11,9 @@
 // under a fullscreen game, the displayed rate under in-game frame generation, the desktop
 // rate with no game). The relay therefore inherits a present cadence, and a present jitter,
 // that belong to another display, and the sink samples one, two or three of those presents
-// per scan. The flip-model path exists to replace that; this one stays as the path that
-// needs nothing from the window manager and carries every compositor.
+// per scan. The D3D11 present replaced it for the vblank and timer modes; this one carries the
+// DWM modes (t, t:dwm, b:dwm), whose clock is exactly this blocking present, and the timer modes
+// of t and b under -d3d9, to be removed once the D3D11 present has held through a release.
 //
 // Hosts any IFrameCompositor (nearest, blend, interp): the compositor decides and draws,
 // this path acquires the back buffer, burns the marker, presents and keeps the statistics.
@@ -36,7 +37,7 @@ public:
     void Compose(const FrameBracket& bracket, const policy::PresentStepResult& step,
                  CompositeOutcome* out) override;
     long long BurnMarker(const CompositeOutcome& out) override;
-    LONGLONG Present(bool vsync) override;
+    LONGLONG Present() override;
 
     // A D3D9 swapchain reports its trouble through the present status, which Present logs;
     // there is no silent stall to detect.

@@ -29,7 +29,10 @@ namespace launch {
 // because the benchmark measured it about 58 points cheaper for the game than the pool on the
 // present's device; -nowgcopen keeps it on the present's device. With -wgc a frame shown as it
 // is goes to the screen through the GPU's copy engine, because the benchmark measured it about
-// 72 points cheaper for the game than drawing it; -nocopyengine draws every frame.
+// 72 points cheaper for the game than drawing it; -nocopyengine draws every frame. A mode on a
+// timer wakes just before each deadline and waits out the rest on the clock itself, because the
+// timer alone woke a median 0.32 ms late and up to 2.2 ms (b:60, 2026-10-28); -notightwait waits
+// on the timer alone.
 struct Options {
     float srcRateHint = 0.0f;       // -src: declared BASE render rate; 0 = not declared
     bool lock = true;               // -lock / -nolock: the phase comb lock
@@ -46,7 +49,8 @@ struct Options {
     unsigned int extraLagMs = 75;   // -lag N: extra bracketing delay, 0 to 200 ms
     bool deferCopy = true;          // -defercopy / -nodefercopy: no ring copy for the frame of a
                                     // frame-generated pair that keep-real drops
-    bool wgc = false;               // -wgc: capture through Windows.Graphics.Capture (b:vsync)
+    bool wgc = false;               // -wgc: capture through Windows.Graphics.Capture (the modes
+                                    // on the D3D11 present)
     bool wgcDrop = true;            // -wgcdrop / -nowgcdrop: with -wgc, leave out the frames
                                     // that only a move of the mouse pointer brought
     bool wgcCursor = true;          // -wgccursor / -nowgccursor: with -wgc, the mouse pointer
@@ -62,6 +66,9 @@ struct Options {
     int blendShader = -1;           // -blend <shader>: synthesized frames on the D3D11 present
                                     // drawn with BlendShaderNames()[blendShader]; -1, not
                                     // typed, the plain blend
+    bool tightWait = true;          // -notightwait: a mode on a timer waits on the timer alone
+    bool d3d9 = false;              // -d3d9: the timer modes of t and b present on the D3D9
+                                    // swapchain, as before they moved to the D3D11 present
 };
 
 // -wgcscale's filters by number, bilinear (0) the default. The names are OBS's.
@@ -173,7 +180,8 @@ inline const std::vector<UsageRow>& OptionRows() {
         {"-defercopy", "", "Skipping that copy; on by default, accepted so a launch string that "
                            "names it keeps working", false, false},
         {"-wgc", "", "Capture through Windows (Windows.Graphics.Capture) in place of NvFBC, with "
-                     "b:vsync only; NvFBC stays when it cannot start", false, false},
+                     "b:vsync, o:vsync and the timer modes (b:60, t:60, o:60); NvFBC stays when "
+                     "it cannot start", false, false},
         {"-nowgcdrop", "", "With -wgc, keep the frames Windows sends when only the mouse pointer "
                            "moved. By default they are left out, since each is a copy of the "
                            "frame before it", false, false},
@@ -196,12 +204,20 @@ inline const std::vector<UsageRow>& OptionRows() {
                               "default a frame shown as it is is copied by a part of the "
                               "graphics card the game does not use, which costs the game less",
          false, false},
-        {"-blend", "pan", "With b:vsync, draw the in-between frames another way: linear (mixed "
-                          "in linear light) or pan (moved along with a camera pan). By default "
-                          "the two frames are simply mixed", false, false},
+        {"-blend", "pan", "With b:vsync or b:60, draw the in-between frames another way: linear "
+                          "(mixed in linear light) or pan (moved along with a camera pan). By "
+                          "default the two frames are simply mixed", false, false},
+        {"-notightwait", "", "With a mode on a timer (b:60, t:59.94), wait on the timer alone. By "
+                             "default the relay wakes just before each frame is due and watches "
+                             "the clock for the rest, which keeps frames evenly spaced and keeps "
+                             "one processor core busy for up to a millisecond a frame",
+         false, false},
+        {"-d3d9", "", "Show the timer modes of t and b (b:60, t:59.94) through the older "
+                      "Direct3D 9 output, as before they moved to the newer one", false, false},
         {"-nojoin", "", "Keep the ETW session and its flip lines, skip the per-present flip join",
          false, false},
-        {"-tint", "", "Border every synthesized frame", false, false},
+        {"-tint", "", "Border every in-between frame: red a blend, green an optical flow frame, "
+                      "blue one shown again", false, false},
         {"-fgphase", "", "Frame-generation phase instrument; stalls the capture thread every wake",
          false, false},
         {"-phasekeep", "", "Phase-aware keep-real, the x3 rotation vote", false, false},
@@ -229,8 +245,9 @@ inline const std::vector<UsageRow>& ModeRows() {
         {"vsync", "", "Shows the newest frame, in step with Windows' desktop.", true, false},
         {"60", "", "Shows the newest frame, on a timer at the given frame rate. This is how "
                    "the original relay ran.", true, false},
-        {"o, o:vsync", "", "Optical-flow interpolation in place of the blend, on the same output "
-                           "as b:vsync", false, false},
+        {"o, o:vsync, o:60", "", "Optical-flow interpolation in place of the blend, on the same "
+                                 "output as b:vsync, or on a timer at the given frame rate "
+                                 "(o:60)", false, false},
         {"diag, diag:vsync", "", "Clock probes: DWM compose timing and the card's raster", false,
          false},
         {"ofprobe, ofprobe:30, ofprobeorder:30", "",
@@ -345,6 +362,8 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-wgcopen")     { o->wgcOpen = true;    return 1; }
     if (t == "-nowgcopen")   { o->wgcOpen = false;   return 1; }
     if (t == "-nocopyengine") { o->copyEngine = false; return 1; }
+    if (t == "-notightwait")  { o->tightWait = false;  return 1; }
+    if (t == "-d3d9")      { o->d3d9 = true;      return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
@@ -537,6 +556,8 @@ inline std::string FormatOptions(const Options& o) {
     if (o.wgcScale != d.wgcScale) add(std::string("-wgcscale ") + WgcScaleNames()[o.wgcScale]);
     if (!o.copyEngine) add("-nocopyengine");
     if (o.blendShader >= 0) add(std::string("-blend ") + BlendShaderNames()[o.blendShader]);
+    if (!o.tightWait) add("-notightwait");
+    if (o.d3d9) add("-d3d9");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");
@@ -566,6 +587,8 @@ struct ModeSpec {
     ModeKind kind = ModeKind::Invalid;
     Compositor compositor = Compositor::Nearest;
     bool vsyncPresent = false;   // present on vsync; false = QPC timer
+    bool dwmClock = false;       // with vsyncPresent: on DWM's compose clock (:dwm, the D3D9
+                                 // present's blocking present), not on the output's own vblank
     bool d3d11Present = false;   // the D3D11 flip-model swapchain rather than D3D9
     float framerate = 0.0f;
     int probeSeconds = 0;        // FlowProbe: the sustained loop's length; 0 = no loop
@@ -613,15 +636,21 @@ inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
 }
 
 // The capture-mode grammar. The first letter picks the temporal compositor: t nearest selection,
-// b blend, o optical-flow interp. The bare letter and X:vsync present on vsync, X:<fps> on a QPC
-// timer at that rate (t and b only).
-//
-// Two present paths carry the vsync present. t runs on the D3D9 swapchain, whose windowed
-// INTERVAL_ONE present blocks on DWM's compose clock (card-locked 60 Hz under a fullscreen game on
-// the source; the DISPLAYED rate under in-game frame generation). b and b:vsync, o and o:vsync
-// present through a D3D11 flip-model swapchain on the output window, which Windows promotes to
-// independent flip so the present blocks on the SINK's own vblank, and b:dwm is the blend on the
-// D3D9 swapchain. The D3D11 path carries the blend and the optical-flow interp.
+// b blend, o optical-flow interp. The second part picks the clock the present keeps:
+//   b, b:vsync, o, o:vsync   the output's own vblank (the D3D11 swapchain's waitable object,
+//                            the SINK's vblank once Windows promotes the window to independent
+//                            flip);
+//   t, t:dwm, b:dwm          DWM's compose clock (card-locked 60 Hz under a fullscreen game on
+//                            the source; the DISPLAYED rate under in-game frame generation; the
+//                            desktop's rate with no game);
+//   t:<fps>, b:<fps>, o:<fps>  a QPC timer at that rate.
+// The vblank and timer modes present through D3D11 (the timer through the copy engine's
+// composition swapchain); MovesToD3D9 says which of them -d3d9 puts back on the D3D9 swapchain.
+// The DWM modes stay on the D3D9 swapchain, whose blocking present IS DWM's clock: on D3D11 the
+// swapchain's own wait lined each DWM wake up with the card's vblank, and in a game DWM composes
+// at its own rate (Pandora, 2026-10-29) that beat left 1.4 to 2.4 refreshes a second showing no
+// new frame. t:vsync (nearest selection on the output's vblank) and o:dwm are refused: nothing
+// has asked for either yet.
 //
 // An empty string is a bare launch and selects b:vsync, the release path. "vsync" selects the
 // plain vsync mode, "diag" and "diag:vsync" the clock probes, and a bare number the plain timer
@@ -645,6 +674,7 @@ inline ModeSpec ParseMode(const std::string& modeStr) {
         s.kind = ModeKind::Temporal;
         s.compositor = comp;
         s.vsyncPresent = true;
+        s.dwmClock = true;
         s.framerate = 60.0f;
         return s;
     }
@@ -657,11 +687,12 @@ inline ModeSpec ParseMode(const std::string& modeStr) {
         s.framerate = 60.0f;
         return s;
     }
-    if (modeStr.length() > 2 && (c0 == 't' || c0 == 'b') && modeStr[1] == ':') {
+    if (modeStr.length() > 2 && (c0 == 't' || c0 == 'b' || c0 == 'o') && modeStr[1] == ':') {
         float fps;
         if (ParseFps(modeStr.substr(2), &fps)) {
             s.kind = ModeKind::Temporal;
             s.compositor = comp;
+            s.d3d11Present = true;
             s.framerate = fps;
             return s;
         }
@@ -683,6 +714,17 @@ inline ModeSpec ParseMode(const std::string& modeStr) {
         s.framerate = fps;
     }
     return s;
+}
+
+// Whether -d3d9 puts this mode on the D3D9 swapchain. It takes the timer modes of the nearest
+// selection and the blend, which ran there before they moved to the D3D11 present. The modes on
+// the output's own vblank and the optical flow have only the D3D11 present, and the DWM modes are
+// on the D3D9 one already, so -d3d9 leaves those where they are.
+inline bool MovesToD3D9(const ModeSpec& s, bool d3d9Asked) {
+    if (!d3d9Asked || s.kind != ModeKind::Temporal || s.compositor == Compositor::Interp) {
+        return false;
+    }
+    return !s.vsyncPresent;
 }
 
 // Whether a command line can run as it stands. It can when it names two different displays that

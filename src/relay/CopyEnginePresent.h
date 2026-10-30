@@ -31,6 +31,9 @@
 //
 // TWO BUFFERS, as the flip-model swapchain had: the buffer shown before the current one comes
 // back when the next is shown, and waiting for it is the frame-pacing wait, at the card's refresh.
+// A mode on a timer asks for THREE: with two, a GPU-bound game held every timer present a whole
+// refresh for its buffer (Pandora, 2026-10-29: about 95% of presents held past half a refresh),
+// so the card's refresh paced it again; a third gives the timer that refresh of slack.
 //
 // THE FRAME MARKER of a copied present is copied too: its strip is written on the CPU into an
 // upload buffer, in the pixels the marker shader draws, and the copy queue puts it over the
@@ -121,13 +124,13 @@ public:
     CopyEngineTarget(const CopyEngineTarget&) = delete;
     CopyEngineTarget& operator=(const CopyEngineTarget&) = delete;
 
-    // Builds the presenting device, the D3D12 copy queue and the two buffers on the adapter of
+    // Builds the presenting device, the D3D12 copy queue and the buffers on the adapter of
     // drawDevice (the D3D11 present's device, which draws into the buffers when a present is not
     // a copy), and puts the buffers on hwnd. width, height and format are the output's;
-    // sinkRefreshHz (0 when unknown) sizes the missed-refresh count. Failure is logged and
-    // leaves nothing usable.
+    // sinkRefreshHz (0 when unknown) sizes the missed-refresh count; buffers is 2 or 3. Failure
+    // is logged and leaves nothing usable.
     bool Setup(ID3D11Device* drawDevice, ID3D11DeviceContext* drawContext, HWND hwnd, int width,
-               int height, DXGI_FORMAT format, int sinkRefreshHz);
+               int height, DXGI_FORMAT format, int sinkRefreshHz, int buffers = 2);
 
     // The frame-pacing wait: blocks until the next buffer has come back from the display. 1
     // when it has, 0 on the timeout, -1 when the presentation manager was lost (it does not come
@@ -165,7 +168,8 @@ private:
     bool Present();
     void DrainStatistics();
 
-    static const int kBuffers = 2;
+    static const int kMaxBuffers = 3;
+    int m_buffers = 2;                  // in use, 2 or 3 (Setup)
 
     int m_width = 0, m_height = 0;
     DXGI_FORMAT m_format = DXGI_FORMAT_UNKNOWN;
@@ -177,7 +181,7 @@ private:
     ID3D11DeviceContext4* m_presentContext = NULL;
     ID3D12Device* m_d3d12 = NULL;
     ID3D12CommandQueue* m_copyQueue = NULL;
-    ID3D12CommandAllocator* m_alloc[kBuffers] = {NULL, NULL};
+    ID3D12CommandAllocator* m_alloc[kMaxBuffers] = {};
     ID3D12GraphicsCommandList* m_list = NULL;
 
     composition::IPresentationManager* m_manager = NULL;
@@ -190,12 +194,12 @@ private:
     HANDLE m_lost = NULL;
     HANDLE m_statsEvent = NULL;
 
-    ID3D11Texture2D* m_buffer[kBuffers] = {NULL, NULL};         // on the presenting device
-    composition::IPresentationBuffer* m_presentationBuffer[kBuffers] = {NULL, NULL};
-    HANDLE m_available[kBuffers] = {NULL, NULL};
-    ID3D11RenderTargetView* m_rtv[kBuffers] = {NULL, NULL};     // on the drawing device
-    ID3D12Resource* m_buffer12[kBuffers] = {NULL, NULL};
-    UINT64 m_allocDone[kBuffers] = {0, 0};
+    ID3D11Texture2D* m_buffer[kMaxBuffers] = {};                // on the presenting device
+    composition::IPresentationBuffer* m_presentationBuffer[kMaxBuffers] = {};
+    HANDLE m_available[kMaxBuffers] = {};
+    ID3D11RenderTargetView* m_rtv[kMaxBuffers] = {};            // on the drawing device
+    ID3D12Resource* m_buffer12[kMaxBuffers] = {};
+    UINT64 m_allocDone[kMaxBuffers] = {};
     int m_next = 0;
 
     // The copy queue's fence (D3D12 signals, the presenting device waits) and the drawing
@@ -214,8 +218,8 @@ private:
     // The marker strip: its rectangle (FrameMarker::StripRect, at the top left), one upload
     // buffer per output buffer, kept mapped, and the cells MarkNextCopy asked for.
     RECT m_strip = {0, 0, 0, 0};
-    ID3D12Resource* m_stripUpload[kBuffers] = {NULL, NULL};
-    BYTE* m_stripMapped[kBuffers] = {NULL, NULL};
+    ID3D12Resource* m_stripUpload[kMaxBuffers] = {};
+    BYTE* m_stripMapped[kMaxBuffers] = {};
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_stripFootprint = {};
     bool m_markPending = false;
     bool m_markCells[FrameMarker::kCells] = {};

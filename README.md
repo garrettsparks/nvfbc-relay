@@ -82,14 +82,18 @@ update its numbers.
 | Mode | Behavior |
 | ---- | -------- |
 | `vsync` | Plain capture, present blocked on DWM's compose clock. No temporal selection. |
-| `t` or `t:dwm` | Temporal selection, present blocked on DWM's compose clock. |
-| `t:<fps>` | Temporal selection, present driven by a QPC timer at the given rate. |
-| `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the frame before it and the frame after it otherwise), presented through a D3D11 flip-model swapchain on the capture card's own vblank. The default. |
-| `b:dwm` | The same blend on the D3D9 swapchain, present blocked on DWM's compose clock. The path `t` runs on. |
-| `b:<fps>` | The same blend, present driven by a QPC timer at the given rate. |
+| `t` or `t:dwm` | Temporal selection, paced by DWM's compose clock. |
+| `t:<fps>` | Temporal selection, paced by a QPC timer at the given rate. |
+| `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the frame before it and the frame after it otherwise), paced by the capture card's own vblank. The default. |
+| `b:dwm` | The same blend, paced by DWM's compose clock. |
+| `b:<fps>` | The same blend, paced by a QPC timer at the given rate. |
 | `<fps>` | Plain timer capture at the given rate. No temporal selection. How the original relay ran. |
 | `diag` | Diagnostic clock probe: QPC 60Hz, immediate present. Logs DWM compose timing and card raster per tick. |
 | `diag:vsync` | Diagnostic probe on `INTERVAL_ONE`. Present block time measures DWM's delivery cadence. |
+
+`b:vsync` and the timer modes (`t:<fps>`, `b:<fps>`) present through D3D11.
+`t`, `t:dwm`, `b:dwm`, `vsync`, `<fps>` and `diag` present through D3D9, whose
+present is what waits on DWM's compose clock.
 
 `t:dwm` presents on DWM's compose clock. While a game runs fullscreen on the
 source display, that clock runs at the capture card's 60 Hz, so `t:dwm`
@@ -186,14 +190,17 @@ reads `@60Hz` for the custom mode and `@59Hz` for the 59.95 Hz one.
 
 ## Present paths
 
-The blend mode can present two ways, and the mode's name says which clock it
-waits on. `b:vsync` presents through a D3D11 flip-model swapchain on the output
-window. Windows promotes it to independent flip, so each present waits for the
-capture card's own vblank. `b:dwm` presents through the D3D9 swapchain and
-waits on DWM's compose clock, like `t`. Under in-game frame generation that
-clock runs at the displayed rate, so `b:dwm` presents twice for each frame the
-game renders. The capture card shows only 60 of those a second, so recordings
-from it have repeated frames.
+The mode's name says which clock it waits on. `b:vsync` presents through a
+D3D11 flip-model swapchain on the output window. Windows promotes it to
+independent flip, so each present waits for the capture card's own vblank.
+`b:dwm` waits on DWM's compose clock, like `t`. Under in-game frame generation
+that clock runs at the displayed rate, so `b:dwm` presents twice for each frame
+the game renders. The capture card shows only 60 of those a second, so
+recordings from it have repeated frames.
+
+`b:dwm` still presents through the D3D9 swapchain measured below. The timer
+modes moved to D3D11 on 2026-10-29, where one benchmark sitting measured them
+about 0.65% of the game's score cheaper than on D3D9.
 
 Measured in one session with a game rendering 60 FPS and in-game frame
 generation doubling it to 120, on the default settings plus `-mark`, during the
@@ -232,16 +239,16 @@ full numbers are in [`docs/relay-cost-results.md`](docs/relay-cost-results.md).
 # Architecture
 
 Capture and present run on separate threads with separate devices. Capture
-grabs into its own D3D9Ex device. `b:vsync` presents through a D3D11 device and
-a flip-model swapchain, and every other mode presents through a second D3D9Ex
-device. With one shared device, the blocking NvFBC grab kept the device locked
+grabs into its own D3D9Ex device. `b:vsync` and the timer modes present through
+a D3D11 device, and the DWM modes, `vsync`, `<fps>` and `diag` present through a
+second D3D9Ex device. With one shared device, the blocking NvFBC grab kept the device locked
 while it waited, which tied present timing to capture arrivals and measured as
 present jitter of half a capture period.
 
 Ring slots are render target textures created on the capture device with shared
 handles. The present side opens the same textures through those handles, as
-D3D9Ex textures on the D3D9 present device or as D3D11 textures on the
-`b:vsync` path, so the present thread never touches the capture device. The
+D3D9Ex textures on the D3D9 present device or as D3D11 textures on the D3D11
+present, so the present thread never touches the capture device. The
 shared textures have no cross-device sync primitive, so the ordering between
 the devices relies on driver behavior. If the output shows tearing or partial
 frames inside a slot, look there first.
@@ -331,8 +338,10 @@ flowchart TD
     A{"present axis"}
     A -- "t:60 timer" --> B["wait on absolute QPC deadline"]
     A -- "t:dwm<br/>DWM's compose clock" --> C["deadline = now<br/>the blocking PresentEx is the wait"]
+    A -- "b:vsync<br/>capture card's vblank" --> C2["deadline = now<br/>after the swapchain's waitable object"]
     B --> D["target = deadline - bracketingDelay - pull"]
     C --> D
+    C2 --> D
     D --> E["ring.FindBracket target"]
     E --> F{"both sides present"}
     F -- "yes" --> G["UpdatePhaseLock<br/>sets pull for the NEXT present"]
