@@ -24,7 +24,6 @@ void UsHistogram::Add(long long us) {
     m_bins[us < kBins ? us : kBins]++;
     m_count++;
     if (us > m_max) m_max = us;
-    m_sum += (double)us;
 }
 
 long long UsHistogram::Percentile(double p) const {
@@ -40,13 +39,18 @@ long long UsHistogram::Percentile(double p) const {
 
 void IPacing::RecordWake(LONGLONG now) {
     if (m_lastWake != 0) m_interval.Add((now - m_lastWake) * 1000000 / m_freq);
+    else m_firstWake = now;
     m_lastWake = now;
 }
 
 void IPacing::LogSummary() const {
-    const double mean = m_interval.MeanUs();
+    double mean = 0.0;
+    if (m_interval.Count() > 0) {
+        mean = (double)(m_lastWake - m_firstWake) * 1000000.0 / (double)m_freq /
+               (double)m_interval.Count();
+    }
     LOG("pacing summary (%s): %lld waits; between wakes p50 %lld us, p90 %lld, p99 %lld, "
-        "max %lld, mean %.1f us (%.4f Hz)",
+        "max %lld, mean %.3f us (%.6f Hz)",
         Name(), m_lastWake != 0 ? m_interval.Count() + 1 : 0, m_interval.Percentile(0.5),
         m_interval.Percentile(0.9),
         m_interval.Percentile(0.99), m_interval.Max(), mean, mean > 0.0 ? 1000000.0 / mean : 0.0);

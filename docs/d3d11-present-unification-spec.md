@@ -1,7 +1,7 @@
 # Every temporal mode on the D3D11 present
 
 Written 2026-10-28, after the present-step refactor (`docs/present-step-spec.md`, stages 1 to 4,
-commits cbceb0a to c3d3e1e). Implemented as code 2026-10-29, steps 1 to 5 in one change, with the
+commits 4b34c32 to 982c96b). Implemented as code 2026-10-29, steps 1 to 5 in one change, with the
 answers of section 6; every capture gate of section 4 is still owed (section 7).
 
 ## 1. Why
@@ -111,6 +111,8 @@ What still matters is the wake jitter. When the timer's phase reaches the card's
 drifts past it at about 0.09 us per present, so presents near the edge fall either side of the
 refresh for as long as the jitter band takes to cross: at plus or minus 1 ms, about 22,500
 presents (about 6 minutes) of repeats and skips, once an hour. An estimate, to be measured.
+Measured 2026-10-30 (7.2): no such band at 10 and 100 times the real drift; a slip was one
+repeated refresh.
 
 The tight wait: the high-resolution waitable timer to about 1 ms before the deadline, then a spin
 on QPC to the deadline (yielding with `SwitchToThread`). Cost: up to about 1 ms of one core per
@@ -351,9 +353,10 @@ called A and B):
   26 ms offset (the held rule). KCD's room had let it run (`o:60 -wgc`, 5 ms): the load decides.
 - 3 buffers for timer modes (sitting B; `CopyEngineTarget::Setup(..., buffers)`; `b:vsync -wgc`
   keeps 2): held 0 on every timer row; woke late p99 75-83 us; wait for a buffer p50 1 us (`b:60`,
-  `-wgc`), 0.9 ms (`t:60`), 5.6 ms (`o:60`), all under a refresh; wakes at 60.0023 Hz, the timer's
-  rate, not the card's. Refreshes with no new frame: 0 on `b:60`, `t:60`, `o:60`, 1 on `b:60 -wgc`,
-  against 8 on `b:vsync` in the same sitting.
+  `-wgc`), 0.9 ms (`t:60`), 5.6 ms (`o:60`), all under a refresh; wakes at the timer's rate, not
+  the card's (the 60.0023 Hz read here was the summary's rounding; the true rate is 59.99988 Hz,
+  7.2). Refreshes with no new frame: 0 on `b:60`, `t:60`, `o:60`, 1 on `b:60 -wgc`, against 8 on
+  `b:vsync` in the same sitting (the timer rows' counts are not evidence, 7.2).
 - Cost (score lost against the mean of the no-relay rows at both ends; sitting A / B):
   `b:vsync` 3.13 / 3.29%, `b:60` (drawn through the composition swapchain) 4.18 / 4.29%, `t:60`
   4.23 / 4.29%, `o:60` 5.30 / 5.33%, `b:60 -wgc` (two thirds copied) 2.09 / 2.24%. The third buffer
@@ -364,7 +367,7 @@ called A and B):
 
 **The matched and old-against-new sittings, 2026-10-29 (Pandora as above; C and D):**
 
-| mode | old: `c3d3e1e`, D3D9 | new: the 3-buffer tree, D3D11 | same launch |
+| mode | old: `982c96b`, D3D9 | new: the 3-buffer tree, D3D11 | same launch |
 |---|---|---|---|
 | `b:60` | 4.87% | 4.19% | D |
 | `t:60` | 4.73% | 4.10% | D |
@@ -394,6 +397,90 @@ called A and B):
   `:dwm` modes keep their old behaviour and cost until the D3D9 present is removed, and `t:vsync`
   is the nearest selection's way onto the card's vblank.
 
+### 7.2 The tight timer on D3D9, the slip, and two instruments, 2026-10-30
+
+Pandora as in 7.1, one launch per sitting, rows on the CI build of e17dd87 or on builds of the tree
+with the two fixes below; desktop rows 45 s to 2 minutes.
+
+**The tight timer on the D3D9 path (step 2, in Pandora rather than a capture):**
+
+| row | `jit=` p50 / p90 / p99 / max | timer late p50 / p99 | cost |
+|---|---|---|---|
+| `b:60 -d3d9` | 21 / 30 / 161 / 3,174 us | 0 / 79 us | 4.58% |
+| `b:60 -d3d9 -notightwait` | 296 / 516 / 853 / 3,522 us | 272 / 801 us | 4.63% |
+| `t:60 -d3d9` | 18 / 25 / 58 / 533 us | 0 / 32 us | 4.48% |
+| `b:60` | 203 / 321 / 453 / 4,098 us | 0 / 72 us | 3.98% |
+| `b:60 -notightwait` | 7,642 / 7,791 / 7,901 / 8,532 us | 263 / 777 us | 3.81% |
+| `t:60` | 6,314 / 6,464 / 6,592 / 8,068 us | 0 / 71 us | 4.02% |
+
+- The `-notightwait` row reproduces the 2026-10-28 p50 of 0.32 ms under a different game, so the
+  14-fold drop is the wait's. Step 2 is done.
+- On D3D11 `jit=` includes the wait for room, so the D3D9 rows are the ones to read against 0.32 ms;
+  on D3D11 read the summary's timer lateness.
+- D3D11 stays cheaper than `-d3d9` in one launch: 0.60 points on `b:60`, 0.46 on `t:60`, as the
+  old-against-new sitting read (0.68, 0.63).
+- The tight wait costs nothing that shows: +0.17 points on D3D11, -0.05 on D3D9, the game's CPU %
+  column 10.3-10.4 on all six. One run per row, so a few tenths are noise.
+
+**Two instruments were wrong, and both are fixed in the tree:**
+
+- **The summary's mean rate.** It summed whole microseconds, so a 16,666.7 us period read 16,666.0
+  and 60.0023 Hz. The mean now comes from the first and last wake in QPC ticks. Control: `b:60` reads
+  16,666.700 us, 59.999880 Hz, the period of 3.3.
+- **"Refreshes showed no new frame" on the timer modes.** It timed the end of the buffer wait, and
+  a timer that finds its buffer back already only reads its own period. Under `b:59.98`, where a
+  repeat must happen every 50 s, it read 0 or 1 on rows that held 2 or 3. So every timer row's zero
+  in 7.1 says nothing about repeats, with `-wgc` or without. The vblank modes are not affected,
+  since their wait really waits. The new count uses `GetDisplayedTime` of the independent-flip
+  statistics: `copy engine displayed:` at exit and a `display gap:` line per gap, with the old count
+  left beside it. It runs wherever the composition swapchain does, so not on `b:vsync` without
+  `-wgc`, and frames composed by Windows are not read (their next gap is dropped).
+
+| control of the new count | expected | read |
+|---|---|---|
+| `b:60`, desktop, 45 s | 0 | 0 |
+| `b:30`, desktop, 45 s | a repeat on every present | 1,384 of 1,389 presents |
+| `b:59.98`, desktop, 2 minutes | 2.4 from the rates | 2 |
+| `b:vsync -wgc`, Pandora | as the old count (7) | 8 |
+
+**The slip.** A timer slower than the card was run off-rate, so slips come at a known rate:
+
+| row | slips expected from the rates | slips read | each slip |
+|---|---|---|---|
+| `b:59.98`, Pandora, 123 s | 2.5 | 2, 49.6 s apart | one repeat, 2.00 refreshes |
+| `t:59.98`, Pandora, 123 s | 2.5 | 2 | one repeat |
+| `b:59.98 -wgc`, Pandora, 123 s | 2.5 | 2 | one repeat |
+| `b:59.998`, Pandora, 18 minutes | 2.1 | 2, 415 s apart (505 predicted) | one repeat |
+
+Those rows each also show a gap in the first 7 s; `b:60` has one there too, so it belongs to the
+start. `o:59.98 -wgc` held more (four gaps, 623 presents held) because its flow work keeps the wait
+for room long; it was not read further.
+
+- A slip is one repeated refresh, with 0 skipped presents and no band of repeats and skips, at 10
+  and 100 times the real drift, against the 6 minutes that 3.3 estimated. The real drift itself was
+  not run. A reading, not traced: the presentation queue is first in, first out, so a frame that
+  misses one refresh moves every later frame by one and the jitter has nothing left to flip.
+- The 415 s against 505 s is not explained.
+- A timer faster than the card (`b:60.02`) falls onto the card: 5,286 of 7,390 presents held, wait
+  for room p50 16.2 ms, one gap, 0 skipped. Nothing breaks; it is `b:vsync` with a late decision.
+
+**The rates, read 2026-10-30.** The card fits 60.000208 Hz on the desktop (the wakes of `b:vsync`,
+residual sd 14 us), matching the CRU mode's 60.000199 and a slip every 51 minutes. In Pandora it
+fits 60.000057 Hz, and 60.000035 Hz on 2026-10-29, a slip every 94 to 108 minutes. A second way
+agrees: under load the wait for room is the distance from the timer's deadline to the card's
+next refresh, and it fell 3.0 and 3.1 us a second on `b:60 -notightwait` and `t:60`. The desktop
+reading came between those two game readings of 2026-10-30, so this is not a trend in time; why
+load moves the card 2.5 ppm against QPC is not known.
+
+**The wait for room reads the phase.** In one launch the D3D11 rows settled at wait p50 0.2 ms, 6.3
+ms and 7.3 ms, and at about 1 us in another: the timer's phase against the card is set per run. The
+step from no wait to a wait came 7 and 27 s into a run on the two rows that had one. It looks like
+the queue going one frame deeper, which would add up to a refresh of latency to that run; not
+traced.
+
+**`o` on a timer, in Pandora, not at the forge:** `o:60 -wgc` fl=hit 2,489, fl=late 14, fl=own 0,
+cost 3.48%, held 0. The stutter question was not run (see the owed list).
+
 Owed, in the order of section 4, each on the rig:
 
 1. DONE 2026-10-29 (7.1), except the copy engine's statistics under DWM pacing. Step 1 as runs:
@@ -408,11 +495,12 @@ Owed, in the order of section 4, each on the rig:
    desktop's clock its blocking present follows, which a summary that only ever read the card's
    rate would fail. (`t:dwm` on the D3D11 present waits for room after `DwmFlush`, so whether it
    reads 4,167 or 16,667 there is the question, not a control.)
-2. Step 2: a `b:60 -d3d9` capture, the tight timer on the D3D9 path: `jit=` against the
-   2026-10-28 p50 0.32 ms.
-3. Steps 3 and 4: `t:dwm`, `t:60`, `b:dwm`, `b:60` captures, the health check and the replay against
-   the `kcd_60x2_tdwm`, `b60`, `bdwm` fixtures, line templates against the 2026-10-28 logs; then
-   the cost bench of 4.1 (each mode with and without `-d3d9`).
-4. Step 5: `o:60 -wgc` at the forge.
-5. Step 6: the hour-long timer capture.
+2. DONE 2026-10-30 (7.2), in Pandora. Step 2: the tight timer on the D3D9 path, `jit=` p50 21 us
+   against the 2026-10-28 p50 0.32 ms.
+3. Steps 3 and 4: `t:60`, `b:60` captures, the health check and the replay against the `b60`
+   fixture, line templates against the 2026-10-28 logs. The cost bench of 4.1 is DONE for `t:60` and
+   `b:60` (7.2); the `:dwm` modes stayed on D3D9.
+4. Step 5: DROPPED by the user 2026-10-30 ("i think we skip the forge test for these"). `o:<fps>`
+   was checked in Pandora only (7.2); the planner under stutter on a timer stays unmeasured.
+5. Step 6: the hour-long timer capture, now only to confirm one repeat at the real drift (7.2).
 6. Step 7: removing the D3D9 present after a release.

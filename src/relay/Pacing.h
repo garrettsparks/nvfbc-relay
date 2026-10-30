@@ -14,7 +14,6 @@ public:
     void Add(long long us);
     long long Count() const { return m_count; }
     long long Max() const { return m_max; }
-    double MeanUs() const { return m_count > 0 ? m_sum / (double)m_count : 0.0; }
     // The smallest bin holding at least fraction p of the samples.
     long long Percentile(double p) const;
 
@@ -23,7 +22,6 @@ private:
     long long m_bins[kBins + 1] = {};
     long long m_count = 0;
     long long m_max = 0;
-    double m_sum = 0.0;
 };
 
 // THE PACING: what a temporal mode's present waits on before the policy step decides it. Two
@@ -73,7 +71,8 @@ protected:
     void RecordWake(LONGLONG now);
 
     LONGLONG m_freq = 0;
-    LONGLONG m_lastWake = 0;
+    LONGLONG m_firstWake = 0;   // the mean comes from these two: the bins hold whole microseconds,
+    LONGLONG m_lastWake = 0;    // and a sum of them reads a 16,666.7 us period as 16,666.0
     UsHistogram m_interval;     // between two wakes of the clock
     UsHistogram m_late;         // timer only: how far past its deadline it woke
     UsHistogram m_pathWait;     // the D3D11 path's own wait after another clock woke

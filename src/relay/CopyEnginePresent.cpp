@@ -11,6 +11,8 @@ const GUID kIidPresentationFactory =
     {0x8FB37B58, 0x1D74, 0x4F64, {0xA4, 0x9C, 0x1F, 0x97, 0xA8, 0x0A, 0x2E, 0xC0}};
 const GUID kIidPresentStatusPresentStatistics =
     {0xC9ED2A41, 0x79CB, 0x435E, {0x96, 0x4E, 0xC8, 0x55, 0x30, 0x55, 0x42, 0x0C}};
+const GUID kIidIndependentFlipFramePresentStatistics =
+    {0x8C93BE27, 0xAD94, 0x4DA0, {0x8F, 0xD4, 0x24, 0x13, 0x13, 0x2D, 0x12, 0x4E}};
 
 typedef HRESULT(WINAPI* CreatePresentationFactoryFn)(IUnknown*, REFIID, void**);
 typedef HRESULT(WINAPI* DCompositionCreateDeviceFn)(IDXGIDevice*, REFIID, void**);
@@ -77,7 +79,10 @@ bool CopyEngineTarget::Setup(ID3D11Device* drawDevice, ID3D11DeviceContext* draw
     m_drawDevice = drawDevice;
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
-    if (sinkRefreshHz > 0) m_refreshTicks = (double)freq.QuadPart / (double)sinkRefreshHz;
+    if (sinkRefreshHz > 0) {
+        m_refreshTicks = (double)freq.QuadPart / (double)sinkRefreshHz;
+        m_refreshUnits = 10000000.0 / (double)sinkRefreshHz;
+    }
     HRESULT hr = drawContext->QueryInterface(__uuidof(ID3D11DeviceContext4),
                                              (void**)&m_drawContext);
     if (FAILED(hr)) {
@@ -425,7 +430,9 @@ int CopyEngineTarget::WaitForBuffer(DWORD timeoutMs) {
     if (r != WAIT_OBJECT_0 + 1) return 0;
     // A buffer comes back when the one after it is shown, so the time between two coming back
     // is the time a picture stayed on the display: more than one refresh is a refresh that
-    // showed no new picture.
+    // showed no new picture. This reads the moment the wait ended, so it counts only while the
+    // wait really waits: a timer that finds its buffer back already reads its own period here.
+    // The summary's displayed count has no such limit.
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     if (m_lastBack != 0 && m_refreshTicks > 0.0) {
@@ -545,8 +552,20 @@ void CopyEngineTarget::DrainStatistics() {
         composition::IPresentStatistics* stats = NULL;
         if (FAILED(m_manager->GetNextPresentStatistics(&stats)) || !stats) break;
         const composition::PresentStatisticsKind kind = stats->GetKind();
-        if (kind == composition::PresentStatisticsKind_IndependentFlipFrame) m_flipFrames++;
-        else if (kind == composition::PresentStatisticsKind_CompositionFrame) m_composedFrames++;
+        if (kind == composition::PresentStatisticsKind_IndependentFlipFrame) {
+            m_flipFrames++;
+            composition::IIndependentFlipFramePresentStatistics* flip = NULL;
+            if (SUCCEEDED(stats->QueryInterface(kIidIndependentFlipFramePresentStatistics,
+                                                (void**)&flip))) {
+                composition::SystemInterruptTime shown = {};
+                flip->GetDisplayedTime(&shown);
+                flip->Release();
+                CountDisplayedGap(shown.value);
+            }
+        } else if (kind == composition::PresentStatisticsKind_CompositionFrame) {
+            m_composedFrames++;
+            m_lastDisplayed = 0;   // its time is not read, so the next gap has no start
+        }
         if (kind == composition::PresentStatisticsKind_PresentStatus) {
             composition::IPresentStatusPresentStatistics* status = NULL;
             if (SUCCEEDED(stats->QueryInterface(kIidPresentStatusPresentStatistics,
@@ -561,7 +580,21 @@ void CopyEngineTarget::DrainStatistics() {
     }
 }
 
+void CopyEngineTarget::CountDisplayedGap(UINT64 shown) {
+    if (m_lastDisplayed != 0 && m_refreshUnits > 0.0) {
+        const double refreshes = (double)(shown - m_lastDisplayed) / m_refreshUnits;
+        if (refreshes >= 1.5) {
+            m_displayedGaps++;
+            m_repeatedRefreshes += (long long)floor(refreshes + 0.5) - 1;
+            LOG("display gap: %.2f refreshes between two frames on the display", refreshes);
+        }
+    }
+    m_lastDisplayed = shown;
+}
+
 void CopyEngineTarget::LogSummary() const {
+    LOG("copy engine displayed: %lld refreshes held a frame over, in %lld gaps (from the times "
+        "the display reported)", m_repeatedRefreshes, m_displayedGaps);
     LOG("copy engine summary: %lld presents (%lld copied on the copy engine, %lld of them with "
         "the marker, %lld drawn), %lld failed, %lld skipped and %lld canceled by the "
         "presentation manager; %lld refreshes showed no new frame (from when the buffers came "

@@ -46,10 +46,10 @@
 namespace composition {
 
 // The composition swapchain's interfaces, declared from the SDK's Presentation.idl (the MinGW
-// headers have no presentation.h), in the IDL's method order. Methods that return a structure
-// by value are declared but never called: MSVC and MinGW return those differently from a member
-// function.
-struct SystemInterruptTime { UINT64 value; };
+// headers have no presentation.h), in the IDL's method order. A method that returns a structure
+// by value is declared with the pointer it fills in: MSVC and MinGW return those differently from
+// a member function, and the pointer is what both pass underneath.
+struct SystemInterruptTime { UINT64 value; };   // 100 ns units since the system started
 struct PresentationTransform { float M11, M12, M21, M22, M31, M32; };
 typedef UINT64 CompositionFrameId;
 enum PresentStatisticsKind {
@@ -88,6 +88,13 @@ struct IPresentStatistics : public IUnknown {
 struct IPresentStatusPresentStatistics : public IPresentStatistics {
     virtual CompositionFrameId STDMETHODCALLTYPE GetCompositionFrameId() = 0;
     virtual PresentStatus STDMETHODCALLTYPE GetPresentStatus() = 0;
+};
+struct IIndependentFlipFramePresentStatistics : public IPresentStatistics {
+    virtual void STDMETHODCALLTYPE GetOutputAdapterLUID(LUID* luid) = 0;
+    virtual UINT STDMETHODCALLTYPE GetOutputVidPnSourceId() = 0;
+    virtual UINT_PTR STDMETHODCALLTYPE GetContentTag() = 0;
+    virtual void STDMETHODCALLTYPE GetDisplayedTime(SystemInterruptTime* time) = 0;
+    virtual void STDMETHODCALLTYPE GetPresentDuration(SystemInterruptTime* duration) = 0;
 };
 struct IPresentationManager : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE AddBufferFromResource(IUnknown* resource,
@@ -167,6 +174,7 @@ private:
     ID3D12Resource* OpenOnD3D12(ID3D11Texture2D* texture);
     bool Present();
     void DrainStatistics();
+    void CountDisplayedGap(UINT64 shown);
 
     static const int kMaxBuffers = 3;
     int m_buffers = 2;                  // in use, 2 or 3 (Setup)
@@ -228,6 +236,10 @@ private:
     long long m_copies = 0, m_markedCopies = 0, m_draws = 0, m_presents = 0;
     long long m_presentFailures = 0, m_skipped = 0, m_canceled = 0, m_missedRefreshes = 0;
     long long m_flipFrames = 0, m_composedFrames = 0;   // how presents reached the screen
+    double m_refreshUnits = 0.0;        // one refresh in SystemInterruptTime units; 0 when unknown
+    UINT64 m_lastDisplayed = 0;         // when the last frame flipped to the display was shown
+    long long m_displayedGaps = 0;      // displayed frames that came after a repeated refresh
+    long long m_repeatedRefreshes = 0;  // refreshes those gaps held the old frame
     long long m_formatMismatches = 0;                   // presents drawn over a frame's format
     long long m_opened = 0, m_openFailures = 0;
     bool m_lostReported = false;

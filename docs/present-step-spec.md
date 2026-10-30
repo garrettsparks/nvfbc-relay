@@ -119,7 +119,7 @@ PresentStepResult StepPresent(PresentStepState& s, const PolicyConfig& cfg,
 - **A frame that has not arrived** by the present the plan is made at. With the lag at 95.8 ms,
   a present two periods ahead targets about 60 ms in the past, so its frames are almost always in
   the ring. A late frame changes the bracket, the prediction misses, and that present draws the
-  blend with no flow (the rule since 3bee31c).
+  blend with no flow (the rule since 56e78f8).
 - **A dejitter correction** inserted between the plan and the present. Rare (about 0.3% of
   batches are corrected at all), and a miss again costs one blend.
 - **The deadline itself**: the next vsync is predicted as one period on. Its jitter is tens of
