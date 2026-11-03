@@ -187,6 +187,16 @@ kcd_60x2_ovsync_2026_10_28_3.trace
 kcd_60x2_tdwm_2026_10_28_0.trace
 kcd_60x2_b60_2026_10_28_1.trace
 kcd_60x2_bdwm_2026_10_28_2.trace
+# t:vsync, the nearest selection on the card's vblank, 3 minutes of a marked local recording
+# (2026-10-30), walking and turning in the save's room. Shorter than the rest because it comes from
+# the mode's rig check; the video showed all 11,205 frames in order, none repeated.
+kcd_60x2_tvsync_2026_10_30_0.trace
+# 44 minutes of the 2026-11-02 stream, o:vsync through Windows.Graphics.Capture on the build that
+# moved the timer modes onto the D3D11 present: 199 hitches and 65 stalls an hour in 42 bursts,
+# with the dice game from about 3.5 minutes in. 2 lock releases, the same 2 on the replay; worst
+# blend run 18 in both. All 770 synthesized presents were planned (721 warped, 49 drawn as the
+# blend).
+kcd_60x2_ovsync_2026_11_02_0.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions

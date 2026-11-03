@@ -162,7 +162,9 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
             "falls back to the present period");
     }
     LOG("Capture mode: %s", r.mode->GetModeName());
-    LOG("%s", launch::ResolvedOptionsLine(options, r.mode->PresentsViaD3D11()).c_str());
+    LOG("%s", launch::ResolvedOptionsLine(options, r.mode->PresentsViaD3D11(),
+                                          r.mode->PresentsThroughComposition())
+                  .c_str());
 
     // Settled before any window exists, so turning NvFBC on and relaunching never flashes a
     // window on the capture card. A status that cannot be read is no reason to turn anything

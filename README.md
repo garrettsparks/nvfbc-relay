@@ -82,7 +82,8 @@ update its numbers.
 | Mode | Behavior |
 | ---- | -------- |
 | `vsync` | Plain capture, present blocked on DWM's compose clock. No temporal selection. |
-| `t` or `t:dwm` | Temporal selection, paced by DWM's compose clock. |
+| `t` or `t:vsync` | Temporal selection, paced by the capture card's own vblank. |
+| `t:dwm` | Temporal selection, paced by DWM's compose clock. |
 | `t:<fps>` | Temporal selection, paced by a QPC timer at the given rate. |
 | `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the frame before it and the frame after it otherwise), paced by the capture card's own vblank. The default. |
 | `b:dwm` | The same blend, paced by DWM's compose clock. |
@@ -91,8 +92,8 @@ update its numbers.
 | `diag` | Diagnostic clock probe: QPC 60Hz, immediate present. Logs DWM compose timing and card raster per tick. |
 | `diag:vsync` | Diagnostic probe on `INTERVAL_ONE`. Present block time measures DWM's delivery cadence. |
 
-`b:vsync` and the timer modes (`t:<fps>`, `b:<fps>`) present through D3D11.
-`t`, `t:dwm`, `b:dwm`, `vsync`, `<fps>` and `diag` present through D3D9, whose
+`t:vsync`, `b:vsync` and the timer modes (`t:<fps>`, `b:<fps>`) present through
+D3D11. `t:dwm`, `b:dwm`, `vsync`, `<fps>` and `diag` present through D3D9, whose
 present is what waits on DWM's compose clock.
 
 `t:dwm` presents on DWM's compose clock. While a game runs fullscreen on the
@@ -193,7 +194,7 @@ reads `@60Hz` for the custom mode and `@59Hz` for the 59.95 Hz one.
 The mode's name says which clock it waits on. `b:vsync` presents through a
 D3D11 flip-model swapchain on the output window. Windows promotes it to
 independent flip, so each present waits for the capture card's own vblank.
-`b:dwm` waits on DWM's compose clock, like `t`. Under in-game frame generation
+`b:dwm` waits on DWM's compose clock, like `t:dwm`. Under in-game frame generation
 that clock runs at the displayed rate, so `b:dwm` presents twice for each frame
 the game renders. The capture card shows only 60 of those a second, so
 recordings from it have repeated frames.

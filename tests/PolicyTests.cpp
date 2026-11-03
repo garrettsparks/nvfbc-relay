@@ -5646,9 +5646,12 @@ static void test_launch_mode_parsing() {
         {"b",          ModeKind::Temporal, Compositor::Blend,   true,  false, true,  60.0f},
         {"b:vsync",    ModeKind::Temporal, Compositor::Blend,   true,  false, true,  60.0f},
         {"B:VSYNC",    ModeKind::Temporal, Compositor::Blend,   true,  false, true,  60.0f},
+        // The nearest selection on the same present, bare t included.
+        {"t",          ModeKind::Temporal, Compositor::Nearest, true,  false, true,  60.0f},
+        {"t:vsync",    ModeKind::Temporal, Compositor::Nearest, true,  false, true,  60.0f},
+        {"T:VSYNC",    ModeKind::Temporal, Compositor::Nearest, true,  false, true,  60.0f},
         // The same blend and the nearest selection on DWM's compose clock, on the D3D9 present.
         {"b:dwm",      ModeKind::Temporal, Compositor::Blend,   true,  true,  false, 60.0f},
-        {"t",          ModeKind::Temporal, Compositor::Nearest, true,  true,  false, 60.0f},
         {"t:dwm",      ModeKind::Temporal, Compositor::Nearest, true,  true,  false, 60.0f},
         {"T:DWM",      ModeKind::Temporal, Compositor::Nearest, true,  true,  false, 60.0f},
         // The optical flow interpolation, on the D3D11 flip-model swapchain like b:vsync.
@@ -5675,10 +5678,9 @@ static void test_launch_mode_parsing() {
               (int)s.d3d11Present, s.framerate);
     }
 
-    // Everything else is refused, including the retired b:flip spelling, t:vsync (frame selection
-    // on the sink's vblank, the name kept for when someone asks for it), o:dwm (the optical flow
-    // on DWM's clock, likewise), and rates outside (0, 1000].
-    for (const char* bad : {"b:", "b:abc", "b:flip", "t:vsync", "b:0", "0", "1001", "x:60", "abc",
+    // Everything else is refused, including the retired b:flip spelling, o:dwm (the optical flow
+    // on DWM's clock, the name kept for when someone asks for it), and rates outside (0, 1000].
+    for (const char* bad : {"b:", "b:abc", "b:flip", "b:0", "0", "1001", "x:60", "abc",
                             "d:60", "o:dwm", "o:0", "o:1001", "o:abc"}) {
         CHECK(launch::ParseMode(bad).kind == ModeKind::Invalid, "mode '%s' must be refused", bad);
     }
@@ -5688,8 +5690,8 @@ static void test_launch_mode_parsing() {
     // DWM modes are on the D3D9 one already, and nothing moves without the option.
     struct Move { const char* text; bool moves; };
     const Move moves[] = {
-        {"t:59.94", true}, {"b:60", true}, {"t", false}, {"t:dwm", false}, {"b:dwm", false},
-        {"", false}, {"b", false}, {"b:vsync", false}, {"o", false}, {"o:vsync", false},
+        {"t:59.94", true}, {"b:60", true}, {"t", false}, {"t:vsync", false}, {"t:dwm", false},
+        {"b:dwm", false}, {"", false}, {"b", false}, {"b:vsync", false}, {"o", false}, {"o:vsync", false},
         {"o:60", false}, {"vsync", false}, {"60", false}, {"diag", false},
     };
     for (const Move& m : moves) {
@@ -6174,8 +6176,15 @@ static void test_launch_resolved_options_line() {
     CHECK(bare == "Resolved options: src rate hint 0.0 fps (not declared; 60 assumed), comb lock "
                   "on, frame marker off, blend tint off, etw flip capture on, flip join on, "
                   "dejitter ON (-dejit), fgphase off, phasekeep off, flip mode bitblt (DISCARD), "
-                  "extra lag 75 ms, present path D3D11 flip-model swapchain (b:vsync)",
+                  "extra lag 75 ms, present path D3D11 flip-model swapchain",
           "the default launch's resolved-options line must not change, got '%s'", bare.c_str());
+
+    // The present path named is the one that runs: -wgc's copy engine and every timer mode
+    // present through the composition swapchain.
+    const std::string composed = launch::ResolvedOptionsLine(launch::Options(), true, true);
+    CHECK(composed.find(", present path D3D11 composition swapchain") != std::string::npos &&
+              composed.find("flip-model") == std::string::npos,
+          "a composition present must be named as one, got '%s'", composed.c_str());
 
     // The two phrases mktrace.py reads, at other values.
     launch::Options o;

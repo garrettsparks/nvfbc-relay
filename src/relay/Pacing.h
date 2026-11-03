@@ -27,9 +27,9 @@ private:
 // THE PACING: what a temporal mode's present waits on before the policy step decides it. Two
 // kinds, one per mode string's second part (launch::ParseMode):
 //   PathPacing   the present path's own wait: on the D3D11 present the swapchain's waitable object
-//                (the output's vblank under independent flip, :vsync and the bare b and o); on the
-//                D3D9 present its INTERVAL_ONE present, which blocks on DWM's compose clock (:dwm
-//                and the bare t).
+//                (the output's vblank under independent flip, :vsync and the bare t, b and o); on
+//                the D3D9 present its INTERVAL_ONE present, which blocks on DWM's compose clock
+//                (:dwm).
 //   TimerPacing  PresentScheduler's QPC deadline (:<fps>), with the tight wait unless
 //                -notightwait.
 // After the timer, the D3D11 path's own wait runs, so a frame is never drawn into a buffer the

@@ -180,8 +180,8 @@ inline const std::vector<UsageRow>& OptionRows() {
         {"-defercopy", "", "Skipping that copy; on by default, accepted so a launch string that "
                            "names it keeps working", false, false},
         {"-wgc", "", "Capture through Windows (Windows.Graphics.Capture) in place of NvFBC, with "
-                     "b:vsync, o:vsync and the timer modes (b:60, t:60, o:60); NvFBC stays when "
-                     "it cannot start", false, false},
+                     "t:vsync, b:vsync, o:vsync and the timer modes (t:60, b:60, o:60); NvFBC "
+                     "stays when it cannot start", false, false},
         {"-nowgcdrop", "", "With -wgc, keep the frames Windows sends when only the mouse pointer "
                            "moved. By default they are left out, since each is a copy of the "
                            "frame before it", false, false},
@@ -239,9 +239,10 @@ inline const std::vector<UsageRow>& ModeRows() {
                            "The default: press Enter to pick it.", true, false},
         {"b:dwm, b:60", "", "The same, in step with Windows' desktop (b:dwm) or on a timer at "
                             "the given frame rate (b:60).", true, false},
-        {"t, t:dwm", "", "Shows the nearest real frame and never blends, in step with "
-                         "Windows' desktop.", true, false},
-        {"t:59.94", "", "The same, on a timer at the given frame rate.", true, false},
+        {"t, t:vsync", "", "Shows the nearest real frame and never blends, in step with the "
+                           "capture card's own refresh.", true, false},
+        {"t:dwm, t:59.94", "", "The same, in step with Windows' desktop (t:dwm) or on a timer "
+                               "at the given frame rate (t:59.94).", true, false},
         {"vsync", "", "Shows the newest frame, in step with Windows' desktop.", true, false},
         {"60", "", "Shows the newest frame, on a timer at the given frame rate. This is how "
                    "the original relay ran.", true, false},
@@ -637,10 +638,10 @@ inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
 
 // The capture-mode grammar. The first letter picks the temporal compositor: t nearest selection,
 // b blend, o optical-flow interp. The second part picks the clock the present keeps:
-//   b, b:vsync, o, o:vsync   the output's own vblank (the D3D11 swapchain's waitable object,
-//                            the SINK's vblank once Windows promotes the window to independent
-//                            flip);
-//   t, t:dwm, b:dwm          DWM's compose clock (card-locked 60 Hz under a fullscreen game on
+//   t, t:vsync, b, b:vsync, o, o:vsync   the output's own vblank (the D3D11 swapchain's waitable
+//                            object, the SINK's vblank once Windows promotes the window to
+//                            independent flip);
+//   t:dwm, b:dwm             DWM's compose clock (card-locked 60 Hz under a fullscreen game on
 //                            the source; the DISPLAYED rate under in-game frame generation; the
 //                            desktop's rate with no game);
 //   t:<fps>, b:<fps>, o:<fps>  a QPC timer at that rate.
@@ -649,8 +650,7 @@ inline bool ParseFlowProbe(const std::string& modeStr, ModeSpec* s) {
 // The DWM modes stay on the D3D9 swapchain, whose blocking present IS DWM's clock: on D3D11 the
 // swapchain's own wait lined each DWM wake up with the card's vblank, and in a game DWM composes
 // at its own rate (Pandora, 2026-10-29) that beat left 1.4 to 2.4 refreshes a second showing no
-// new frame. t:vsync (nearest selection on the output's vblank) and o:dwm are refused: nothing
-// has asked for either yet.
+// new frame. o:dwm is refused: nothing has asked for it.
 //
 // An empty string is a bare launch and selects b:vsync, the release path. "vsync" selects the
 // plain vsync mode, "diag" and "diag:vsync" the clock probes, and a bare number the plain timer
@@ -669,8 +669,7 @@ inline ModeSpec ParseMode(const std::string& modeStr) {
     if (c0 == 'b') comp = Compositor::Blend;
     else if (c0 == 'o') comp = Compositor::Interp;
 
-    if (EqualsNoCase(modeStr, "t") || EqualsNoCase(modeStr, "t:dwm") ||
-        EqualsNoCase(modeStr, "b:dwm")) {
+    if (EqualsNoCase(modeStr, "t:dwm") || EqualsNoCase(modeStr, "b:dwm")) {
         s.kind = ModeKind::Temporal;
         s.compositor = comp;
         s.vsyncPresent = true;
@@ -678,7 +677,8 @@ inline ModeSpec ParseMode(const std::string& modeStr) {
         s.framerate = 60.0f;
         return s;
     }
-    if (EqualsNoCase(modeStr, "b") || EqualsNoCase(modeStr, "b:vsync") ||
+    if (EqualsNoCase(modeStr, "t") || EqualsNoCase(modeStr, "t:vsync") ||
+        EqualsNoCase(modeStr, "b") || EqualsNoCase(modeStr, "b:vsync") ||
         EqualsNoCase(modeStr, "o") || EqualsNoCase(modeStr, "o:vsync")) {
         s.kind = ModeKind::Temporal;
         s.compositor = comp;
@@ -829,7 +829,10 @@ inline PromptAnswer ParsePromptAnswer(const std::string& line) {
 // The startup line that records every resolved option, including those entered at the prompt,
 // which appear nowhere else. mktrace.py reads its "src rate hint <n> fps" and "extra lag <n> ms"
 // phrases, and log readers echo it as a header, so its wording and field order stay fixed.
-inline std::string ResolvedOptionsLine(const Options& o, bool d3d11Present) {
+// d3d11Present and composition are the chosen present path's (the capture mode's
+// PresentsViaD3D11 and PresentsThroughComposition), so the line names the swapchain that runs.
+inline std::string ResolvedOptionsLine(const Options& o, bool d3d11Present,
+                                       bool composition = false) {
     char mark[48];
     if (!o.mark) snprintf(mark, sizeof(mark), "off");
     else if (o.markFrames) snprintf(mark, sizeof(mark), "on (first %u presents)", o.markFrames);
@@ -844,6 +847,9 @@ inline std::string ResolvedOptionsLine(const Options& o, bool d3d11Present) {
     const char* phaseKeep = "off";
     if (o.phaseKeep && joinOn) phaseKeep = "ON (-phasekeep)";
     else if (o.phaseKeep) phaseKeep = "REFUSED (-phasekeep needs -etw with the join on)";
+    const char* presentPath = "D3D9 swapchain";
+    if (d3d11Present && composition) presentPath = "D3D11 composition swapchain";
+    else if (d3d11Present) presentPath = "D3D11 flip-model swapchain";
     char line[768];
     snprintf(line, sizeof(line),
              "Resolved options: src rate hint %.1f fps%s, comb lock %s, frame marker %s, blend "
@@ -855,7 +861,7 @@ inline std::string ResolvedOptionsLine(const Options& o, bool d3d11Present) {
              o.fgPhase ? "requested (-fgphase; ACTIVE only when the instrument line follows)"
                        : "off",
              phaseKeep, o.flipEx ? "FLIPEX (-flipex)" : "bitblt (DISCARD)", o.extraLagMs,
-             d3d11Present ? "D3D11 flip-model swapchain (b:vsync)" : "D3D9 swapchain");
+             presentPath);
     return line;
 }
 

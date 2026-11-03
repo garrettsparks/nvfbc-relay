@@ -135,13 +135,20 @@ clock; together they pick the present path. Every row runs the one `policy::Step
 |---|---|---|---|---|---|
 | `b`, `b:vsync` | `DecideComposite` | `PathPacing`: the D3D11 waitable object, the card's vblank | D3D11, flip-model swapchain; with `-wgc` the composition swapchain, 2 buffers | passthrough or the blend (`-blend` shader if typed) | yes, frames shown as they are copied on the copy engine |
 | `o`, `o:vsync` | `DecideComposite`, plus the flow planner (`PlanNextPresents`) | as `b:vsync` | as `b:vsync` | passthrough, the flow warp, the blend when no flow | yes |
+| `t`, `t:vsync` | `SelectFrame` | as `b:vsync` | as `b:vsync` | the picked frame as is | yes |
 | `t:<fps>` | `SelectFrame` | `TimerPacing`, tight wait | D3D11, composition swapchain, 3 buffers | the picked frame as is | yes |
 | `b:<fps>` | `DecideComposite` | `TimerPacing` | D3D11, composition swapchain, 3 buffers | as `b:vsync` | yes |
 | `o:<fps>` | `DecideComposite` + planner (period = the timer's) | `TimerPacing` | D3D11, composition swapchain, 3 buffers | as `o:vsync` | yes |
-| `t`, `t:dwm` | `SelectFrame` | `PathPacing`: the D3D9 present blocks on DWM's compose clock | D3D9 swapchain, `NearestCompositor` | `StretchRect` of the picked frame | ignored |
+| `t:dwm` | `SelectFrame` | `PathPacing`: the D3D9 present blocks on DWM's compose clock | D3D9 swapchain, `NearestCompositor` | `StretchRect` of the picked frame | ignored |
 | `b:dwm` | `DecideComposite` | as `t:dwm` | D3D9 swapchain, `BlendCompositor` | passthrough or the ps_3_0 blend | ignored |
 | `t:<fps> -d3d9`, `b:<fps> -d3d9` | as without | `TimerPacing` | D3D9 swapchain, IMMEDIATE present | as `t:dwm` / `b:dwm` | ignored |
-| `t:vsync`, `o:dwm` | refused | | | | |
+| `o:dwm` | refused | | | | |
+
+`t:vsync` was added 2026-10-30, and bare `t` moved from `t:dwm` to it, as the user decided on
+2026-10-29; the mode needed only the parser, since the nearest draw and the vblank pacing already
+existed. `o:dwm` stays refused, the user's decision of 2026-10-30 ("we'll probably drop dwm modes in
+the future. let's not do o:dwm"): flow runs only on D3D11, DWM's clock lives in the D3D9 present,
+and the planner has no period for an uneven clock (3.4).
 
 What each decider uses, from `PolicyConfig` (set in `TemporalCaptureMode::Setup`):
 
@@ -213,7 +220,7 @@ replacing the D3D9 one only if the user says so.
 - NvFBC capture's D3D9 device.
 - Locking a timer's phase to the sink (head-1 flips): modelled worse on 2026-08-30 for a noisy
   sensor; not revisited here.
-- `t:vsync` (the user's item, after this).
+- `t:vsync` (the user's item, after this; added 2026-10-30, see 3.5).
 
 ## 6. Decisions for the user
 
@@ -480,6 +487,52 @@ traced.
 
 **`o` on a timer, in Pandora, not at the forge:** `o:60 -wgc` fl=hit 2,489, fl=late 14, fl=own 0,
 cost 3.48%, held 0. The stutter question was not run (see the owed list).
+
+### 7.3 `t:vsync`, 2026-10-30
+
+A build of the tree with `t:vsync` added, on the rig.
+
+**Desktop, 30 s a row:** bare `t` and `t:vsync` start the same mode (`Temporal (D3D11 flip-model
+present, paced by the output's vblank)`), wake interval p50 16,666 us, against `t:dwm`'s 4,164 us on
+the 240 Hz desktop. `-wgc` runs it on the composition swapchain. `-d3d9` and `-blend linear` are each
+ignored with their log line.
+
+**Pandora, one launch, one run a row, with OBS's frame trace reading the card:**
+
+| row | cost | card repeats/s | card skips/s | relay's own repeat count |
+|---|---|---|---|---|
+| `t:vsync` | 3.06% | 0.000 | 0.000 | 6 |
+| `b:vsync` | 3.11% | 0.011 | 0.000 | 6 |
+| `t:dwm` | 4.67% | 0.000 | 0.000 | |
+| `t:60` | 4.12% | 0.043 | 0.011 | 1 |
+| `t:vsync -wgc` | 1.54% | 0.011 | 0.011 | 6 |
+| `b:vsync -wgc` | 1.98% | 0.021 | 0.000 | 7 |
+| no relay, each end | | 0.000, 0.011 | 0.000, 0.011 | |
+
+So `t:vsync` is `b:vsync`'s cost, and bare `t` gets 1.6 points cheaper by leaving `t:dwm`. The card's
+repeats and skips are each a few in 94 s, and the no-relay row shows the same size, so these rows
+cannot separate them. `pick=repeat` ran 127 of 7,386 on `t:vsync` against 14 on `t:60`; 124 of the 127
+fall in the first 10 s, a menu drawing about 10 frames a second, where a repeat is right.
+
+**KCD, 3 minutes each, marked, recorded through OBS, walking in the save's room:**
+
+| row | presents/s | video frames | steps | counters found in the log |
+|---|---|---|---|---|
+| `t:vsync -mark 18000` | 59.99 | 11,205 | +1 every one | 11,205 of 11,205, none missing |
+| `t:dwm -mark 18000` | 64.1 | 11,192 | 2 skips, 1 repeat, all in the first second of video | 11,192 of 11,192, 2 missing |
+
+No synthesized frames in either, and `t:vsync` chose no repeat after its first 15 s. The `t:vsync`
+row joined the corpus as `kcd_60x2_tvsync_2026_10_30_0`: repeats 0 / 0 and pull wraps 0 / 0, replay
+against field, with 27 of 11,204 picks on the other side of the bracket midpoint.
+
+**One row stalled, not explained.** The first KCD `t:vsync` row received one frame in 194 s: the game
+stopped flipping (15 flips on the source display, all in the relay's first 0.19 s), 1,937 grabs
+timed out, and the relay kept presenting at 60 with every counter +1. The game ran normally on the
+next row. Rerun as `t:vsync`, `b:vsync`, `t:vsync`, `t:dwm`, `t:vsync` (60 s each, the first right
+after the game loaded) and then a 3-minute `t:vsync`, nothing recurred: about 7,450 captures a minute
+on every row. So it did not follow the mode or the position, and `t:vsync` opens the same window
+as `b:vsync`; what stopped the game is not known. A focus change at the relay's start is the
+guess, unproven.
 
 Owed, in the order of section 4, each on the rig:
 

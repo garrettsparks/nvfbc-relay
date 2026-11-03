@@ -12,7 +12,7 @@
 // rate with no game). The relay therefore inherits a present cadence, and a present jitter,
 // that belong to another display, and the sink samples one, two or three of those presents
 // per scan. The D3D11 present replaced it for the vblank and timer modes; this one carries the
-// DWM modes (t, t:dwm, b:dwm), whose clock is exactly this blocking present, and the timer modes
+// DWM modes (t:dwm, b:dwm), whose clock is exactly this blocking present, and the timer modes
 // of t and b under -d3d9, to be removed once the D3D11 present has held through a release.
 //
 // Hosts any IFrameCompositor (nearest, blend, interp): the compositor decides and draws,
