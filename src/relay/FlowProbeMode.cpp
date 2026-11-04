@@ -530,10 +530,12 @@ bool MakeWarpRig(Device& d, WarpRig* rig) {
 
 bool ReadTarget(Device& d, const Tex& target, std::vector<float>* out);
 
-// Draws the warp at w and returns the red channel of the result, row major.
+// Draws the warp at w and returns the red channel of the result, row major. means: the pair's
+// 2x1 mean luma for the cut gate, or none (both read 0, never a cut).
 bool RunWarp(Device& d, WarpRig& rig, ID3D11ShaderResourceView* before,
              ID3D11ShaderResourceView* after, ID3D11ShaderResourceView* fwd,
-             ID3D11ShaderResourceView* bwd, int grid, float w, std::vector<float>* out) {
+             ID3D11ShaderResourceView* bwd, int grid, float w, std::vector<float>* out,
+             ID3D11ShaderResourceView* means = NULL) {
     FlowWarpParams params = {};
     params.w = w;
     params.grid = (float)grid;
@@ -552,13 +554,13 @@ bool RunWarp(Device& d, WarpRig& rig, ID3D11ShaderResourceView* before,
     d.ctx->IASetInputLayout(NULL);
     d.ctx->VSSetShader(rig.vs, NULL, 0);
     d.ctx->PSSetShader(rig.ps, NULL, 0);
-    ID3D11ShaderResourceView* srvs[4] = {before, after, fwd, bwd};
-    d.ctx->PSSetShaderResources(0, 4, srvs);
+    ID3D11ShaderResourceView* srvs[5] = {before, after, fwd, bwd, means};
+    d.ctx->PSSetShaderResources(0, 5, srvs);
     d.ctx->PSSetSamplers(0, 1, &rig.sampler);
     d.ctx->PSSetConstantBuffers(0, 1, &rig.cb);
     d.ctx->Draw(3, 0);
-    ID3D11ShaderResourceView* nulls[4] = {NULL, NULL, NULL, NULL};
-    d.ctx->PSSetShaderResources(0, 4, nulls);
+    ID3D11ShaderResourceView* nulls[5] = {NULL, NULL, NULL, NULL, NULL};
+    d.ctx->PSSetShaderResources(0, 5, nulls);
     ID3D11RenderTargetView* noTarget = NULL;
     d.ctx->OMSetRenderTargets(1, &noTarget, NULL);
     return ReadTarget(d, rig.target, out);
@@ -608,9 +610,11 @@ bool MakeField(Device& d, const std::vector<flowwarp::Vec2>& v, int cellsX, int 
 }
 
 // The largest difference between the GPU's output and the CPU reference's, over every pixel.
+// gated: the reference with the cut gate on the means m0 and m1 (WarpPixelGated).
 float WorstAgainstReference(const std::vector<float>& gpu, const GreyFrame& a, const GreyFrame& b,
                             const std::vector<flowwarp::Vec2>& fwd,
-                            const std::vector<flowwarp::Vec2>& bwd, float w) {
+                            const std::vector<flowwarp::Vec2>& bwd, float w, bool gated = false,
+                            float m0 = 0.0f, float m1 = 0.0f) {
     flowwarp::FlowField f, g;
     f.cellsX = g.cellsX = kTestW;
     f.cellsY = g.cellsY = kTestH;
@@ -621,7 +625,10 @@ float WorstAgainstReference(const std::vector<float>& gpu, const GreyFrame& a, c
     float worst = 0.0f;
     for (int y = 0; y < kTestH; y++) {
         for (int x = 0; x < kTestW; x++) {
-            const float ref = flowwarp::WarpPixel(before, after, f, g, {x + 0.5f, y + 0.5f}, w).value;
+            const flowwarp::Vec2 p = {x + 0.5f, y + 0.5f};
+            const float ref = gated
+                ? flowwarp::WarpPixelGated(before, after, f, g, p, w, m0, m1).value
+                : flowwarp::WarpPixel(before, after, f, g, p, w).value;
             worst = std::max(worst, std::fabs(gpu[(size_t)y * kTestW + x] - ref));
         }
     }
@@ -1377,6 +1384,87 @@ void BlendShaderTest(Device& d, const std::vector<float>& pattern) {
     }
 }
 
+// THE CUT GATE ON THE ENGINE: the compositor's own OpticalFlowWarp measuring the frames' means
+// itself, flowing the square frame into a black one and into the square moved right. The cut
+// must come out as the crossfade, pixel for pixel, with its ratio read back under the cut; the
+// moved square must come out as the warp, far from the crossfade in the bands the edges sweep
+// (the control: a gate stuck on would pass the first half), with its ratio read back near 1.
+bool CutGateEngineCheck(Device& d) {
+    OpticalFlowWarp warp;
+    const GreyFrame f0 = SquareFrame(0, true);
+    const GreyFrame f1 = SquareFrame(kSquareMove, true);
+    GreyFrame black;
+    black.rgba.assign((size_t)kTestW * kTestH * 4, 0);
+    black.value.assign((size_t)kTestW * kTestH, 0.0f);
+    for (size_t i = 3; i < black.rgba.size(); i += 4) black.rgba[i] = 255;
+    Tex t0, t1, tb, target;
+    Srv s0, s1, sb;
+    ID3D11Query* event = NULL;
+    D3D11_QUERY_DESC qd = {};
+    qd.Query = D3D11_QUERY_EVENT;
+    if (!MakeTexture(d.dev, kTestW, kTestH, DXGI_FORMAT_R8G8B8A8_UNORM, f0.rgba.data(), kTestW * 4,
+                     D3D11_BIND_SHADER_RESOURCE, &t0) ||
+        !MakeTexture(d.dev, kTestW, kTestH, DXGI_FORMAT_R8G8B8A8_UNORM, f1.rgba.data(), kTestW * 4,
+                     D3D11_BIND_SHADER_RESOURCE, &t1) ||
+        !MakeTexture(d.dev, kTestW, kTestH, DXGI_FORMAT_R8G8B8A8_UNORM, black.rgba.data(),
+                     kTestW * 4, D3D11_BIND_SHADER_RESOURCE, &tb) ||
+        FAILED(d.dev->CreateShaderResourceView(t0.tex, NULL, &s0.view)) ||
+        FAILED(d.dev->CreateShaderResourceView(t1.tex, NULL, &s1.view)) ||
+        FAILED(d.dev->CreateShaderResourceView(tb.tex, NULL, &sb.view)) ||
+        !MakeTexture(d.dev, kTestW, kTestH, DXGI_FORMAT_R32G32B32A32_FLOAT, NULL, 0,
+                     D3D11_BIND_RENDER_TARGET, &target) ||
+        FAILED(d.dev->CreateQuery(&qd, &event)) ||
+        !warp.Setup(d.dev, d.ctx, kTestW, kTestH)) {
+        if (event) event->Release();
+        LOG("ofprobe: cut gate on engine: RESULT could not be set up");
+        return false;
+    }
+    std::vector<float> crossCut((size_t)kTestW * kTestH), crossMove(crossCut.size());
+    for (size_t i = 0; i < crossCut.size(); i++) {
+        crossCut[i] = 0.5f * f0.value[i];
+        crossMove[i] = 0.5f * (f0.value[i] + f1.value[i]);
+    }
+    // One flow into slot 0, finished, then its warp at 0.5, read back, and the slot's ratio.
+    auto run = [&](const Srv& after, int64_t afterTs, std::vector<float>* out, float* ratio) {
+        OpticalFlowWarp::Frame a, b;
+        a.ts = 1;
+        a.srv = s0.view;
+        b.ts = afterTs;
+        b.srv = after.view;
+        if (!warp.Flow(0, a, b, false) || !WaitIdle(d, event)) return false;
+        Sleep(50);
+        if (!warp.Warp(0, s0.view, after.view, 0.5f, target.rtv, afterTs) ||
+            !ReadTarget(d, target, out)) {
+            return false;
+        }
+        *ratio = warp.PairRatio(0);
+        return true;
+    };
+    std::vector<float> cutOut, moveOut;
+    float cutRatio = -1.0f, moveRatio = -1.0f;
+    const bool ran = run(sb, 2, &cutOut, &cutRatio) && run(s1, 3, &moveOut, &moveRatio);
+    event->Release();
+    if (!ran) {
+        LOG("ofprobe: cut gate on engine: RESULT could not run");
+        return false;
+    }
+    float worstCut = 0.0f;
+    for (size_t i = 0; i < cutOut.size(); i++) {
+        worstCut = std::max(worstCut, std::fabs(cutOut[i] - crossCut[i]));
+    }
+    const float moveDiffers = DifferingShare(moveOut, crossMove);
+    const bool pass = worstCut < 0.002f && cutRatio >= 0.0f && cutRatio < flowwarp::kCutRatio &&
+                      moveDiffers > 0.01f && moveRatio > 0.9f;
+    LOG("ofprobe: cut gate on engine: the square into black against the crossfade worst %.4f "
+        "(want < 0.002), ratio read back %.3f (want 0 to %.2f); the square moved against the "
+        "crossfade %.2f%% of pixels differ by more than 0.1 (want > 1%%: the warp, not the gate), "
+        "ratio read back %.3f (want > 0.9)", worstCut, (double)cutRatio,
+        (double)flowwarp::kCutRatio, 100.0 * moveDiffers, (double)moveRatio);
+    LOG("ofprobe: cut gate on engine: RESULT %s", pass ? "PASS" : "FAIL");
+    warp.LogSummary();
+    return pass;
+}
+
 // Runs the self-test and logs one line per check and a verdict.
 void WarpSelfTest(Device& d) {
     WarpRig rig;
@@ -1454,6 +1542,45 @@ void WarpSelfTest(Device& d) {
     pass = pass && worstWrong > 0.2f;
     LOG("ofprobe: warp self-test: wrong-sign fields against the reference: worst %.4f (must be "
         "> 0.2)", worstWrong);
+
+    // The cut gate (FlowWarpMath.h, step 4), with the pair's means handed to the shader. Each
+    // case against the gated reference; the cut against the ungated one as well, which must be
+    // far off or the comparison could not see the gate at all; and a pair either side of the
+    // ratio, so the shader's constant is checked against the reference's.
+    struct GateCase {
+        const char* name;
+        float m0, m1;
+        bool cut;
+    };
+    const GateCase gateCases[] = {
+        {"a cut to black (0.45 to 0.00)", 0.45f, 0.00f, true},
+        {"an ordinary pair (0.45 to 0.43)", 0.45f, 0.43f, false},
+        {"just under the ratio (0.40 to 0.18)", 0.40f, 0.18f, true},
+        {"just over the ratio (0.40 to 0.21)", 0.40f, 0.21f, false},
+    };
+    for (const GateCase& c : gateCases) {
+        const float m[2] = {c.m0, c.m1};
+        Tex meansT;
+        Srv meansS;
+        if (!MakeTexture(d.dev, 2, 1, DXGI_FORMAT_R32_FLOAT, m, 8, D3D11_BIND_SHADER_RESOURCE,
+                         &meansT) ||
+            FAILED(d.dev->CreateShaderResourceView(meansT.tex, NULL, &meansS.view)) ||
+            !RunWarp(d, rig, s0.view, s1.view, fwdS.view, bwdS.view, 1, 0.5f, &out,
+                     meansS.view)) {
+            LOG("ofprobe: warp self-test: RESULT the cut gate's case could not be drawn");
+            return;
+        }
+        const bool cpuCut = flowwarp::IsCut(c.m0, c.m1);
+        const float gated = WorstAgainstReference(out, f0, f1, fwd, bwd, 0.5f, true, c.m0, c.m1);
+        const float ungated = WorstAgainstReference(out, f0, f1, fwd, bwd, 0.5f);
+        bool ok = cpuCut == c.cut && gated < 0.01f;
+        if (c.cut) ok = ok && ungated > 0.2f;
+        pass = pass && ok;
+        LOG("ofprobe: warp self-test: cut gate, %s: the reference calls it %s (want %s); against "
+            "the gated reference worst %.4f (want < 0.01), against the ungated %.4f (%s) %s",
+            c.name, cpuCut ? "a cut" : "no cut", c.cut ? "a cut" : "no cut", gated, ungated,
+            c.cut ? "must be > 0.2" : "the warp itself", ok ? "ok" : "FAILED");
+    }
     LOG("ofprobe: warp self-test: RESULT %s", pass ? "PASS" : "FAIL");
 
     // The compositor's own OpticalFlowWarp on the engine's flow: how well it warps the square (a
@@ -1466,6 +1593,7 @@ void WarpSelfTest(Device& d) {
         return;
     }
     EngineReading(d, engine);
+    CutGateEngineCheck(d);
     OrderingTally tally;
     for (int i = 0; i < 100; i++) tally.Run(d, engine);
     tally.Log("ordering check (idle)");

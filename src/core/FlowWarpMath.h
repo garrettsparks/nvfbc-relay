@@ -42,6 +42,14 @@
 //    follows the scene under it), and the crossfade at p, which is the overlay itself, is used.
 //    Agreement is asked of p and four neighbours, not of p alone (FFmpeg's guard): moving
 //    texture matches itself at one pixel by coincidence often enough to speckle, at five rarely.
+//
+// 4. THE CUT GATE, over the whole frame and ahead of the three steps above. When one frame of the
+//    pair is far darker than the other, as at a cut to black (a map or menu opening in a game),
+//    there is no motion between them to follow: the engine matches lit texture against nothing,
+//    every pixel differs so the static guard stays out, and the warp draws whatever the vectors
+//    point at, blocks of black dragged across the picture. Then the whole frame is the crossfade,
+//    which across a cut to black is a quick fade. Each frame's mean luma is measured once, when
+//    it is drawn for the engine; the gate compares the darker mean with the brighter.
 
 #include <cmath>
 
@@ -88,6 +96,29 @@ const float kStaticLumaSigma = 0.03f;
 const float kGuardSpreadPx = 2.0f;
 const float kGuardNearPx = 2.0f;
 const float kGuardFarPx = 8.0f;
+
+// The cut gate: the pair is a cut when the darker frame's mean luma (on 0..1), plus kCutFloor,
+// is under kCutRatio of the brighter one's plus kCutFloor. The floor keeps a black frame from
+// dividing by zero and two very dark frames from reading as a cut on a small absolute change.
+// Measured on the 2026-11-02 stream's video: consecutive frames in 40 s of riding never went
+// below 0.992, and the pair at a map opening read about 0.04.
+const float kCutRatio = 0.5f;
+const float kCutFloor = 0.02f;
+
+// The darker mean over the brighter, each with the floor added: 1 for equal means, toward 0
+// for a cut to black.
+inline float MeanRatio(float meanBefore, float meanAfter) {
+    const float lo = std::fmin(meanBefore, meanAfter) + kCutFloor;
+    const float hi = std::fmax(meanBefore, meanAfter) + kCutFloor;
+    return lo / hi;
+}
+
+// The shader's form, with no division: lo < kCutRatio hi.
+inline bool IsCut(float meanBefore, float meanAfter) {
+    const float lo = std::fmin(meanBefore, meanAfter) + kCutFloor;
+    const float hi = std::fmax(meanBefore, meanAfter) + kCutFloor;
+    return lo < kCutRatio * hi;
+}
 
 inline float Clamp01(float x) {
     if (x < 0.0f) return 0.0f;
@@ -204,6 +235,23 @@ inline WarpResult WarpPixel(const BeforeFn& before, const AfterFn& after, const 
     r.guard = staticness * Smoothstep(kGuardNearPx, kGuardFarPx, reach);
     r.value = warped + (crossfade - warped) * r.guard;
     return r;
+}
+
+// The pixel as the shader draws it: the crossfade at p when the pair is a cut (step 4), the warp
+// above otherwise. meanBefore and meanAfter are the frames' mean luma on 0..1.
+template <class BeforeFn, class AfterFn>
+inline WarpResult WarpPixelGated(const BeforeFn& before, const AfterFn& after,
+                                 const FlowField& fwd, const FlowField& bwd, Vec2 p, float w,
+                                 float meanBefore, float meanAfter) {
+    if (IsCut(meanBefore, meanAfter)) {
+        WarpResult r;
+        r.value = Lerp(before(p), after(p), w);
+        r.before = p;
+        r.after = p;
+        r.guard = 1.0f;
+        return r;
+    }
+    return WarpPixel(before, after, fwd, bwd, p, w);
 }
 
 }  // namespace flowwarp

@@ -713,12 +713,16 @@ MaybeFailure TemporalCaptureMode::Run(RelayContext& ctx,
                 nf += snprintf(flowField + nf, sizeof(flowField) - nf, " pta=%d", outcome.synthAge);
             }
             if (outcome.panFollow >= 0 && nf >= 0 && (size_t)nf < sizeof(flowField)) {
-                snprintf(flowField + nf, sizeof(flowField) - nf, " ps=%.1f,%.1f,%.2f,%s",
-                         (double)outcome.panX, (double)outcome.panY, (double)outcome.panRatio,
-                         outcome.panFollow ? "y" : "n");
+                nf += snprintf(flowField + nf, sizeof(flowField) - nf, " ps=%.1f,%.1f,%.2f,%s",
+                               (double)outcome.panX, (double)outcome.panY,
+                               (double)outcome.panRatio, outcome.panFollow ? "y" : "n");
             }
-            // blk= goes after the appended op/flip fields, followed only by ease=, fl=, pta= and
-            // ps=.
+            if (outcome.lumaRatio >= 0.0f && nf >= 0 && (size_t)nf < sizeof(flowField)) {
+                snprintf(flowField + nf, sizeof(flowField) - nf, " lr=%.3f",
+                         (double)outcome.lumaRatio);
+            }
+            // blk= goes after the appended op/flip fields, followed only by ease=, fl=, pta=, ps=
+            // and lr=.
             // The offline parsers match this line as a contiguous chain of named fields, so a
             // field inserted between two existing ones silently drops every field after it rather
             // than failing.

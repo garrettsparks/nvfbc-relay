@@ -11,9 +11,11 @@
 // the CPU reference on generated frames and fields.
 //
 // Bindings: t0 the before frame, t1 the after frame (sampled linearly, clamped), t2 the forward
-// field, t3 the backward field (R16G16_SINT, S10.5 fixed point, one vector per grid cell), s0 the
+// field, t3 the backward field (R16G16_SINT, S10.5 fixed point, one vector per grid cell), t4 the
+// pair's mean luma (R32_FLOAT, 2x1: the before frame's at x 0, the after frame's at x 1), s0 the
 // linear clamp sampler, b0 WarpParams. Positions are pixels with centres at i + 0.5, as
-// SV_Position gives them; a frame is sampled at position / size.
+// SV_Position gives them; a frame is sampled at position / size. With nothing bound at t4 both
+// means read 0, which is never a cut, so the warp is drawn as before the gate existed.
 //
 // The guard's luma is BT.709 of the sampled colour; on grey frames it equals the CPU reference's
 // one-channel value exactly, which is what the self-test feeds both.
@@ -32,17 +34,20 @@ inline std::string FlowWarpShaderSource() {
              "#define LUMA_SIGMA %.9g\n"
              "#define GUARD_SPREAD %.9g\n"
              "#define GUARD_NEAR %.9g\n"
-             "#define GUARD_FAR %.9g\n",
+             "#define GUARD_FAR %.9g\n"
+             "#define CUT_RATIO %.9g\n"
+             "#define CUT_FLOOR %.9g\n",
              flowwarp::kSourceSteps, flowwarp::kSourceDamping, flowwarp::kResidualNearPx,
              flowwarp::kResidualFarPx, flowwarp::kRoundTripScale, flowwarp::kRoundTripFloorPx2,
              flowwarp::kRoundTripFade, flowwarp::kInconsistentWeight, flowwarp::kMinSideWeight,
              flowwarp::kStaticLumaSigma, flowwarp::kGuardSpreadPx, flowwarp::kGuardNearPx,
-             flowwarp::kGuardFarPx);
+             flowwarp::kGuardFarPx, flowwarp::kCutRatio, flowwarp::kCutFloor);
     static const char* kBody =
         "Texture2D beforeTex : register(t0);\n"
         "Texture2D afterTex : register(t1);\n"
         "Texture2D<int2> fwdTex : register(t2);\n"
         "Texture2D<int2> bwdTex : register(t3);\n"
+        "Texture2D<float> meansTex : register(t4);\n"
         "SamplerState samp : register(s0);\n"
         "cbuffer WarpParams : register(b0) {\n"
         "    float w;        // 0 = the before frame's instant, 1 = the after frame's\n"
@@ -75,6 +80,14 @@ inline std::string FlowWarpShaderSource() {
         "float Luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }\n"
         "float4 main(float4 pos : SV_Position) : SV_Target {\n"
         "    float2 p = pos.xy;\n"
+        "    float3 z0 = Before(p);\n"
+        "    float3 z1 = After(p);\n"
+        "    float3 crossfade = z0 * (1.0 - w) + z1 * w;\n"
+        "    float m0 = meansTex.Load(int3(0, 0, 0));\n"
+        "    float m1 = meansTex.Load(int3(1, 0, 0));\n"
+        "    if (min(m0, m1) + CUT_FLOOR < CUT_RATIO * (max(m0, m1) + CUT_FLOOR)) {\n"
+        "        return float4(crossfade, 1.0);\n"
+        "    }\n"
         "    float r0, r1;\n"
         "    float2 s0 = Solve(fwdTex, p, w, r0);\n"
         "    float2 s1 = Solve(bwdTex, p, 1.0 - w, r1);\n"
@@ -82,9 +95,6 @@ inline std::string FlowWarpShaderSource() {
         "    float vis1 = 1.0 - smoothstep(RESIDUAL_NEAR, RESIDUAL_FAR, r1);\n"
         "    float trip0 = RoundTrip(fwdTex, bwdTex, s0);\n"
         "    float trip1 = RoundTrip(bwdTex, fwdTex, s1);\n"
-        "    float3 z0 = Before(p);\n"
-        "    float3 z1 = After(p);\n"
-        "    float3 crossfade = z0 * (1.0 - w) + z1 * w;\n"
         "    float k0 = (1.0 - w) * vis0 * (INCONSISTENT + trip0);\n"
         "    float k1 = w * vis1 * (INCONSISTENT + trip1);\n"
         "    float3 warped = crossfade;\n"

@@ -33,6 +33,13 @@
 //
 // The flow fields live in policy::kFlowSlots cache slots, one forward and one backward field and
 // their costs each, numbered as the FlowPlanner numbers them.
+//
+// THE CUT GATE (FlowWarpMath.h, step 4): when a frame's luma is drawn for the engine, it is also
+// drawn at 64x32 and reduced by mips to its mean, on the GPU. Handing a flow over copies the
+// pair's two means beside the slot's fields, and the warp shader reads them: a pair whose darker
+// mean is under half the brighter (a cut to black) is drawn as the crossfade. Nothing waits for
+// the means on the CPU; a copy is read back a few presents later for the log only (the summary,
+// a line per cut, and lr= on the present's line through PairRatio).
 class OpticalFlowWarp {
 public:
     // A captured frame as the present sees it.
@@ -75,6 +82,12 @@ public:
     // Every result goes into the summary; the newest is returned.
     bool TakeWarpTime(long long present, long long* us, int* presentsAgo);
 
+    // The darker-over-brighter ratio of the means of the pair flowed into slot
+    // (flowwarp::MeanRatio), once its read-back has arrived; -1 until then. Under
+    // flowwarp::kCutRatio the slot's warps draw the crossfade. Reads any read-back that has
+    // arrived first, without waiting.
+    float PairRatio(int slot);
+
     // The slot's forward field, for the probe to copy and read back.
     ID3D11Texture2D* ForwardField(int slot) const {
         return slot >= 0 && slot < policy::kFlowSlots ? m_slots[slot].fwd.texture : NULL;
@@ -87,10 +100,22 @@ private:
     // Luma frames kept: the four cached pairs share frames, so six covers them with room.
     static const int kLumaSlots = 6;
 
+    // The cut gate's mean: each frame drawn at kMeanW x kMeanH, R32_FLOAT, whose last of
+    // kMeanMips mips is its mean.
+    static const int kMeanW = 64;
+    static const int kMeanH = 32;
+    static const int kMeanMips = 7;
+    // Means read-backs that can be in flight at once; a flow handed over with none free is
+    // gated all the same, only not logged.
+    static const int kMeanReads = 8;
+
     struct Luma {
         ID3D11Texture2D* texture = NULL;
         ID3D11RenderTargetView* rtv = NULL;
         NvOFGPUBufferHandle handle = NULL;
+        ID3D11Texture2D* mean = NULL;             // kMeanW x kMeanH with mips
+        ID3D11RenderTargetView* meanRtv = NULL;   // its top mip
+        ID3D11ShaderResourceView* meanSrv = NULL; // every mip, for GenerateMips
         int64_t ts = 0;
         bool valid = false;
         long long lastUse = 0;
@@ -102,6 +127,17 @@ private:
     };
     struct Slot {
         Field fwd, bwd, fwdCost, bwdCost;
+        ID3D11Texture2D* means = NULL;            // 2x1 R32_FLOAT: before, after
+        ID3D11ShaderResourceView* meansSrv = NULL;
+        int64_t beforeTs = 0, afterTs = 0;        // the pair last handed over
+        float ratio = -1.0f;                      // its MeanRatio once read back, else -1
+    };
+    // One copy of a slot's means on its way back to the CPU.
+    struct MeanRead {
+        ID3D11Texture2D* staging = NULL;
+        int slot = -1;
+        int64_t beforeTs = 0, afterTs = 0;
+        bool pending = false;
     };
     // One warp's timestamp queries, in flight until read.
     struct Timing {
@@ -115,10 +151,18 @@ private:
     static const int kTimings = 8;
 
     bool MakeField(DXGI_FORMAT format, bool view, Field* out);
+    bool MakeCutGate();
     bool CompileShaders();
     // The engine's input for a frame: its luma, drawn now if not kept. NULL when it has none.
-    NvOFGPUBufferHandle InputFor(const Frame& frame, int64_t keep);
+    Luma* InputFor(const Frame& frame, int64_t keep);
     bool DrawLuma(const Frame& frame, Luma* into);
+    // The frame's mean, drawn after its luma, timed.
+    void DrawMean(const Frame& frame, Luma* into);
+    // Reads every means read-back and pass time that has arrived, without waiting.
+    void PollMeans();
+    // Reads finished timestamp queries into us; the newest present's value into *newestUs.
+    bool ReadTimings(Timing* timings, std::vector<float>* us, long long present,
+                     long long* newestUs, int* presentsAgo);
 
     bool m_ready = false;
     int m_width = 0, m_height = 0;
@@ -137,10 +181,24 @@ private:
     ID3D11PixelShader* m_warpPs = NULL;
     ID3D11SamplerState* m_linear = NULL;
     ID3D11Buffer* m_lumaCb = NULL;
+    ID3D11Buffer* m_meanCb = NULL;
     ID3D11Buffer* m_warpCb = NULL;
     Timing m_timings[kTimings];
     std::vector<float> m_warpUs;           // every warp GPU time read, for the summary
     long long m_warpsUntimed = 0;
+
+    // The cut gate.
+    bool m_gate = false;                   // the means are drawn; false leaves every pair a warp
+    MeanRead m_meanReads[kMeanReads];
+    Timing m_meanTimings[kTimings];
+    std::vector<float> m_meanUs;           // every mean pass's GPU time read
+    long long m_meansUntimed = 0;
+    std::vector<float> m_ratios;           // every pair's MeanRatio read back
+    long long m_meanReadsSkipped = 0;      // flows handed over with no read-back free
+    long long m_meanReadsFailed = 0;
+    long long m_cuts = 0;                  // pairs read back as a cut
+    long long m_warpsCut = 0;              // warps drawn over a pair known to be a cut
+    long long m_warpsRatioUnread = 0;      // warps drawn before their pair's ratio was read
 
     long long m_uses = 0;
     long long m_flows = 0;

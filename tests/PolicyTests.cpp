@@ -6679,6 +6679,69 @@ static void test_flow_warp_math() {
         }
         CHECK(bad == 0, "extreme flow: %d outputs outside the frames' range or NaN (want 0)", bad);
     }
+    // The cut gate. Where it sits: a cut to black and the pair just under the ratio are cuts; an
+    // ordinary pair, the pair just over, two black frames and two nearly black ones are not.
+    {
+        CHECK(flowwarp::IsCut(0.45f, 0.0f) && flowwarp::IsCut(0.0f, 0.45f) &&
+                  flowwarp::IsCut(0.40f, 0.18f) && !flowwarp::IsCut(0.40f, 0.21f) &&
+                  !flowwarp::IsCut(0.45f, 0.43f) && !flowwarp::IsCut(0.0f, 0.0f) &&
+                  !flowwarp::IsCut(0.01f, 0.0f),
+              "cut gate: a pair is called a cut on the wrong side of the ratio");
+        // The shader's form (no division) and MeanRatio agree everywhere off the edge itself,
+        // either way round.
+        int disagree = 0;
+        for (int i = 0; i <= 100; i++) {
+            for (int j = 0; j <= 100; j++) {
+                const float a = i / 100.0f, b = j / 100.0f;
+                const float ratio = flowwarp::MeanRatio(a, b);
+                if (std::fabs(ratio - flowwarp::kCutRatio) < 1e-5f) continue;
+                if (flowwarp::IsCut(a, b) != (ratio < flowwarp::kCutRatio)) disagree++;
+                if (flowwarp::MeanRatio(b, a) != ratio) disagree++;
+            }
+        }
+        CHECK(disagree == 0, "cut gate: IsCut and MeanRatio disagree on %d pairs (want 0)",
+              disagree);
+    }
+    // What it draws: across a cut, the crossfade at p at every pixel, whatever the flow says;
+    // on an ordinary pair, the warp exactly as without the gate (the control: a gate that drew
+    // the crossfade everywhere would pass the first half). The scene changes fast enough along
+    // x that the crossfade of the 9 px move is far from the warp; at the 0.11 of the uniform
+    // motion case above it came within 0.024, and the control could not tell the two apart.
+    {
+        auto scene = [](Vec2 p) {
+            return 0.5f + 0.2f * std::sin(0.6f * p.x + 0.3f) + 0.2f * std::cos(0.07f * p.y);
+        };
+        const Vec2 d = {9.0f, 0.0f};
+        auto before = [&](Vec2 p) { return scene(p); };
+        auto after = [&](Vec2 p) { return scene(flowwarp::Sub(p, d)); };
+        std::vector<Vec2> fs, bs;
+        const flowwarp::FlowField fwd = UniformField(fs, 16, 16, 4.0f, d);
+        const flowwarp::FlowField bwd = UniformField(bs, 16, 16, 4.0f, flowwarp::Scale(d, -1.0f));
+        int cutWrong = 0, plainWrong = 0;
+        float warpFromCrossfade = 0.0f;
+        for (float w : {0.25f, 0.5f, 0.75f}) {
+            for (float y = 8.5f; y < 56.0f; y += 2.5f) {
+                for (float x = 8.5f; x < 56.0f; x += 2.5f) {
+                    const Vec2 p = {x, y};
+                    const float crossfade = flowwarp::Lerp(before(p), after(p), w);
+                    const float cut =
+                        flowwarp::WarpPixelGated(before, after, fwd, bwd, p, w, 0.45f, 0.0f).value;
+                    if (cut != crossfade) cutWrong++;
+                    const float plain =
+                        flowwarp::WarpPixelGated(before, after, fwd, bwd, p, w, 0.45f, 0.43f).value;
+                    const float warp = flowwarp::WarpPixel(before, after, fwd, bwd, p, w).value;
+                    if (plain != warp) plainWrong++;
+                    warpFromCrossfade = std::max(warpFromCrossfade, std::fabs(warp - crossfade));
+                }
+            }
+        }
+        CHECK(cutWrong == 0, "cut gate: %d pixels across a cut are not the crossfade (want 0)",
+              cutWrong);
+        CHECK(plainWrong == 0 && warpFromCrossfade > 0.05f,
+              "cut gate: %d pixels of an ordinary pair differ from the ungated warp (want 0); the "
+              "warp is at most %g from the crossfade (want > 0.05, or this case cannot tell them "
+              "apart)", plainWrong, (double)warpFromCrossfade);
+    }
 }
 
 int main(int argc, char** argv) {

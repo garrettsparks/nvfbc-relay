@@ -770,6 +770,7 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket,
     out->panFollow = -1;
     out->synthExec = NULL;
     out->pixelExec = 0;
+    out->lumaRatio = -1.0f;
     // pt= and pta=: the GPU time of an earlier warp, read now that the GPU has it.
     if (m_flow) {
         long long us = 0;
@@ -897,6 +898,8 @@ void D3D11PresentBackend::Compose(const FrameBracket& bracket,
     if (d.op == policy::CompositeOp::Synthesize) out->synthExec = SynthExecLabel(exec);
     out->synthesized = exec != 0;
     out->pixelExec = exec;
+    // lr=: the cut gate's reading of the pair this warp was drawn from, once it is back.
+    if (m_flow && exec == kExecWarp && flowSlot >= 0) out->lumaRatio = m_flow->PairRatio(flowSlot);
     // Planned flows ride this present's draw, or go alone when the next present needs them. With
     // the copy engine they wait until after the present (Present): a drawn present reaches the
     // screen behind everything queued on this context before it, a flow included, and a present

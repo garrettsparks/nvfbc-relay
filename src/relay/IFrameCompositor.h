@@ -35,6 +35,10 @@ struct CompositeOutcome {
     float panX = 0.0f;             // for the draw pt= timed, followed or not: panX,panY pixels,
     float panY = 0.0f;             // panRatio its match's cost over no shift's, y when
     float panRatio = 0.0f;         // followed (1), n when not (0); -1 = no field
+    float lumaRatio = -1.0f;       // lr= field: a warp's pair, its darker mean luma over the
+                                   // brighter (flowwarp::MeanRatio), under the cut ratio drawn
+                                   // as the crossfade; -1 = no field (not a warp, or the pair's
+                                   // means not read back yet)
 };
 
 // Synthesis executor codes: what actually produced a present's pixels. One vocabulary
