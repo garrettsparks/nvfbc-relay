@@ -1,7 +1,7 @@
 // Tests-as-spec for TemporalPolicy (docs/policy-extraction-spec.md). Console target,
-// deliberately NOT in the Windows solution: pure C++17, no GPU, no timing dependence.
+// deliberately NOT in the Windows solution: pure C++20, no GPU, no timing dependence.
 //
-//   g++ -std=c++17 -O2 -o policytests PolicyTests.cpp TemporalPolicy.cpp
+//   g++ -std=c++20 -O2 -o policytests PolicyTests.cpp TemporalPolicy.cpp
 //   ./policytests                       run the synthetic invariant suite
 //   ./policytests --replay NvFBCR.log [--comb <us>] [--passthrough <us>]
 //                                       pin the policy against a real log: nearest-mode
@@ -9,6 +9,11 @@
 //                                       logs replay op=/bw= (threshold self-configures
 //                                       from the Setup line; --passthrough overrides),
 //                                       and --comb adds the pull=/lk= lock pin
+//   ./policytests --only <fixture>      replay one corpus fixture named in
+//                                       testdata/index.txt (with or without .trace) and
+//                                       nothing else: its replay, field and bounds lines in
+//                                       minutes where the whole suite takes much longer. It is
+//                                       not a pass of the suite and says so on its last line
 //
 // All synthetic tests run in the microsecond domain; the policy is unit-agnostic.
 
@@ -2959,6 +2964,9 @@ static std::string TestDataDir() {
     return ((cut == std::string::npos) ? std::string() : here.substr(0, cut + 1)) + "testdata/";
 }
 
+// Set by --only: the one index entry the corpus replays. Empty runs every entry.
+static std::string g_onlyFixture;
+
 static std::vector<std::string> FixturePaths() {
     std::vector<std::string> out;
     std::string dir = TestDataDir();
@@ -2972,6 +2980,7 @@ static std::vector<std::string> FixturePaths() {
     char name[256];
     while (std::fscanf(idx, "%255s", name) == 1) {
         if (name[0] == '#') { int c; while ((c = std::fgetc(idx)) != EOF && c != '\n') {} continue; }
+        if (!g_onlyFixture.empty() && g_onlyFixture != name) continue;
         out.push_back(dir + name);
     }
     std::fclose(idx);
@@ -3360,10 +3369,15 @@ static void CheckNearestFixture(const TraceFixture& fx, const SimParams& p, cons
 
 static void test_replay_capture_corpus() {
     const std::vector<std::string> paths = FixturePaths();
+    // A mistyped --only name would otherwise replay nothing and pass.
+    CHECK(g_onlyFixture.empty() || paths.size() == 1,
+          "--only %s: %zu entries of that name in index.txt, want exactly 1",
+          g_onlyFixture.c_str(), paths.size());
     // Loud, never a skip: a corpus gate that quietly vanishes leaves the suite green
     // while the thing it guards regresses. Both lookup paths are relative to the repo
-    // root, which is where CI and the documented local command both run.
-    CHECK(!paths.empty(),
+    // root, which is where CI and the documented local command both run. Under --only the
+    // check above already says what is missing.
+    CHECK(!g_onlyFixture.empty() || !paths.empty(),
           "no replay fixtures found (looked for %sindex.txt and "
           "tests/testdata/index.txt). Run the suite from the repository "
           "root. The capture corpus is the only gate that has caught a real pacing "
@@ -6752,8 +6766,35 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--replay") && i + 1 < argc) replayPath = argv[++i];
         else if (!std::strcmp(argv[i], "--comb") && i + 1 < argc) combUs = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "--passthrough") && i + 1 < argc) passUs = std::atoll(argv[++i]);
+        else if (!std::strcmp(argv[i], "--only") && i + 1 < argc) g_onlyFixture = argv[++i];
     }
     if (replayPath) return Replay(replayPath, combUs, passUs);
+
+    if (!g_onlyFixture.empty()) {
+        const std::string ext = ".trace";
+        const bool hasExt = g_onlyFixture.size() > ext.size() &&
+            g_onlyFixture.compare(g_onlyFixture.size() - ext.size(), ext.size(), ext) == 0;
+        if (!hasExt) g_onlyFixture += ext;
+        // The other entries are not replayed, but each must still open: an index edit that
+        // turns a comment into a name, or mistypes one, fails here and not first on CI.
+        const std::string only = g_onlyFixture;
+        g_onlyFixture.clear();
+        for (const std::string& path : FixturePaths()) {
+            std::FILE* f = std::fopen(path.c_str(), "rb");
+            CHECK(f != nullptr, "index.txt names %s, which does not open", path.c_str());
+            if (f) std::fclose(f);
+        }
+        g_onlyFixture = only;
+        test_replay_capture_corpus();
+        if (g_failures) {
+            std::printf("ONE FIXTURE FAILED (%s): %d failure(s); the rest of the suite did not run\n",
+                        g_onlyFixture.c_str(), g_failures);
+            return 1;
+        }
+        std::printf("ONE FIXTURE PASSED (%s); the rest of the suite did not run\n",
+                    g_onlyFixture.c_str());
+        return 0;
+    }
 
     test_lock_off_matches_v15();
     test_monotonic_and_pull_bounds_across_wrap();

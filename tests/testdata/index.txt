@@ -197,6 +197,12 @@ kcd_60x2_tvsync_2026_10_30_0.trace
 # blend run 18 in both. All 770 synthesized presents were planned (721 warped, 49 drawn as the
 # blend).
 kcd_60x2_ovsync_2026_11_02_0.trace
+# 71 minutes of the 2026-11-04 stream, o:vsync through Windows.Graphics.Capture on the build that
+# added the flow warp's cut gate: 398 hitches and 63 stalls an hour in 99 bursts, 36 of the 50
+# stall bursts at cuts to or from black (map opens, the wait and sleep dial). 10 lock releases, the
+# same 10 on the replay; worst blend run 39 in both. Of 2033 synthesized presents, 1936 warped
+# and 95 drawn as the blend.
+kcd_60x2_ovsync_2026_11_04_0.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions
