@@ -13,11 +13,11 @@ std::string Narrow(const WCHAR* text) {
     return out;
 }
 
-// Gives each display its monitor's friendly name. Windows' display configuration lists one
-// path per active monitor, and each path names the GDI device it is shown through, so the name
-// goes to the display with that device name. The order of the paths is not the order of the
-// Direct3D adapters, and a duplicated desktop has more paths than adapters; there the first
-// monitor's name is kept.
+// Gives each display its monitor's friendly name and its exact refresh rate. Windows' display
+// configuration lists one path per active monitor, and each path names the GDI device it is
+// shown through, so the name and the rate go to the display with that device name. The order
+// of the paths is not the order of the Direct3D adapters, and a duplicated desktop has more
+// paths than adapters; there the first monitor's name and rate are kept.
 void AddFriendlyNames(std::vector<DisplayInfo>* displays) {
     std::vector<DISPLAYCONFIG_PATH_INFO> activePaths;
     std::vector<DISPLAYCONFIG_MODE_INFO> activeModes;
@@ -51,14 +51,30 @@ void AddFriendlyNames(std::vector<DisplayInfo>* displays) {
         target.header.size = sizeof(target);
         target.header.adapterId = path.targetInfo.adapterId;
         target.header.id = path.targetInfo.id;
-        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
-            DisplayConfigGetDeviceInfo(&target.header) != ERROR_SUCCESS) {
-            continue;
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) continue;
+        const bool named = DisplayConfigGetDeviceInfo(&target.header) == ERROR_SUCCESS;
+        // The path's target mode carries the signal the display is driven with. Its rounded
+        // refresh (vSyncFreq) and EnumDisplaySettings' whole hertz cannot tell 59.95 from 60.0002;
+        // the pixel clock over the total size can.
+        const DISPLAYCONFIG_VIDEO_SIGNAL_INFO* signal = NULL;
+        const UINT32 modeIndex = path.targetInfo.modeInfoIdx;
+        if (modeIndex != DISPLAYCONFIG_PATH_MODE_IDX_INVALID && modeIndex < activeModes.size() &&
+            activeModes[modeIndex].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) {
+            signal = &activeModes[modeIndex].targetMode.targetVideoSignalInfo;
         }
         const std::string gdiName = Narrow(source.viewGdiDeviceName);
         for (DisplayInfo& d : *displays) {
-            if (d.friendlyName.empty() && _stricmp(d.deviceName.c_str(), gdiName.c_str()) == 0) {
+            if (_stricmp(d.deviceName.c_str(), gdiName.c_str()) != 0) continue;
+            if (named && d.friendlyName.empty()) {
                 d.friendlyName = Narrow(target.monitorFriendlyDeviceName);
+            }
+            if (signal && d.exactHz == 0.0 && signal->totalSize.cx > 0 &&
+                signal->totalSize.cy > 0 && signal->pixelRate > 0) {
+                d.pixelClockHz = signal->pixelRate;
+                d.totalWidth = (int)signal->totalSize.cx;
+                d.totalHeight = (int)signal->totalSize.cy;
+                d.exactHz = (double)signal->pixelRate /
+                            ((double)signal->totalSize.cx * (double)signal->totalSize.cy);
             }
         }
     }

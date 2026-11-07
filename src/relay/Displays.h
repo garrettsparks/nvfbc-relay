@@ -14,6 +14,12 @@ struct DisplayInfo {
     std::string friendlyName;   // the monitor's own name; empty when Windows reports none
     RECT rect = {};             // desktop coordinates, in physical pixels
     int refreshHz = 0;          // 0 when it could not be read
+    // The exact refresh from the display configuration's target mode: the pixel clock over the
+    // total size, blanking included. 0 when the configuration gave no target mode for it.
+    double exactHz = 0.0;
+    unsigned long long pixelClockHz = 0;
+    int totalWidth = 0;
+    int totalHeight = 0;
 
     const std::string& Name() const { return friendlyName.empty() ? deviceName : friendlyName; }
     int Width() const { return rect.right - rect.left; }

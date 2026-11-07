@@ -203,6 +203,12 @@ kcd_60x2_ovsync_2026_11_02_0.trace
 # same 10 on the replay; worst blend run 39 in both. Of 2033 synthesized presents, 1936 warped
 # and 95 drawn as the blend.
 kcd_60x2_ovsync_2026_11_04_0.trace
+# 84 minutes of the 2026-11-05 stream, o:vsync through Windows.Graphics.Capture, the first
+# stream through a second capture card: 222 hitches and 19 stalls an hour in 81 bursts, the
+# busiest the opening's first five minutes. 9 lock releases, the same 9 on the replay; worst
+# blend run 39 in both, starting at a release. Of 1496 synthesized presents, 1468 warped and 28
+# drawn as the blend.
+kcd_60x2_ovsync_2026_11_05_0.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions

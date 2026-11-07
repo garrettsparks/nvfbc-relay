@@ -1,6 +1,7 @@
 #pragma once
 
 #include <climits>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -265,11 +266,42 @@ inline const UsageRow* FindOptionRow(const std::string& flag) {
     return NULL;
 }
 
+// Text for the console wrapped at spaces into lines no wider than width, so no word breaks at
+// the console's edge. A word longer than width keeps a line of its own, and runs of spaces
+// collapse to one. A flag keeps its value on its line: "-src 80" never splits. The default fits
+// the narrowest console likely, 80 columns; a line that fills a console's width exactly can take
+// a second row there, hence 79.
+inline std::vector<std::string> WrapWords(const std::string& text, size_t width = 79) {
+    std::vector<std::string> lines;
+    std::string line;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find(' ', pos);
+        if (end == std::string::npos) end = text.size();
+        std::string word = text.substr(pos, end - pos);
+        pos = end + 1;
+        if (word.empty()) continue;
+        if (word.size() > 1 && word[0] == '-' && pos < text.size()) {
+            size_t valueEnd = text.find(' ', pos);
+            if (valueEnd == std::string::npos) valueEnd = text.size();
+            word += " " + text.substr(pos, valueEnd - pos);
+            pos = valueEnd + 1;
+        }
+        if (!line.empty() && line.size() + 1 + word.size() > width) {
+            lines.push_back(line);
+            line.clear();
+        }
+        if (!line.empty()) line += ' ';
+        line += word;
+    }
+    if (!line.empty()) lines.push_back(line);
+    return lines;
+}
+
 // The usage list the mode prompt prints, one string per line, no line wider than width. The
 // spellings sit in one column and each description beside them, wrapped at spaces so that a
 // long one continues under its own first word rather than at the console's left edge. A blank
-// line separates the modes from the options. The default fits the narrowest console likely, 80
-// columns; a line that fills a console's width exactly can take a second row there, hence 79.
+// line separates the modes from the options.
 inline std::vector<std::string> UsageLines(size_t width = 79) {
     auto spelling = [](const UsageRow& r) {
         std::string s = r.flag;
@@ -288,37 +320,17 @@ inline std::vector<std::string> UsageLines(size_t width = 79) {
 
     std::vector<std::string> lines;
     auto add = [&](const UsageRow& r) {
-        std::string line = "  " + spelling(r);
-        line.resize(column, ' ');
-        size_t used = 0;   // description characters on the current line
-        const std::string text = r.text;
-        size_t pos = 0;
-        while (pos < text.size()) {
-            size_t end = text.find(' ', pos);
-            if (end == std::string::npos) end = text.size();
-            std::string word = text.substr(pos, end - pos);
-            pos = end + 1;
-            if (word.empty()) continue;
-            // A flag keeps its value on its own line: "-src 80" never splits.
-            if (word.size() > 1 && word[0] == '-' && pos < text.size()) {
-                size_t valueEnd = text.find(' ', pos);
-                if (valueEnd == std::string::npos) valueEnd = text.size();
-                word += " " + text.substr(pos, valueEnd - pos);
-                pos = valueEnd + 1;
-            }
-            if (used > 0 && used + 1 + word.size() > textWidth) {
-                lines.push_back(line);
-                line.assign(column, ' ');
-                used = 0;
-            }
-            if (used > 0) {
-                line += ' ';
-                used++;
-            }
-            line += word;
-            used += word.size();
+        std::string first = "  " + spelling(r);
+        first.resize(column, ' ');
+        const std::vector<std::string> wrapped = WrapWords(r.text, textWidth);
+        if (wrapped.empty()) {
+            lines.push_back(first);
+            return;
         }
-        lines.push_back(line);
+        lines.push_back(first + wrapped[0]);
+        for (size_t i = 1; i < wrapped.size(); i++) {
+            lines.push_back(std::string(column, ' ') + wrapped[i]);
+        }
     };
     lines.push_back("Capture modes:");
     for (const UsageRow& r : ModeRows()) {
@@ -786,6 +798,83 @@ inline bool CheckDisplayAnswer(const std::string& answer, int displayCount, int 
         return true;
     }
     return false;
+}
+
+// The capture card display's refresh rate against the whole number of frames a second a game
+// draws. A display d hertz off the nearest whole number repeats or skips one picture every 1/d
+// seconds; the prompts note it when that comes more often than kCardRateNoteSeconds.
+const double kCardRateNoteSeconds = 600.0;
+
+struct CardRate {
+    bool read = false;          // false when the rate could not be read (given as 0)
+    int whole = 0;              // the nearest whole number of hertz, at least 1
+    double slipSeconds = 0.0;   // between repeated or skipped pictures; 0 when exactly whole
+    bool note = false;          // slips come more often than kCardRateNoteSeconds
+};
+
+inline CardRate CheckCardRate(double hz) {
+    CardRate r;
+    if (!(hz > 0.0)) return r;
+    r.read = true;
+    r.whole = (int)std::lround(hz);
+    if (r.whole < 1) r.whole = 1;
+    const double off = std::fabs(hz - (double)r.whole);
+    if (off > 0.0) r.slipSeconds = 1.0 / off;
+    r.note = off > 0.0 && r.slipSeconds < kCardRateNoteSeconds;
+    return r;
+}
+
+// The rate to two decimals, or as many more (up to six) as it takes not to read as the whole
+// number when it is not one: 59.95, 239.97, 59.995.
+inline std::string FormatRefreshHz(double hz) {
+    const long whole = std::lround(hz);
+    int decimals = 2;
+    while (decimals < 6 && std::fabs(hz - (double)whole) > 0.0) {
+        const double scale = std::pow(10.0, decimals);
+        if (std::lround(hz * scale) != whole * (long)scale) break;
+        decimals++;
+    }
+    char text[32];
+    snprintf(text, sizeof(text), "%.*f", decimals, hz);
+    return text;
+}
+
+// How often a picture repeats or skips, in words: whole seconds under two minutes, whole minutes
+// under two hours, hours to one decimal above.
+inline std::string FormatSlipInterval(double seconds) {
+    char text[48];
+    if (seconds < 120.0) {
+        snprintf(text, sizeof(text), "%ld seconds", std::lround(seconds));
+    } else if (seconds < 7200.0) {
+        snprintf(text, sizeof(text), "%ld minutes", std::lround(seconds / 60.0));
+    } else {
+        snprintf(text, sizeof(text), "%.1f hours", seconds / 3600.0);
+    }
+    return text;
+}
+
+// What the console says after the capture card display is picked; empty when the rate is
+// whole enough or was not read.
+inline std::string CardRateNote(double hz) {
+    const CardRate r = CheckCardRate(hz);
+    if (!r.note) return "";
+    return "The capture card's display is running at " + FormatRefreshHz(hz) + " Hz, not " +
+           std::to_string(r.whole) +
+           ". The stream will repeat or skip a frame about every " +
+           FormatSlipInterval(r.slipSeconds) + ". To fix it, set the capture card's display to "
+           "exactly " + std::to_string(r.whole) + " Hz with a custom resolution.";
+}
+
+
+// The end of the log's target display timing line.
+inline std::string CardRateLogText(double hz) {
+    const CardRate r = CheckCardRate(hz);
+    if (!r.read) return "not read";
+    if (r.slipSeconds == 0.0) return "a whole-number rate";
+    return "a frame repeats or skips about every " + FormatSlipInterval(r.slipSeconds) +
+           " against " + std::to_string(r.whole) + " Hz" +
+           (r.note ? "; more often than every 10 minutes, so a launch from the prompts notes it"
+                   : "");
 }
 
 // An answer at the mode prompt: a mode, then options, or options alone for the default mode.

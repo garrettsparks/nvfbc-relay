@@ -33,6 +33,21 @@ public:
         WriteConsoleA(m_out, text.data(), (DWORD)text.size(), &written, NULL);
     }
 
+    // Writes the text in yellow on the console's own background, then puts the console's own
+    // colors back. Plain text when the colors cannot be read. Plain yellow, not the bright one:
+    // Windows' default color scheme makes bright yellow a pale cream.
+    void WriteWarning(const std::string& text) {
+        CONSOLE_SCREEN_BUFFER_INFO info = {};
+        if (!GetConsoleScreenBufferInfo(m_out, &info)) {
+            Write(text);
+            return;
+        }
+        const WORD background = info.wAttributes & (WORD)0xF0;
+        SetConsoleTextAttribute(m_out, (WORD)(background | FOREGROUND_RED | FOREGROUND_GREEN));
+        Write(text);
+        SetConsoleTextAttribute(m_out, info.wAttributes);
+    }
+
     // One typed line without its line ending. False when the input has ended.
     bool ReadLine(std::string* line) {
         line->clear();
@@ -56,14 +71,16 @@ private:
     HANDLE m_out = INVALID_HANDLE_VALUE;
 };
 
-// One line per display, in the terms a user picks by: its name, its size and where it sits on
-// the desktop.
+// One line per display, in the terms a user picks by: its name, its size, its exact refresh rate
+// when it was read, and where it sits on the desktop.
 void WriteDisplayList(Console& console, const std::vector<DisplayInfo>& displays) {
     std::string list = "\n";
     for (const DisplayInfo& d : displays) {
+        const std::string rate =
+            d.exactHz > 0.0 ? " at " + launch::FormatRefreshHz(d.exactHz) + " Hz," : "";
         char line[256];
-        snprintf(line, sizeof(line), "[%u] %s, %dx%d at (%ld,%ld)\n", d.adapter, d.Name().c_str(),
-                 d.Width(), d.Height(), d.rect.left, d.rect.top);
+        snprintf(line, sizeof(line), "[%u] %s, %dx%d%s at (%ld,%ld)\n", d.adapter,
+                 d.Name().c_str(), d.Width(), d.Height(), rate.c_str(), d.rect.left, d.rect.top);
         list += line;
     }
     console.Write(list + "\n");
@@ -113,10 +130,21 @@ bool ChooseLaunch(const std::string& commandLine, const std::vector<DisplayInfo>
                     &out->target)) {
         return false;
     }
-
     std::string usage = "\n";
     for (const std::string& line : launch::UsageLines()) usage += line + "\n";
     console.Write(usage + "\n");
+
+    // A card display off a whole number of hertz repeats or skips a frame on a schedule. Said
+    // after the usage list, right above the mode prompt, so it is the last thing read before the
+    // launch and can be fixed first. A command-line launch only logs it.
+    const std::string rateNote = launch::CardRateNote(displays[out->target].exactHz);
+    if (!rateNote.empty()) {
+        LOG("Capture card display rate noted at the prompts: %.6f Hz",
+            displays[out->target].exactHz);
+        std::string wrapped;
+        for (const std::string& line : launch::WrapWords(rateNote)) wrapped += line + "\n";
+        console.WriteWarning(wrapped + "\n");
+    }
     for (;;) {
         console.Write("Mode and options (press Enter for the default) ? ");
         std::string answer;

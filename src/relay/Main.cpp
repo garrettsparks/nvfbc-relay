@@ -161,6 +161,14 @@ MaybeFailure RunRelay(Relay& r, HINSTANCE instance, int showCommand,
         LOG("Target display refresh: UNKNOWN (EnumDisplaySettings failed); the tooth guard "
             "falls back to the present period");
     }
+    if (target.exactHz > 0.0) {
+        LOG("Target display timing: %.6f Hz (pixel clock %.3f MHz, total %dx%d); %s",
+            target.exactHz, (double)target.pixelClockHz / 1e6, target.totalWidth,
+            target.totalHeight, launch::CardRateLogText(target.exactHz).c_str());
+    } else {
+        LOG("Target display timing: not read (the display configuration gave no target mode "
+            "for this display)");
+    }
     LOG("Capture mode: %s", r.mode->GetModeName());
     LOG("%s", launch::ResolvedOptionsLine(options, r.mode->PresentsViaD3D11(),
                                           r.mode->PresentsThroughComposition())

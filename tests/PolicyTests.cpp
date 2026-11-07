@@ -6183,6 +6183,85 @@ static void test_launch_prompt_answers() {
     }
 }
 
+static void test_launch_card_rate() {
+    // The two timings one capture card display ran at on 2026-11-05, read from the display
+    // configuration: the same totals, 2720x1481, at the standard 241.50 MHz and the custom
+    // 241.70 MHz pixel clock.
+    const double standard = 241500000.0 / (2720.0 * 1481.0);   // 59.950550
+    const double custom = 241700000.0 / (2720.0 * 1481.0);     // 60.000199
+    const struct {
+        double hz;
+        bool note;
+        int whole;
+        const char* shown;
+        const char* log;
+    } rows[] = {
+        {standard, true, 60, "59.95",
+         "a frame repeats or skips about every 20 seconds against 60 Hz; more often than every "
+         "10 minutes, so a launch from the prompts notes it"},
+        {59.94006, true, 60, "59.94",
+         "a frame repeats or skips about every 17 seconds against 60 Hz; more often than every "
+         "10 minutes, so a launch from the prompts notes it"},
+        {59.995, true, 60, "59.995",
+         "a frame repeats or skips about every 3 minutes against 60 Hz; more often than every "
+         "10 minutes, so a launch from the prompts notes it"},
+        {custom, false, 60, "60.0002", "a frame repeats or skips about every 84 minutes against 60 Hz"},
+        {60.0, false, 60, "60.00", "a whole-number rate"},
+        {120.0, false, 120, "120.00", "a whole-number rate"},
+        {239.969753, true, 240, "239.97",
+         "a frame repeats or skips about every 33 seconds against 240 Hz; more often than every "
+         "10 minutes, so a launch from the prompts notes it"},
+    };
+    for (const auto& r : rows) {
+        const launch::CardRate c = launch::CheckCardRate(r.hz);
+        CHECK(c.read && c.note == r.note && c.whole == r.whole,
+              "%.6f Hz: want note %d against %d, got read %d note %d against %d", r.hz, (int)r.note,
+              r.whole, (int)c.read, (int)c.note, c.whole);
+        CHECK(launch::FormatRefreshHz(r.hz) == r.shown, "%.6f Hz must show as '%s', got '%s'",
+              r.hz, r.shown, launch::FormatRefreshHz(r.hz).c_str());
+        CHECK(launch::CardRateLogText(r.hz) == r.log, "%.6f Hz log text: want '%s', got '%s'",
+              r.hz, r.log, launch::CardRateLogText(r.hz).c_str());
+        CHECK(launch::CardRateNote(r.hz).empty() != r.note, "%.6f Hz: the prompts' note must %s",
+              r.hz, r.note ? "be there" : "be empty");
+    }
+
+    // The bar: a slip every 599 s is noted, every 601 s is not.
+    CHECK(launch::CheckCardRate(60.0 - 1.0 / 599.0).note, "a slip every 599 s must be noted");
+    CHECK(!launch::CheckCardRate(60.0 + 1.0 / 601.0).note, "a slip every 601 s must not be noted");
+
+    // A rate that could not be read is said in the log and noted nowhere.
+    const launch::CardRate unread = launch::CheckCardRate(0.0);
+    CHECK(!unread.read && !unread.note, "a rate of 0 must read as not read, without a note");
+    CHECK(launch::CardRateNote(0.0).empty() && launch::CardRateLogText(0.0) == "not read",
+          "a rate of 0 must give no note and the log text 'not read'");
+
+    // The note word for word, for the standard timing.
+    const std::string note = launch::CardRateNote(standard);
+    const char* want =
+        "The capture card's display is running at 59.95 Hz, not 60. The stream will repeat or "
+        "skip a frame about every 20 seconds. To fix it, set the capture card's display to "
+        "exactly 60 Hz with a custom resolution.";
+    CHECK(note == want, "the note for 59.95 Hz must read:\n%s\ngot:\n%s", want, note.c_str());
+
+    // The prompts print it wrapped at the usage list's width: these three lines exactly, none
+    // wider than 79, and back together they are the note.
+    const std::vector<std::string> wrapped = launch::WrapWords(note);
+    const std::vector<std::string> wantLines = {
+        "The capture card's display is running at 59.95 Hz, not 60. The stream will",
+        "repeat or skip a frame about every 20 seconds. To fix it, set the capture",
+        "card's display to exactly 60 Hz with a custom resolution.",
+    };
+    std::string joined;
+    bool narrow = true;
+    for (const std::string& line : wrapped) {
+        if (line.size() > 79) narrow = false;
+        joined += (joined.empty() ? "" : " ") + line;
+    }
+    CHECK(wrapped == wantLines && narrow && joined == note,
+          "the note must wrap to the three lines at 79 columns, got %zu lines:\n%s",
+          wrapped.size(), joined.c_str());
+}
+
 static void test_launch_resolved_options_line() {
     // The default launch's line, word for word as the reference logs carry it: mktrace.py reads
     // two of its phrases, so the wording is part of the log contract.
@@ -6856,6 +6935,7 @@ int main(int argc, char** argv) {
     test_launch_usage_table();
     test_launch_command_line_check();
     test_launch_prompt_answers();
+    test_launch_card_rate();
     test_launch_resolved_options_line();
     test_lock_anchor_and_comb();
     test_flow_plan();
