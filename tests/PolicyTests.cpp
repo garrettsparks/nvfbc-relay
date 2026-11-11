@@ -286,6 +286,43 @@ static bool EasedTarget(const SimResult& r, size_t i) {
     return i > 0 && i - 1 < r.ease.size() && r.ease[i - 1] != 0;
 }
 
+// How evenly the output's content time advances: each present's content step set against the
+// step between the two presents. A steady stream shown one real frame per present reads near
+// zero however far the shown frame sits from the target, because that offset is the same every
+// present; what counts is the offset CHANGING, which is motion that speeds up and slows down
+// on screen. A step off by a refresh's worth or more is a repeat or a skip: counted apart and
+// kept out of the rms, so one hitch does not drown the unevenness between hitches.
+struct StepEvenness {
+    double rmsUs = 0.0;       // rms of the step error, steps under kWholeStepUs only
+    double over2Pct = 0.0;    // share of presents with a step error over 2 ms
+    double over5Pct = 0.0;    // and over 5 ms
+    int wholeSteps = 0;       // step errors of kWholeStepUs or more
+};
+static const int64_t kWholeStepUs = 12000;
+
+static StepEvenness MeasureStepEvenness(const SimResult& r, const std::vector<int64_t>& presents,
+                                        size_t warmup) {
+    StepEvenness e;
+    double sumSq = 0.0;
+    long long n = 0, small = 0, over2 = 0, over5 = 0;
+    for (size_t i = warmup > 0 ? warmup : 1; i < r.outTs.size() && i < presents.size(); i++) {
+        const int64_t err = (r.outTs[i] - r.outTs[i - 1]) - (presents[i] - presents[i - 1]);
+        const int64_t mag = err < 0 ? -err : err;
+        n++;
+        if (mag > 2000) over2++;
+        if (mag > 5000) over5++;
+        if (mag >= kWholeStepUs) { e.wholeSteps++; continue; }
+        sumSq += (double)err * (double)err;
+        small++;
+    }
+    if (small > 0) e.rmsUs = std::sqrt(sumSq / (double)small);
+    if (n > 0) {
+        e.over2Pct = 100.0 * (double)over2 / (double)n;
+        e.over5Pct = 100.0 * (double)over5 / (double)n;
+    }
+    return e;
+}
+
 // The bracketing lag a simulation runs: sized from the source rate as production sizes it,
 // plus the extra lag, unless overridden.
 static int64_t BracketingLag(const SimParams& p) {
@@ -2766,6 +2803,11 @@ struct TraceFixture {
     // run. Absent (-1) holds the dejitter arm to max_worst_run, so the plain arm keeps its
     // own tight bound either way.
     int maxWorstRunDejit = -1;
+    // Optional ceilings on the rms of the content step error (MeasureStepEvenness), in
+    // microseconds: the plain replay's, and the dejitter arm's own. Absent (-1) asserts
+    // nothing; the evenness line prints either way.
+    double maxStepRmsUs = -1.0;
+    double maxStepRmsUsDejit = -1.0;
     int maxLongRuns = -1;
     double maxSynthPct = -1.0;
     int minReseeds = -1;
@@ -2859,6 +2901,8 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         else if (std::strcmp(tag, "max_worst_run_dejit") == 0) {
             num(&n); out->maxWorstRunDejit = (int)n;
         }
+        else if (std::strcmp(tag, "max_step_rms_us") == 0)       { dbl(&out->maxStepRmsUs); }
+        else if (std::strcmp(tag, "max_step_rms_us_dejit") == 0) { dbl(&out->maxStepRmsUsDejit); }
         else if (std::strcmp(tag, "max_long_runs") == 0){ num(&n); out->maxLongRuns = (int)n; }
         else if (std::strcmp(tag, "min_reseeds") == 0)  { num(&n); out->minReseeds = (int)n; }
         else if (std::strcmp(tag, "max_synth_pct") == 0){ dbl(&out->maxSynthPct); }
@@ -3457,7 +3501,9 @@ static void test_replay_capture_corpus() {
         p.combQpc = 16667;
         p.presents = 0;               // explicitPresents drives the count
         p.phaseOffset = 0;
-        p.passthroughQpc = 4166;
+        // Production's own function at every source rate, declared or assumed, so a change to
+        // the threshold reaches every fixture.
+        p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
         p.lagOverride = 0;
         if (fx.srcHint > 0.0) {
             // Size the declared-rate periods the way TemporalCaptureMode does at startup,
@@ -3554,6 +3600,10 @@ static void test_replay_capture_corpus() {
                     fx.description.empty() ? path.c_str() : fx.description.c_str(),
                     spanStart, spanEnd, (spanEnd - spanStart) / 60.0, fx.presents.size(),
                     synthPct, longRuns, worst, reseeds, pullWraps);
+        const StepEvenness even = MeasureStepEvenness(r, fx.presents, kWarmup);
+        std::printf("    evenness: content step against the present step, rms %.0f us, off by "
+                    "over 2 ms %.2f%%, over 5 ms %.2f%%, by a refresh or more %d\n",
+                    even.rmsUs, even.over2Pct, even.over5Pct, even.wholeSteps);
         if (fx.regrabCopies) {
             std::printf("    grab-timeout copies removed before replay: %d\n",
                         fx.regrabCopiesDropped);
@@ -3633,6 +3683,12 @@ static void test_replay_capture_corpus() {
                   "skips one",
                   fx.description.c_str(), pullWraps, fx.maxPullWraps);
         }
+        if (fx.maxStepRmsUs >= 0.0) {
+            CHECK(even.rmsUs <= fx.maxStepRmsUs,
+                  "[%s] content step rms grew to %.0f us (bound %.0f): the motion on screen "
+                  "is less even",
+                  fx.description.c_str(), even.rmsUs, fx.maxStepRmsUs);
+        }
 
         // STAGE 6 GATE: replay the same capture with delivery-lateness correction armed.
         // The design constraint is DO NO HARM on a steady capture: on-time batches are
@@ -3676,6 +3732,16 @@ static void test_replay_capture_corpus() {
             CHECK(worst6 <= worstBound6,
                   "[%s] DEJITTERED worst recovery %d exceeds the fixture bound %d",
                   fx.description.c_str(), worst6, worstBound6);
+            const StepEvenness even6 = MeasureStepEvenness(r6, fx.presents, kWarmup);
+            std::printf("    stage6 evenness: rms %.0f us, off by over 2 ms %.2f%%, over 5 ms "
+                        "%.2f%%, by a refresh or more %d\n",
+                        even6.rmsUs, even6.over2Pct, even6.over5Pct, even6.wholeSteps);
+            if (fx.maxStepRmsUsDejit >= 0.0) {
+                CHECK(even6.rmsUs <= fx.maxStepRmsUsDejit,
+                      "[%s] DEJITTERED content step rms grew to %.0f us (bound %.0f): the "
+                      "motion on screen is less even",
+                      fx.description.c_str(), even6.rmsUs, fx.maxStepRmsUsDejit);
+            }
             CHECK(r6.anchoredBatches * 100 >= r6.measuredBatches * 95,
                   "[%s] only %lld of %lld batches anchored: the stride chain is not "
                   "holding on this capture",
