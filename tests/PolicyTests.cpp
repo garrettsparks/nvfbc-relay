@@ -2761,6 +2761,11 @@ struct TraceFixture {
     // regression fails. Absent (-1) means the fixture is unblessed: the test prints the
     // measured lines and fails, so a new capture cannot silently join as a no-op.
     int maxWorstRun = -1;
+    // Optional ceiling on the worst run of the dejitter arm alone, for a capture where the
+    // correction makes a longer run than the plain replay does and the field shows the same
+    // run. Absent (-1) holds the dejitter arm to max_worst_run, so the plain arm keeps its
+    // own tight bound either way.
+    int maxWorstRunDejit = -1;
     int maxLongRuns = -1;
     double maxSynthPct = -1.0;
     int minReseeds = -1;
@@ -2851,6 +2856,9 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         if (tag[0] == '#')                              { rest_of_line(NULL); }
         else if (std::strcmp(tag, "description") == 0)  { rest_of_line(&out->description); }
         else if (std::strcmp(tag, "max_worst_run") == 0){ num(&n); out->maxWorstRun = (int)n; }
+        else if (std::strcmp(tag, "max_worst_run_dejit") == 0) {
+            num(&n); out->maxWorstRunDejit = (int)n;
+        }
         else if (std::strcmp(tag, "max_long_runs") == 0){ num(&n); out->maxLongRuns = (int)n; }
         else if (std::strcmp(tag, "min_reseeds") == 0)  { num(&n); out->minReseeds = (int)n; }
         else if (std::strcmp(tag, "max_synth_pct") == 0){ dbl(&out->maxSynthPct); }
@@ -3663,9 +3671,11 @@ static void test_replay_capture_corpus() {
                   "[%s] DEJITTERED synth share %.1f%% exceeds the fixture bound %.1f%%: "
                   "the correction is doing harm on a steady capture",
                   fx.description.c_str(), synthPct6, fx.maxSynthPct);
-            CHECK(worst6 <= fx.maxWorstRun,
+            int worstBound6 = fx.maxWorstRun;
+            if (fx.maxWorstRunDejit >= 0) worstBound6 = fx.maxWorstRunDejit;
+            CHECK(worst6 <= worstBound6,
                   "[%s] DEJITTERED worst recovery %d exceeds the fixture bound %d",
-                  fx.description.c_str(), worst6, fx.maxWorstRun);
+                  fx.description.c_str(), worst6, worstBound6);
             CHECK(r6.anchoredBatches * 100 >= r6.measuredBatches * 95,
                   "[%s] only %lld of %lld batches anchored: the stride chain is not "
                   "holding on this capture",

@@ -88,12 +88,14 @@ update its numbers.
 | `b` or `b:vsync` | Temporal blend (sharp passthrough when a real frame sits on the target, a lerp of the frame before it and the frame after it otherwise), paced by the capture card's own vblank. The default. |
 | `b:dwm` | The same blend, paced by DWM's compose clock. |
 | `b:<fps>` | The same blend, paced by a QPC timer at the given rate. |
+| `o` or `o:vsync` | Optical flow: like `b:vsync`, but where `b:vsync` would blend the frame before and the frame after, it builds the frame between them from their motion with NVIDIA's optical flow. Paced by the capture card's own vblank. |
+| `o:<fps>` | The same, paced by a QPC timer at the given rate. |
 | `<fps>` | Plain timer capture at the given rate. No temporal selection. How the original relay ran. |
 | `diag` | Diagnostic clock probe: QPC 60Hz, immediate present. Logs DWM compose timing and card raster per tick. |
 | `diag:vsync` | Diagnostic probe on `INTERVAL_ONE`. Present block time measures DWM's delivery cadence. |
 
-`t:vsync`, `b:vsync` and the timer modes (`t:<fps>`, `b:<fps>`) present through
-D3D11. `t:dwm`, `b:dwm`, `vsync`, `<fps>` and `diag` present through D3D9, whose
+`t:vsync`, `b:vsync`, `o:vsync` and the timer modes (`t:<fps>`, `b:<fps>`,
+`o:<fps>`) present through D3D11. `t:dwm`, `b:dwm`, `vsync`, `<fps>` and `diag` present through D3D9, whose
 present is what waits on DWM's compose clock.
 
 `t:dwm` presents on DWM's compose clock. While a game runs fullscreen on the

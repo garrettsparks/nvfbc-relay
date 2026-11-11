@@ -131,7 +131,7 @@ bool OpticalFlowWarp::Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int wid
     init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
     init.mode = NV_OF_MODE_OPTICALFLOW;
     init.perfLevel = NV_OF_PERF_LEVEL_MEDIUM;
-    init.enableOutputCost = NV_OF_TRUE;
+    init.enableOutputCost = kCost ? NV_OF_TRUE : NV_OF_FALSE;
     init.predDirection = NV_OF_PRED_DIRECTION_BOTH;
     init.inputBufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
     st = m_of.nvOFInit(m_session, &init);
@@ -143,9 +143,11 @@ bool OpticalFlowWarp::Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int wid
 
     for (Slot& s : m_slots) {
         if (!MakeField(DXGI_FORMAT_R16G16_SINT, true, &s.fwd) ||
-            !MakeField(DXGI_FORMAT_R16G16_SINT, true, &s.bwd) ||
-            !MakeField(DXGI_FORMAT_R32_UINT, false, &s.fwdCost) ||
-            !MakeField(DXGI_FORMAT_R32_UINT, false, &s.bwdCost)) {
+            !MakeField(DXGI_FORMAT_R16G16_SINT, true, &s.bwd)) {
+            return false;
+        }
+        if (kCost && (!MakeField(DXGI_FORMAT_R32_UINT, false, &s.fwdCost) ||
+                      !MakeField(DXGI_FORMAT_R32_UINT, false, &s.bwdCost))) {
             return false;
         }
     }
@@ -174,8 +176,8 @@ bool OpticalFlowWarp::Setup(ID3D11Device* dev, ID3D11DeviceContext* ctx, int wid
     m_gate = MakeCutGate();
     m_ready = true;
     LOG("OpticalFlowWarp: optical flow engine on the present's device, %dx%d, grid 4 MEDIUM, "
-        "both ways, cost on, %d flow slots, input luma drawn from each frame", width, height,
-        policy::kFlowSlots);
+        "both ways, cost %s, %d flow slots, input luma drawn from each frame", width, height,
+        kCost ? "on" : "off", policy::kFlowSlots);
     if (m_gate) {
         LOG("OpticalFlowWarp: cut gate on: each frame's mean luma from %dx%d, a pair whose darker "
             "mean (+%.2f) is under %.2f of the brighter's (+%.2f) is drawn as the crossfade",
@@ -462,6 +464,7 @@ bool OpticalFlowWarp::Flow(int slot, const Frame& before, const Frame& after, bo
     in.disableTemporalHints = hints ? NV_OF_FALSE : NV_OF_TRUE;
     NV_OF_EXECUTE_OUTPUT_PARAMS out = {};
     out.outputBuffer = m_slots[slot].fwd.handle;
+    // NULL with kCost off: the cost fields were never created.
     out.outputCostBuffer = m_slots[slot].fwdCost.handle;
     out.bwdOutputBuffer = m_slots[slot].bwd.handle;
     out.bwdOutputCostBuffer = m_slots[slot].bwdCost.handle;

@@ -240,6 +240,10 @@ inline const std::vector<UsageRow>& ModeRows() {
                            "The default: press Enter to pick it.", true, false},
         {"b:dwm, b:60", "", "The same, in step with Windows' desktop (b:dwm) or on a timer at "
                             "the given frame rate (b:60).", true, false},
+        {"o, o:vsync", "", "Like b:vsync, but where it would blend two frames it builds the "
+                           "frame between them from their motion (optical flow), in step with "
+                           "the capture card's own refresh.", true, false},
+        {"o:60", "", "The same, on a timer at the given frame rate.", true, false},
         {"t, t:vsync", "", "Shows the nearest real frame and never blends, in step with the "
                            "capture card's own refresh.", true, false},
         {"t:dwm, t:59.94", "", "The same, in step with Windows' desktop (t:dwm) or on a timer "
@@ -247,9 +251,6 @@ inline const std::vector<UsageRow>& ModeRows() {
         {"vsync", "", "Shows the newest frame, in step with Windows' desktop.", true, false},
         {"60", "", "Shows the newest frame, on a timer at the given frame rate. This is how "
                    "the original relay ran.", true, false},
-        {"o, o:vsync, o:60", "", "Optical-flow interpolation in place of the blend, on the same "
-                                 "output as b:vsync, or on a timer at the given frame rate "
-                                 "(o:60)", false, false},
         {"diag, diag:vsync", "", "Clock probes: DWM compose timing and the card's raster", false,
          false},
         {"ofprobe, ofprobe:30, ofprobeorder:30", "",

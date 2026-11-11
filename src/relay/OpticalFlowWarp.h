@@ -97,6 +97,10 @@ public:
 
 private:
     static const int kGrid = 4;
+    // The engine's cost per block, its measure of how badly the two frames matched there.
+    // Nothing reads it yet, so it is off: the session is opened without it and the cost fields
+    // are never created, registered or written. A gate that reads it turns this on.
+    static const bool kCost = false;
     // Luma frames kept: the four cached pairs share frames, so six covers them with room.
     static const int kLumaSlots = 6;
 
