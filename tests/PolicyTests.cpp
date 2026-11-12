@@ -14,6 +14,10 @@
 //                                       nothing else: its replay, field and bounds lines in
 //                                       minutes where the whole suite takes much longer. It is
 //                                       not a pass of the suite and says so on its last line
+//   ./policytests --timesten [--only <fixture>]
+//                                       also replay each corpus fixture on a clock ten times
+//                                       finer, to find a rule written as a number of
+//                                       microseconds (see CheckClockScale); off by default
 //   ./policytests --mktrace NvFBCR.log <out.trace> ["<description>"] [--skip-us N] [--until-us N]
 //                                       write a corpus fixture from a relay log (see MakeTrace)
 //
@@ -103,6 +107,7 @@ static int64_t JitterUs(int64_t amplitude) {
 struct SimResult {
     std::vector<Pick> picks;
     std::vector<int64_t> shownTs;     // after each present (Repeat carries forward)
+    std::vector<int64_t> target;      // the content time each present aimed at
     std::vector<int64_t> pull;        // lock pull after each present's update
     std::vector<int64_t> ease;        // wrap ease after each present's update (0 outside a ramp)
     std::vector<char> rephased;       // a planned phase-step move landed on this present
@@ -289,7 +294,50 @@ struct SimParams {
     // drifts tens of microseconds from the capture's over a stream. For the tools that compare a
     // replay with a live capture; no check in this file sets it.
     std::vector<int64_t> forcedTargets;
+    // The clock every time above is in, as ticks per microsecond. The suite runs in
+    // microseconds (1); the relay runs in QPC ticks, 10 to the microsecond on the machines it
+    // has run on. ScaledParams moves a whole simulation onto another clock.
+    int64_t ticksPerUs = 1;
 };
+
+// The same simulation with every time multiplied by k and the clock declared k times finer.
+// The policy is meant to be unit-agnostic: every rule sized from the clock, none written as a
+// number of microseconds. A replay on the scaled clock that decides differently has found one
+// that is not.
+static SimParams ScaledParams(const SimParams& p, int64_t k) {
+    SimParams s = p;
+    auto mul = [k](std::vector<int64_t>& v) {
+        for (int64_t& x : v) {
+            if (x != kNotForced) x *= k;
+        }
+    };
+    s.ticksPerUs = p.ticksPerUs * k;
+    s.srcPeriod *= k;
+    s.presentPeriod *= k;
+    s.arrivalJitter *= k;
+    s.combQpc *= k;
+    s.phaseOffset *= k;
+    s.passthroughQpc *= k;
+    s.lagOverride *= k;
+    s.stallGap *= k;
+    s.postStallPhase *= k;
+    mul(s.periodPattern);
+    mul(s.explicitArrivals);
+    mul(s.explicitFlushes);
+    mul(s.explicitPresents);
+    s.batchThresholdQpc *= k;
+    s.deferCopySlackQpc *= k;
+    mul(s.flipDisplay);
+    mul(s.flipKnown);
+    s.extraLag *= k;
+    s.stepTolerance *= k;
+    s.stepOffsetDecay *= k;
+    s.sinkPeriod *= k;
+    s.recordLookaheadFrom *= k;
+    s.recordLookaheadTo *= k;
+    mul(s.forcedTargets);
+    return s;
+}
 
 // True for a present whose target still carried part of a wrap's ease: the lock had wrapped and
 // the target was crossing the comb on purpose. A blend or a near-boundary target there is the
@@ -360,7 +408,7 @@ static StepEvenness MeasureStepEvenness(const SimResult& r, const std::vector<in
 // clock is microseconds, and a simulation synthesizes when it has a passthrough threshold.
 static policy::PolicySetupInputs SetupInputs(const SimParams& p) {
     policy::PolicySetupInputs in;
-    in.ticksPerSecond = 1000000;
+    in.ticksPerSecond = 1000000 * p.ticksPerUs;
     in.srcPeriodQpc = p.srcPeriod;
     in.presentPeriodQpc = p.presentPeriod;
     in.sinkPeriodQpc = p.sinkPeriod;
@@ -383,10 +431,12 @@ static int ShipRingSlots(const SimParams& p) {
     return policy::BuildPolicySetup(SetupInputs(p)).ringSlots;
 }
 
-// The deferred ring copy's limits as the relay sizes them, in the simulator's microseconds.
-static policy::DeferLimits SizedDeferLimits(int64_t lag, int64_t srcPeriod, int64_t margin) {
-    return policy::SizeDeferLimits(lag, srcPeriod, margin, policy::kDeferWaitAboutMs * 1000,
-                                   policy::kDeferWaitLeastMs * 1000);
+// The deferred ring copy's limits as the relay sizes them, in the simulator's clock.
+static policy::DeferLimits SizedDeferLimits(int64_t lag, int64_t srcPeriod, int64_t margin,
+                                            int64_t ticksPerUs = 1) {
+    return policy::SizeDeferLimits(lag, srcPeriod, margin,
+                                   policy::kDeferWaitAboutMs * 1000 * ticksPerUs,
+                                   policy::kDeferWaitLeastMs * 1000 * ticksPerUs);
 }
 
 // The replay's capture ring, as the present step reads it. Slot i is wake i: its stamp, whether
@@ -598,7 +648,7 @@ static SimResult Simulate(const SimParams& p) {
     size_t nextFlip = 0;
     ReplayLateness lateness;
     lateness.flips = &fliph;
-    lateness.cadenceWindow = 200000;   // production's m_flipCadenceWindowQpc
+    lateness.cadenceWindow = 200000 * p.ticksPerUs;   // production's m_flipCadenceWindowQpc
     // First slot index of each batch, in arrival order (a batch is a maximal run of equal
     // batchStart) - the sim's stand-in for the ring's batch-start history.
     std::vector<size_t> batchFirst;
@@ -618,7 +668,8 @@ static SimResult Simulate(const SimParams& p) {
     // keep-real has retracted it by then anyway. With no wait that fits the lag the deferral
     // is off, as it is in the relay.
     std::vector<int64_t> visibleAt(arrivals.begin(), arrivals.end());
-    const policy::DeferLimits deferLimits = SizedDeferLimits(lag, p.srcPeriod, p.sinkPeriod);
+    const policy::DeferLimits deferLimits =
+        SizedDeferLimits(lag, p.srcPeriod, p.sinkPeriod, p.ticksPerUs);
     if (p.deferCopy && deferLimits.maxWaitTicks > 0) {
         policy::BatchState bs;
         policy::DeferState ds;
@@ -800,6 +851,7 @@ static SimResult Simulate(const SimParams& p) {
             r.picks.push_back(res.pick);
             r.shownTs.push_back(step.sel.lastShownTs);
         }
+        r.target.push_back(res.target);
         r.pull.push_back(lock.pullQpc);
         r.ease.push_back(lock.easeQpc);
         r.engaged.push_back(lock.engaged);
@@ -3411,6 +3463,78 @@ static void CheckDeferredCopy(const TraceFixture& fx, const SimParams& p, size_t
 
 // A nearest capture's gate: repeats, re-seeds and pull wraps against its bounds, and the
 // dejitter arm, which must not add repeats past the bound or stop anchoring.
+// TIMES-TEN ARM: the capture as it ran, replayed on a clock ten times finer (every time
+// multiplied by ten). The suite runs in microseconds and the relay in QPC ticks, so a rule
+// written as a bare number means one thing here and another in the field; the rotation vote's
+// margin did, 80 us here and 8 us there, and nothing in the suite could see it. asRun is the
+// replay of pAsRun on the suite's own clock.
+//
+// Two replays, because one cannot hold both halves of the policy. Left to run free, the finer
+// clock keeps fractions of a microsecond the coarse one drops, the lock's pull drifts a
+// microsecond or two apart, and since the lock parks the target on a real frame that is
+// enough to name the same frame "before" on one clock and "after" on the other, and now and
+// then to wrap a present earlier or later. So:
+//
+//   On the same targets (each present handed the target the microsecond replay aimed at): the
+//   lock cannot drift, and the presents must decide the same. This holds every rule that
+//   reads a target: the selection, the composite decision, the tooth guard, the step
+//   tolerance, the stall rules, the delivery-lateness correction. All but a handful do: a
+//   threshold that does not divide evenly (a 90 fps source's widened gate is 3471.25 us)
+//   is 3471 on one clock and 3471.2 on the other, and a frame exactly 3471 us from its
+//   target is inside one and outside the other. Two fixtures have one or two such presents
+//   in 18000. The allowance is kSameTargetSlack presents, or one in kSameTargetSlackShare
+//   where that is more; stickiness left at a bare 1000 moved 72 presents of 157872, twice
+//   what that allows.
+//
+//   Running free: the lock steers itself, which the first replay takes away. Its pull wraps
+//   must come out within kFreeWrapSlack of the microsecond replay's, or a tenth of them where
+//   that is more. A lock rule written as a number moves them far more than that: the slew
+//   left at a bare 25 took one capture from 34 wraps to 24.
+//
+// Off unless --timesten is given: it is two more replays of every fixture, and what it guards
+// changes only when a rule or the shared configuration does. Run it then.
+static const int kFreeWrapSlack = 2;
+static const long long kSameTargetSlack = 3;
+static const long long kSameTargetSlackShare = 5000;
+static bool g_timesTen = false;
+
+static void CheckClockScale(const TraceFixture& fx, const SimParams& pAsRun,
+                            const SimResult& asRun) {
+    if (!g_timesTen) return;
+    SimParams px = ScaledParams(pAsRun, 10);
+    const SimResult rfree = Simulate(px);
+    px.forcedTargets.clear();
+    for (int64_t t : asRun.target) px.forcedTargets.push_back(t * 10);
+    const SimResult rx = Simulate(px);
+    const bool composite = !asRun.ops.empty();
+    const size_t n = composite ? asRun.ops.size() : asRun.picks.size();
+    const size_t nx = composite ? rx.ops.size() : rx.picks.size();
+    long long differ = 0;
+    size_t first = n;
+    for (size_t i = 0; i < n && i < nx; i++) {
+        const bool same = composite ? asRun.ops[i] == rx.ops[i] : asRun.picks[i] == rx.picks[i];
+        if (same) continue;
+        if (differ == 0) first = i;
+        differ++;
+    }
+    std::printf("    times ten: on the same targets %lld of %zu presents decide differently; "
+                "running free, pull wraps %d (%d)\n", differ, n, rfree.wraps, asRun.wraps);
+    const long long share = (long long)n / kSameTargetSlackShare;
+    const long long allowed = share > kSameTargetSlack ? share : kSameTargetSlack;
+    CHECK(n == nx && differ <= allowed,
+          "[%s] on a clock ten times finer, at the same targets, %lld of %zu presents decide "
+          "differently (allowed %lld), the first at present %zu: a rule is written as a number "
+          "of microseconds instead of being sized from the clock",
+          fx.description.c_str(), differ, n, allowed, first);
+    const int wrapGap = rfree.wraps > asRun.wraps ? rfree.wraps - asRun.wraps
+                                                  : asRun.wraps - rfree.wraps;
+    const int wrapSlack = asRun.wraps / 10 > kFreeWrapSlack ? asRun.wraps / 10 : kFreeWrapSlack;
+    CHECK(wrapGap <= wrapSlack,
+          "[%s] on a clock ten times finer the lock wraps %d times against %d (allowed a gap "
+          "of %d): a lock rule is written as a number of microseconds",
+          fx.description.c_str(), rfree.wraps, asRun.wraps, wrapSlack);
+}
+
 static void CheckNearestFixture(const TraceFixture& fx, const SimParams& p, const SimResult& r,
                                 size_t warmup, int reseeds, int pullWraps) {
     const int repeats = CountRepeats(r, warmup);
@@ -3460,6 +3584,7 @@ static void CheckNearestFixture(const TraceFixture& fx, const SimParams& p, cons
         p6.flipKnown = fx.flipKnown;
         p6.flipDejitter = true;
         const SimResult r6 = Simulate(p6);
+        CheckClockScale(fx, p6, r6);
         const int repeats6 = CountRepeats(r6, warmup);
         std::printf("    stage6 dejitter: repeats %d; batches %lld anchored %lld late %lld "
                     "corrected %lld fence-blocked %lld lock-declined %lld\n",
@@ -3473,6 +3598,7 @@ static void CheckNearestFixture(const TraceFixture& fx, const SimParams& p, cons
               "holding on this capture",
               fx.description.c_str(), r6.anchoredBatches, r6.measuredBatches);
     }
+    if (fx.flipDisplay.empty() || fx.flipKnown.empty()) CheckClockScale(fx, p, r);
     CheckDeferredCopy(fx, p, warmup);
 }
 
@@ -3771,6 +3897,7 @@ static void test_replay_capture_corpus() {
             p6.flipKnown = fx.flipKnown;
             p6.flipDejitter = true;
             const SimResult r6 = Simulate(p6);
+            CheckClockScale(fx, p6, r6);
             int run6 = 0, worst6 = 0, longRuns6 = 0, synth6 = 0;
             for (size_t i = kWarmup; i < r6.ops.size(); i++) {
                 if (r6.ops[i] == policy::CompositeOp::Synthesize) {
@@ -3943,6 +4070,7 @@ static void test_replay_capture_corpus() {
                   fx.description.c_str(), evenS.allRmsUs, evenAsRun.allRmsUs);
         }
 
+        if (fx.flipDisplay.empty() || fx.flipKnown.empty()) CheckClockScale(fx, p, r);
         CheckDeferredCopy(fx, p, kWarmup);
     }
 }
@@ -7664,6 +7792,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--comb") && i + 1 < argc) combUs = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "--passthrough") && i + 1 < argc) passUs = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "--only") && i + 1 < argc) g_onlyFixture = argv[++i];
+        else if (!std::strcmp(argv[i], "--timesten")) g_timesTen = true;
     }
     if (replayPath) return Replay(replayPath, combUs, passUs);
 

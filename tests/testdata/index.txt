@@ -214,6 +214,12 @@ kcd_60x2_ovsync_2026_11_05_0.trace
 # capture gap. 6 lock releases, the same 6 on the replay; worst blend run 35 in both, five
 # presents before a release. Of 1186 synthesized presents, 1145 warped and 41 drawn as the blend.
 kcd_60x2_ovsync_2026_11_06_0.trace
+# 44 minutes of the 2026-11-08 stream, o:vsync through Windows.Graphics.Capture. The one fixture
+# where the replay's two arms part: the worst blend run is 15 presents on the plain arm and 44 on
+# the dejitter arm, which is how the stream ran and what the field shows (a 0.65 s lock release
+# 1.5 s after a hitch). Each arm has its own bound. 176 hitches and 26 stalls an hour in 53
+# bursts; 6 lock releases, the same 6 on the replay.
+kcd_60x2_ovsync_2026_11_08_0.trace
 # 119 minutes of the 2026-11-10 stream, o:vsync through Windows.Graphics.Capture on the build that
 # turned the flow's cost output off, the longest whole stream here: 243 hitches and 28 stalls an
 # hour in 83 bursts, and 22 s near the end where the game ran at about 40 fps walking a camp at
