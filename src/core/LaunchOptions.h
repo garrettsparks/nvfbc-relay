@@ -949,8 +949,9 @@ inline PromptAnswer ParsePromptAnswer(const std::string& line) {
 }
 
 // The startup line that records every resolved option, including those entered at the prompt,
-// which appear nowhere else. mktrace.py reads its "src rate hint <n> fps" and "extra lag <n> ms"
-// phrases, and log readers echo it as a header, so its wording and field order stay fixed.
+// which appear nowhere else. The trace writer (PolicyTests --mktrace) reads its "src rate hint
+// <n> fps" and "extra lag <n> ms" phrases, and log readers echo it as a header, so its wording
+// and field order stay fixed.
 // d3d11Present and composition are the chosen present path's (the capture mode's
 // PresentsViaD3D11 and PresentsThroughComposition), so the line names the swapchain that runs.
 inline std::string ResolvedOptionsLine(const Options& o, bool d3d11Present,

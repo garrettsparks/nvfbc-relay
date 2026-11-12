@@ -150,7 +150,8 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     } else {
         m_pacing = new PathPacing(d3d11Present);
     }
-    // mktrace.py reads the compositor from the "Temporal[ blend| interp] (" prefix.
+    // The trace writer (PolicyTests --mktrace) reads the compositor from the
+    // "Temporal[ blend| interp] (" prefix.
     const char* kindName = "Temporal";
     if (compositor == kCompositorInterp) kindName = "Temporal interp";
     else if (compositor == kCompositorBlend) kindName = "Temporal blend";

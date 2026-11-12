@@ -155,7 +155,7 @@ int64_t FlipHistory::MedianSpacing(int64_t lo, int64_t hi, uint32_t head) const 
     // decreasing displayTs and nothing older can qualify once one falls below the window.
     //
     // FILTERING THE HEAD BEFORE TESTING THE BOUNDARY IS LOAD-BEARING, and the corpus cannot
-    // show it: every fixture is single-head (mktrace.py keeps head 0), so no amount of
+    // show it: every fixture is single-head (the trace writer keeps head 0), so no amount of
     // replayed capture exercises an interleaved ring. Live it is interleaved, and a head-1
     // flip is announced beside a head-0 flip displaying up to 42.8 ms later, so a boundary
     // test that ran first would break out on a trailing head-1 entry and abandon head-0 flips

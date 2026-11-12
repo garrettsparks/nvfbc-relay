@@ -1,6 +1,6 @@
 # Capture corpus for the policy replay gate. One fixture per line.
-# Build with: uv run mktrace.py <NvFBCR.log> <name>.trace "<description>"
-# (mktrace.py lives in this directory; run the suite afterwards for the bounds)
+# Build with: policytests --mktrace <NvFBCR.log> <name>.trace "<description>"
+# (policytests is tests/PolicyTests.cpp built; run it with --only <name> afterwards for the bounds)
 kcd_60x2_mapcycles.trace
 kcd_60x2_mapcycles_postfix.trace
 # Steady walking, the regime the map-cycle fixtures do not cover: they are dominated by

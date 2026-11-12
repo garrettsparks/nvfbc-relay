@@ -14,6 +14,8 @@
 //                                       nothing else: its replay, field and bounds lines in
 //                                       minutes where the whole suite takes much longer. It is
 //                                       not a pass of the suite and says so on its last line
+//   ./policytests --mktrace NvFBCR.log <out.trace> ["<description>"] [--skip-us N] [--until-us N]
+//                                       write a corpus fixture from a relay log (see MakeTrace)
 //
 // All synthetic tests run in the microsecond domain; the policy is unit-agnostic.
 
@@ -69,6 +71,10 @@ static const int64_t kVoteMinSeparationUs = 80;
 static const int kRingSlots = 8;
 static const int kShipRingMin = 16;   // CaptureRing's kDefaultRingSlots
 static const int kShipRingMax = 32;   // CaptureRing's RING_SIZE
+
+// Presents at the head of a capture left out of every count, in the replay and in the field
+// numbers the trace writer records: they are the lock's cold-start acquisition.
+static const size_t kFieldWarmup = 200;
 
 // A present with no forced target (SimParams::forcedTargets).
 static const int64_t kNotForced = INT64_MIN;
@@ -1329,7 +1335,7 @@ static void test_flip_history() {
           (long long)h.MedianSpacing(100000, 100000 + 10 * kHalf, 0));
 
     // (b) THE HEAD FILTER MUST PRECEDE THE EARLY EXIT, and only a unit test can say so: every
-    // corpus fixture is SINGLE-HEAD (mktrace.py keeps head 0 only), so replaying captures
+    // corpus fixture is SINGLE-HEAD (--mktrace keeps head 0 only), so replaying captures
     // cannot exercise this no matter how many hours of them there are. Live, the ring is
     // interleaved, and a head-1 flip is announced beside a head-0 flip whose display time is
     // up to 42.8 ms newer (measured over 200k flips; median 2.9 ms). So a walk that tested
@@ -2794,7 +2800,7 @@ static void test_lock_reseed_stall_paired_cadence() {
 }
 
 // Replay real captures through the real policy. Every .trace in testdata/ is a corpus
-// member: drop a capture in (testdata/mktrace.py builds one from an NvFBCR.log)
+// member: drop a capture in (--mktrace builds one from an NvFBCR.log)
 // and it becomes a permanent gate.
 //
 // WHY A CORPUS AND NOT A SCENARIO. Synthetic stalls only contain the shapes someone
@@ -2823,7 +2829,7 @@ struct TraceFixture {
     std::string description;
     std::vector<int64_t> arrivals;
     // Each wake's copy and flush time, one per arrival; empty for a fixture built before
-    // mktrace.py recorded it, which then publishes every wake at its arrival.
+    // --mktrace recorded it, which then publishes every wake at its arrival.
     std::vector<int64_t> flushes;
     std::vector<int64_t> presents;
     // Head-0 scanout times in DELIVERY order, and the instant each first became knowable
@@ -2887,7 +2893,7 @@ struct TraceFixture {
     // The bound is optional: -1 leaves a fixture ungated on it.
     int fieldPullWraps = -1;
     int maxPullWraps = -1;
-    // The compositor the relay ran: "nearest", "blend" or "interp" (mktrace.py reads it from
+    // The compositor the relay ran: "nearest", "blend" or "interp" (--mktrace reads it from
     // the mode name). Absent means a synthesizing one, which every fixture recorded before the
     // field existed ran. A nearest capture replays the selection the relay ran there, with no
     // passthrough gate and no lookahead, and is measured by its repeats instead of its blends:
@@ -2915,7 +2921,7 @@ struct TraceFixture {
     // real numbers rather than pretending to a cleanliness they do not have). -1 disables.
     int maxBlendsAdded = -1;
     // Set on a capture whose capture loop STORED the grab timeout's re-delivered picture as a
-    // new frame (mktrace.py sets it for a log without the loop's startup line announcing the
+    // new frame (--mktrace sets it for a log without the loop's startup line announcing the
     // skip). The loader removes those wakes, so the replay runs the loop that stores nothing
     // on a timeout. Never set it on a capture from a loop that already skips them: there a
     // real frame arriving after a long stall can land inside the same window.
@@ -3419,7 +3425,7 @@ static void CheckNearestFixture(const TraceFixture& fx, const SimParams& p, cons
     std::printf("    field : nearest, repeats %d", fx.fieldRepeats);
     if (fx.fieldPullWraps >= 0) std::printf(", pull wraps %d", fx.fieldPullWraps);
     std::printf("\n");
-    // The pick census, in mktrace.py's field_picks order.
+    // The pick census, in --mktrace's field_picks order.
     static const Pick kPickCensus[6] = {Pick::Before, Pick::BeforeAdv, Pick::After,
                                         Pick::AfterAdv, Pick::Repeat, Pick::None};
     std::printf("    picks :");
@@ -3609,9 +3615,10 @@ static void test_replay_capture_corpus() {
         pPlan.planAhead = !nearest;
         const SimResult r = Simulate(pPlan);
 
-        // Must match mktrace.py's WARMUP: the lock starts cold here where the relay had
-        // been running for minutes, so the head of a replay is a window artifact.
-        const size_t kWarmup = 200;
+        // The lock starts cold here where the relay had been running for minutes, so the head
+        // of a replay is a window artifact. The trace writer leaves the same presents out of
+        // the field's numbers.
+        const size_t kWarmup = kFieldWarmup;
         int run = 0, worst = 0, longRuns = 0, synth = 0, reseeds = 0;
         for (size_t i = kWarmup; i < r.ops.size(); i++) {
             if (r.ops[i] == policy::CompositeOp::Synthesize) {
@@ -6652,7 +6659,7 @@ static void test_launch_card_rate() {
 }
 
 static void test_launch_resolved_options_line() {
-    // The default launch's line, word for word as the reference logs carry it: mktrace.py reads
+    // The default launch's line, word for word as the reference logs carry it: --mktrace reads
     // two of its phrases, so the wording is part of the log contract.
     const std::string bare = launch::ResolvedOptionsLine(launch::Options(), true);
     CHECK(bare == "Resolved options: src rate hint 0.0 fps (not declared; 60 assumed), comb lock "
@@ -6668,7 +6675,7 @@ static void test_launch_resolved_options_line() {
               composed.find("flip-model") == std::string::npos,
           "a composition present must be named as one, got '%s'", composed.c_str());
 
-    // The two phrases mktrace.py reads, at other values.
+    // The two phrases --mktrace reads, at other values.
     launch::Options o;
     o.srcRateHint = 59.94f;
     o.extraLagMs = 0;
@@ -7226,10 +7233,432 @@ static void test_flow_warp_math() {
     }
 }
 
+// ---------------------------------------------------------------------------------
+// --mktrace: turn an NvFBCR.log into a replay fixture.
+//
+// The fixture holds the capture timeline (capture wake times, relay present deadlines) plus
+// what the relay ACTUALLY DID with it. The timeline is the test input; the recorded behaviour
+// is how the replay model's fidelity gets checked for this specific capture, rather than
+// assumed from whichever capture the model was first tuned on.
+//
+// Bounds are deliberately NOT written here: they describe the model, which only the replay
+// can measure. Add the file to index.txt and run --only on it: it prints the lines to paste.
+//
+// A log from a capture loop that stored the grab timeout's re-delivered picture (no startup
+// line saying a timed-out grab stores nothing) gets regrab_copies 1, and the loader removes
+// those wakes before replaying.
+//
+// --skip-us drops everything before an absolute log time, and --until-us everything at or
+// after one, for a fixture that must isolate one regime. A capture whose early minutes carry
+// source hitches reports the hitch recovery as its headline synth share, which buries a
+// steady-state regression: measured on a 60x2 walk, whole-log synth is 9.1% against 1.1%
+// past the hitches, so a steady-state doubling would sit inside any bound loose enough to hold
+// the whole log. Trim only when another fixture already covers the regime being cut.
+//
+// A long session usually needs BOTH ends cut, because the desktop before and after the game
+// is a different regime at a different rate: on an hour-long gameplay capture the post-exit
+// 240 Hz tail was 6% of presents but 28% of all synthesized frames, and the replay model
+// tracks it far worse than gameplay. Left in, it sets every bound in the fixture and gates
+// nothing anyone plays through.
+//
+// The log's phrases are found by plain text search, each the way the relay prints it.
+// ---------------------------------------------------------------------------------
+
+static bool IsWordChar(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+// Reads an integer at s[pos], with a minus sign when allowed. On success *end is the position
+// after it.
+static bool ReadInt(const std::string& s, size_t pos, bool allowMinus, int64_t* out,
+                    size_t* end) {
+    size_t i = pos;
+    if (allowMinus && i < s.size() && s[i] == '-') i++;
+    const size_t digits = i;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9') i++;
+    if (i == digits) return false;
+    *out = std::strtoll(s.substr(pos, i - pos).c_str(), nullptr, 10);
+    *end = i;
+    return true;
+}
+
+// The first place key is followed by an integer and then suffix; with wordStart, key must not
+// follow a letter, a digit or an underscore. With last, the last such place.
+static bool FindNumber(const std::string& s, const char* key, const char* suffix,
+                       bool allowMinus, bool wordStart, bool last, int64_t* out,
+                       size_t from = 0, size_t* end = nullptr) {
+    const size_t keyLen = std::strlen(key), sufLen = std::strlen(suffix);
+    bool found = false;
+    for (size_t at = s.find(key, from); at != std::string::npos; at = s.find(key, at + 1)) {
+        if (wordStart && at > 0 && IsWordChar(s[at - 1])) continue;
+        int64_t v = 0;
+        size_t e = 0;
+        if (!ReadInt(s, at + keyLen, allowMinus, &v, &e)) continue;
+        if (s.compare(e, sufLen, suffix) != 0) continue;
+        *out = v;
+        if (end) *end = e + sufLen;
+        found = true;
+        if (!last) break;
+    }
+    return found;
+}
+
+// The gaps between successive values after the first, as the fixture format stores a timeline.
+static void WriteDeltas(std::FILE* f, const std::vector<int64_t>& v) {
+    for (size_t i = 0; i < v.size(); i++) {
+        if (i == 0) std::fprintf(f, "%lld", (long long)v[0]);
+        else std::fprintf(f, " %lld", (long long)(v[i] - v[i - 1]));
+    }
+    std::fprintf(f, "\n");
+}
+
+static void WriteValues(std::FILE* f, const std::vector<int64_t>& v) {
+    for (size_t i = 0; i < v.size(); i++) {
+        std::fprintf(f, i == 0 ? "%lld" : " %lld", (long long)v[i]);
+    }
+    std::fprintf(f, "\n");
+}
+
+static int MakeTrace(const std::vector<std::string>& args) {
+    int64_t skipUs = 0, untilUs = 0;
+    bool haveUntil = false;
+    std::vector<std::string> rest;
+    for (size_t i = 0; i < args.size(); i++) {
+        if (args[i] == "--skip-us" && i + 1 < args.size()) skipUs = std::atoll(args[++i].c_str());
+        else if (args[i] == "--until-us" && i + 1 < args.size()) {
+            untilUs = std::atoll(args[++i].c_str());
+            haveUntil = true;
+        }
+        else rest.push_back(args[i]);
+    }
+    if (rest.size() < 2) {
+        std::printf("usage: --mktrace <NvFBCR.log> <out.trace> [\"<description>\"] "
+                    "[--skip-us N] [--until-us N]\n"
+                    "then add the file to testdata/index.txt and run --only on it: it prints "
+                    "the bounds to paste\n");
+        return 2;
+    }
+    const std::string& src = rest[0];
+    const std::string& out = rest[1];
+    std::string desc;
+    if (rest.size() > 2) {
+        desc = rest[2];
+    } else {
+        const size_t slash = src.find_last_of("/\\");
+        desc = slash == std::string::npos ? src : src.substr(slash + 1);
+    }
+    auto keep = [&](int64_t v) { return v >= skipUs && (!haveUntil || v < untilUs); };
+
+    std::vector<int64_t> arr, flushes, pres, pulls;
+    std::vector<char> synth, repeat;
+    std::vector<int> picks;   // an index into kPickNames
+    static const char* const kPickNames[] = {"before", "before-adv", "after", "after-adv",
+                                             "repeat", "none"};
+    const int kPickNone = 5;
+    std::string compositor;
+    bool haveFlush = true;
+    // Head 0 only: head 1 is the relay's own output, which no pairing rule reads. Kept in
+    // DELIVERY order rather than sorted by scanout time, because the replay has to model
+    // when each flip became knowable, and sorting would erase that.
+    std::vector<int64_t> flips, delays;
+    bool haveLag = true;
+    double srcHint = 0.0;
+    int64_t extraLagMs = 0, stepTolPct = 0, comb = 0;
+    bool skipsCopies = false;
+
+    std::FILE* in = std::fopen(src.c_str(), "rb");
+    if (!in) {
+        std::printf("cannot open %s\n", src.c_str());
+        return 1;
+    }
+    std::string line;
+    std::vector<char> buf(1 << 16);
+    for (;;) {
+        // One line, however long, without its line ending.
+        line.clear();
+        bool any = false;
+        while (std::fgets(buf.data(), (int)buf.size(), in)) {
+            any = true;
+            line += buf.data();
+            if (!line.empty() && line.back() == '\n') break;
+        }
+        if (!any) break;
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+
+        // The capture loop's startup line announcing that a grab which waits out the timeout
+        // stores nothing. A log without it came from a loop that stored the timeout's
+        // re-delivered picture as a new frame, and the fixture says so.
+        if (!skipsCopies && line.find("timeout stores nothing") != std::string::npos) {
+            skipsCopies = true;
+            continue;
+        }
+        int64_t v = 0;
+        // A capture wake: "capture #<n> arr=<us>us".
+        {
+            bool isCapture = false;
+            for (size_t at = line.find("capture #"); at != std::string::npos;
+                 at = line.find("capture #", at + 1)) {
+                int64_t n = 0;
+                size_t e = 0;
+                if (!ReadInt(line, at + 9, false, &n, &e)) continue;
+                if (line.compare(e, 5, " arr=") != 0) continue;
+                size_t e2 = 0;
+                if (!ReadInt(line, e + 5, false, &v, &e2)) continue;
+                if (line.compare(e2, 2, "us") != 0) continue;
+                isCapture = true;
+                break;
+            }
+            if (isCapture) {
+                if (keep(v)) {
+                    arr.push_back(v);
+                    // The wake's copy and GPU flush, on the same line. The capture loop
+                    // publishes the slot only after it, so a present whose deadline falls
+                    // inside the flush reads the ring without the frame.
+                    int64_t fl = 0;
+                    if (FindNumber(line, "flush=", "us", false, true, false, &fl)) {
+                        flushes.push_back(fl);
+                    } else {
+                        haveFlush = false;
+                    }
+                }
+                continue;
+            }
+        }
+        // The compositor the relay ran, from its mode name: "Temporal (...)" is the nearest
+        // selection, "Temporal blend (...)" and "Temporal interp (...)" synthesize. It decides
+        // which policy the replay runs.
+        {
+            static const char kMode[] = "Capture mode: Temporal";
+            bool isMode = false;
+            for (size_t at = line.find(kMode); at != std::string::npos;
+                 at = line.find(kMode, at + 1)) {
+                const size_t e = at + sizeof(kMode) - 1;
+                if (line.compare(e, 2, " (") == 0) compositor = "nearest";
+                else if (line.compare(e, 8, " blend (") == 0) compositor = "blend";
+                else if (line.compare(e, 9, " interp (") == 0) compositor = "interp";
+                else continue;
+                isMode = true;
+                break;
+            }
+            if (isMode) continue;
+        }
+        // The declared source rate. Every period the policy derives is sized from it, so the
+        // replay has to run the same declaration or it models a different relay. The -lag the
+        // relay ran with is on the same line: it sizes the bracketing lag and the ring.
+        {
+            static const char kSrc[] = "Resolved options: src rate hint ";
+            bool isSrc = false;
+            for (size_t at = line.find(kSrc); at != std::string::npos;
+                 at = line.find(kSrc, at + 1)) {
+                const size_t b = at + sizeof(kSrc) - 1;
+                size_t e = b;
+                while (e < line.size() && ((line[e] >= '0' && line[e] <= '9') || line[e] == '.')) e++;
+                if (e == b || line.compare(e, 4, " fps") != 0) continue;
+                srcHint = std::strtod(line.substr(b, e - b).c_str(), nullptr);
+                int64_t lagMs = 0;
+                if (FindNumber(line, "extra lag ", " ms", false, true, true, &lagMs,
+                               at + 18)) {
+                    extraLagMs = lagMs;
+                }
+                isSrc = true;
+                break;
+            }
+            if (isSrc) continue;
+        }
+        // The comb modulus the lock runs. A pull that moves by more than half of it in one
+        // present has wrapped, which re-presents a frame or skips one; the replay counts the
+        // same thing.
+        {
+            const size_t at = line.find("Phase comb lock ACTIVE ");
+            int64_t m = 0;
+            if (at != std::string::npos &&
+                FindNumber(line, "modulus ", " us", false, true, true, &m, at + 23)) {
+                comb = m;
+                continue;
+            }
+        }
+        // The step tolerance the relay ran with, as a percentage of the present period. A
+        // capture made with the rule on synthesizes where one without it passes a real frame,
+        // so the replay has to run the same setting to be compared with the field.
+        if (FindNumber(line, "Step tolerance ACTIVE (-steptol ", ")", false, false, false, &v)) {
+            stepTolPct = v;
+            continue;
+        }
+        // A present: "temporal dl=<us>us", with what the relay decided on the same line.
+        if (FindNumber(line, "temporal dl=", "us", true, false, false, &v)) {
+            if (keep(v)) {
+                pres.push_back(v);
+                synth.push_back(line.find("op=synth") != std::string::npos);
+                repeat.push_back(line.find("pick=repeat") != std::string::npos);
+                int pick = kPickNone;
+                for (size_t at = line.find("pick="); at != std::string::npos;
+                     at = line.find("pick=", at + 1)) {
+                    if (at > 0 && IsWordChar(line[at - 1])) continue;
+                    size_t e = at + 5;
+                    while (e < line.size() && ((line[e] >= 'a' && line[e] <= 'z') || line[e] == '-')) e++;
+                    if (e == at + 5) continue;
+                    const std::string name = line.substr(at + 5, e - (at + 5));
+                    pick = -1;
+                    for (int k = 0; k < 6; k++) {
+                        if (name == kPickNames[k]) pick = k;
+                    }
+                    break;
+                }
+                picks.push_back(pick);
+                int64_t pull = 0;
+                if (!FindNumber(line, "pull=", "us", true, true, false, &pull)) pull = 0;
+                pulls.push_back(pull);
+            }
+            continue;
+        }
+        // A flip: "flip disp=<us>us evt=<us>us[ lag=<us>us] head=<n>". lag= is optional: logs
+        // recorded before it existed still carry usable scanout times, they just cannot say
+        // when the relay could first have known them.
+        for (size_t at = line.find("flip disp="); at != std::string::npos;
+             at = line.find("flip disp=", at + 1)) {
+            int64_t disp = 0, evt = 0, lag = 0, head = 0;
+            size_t e = 0;
+            if (!ReadInt(line, at + 10, true, &disp, &e)) continue;
+            if (line.compare(e, 7, "us evt=") != 0) continue;
+            if (!ReadInt(line, e + 7, true, &evt, &e)) continue;
+            if (line.compare(e, 2, "us") != 0) continue;
+            e += 2;
+            bool hasLag = false;
+            if (line.compare(e, 5, " lag=") == 0) {
+                size_t e2 = 0;
+                if (ReadInt(line, e + 5, true, &lag, &e2) && line.compare(e2, 2, "us") == 0) {
+                    hasLag = true;
+                    e = e2 + 2;
+                }
+            }
+            if (line.compare(e, 6, " head=") != 0) continue;
+            const size_t headAt = e + 6;
+            size_t e3 = 0;
+            if (!ReadInt(line, headAt, false, &head, &e3)) continue;
+            if (e3 - headAt == 1 && head == 0 && keep(disp)) {
+                flips.push_back(disp);
+                if (!hasLag) {
+                    haveLag = false;
+                } else {
+                    // When the relay could FIRST have known this flip, relative to the flip
+                    // itself. Drives the coherence rule offline: an upgrade that arrives
+                    // after the policy already bracketed the slot has to be declined, and
+                    // that is only testable if the fixture records arrival as well as
+                    // occurrence.
+                    delays.push_back(evt + lag - disp);
+                }
+            }
+            break;
+        }
+    }
+    std::fclose(in);
+    if (arr.empty() || pres.empty()) {
+        std::printf("no capture/temporal lines found\n");
+        return 1;
+    }
+
+    // What the relay really did, measured the same way the replay measures itself.
+    int run = 0, worst = 0, longRuns = 0, nsynth = 0, repeats = 0;
+    int census[6] = {0, 0, 0, 0, 0, 0};
+    for (size_t i = kFieldWarmup; i < synth.size(); i++) {
+        if (synth[i]) {
+            nsynth++;
+            run++;
+            if (run > worst) worst = run;
+        } else {
+            if (run >= 50) longRuns++;
+            run = 0;
+        }
+        if (repeat[i]) repeats++;
+        if (picks[i] >= 0) census[picks[i]]++;
+    }
+    if (run >= 50) longRuns++;
+    const size_t counted = synth.size() > kFieldWarmup ? synth.size() - kFieldWarmup : 0;
+    const double pct = 100.0 * nsynth / (double)(counted > 0 ? counted : 1);
+    int wraps = -1;
+    if (comb > 0) {
+        wraps = 0;
+        for (size_t i = kFieldWarmup > 1 ? kFieldWarmup : 1; i < pulls.size(); i++) {
+            const int64_t d = pulls[i] - pulls[i - 1];
+            if ((d < 0 ? -d : d) > comb / 2) wraps++;
+        }
+    }
+
+    std::FILE* f = std::fopen(out.c_str(), "wb");
+    if (!f) {
+        std::printf("cannot write %s\n", out.c_str());
+        return 1;
+    }
+    std::fprintf(f, "# nvfbc-relay policy replay fixture\n");
+    std::fprintf(f, "# %s\n", desc.c_str());
+    std::fprintf(f, "# units: microseconds. first value absolute, rest are deltas.\n");
+    std::fprintf(f, "description %s\n", desc.c_str());
+    std::fprintf(f, "# What the RELAY did on this capture. The replay model is only trustworthy\n");
+    std::fprintf(f, "# for a configuration where it reproduces these; the test checks that.\n");
+    std::fprintf(f, "field_worst_run %d\n", worst);
+    std::fprintf(f, "field_long_runs %d\n", longRuns);
+    std::fprintf(f, "field_synth_pct %.1f\n", pct);
+    if (compositor == "nearest") {
+        std::fprintf(f, "field_repeats %d\n", repeats);
+        std::fprintf(f, "# Picks past the warmup: before, before-adv, after, after-adv, repeat, none.\n");
+        std::fprintf(f, "field_picks %d %d %d %d %d %d\n", census[0], census[1], census[2],
+                     census[3], census[4], census[5]);
+    }
+    if (wraps >= 0) std::fprintf(f, "field_pull_wraps %d\n", wraps);
+    if (srcHint > 0) std::fprintf(f, "src_hint %.1f\n", srcHint);
+    if (!compositor.empty()) std::fprintf(f, "compositor %s\n", compositor.c_str());
+    if (extraLagMs > 0) std::fprintf(f, "extra_lag_ms %lld\n", (long long)extraLagMs);
+    if (stepTolPct > 0) std::fprintf(f, "step_tolerance_pct %lld\n", (long long)stepTolPct);
+    if (!skipsCopies) {
+        std::fprintf(f, "# Recorded by a capture loop that stored the grab timeout's re-delivered picture as a new\n");
+        std::fprintf(f, "# frame; the loader removes those wakes so the replay runs the loop that skips them.\n");
+        std::fprintf(f, "regrab_copies 1\n");
+    }
+    std::fprintf(f, "arrivals %zu\n", arr.size());
+    WriteDeltas(f, arr);
+    if (haveFlush && flushes.size() == arr.size()) {
+        std::fprintf(f, "# Each wake's copy and flush, raw: the ring publishes the frame after it.\n");
+        std::fprintf(f, "flushes %zu\n", flushes.size());
+        WriteValues(f, flushes);
+    }
+    std::fprintf(f, "presents %zu\n", pres.size());
+    WriteDeltas(f, pres);
+    if (!flips.empty()) {
+        std::fprintf(f, "# Head-0 scanout times in delivery order, and how long after each flip\n");
+        std::fprintf(f, "# the relay could first have known it. A fixture without flips_h0_delay\n");
+        std::fprintf(f, "# predates the lag= field and can drive pairing but not the timing rule.\n");
+        std::fprintf(f, "flips_h0 %zu\n", flips.size());
+        WriteDeltas(f, flips);
+        if (haveLag && delays.size() == flips.size()) {
+            std::fprintf(f, "flips_h0_delay %zu\n", delays.size());
+            WriteValues(f, delays);
+        }
+    }
+    const long bytes = std::ftell(f);
+    std::fclose(f);
+
+    std::printf("%s: %zu arrivals, %zu presents, %zu head-0 flips%s, %.2f MB\n", out.c_str(),
+                arr.size(), pres.size(), flips.size(),
+                (haveLag && !flips.empty()) ? "" : " (no lag= in log)", (double)bytes / 1e6);
+    std::printf("  compositor %s\n", compositor.empty() ? "not in the log" : compositor.c_str());
+    std::printf("  field behaviour past warmup %zu: synth %.1f%%, runs>=50 %d, worst %d",
+                kFieldWarmup, pct, longRuns, worst);
+    if (compositor == "nearest") std::printf(", repeats %d", repeats);
+    if (wraps >= 0) std::printf(", pull wraps %d", wraps);
+    std::printf("\n");
+    if (!skipsCopies) {
+        std::printf("  capture loop stored grab-timeout copies: wrote regrab_copies 1\n");
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const char* replayPath = nullptr;
     int64_t combUs = 0;
     int64_t passUs = 0;
+    if (argc > 1 && !std::strcmp(argv[1], "--mktrace")) {
+        return MakeTrace(std::vector<std::string>(argv + 2, argv + argc));
+    }
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--replay") && i + 1 < argc) replayPath = argv[++i];
         else if (!std::strcmp(argv[i], "--comb") && i + 1 < argc) combUs = std::atoll(argv[++i]);
