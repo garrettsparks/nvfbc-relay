@@ -634,8 +634,10 @@ struct Config {
     // Present-side config, all as TemporalCaptureMode::Setup derives it.
     int64_t stickiness = 0;        // freq / 1000
     int64_t comb = 0;              // assumedSrcPeriod / M
-    int64_t phasePullSlew = 0;     // freq / 40000, i.e. 25 us per present
-    int64_t stallSpan = 0;         // assumedSrcPeriod * 2, or * 5/2 under phasekeep
+    // Whether the stall span is the wider one the relay runs under phasekeep. It follows the
+    // capture's own flag, not --arm: arming the vote offline does not change what the relay
+    // that made the capture called a stall.
+    bool stallSpanPhaseKeep = false;
     int64_t lag = 0;               // the static bracketing delay
     int64_t passthrough = 0;       // blend-mode passthrough gate
     bool blend = false;            // the capture ran b: mode, so DecideComposite governs
@@ -700,23 +702,27 @@ CaptureCensus ReplayCaptureSide(const Capture& cap, const Config& cfg,
     policy::SelectionState selState;
     policy::CompositeState compState;
     policy::PhaseLockState lockState;
-    policy::PolicyConfig pcfg;
+    // The policy configuration is the relay's own (policy::BuildPolicySetup, which
+    // TemporalCaptureMode::Setup calls): the lock slew, the stall span, the tooth guard and
+    // the lookahead arming come from it. The present period stands in as the sink's, the
+    // 60 Hz every capture ran at.
+    policy::PolicySetupInputs setupIn;
+    setupIn.ticksPerSecond = 1000000 * kTicksPerUs;
+    setupIn.srcPeriodQpc = cfg.assumedSrcPeriod;
+    setupIn.presentPeriodQpc = cfg.sinkPeriod;
+    setupIn.sinkPeriodQpc = cfg.sinkPeriod;
+    setupIn.combQpc = cfg.comb;
+    setupIn.synthesizes = cfg.blend;
+    setupIn.phaseKeep = cfg.stallSpanPhaseKeep;
+    policy::PolicyConfig pcfg = policy::BuildPolicySetup(setupIn).cfg;
+    // What the log itself recorded takes the place of what the builder sized, so a capture
+    // from a build with another stickiness or threshold replays as that build ran.
     pcfg.stickinessQpc = cfg.stickiness;
-    pcfg.combQpc = cfg.comb;
-    pcfg.phasePullSlewQpc = cfg.phasePullSlew;
-    pcfg.stallSpanQpc = cfg.stallSpan;
     pcfg.passthroughQpc = cfg.passthrough;
-    // The REAL arming rule, not a copy of it (TemporalCaptureMode::Setup calls the same one).
-    if (cfg.toothGuard) {
-        pcfg.srcPeriodQpc = policy::ToothGuardPeriod(cfg.assumedSrcPeriod, cfg.sinkPeriod,
-                                                     cfg.comb > 0);
-    }
-    // As TemporalCaptureMode::Setup arms it: a blend mode whose comb is one source frame.
-    pcfg.phaseLookahead = cfg.blend && cfg.comb > 0 && cfg.comb == cfg.assumedSrcPeriod;
-    pcfg.lateLookahead = pcfg.phaseLookahead;
-    pcfg.lookaheadNeedsLead = pcfg.phaseLookahead;
-    if (cfg.blend && pcfg.srcPeriodQpc > 0) {
-        pcfg.resumeGuardExemptPresents = policy::kResumeGuardExemptPresents;
+    // --no-tooth-guard: builds that predate the guard, and with it its stall-resume exemption.
+    if (!cfg.toothGuard) {
+        pcfg.srcPeriodQpc = 0;
+        pcfg.resumeGuardExemptPresents = 0;
     }
     policy::PhaseLookahead lookahead;
     policy::PresentHistory presentHist;
@@ -1765,10 +1771,9 @@ int main(int argc, char** argv) {
         cfg.passthrough = policy::PassthroughThreshold(cfg.assumedSrcPeriod, cfg.sinkPeriod);
     if (fromS >= 0.0) cfg.fromTs = (int64_t)(fromS * 1e6) * kTicksPerUs;
     if (toS >= 0.0) cfg.toTs = (int64_t)(toS * 1e6) * kTicksPerUs;
-    cfg.phasePullSlew = (int64_t)(freq / 40000.0);        // 25 us per present
-    // stallSpan is widened under phasekeep (TemporalCaptureMode::Setup), because a dropped
-    // all-generated batch legitimately widens the bracket.
-    cfg.stallSpan = cap.phaseKeep ? cfg.assumedSrcPeriod * 5 / 2 : cfg.assumedSrcPeriod * 2;
+    // The stall span is widened under phasekeep, because a dropped all-generated batch
+    // legitimately widens the bracket.
+    cfg.stallSpanPhaseKeep = cap.phaseKeep;
     if (oldConstants) {
         cfg.clampedEma = false;
         cfg.advanceBound = 8;
