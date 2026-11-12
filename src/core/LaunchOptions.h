@@ -68,6 +68,8 @@ struct Options {
                                     // drawn with BlendShaderNames()[blendShader]; -1, not
                                     // typed, the plain blend
     bool tightWait = true;          // -notightwait: a mode on a timer waits on the timer alone
+    unsigned int stepTolPct = 0;    // -steptol N: the step tolerance, as a percentage of the
+                                    // output frame time (1 to 50); 0, not typed, the rule off
     bool d3d9 = false;              // -d3d9: the timer modes of t and b present on the D3D9
                                     // swapchain, as before they moved to the D3D11 present
 };
@@ -212,6 +214,11 @@ inline const std::vector<UsageRow>& OptionRows() {
                              "default the relay wakes just before each frame is due and watches "
                              "the clock for the rest, which keeps frames evenly spaced and keeps "
                              "one processor core busy for up to a millisecond a frame",
+         false, false},
+        {"-steptol", "18", "With b or o, show a real frame only while that keeps the motion "
+                           "even: when it would move the picture by more or less than a frame's "
+                           "worth, off by more than this percentage of a frame (1-50), an "
+                           "in-between frame is drawn instead. Off by default",
          false, false},
         {"-d3d9", "", "Show the timer modes of t and b (b:60, t:59.94) through the older "
                       "Direct3D 9 output, as before they moved to the newer one", false, false},
@@ -412,6 +419,12 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
         else if (warning) *warning = "-blend takes linear or pan, not '" + v + "'";
         return 2;
     }
+    if (t == "-steptol" && i + 1 < tokens.size()) {
+        const long v = std::strtol(tokens[i + 1].c_str(), NULL, 10);
+        if (v >= 1 && v <= 50) o->stepTolPct = (unsigned int)v;
+        else if (warning) *warning = "-steptol takes a whole number from 1 to 50, not '" + tokens[i + 1] + "'";
+        return 2;
+    }
     if (t == "-lag" && i + 1 < tokens.size()) {
         const long v = std::strtol(tokens[i + 1].c_str(), NULL, 10);
         if (v >= 0 && v <= 200) o->extraLagMs = (unsigned int)v;
@@ -571,6 +584,7 @@ inline std::string FormatOptions(const Options& o) {
     if (!o.copyEngine) add("-nocopyengine");
     if (o.blendShader >= 0) add(std::string("-blend ") + BlendShaderNames()[o.blendShader]);
     if (!o.tightWait) add("-notightwait");
+    if (o.stepTolPct > 0) add("-steptol " + std::to_string(o.stepTolPct));
     if (o.d3d9) add("-d3d9");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");

@@ -1151,6 +1151,16 @@ int64_t PassthroughThreshold(int64_t srcPeriodQpc, int64_t presentPeriodQpc) {
     return srcPeriodQpc / 4;
 }
 
+int64_t StepTolerance(int64_t presentPeriodQpc, int percent) {
+    if (percent <= 0 || presentPeriodQpc <= 0) return 0;
+    return presentPeriodQpc * percent / 100;
+}
+
+int64_t StepOffsetDecay(int64_t presentPeriodQpc, int percent) {
+    if (percent <= 0 || presentPeriodQpc <= 0) return 0;
+    return presentPeriodQpc * kStepOffsetDecayPercent / 100;
+}
+
 int64_t RecordPresent(PresentHistory& h, int64_t presentTime) {
     int64_t mean = 0;
     if (h.count >= kPresentMeanSpan) mean = (presentTime - h.times[h.next]) / kPresentMeanSpan;
@@ -1171,6 +1181,69 @@ bool ConsumeGuardExemption(PhaseLockState& s) {
     if (s.guardExemptLeft <= 0) return false;
     s.guardExemptLeft--;
     return true;
+}
+
+// Whether the step tolerance has a step to judge: the rule is on, something was output, and
+// that output is one present back (see PolicyConfig::stepPresentPeriodQpc).
+static bool StepToleranceApplies(const BracketInfo& b, const CompositeState& s,
+                                 const PolicyConfig& cfg) {
+    if (cfg.stepToleranceQpc <= 0 || cfg.stepPresentPeriodQpc <= 0) return false;
+    if (s.lastTargetTs == INT64_MIN || s.lastOutputTs == INT64_MIN) return false;
+    const int64_t advance = (b.beforeTs + b.beforeDiff) - s.lastTargetTs;
+    if (advance * 2 < cfg.stepPresentPeriodQpc || advance * 2 > cfg.stepPresentPeriodQpc * 3) {
+        return false;
+    }
+    // A source well under the present rate (a bracket wider than a present and three quarters)
+    // is rate conversion: every other output is an in-between frame by design and the real
+    // frames between them are the sharp ones worth keeping. Evening the steps there turns
+    // seconds of output into in-between frames with no real frame among them.
+    if (b.hasBefore && b.hasAfter &&
+        (b.afterTs - b.beforeTs) * 4 > cfg.stepPresentPeriodQpc * 7) {
+        return false;
+    }
+    return true;
+}
+
+// Where a synthesis with no real frame in the gate eases its offset to: the offset of the
+// nearer real frame when that frame is inside the gate's outer edge (the gate as a passing
+// stream sees it), zero otherwise. A frame hovering at the gate is inside it on one present
+// and outside on the next; easing toward it on one and toward the target on the other would
+// pull the offset back and forth, and the pass that follows would step by the difference.
+static int64_t NearRealFrameOffset(const BracketInfo& b, const PolicyConfig& cfg) {
+    CompositeState passing;
+    const int64_t outer = PassthroughGate(passing, cfg);
+    const bool before = b.hasBefore && b.beforeDiff < outer;
+    const bool after = b.hasAfter && b.afterDiff < outer;
+    if (before && (!after || b.beforeDiff <= b.afterDiff)) return -b.beforeDiff;
+    if (after) return b.afterDiff;
+    return 0;
+}
+
+// The content time a synthesis shows. With the step tolerance off it is the target. With it
+// on it is the target plus the offset the last output had, moved toward restOffset by the
+// decay and kept inside the bracket: the output then advances by the target's own step, give
+// or take the decay. restOffset is where the offset should end up: the offset of the real
+// frame the gate would have passed, so the output eases back onto real frames wherever the
+// lock has parked them, or zero when no real frame is in the gate.
+static int64_t SynthesisContentTime(const BracketInfo& b, const CompositeState& s,
+                                    const PolicyConfig& cfg, int64_t restOffset) {
+    const int64_t targetTs = b.beforeTs + b.beforeDiff;
+    if (!StepToleranceApplies(b, s, cfg)) return targetTs;
+    int64_t carried = s.lastOutputTs - s.lastTargetTs;
+    if (carried > restOffset + cfg.stepOffsetDecayQpc) carried -= cfg.stepOffsetDecayQpc;
+    else if (carried < restOffset - cfg.stepOffsetDecayQpc) carried += cfg.stepOffsetDecayQpc;
+    else carried = restOffset;
+    int64_t ts = targetTs + carried;
+    if (b.hasBefore && ts < b.beforeTs) ts = b.beforeTs;
+    if (b.hasAfter && ts > b.afterTs) ts = b.afterTs;
+    return ts;
+}
+
+// The synthesis weight for a content time inside a complete bracket.
+static double WeightAt(const BracketInfo& b, int64_t contentTs) {
+    const int64_t span = b.afterTs - b.beforeTs;
+    if (span <= 0) return 0.0;
+    return (double)(contentTs - b.beforeTs) / (double)span;
 }
 
 CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
@@ -1237,18 +1310,31 @@ CompositeDecision DecideComposite(const BracketInfo& b, CompositeState& s,
         // bracket, the hole present reads mid-w, and neighbors are untouched.
         d.op = CompositeOp::Synthesize;
         synth = true;
-        const int64_t span = b.beforeDiff + b.afterDiff;
-        if (span > 0) {
-            d.weight = (double)b.beforeDiff / (double)span;
-        } else {
-            d.weight = 0.0;
-        }
-        outputTs = b.beforeTs + b.beforeDiff;
+        outputTs = SynthesisContentTime(b, s, cfg, NearRealFrameOffset(b, cfg));
+        d.weight = WeightAt(b, outputTs);
     } else {
         // One-sided bracket with the lone frame off target: the after endpoint of a
         // hole has not arrived yet (recovery depth is what the lag buys) or the
         // target fell off the ring. Re-present the last output.
         return d;
+    }
+
+    // STEP TOLERANCE: a pass that would move the output's offset from the target by more than
+    // the tolerance synthesizes instead, when the bracket is complete and the tooth guard
+    // would allow a synthesis here. See the header.
+    if (!synth && b.hasBefore && b.hasAfter && StepToleranceApplies(b, s, cfg)) {
+        const int64_t targetTs = b.beforeTs + b.beforeDiff;
+        const int64_t passOffset = outputTs - targetTs;
+        const int64_t change = passOffset - (s.lastOutputTs - s.lastTargetTs);
+        const int64_t mag = change < 0 ? -change : change;
+        if (mag > cfg.stepToleranceQpc &&
+            (b.toothGuardExempt || !SynthWouldManufactureTooth(b, s, cfg))) {
+            d.op = CompositeOp::Synthesize;
+            synth = true;
+            outputTs = SynthesisContentTime(b, s, cfg, passOffset);
+            d.weight = WeightAt(b, outputTs);
+            passAfter = s.lastPassAfter;
+        }
     }
 
     // MONOTONE OUTPUT GUARD: the composite counterpart of SelectFrame's newer-than-

@@ -101,6 +101,7 @@ private:
     // 0.29/s at +50 ms, 0.01/s at +75 ms; the frames those holds wanted DID arrive, just
     // later than the target. The cost is that they become blends, not passthroughs.
     unsigned int m_extraLagMs;
+    int m_stepTolPct;   // -steptol: the step tolerance as a percentage of the present period
     // The deferred ring copy (CaptureRing::EnableDeferCopy). Off with -fgphase or -phasekeep,
     // which read every captured frame's pixels.
     bool m_deferCopy;
@@ -156,7 +157,8 @@ public:
                         unsigned int extraLagMs = 0, bool d3d11Present = false,
                         bool deferCopy = false, bool wgc = false, bool wgcDrop = true,
                         bool wgcCursor = true, bool wgcOpen = true, int wgcScale = 0,
-                        bool wgcCopyEngine = true, int blendShader = -1, bool tightWait = true);
+                        bool wgcCopyEngine = true, int blendShader = -1, bool tightWait = true,
+                        int stepTolPct = 0);
     virtual ~TemporalCaptureMode();
 
     virtual UINT GetPresentationInterval() const override;

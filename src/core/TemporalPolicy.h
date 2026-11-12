@@ -595,6 +595,21 @@ struct PolicyConfig {
     // the target back blends instead of repeating a frame (kResumeGuardExemptPresents in the
     // blend modes). 0 keeps the guard.
     int resumeGuardExemptPresents = 0;
+    // The step tolerance (DecideComposite): a real frame is passed only while showing it keeps
+    // the output's offset from the target within this much of the offset the last output had.
+    // 0 = off, and the passthrough gate alone decides.
+    int64_t stepToleranceQpc = 0;
+    // How much of the carried offset a synthesized present gives back, per present. At or
+    // above the passthrough gate a synthesis sits on the target, as it does with the rule off.
+    int64_t stepOffsetDecayQpc = 0;
+    // The nominal present period, read only by the step tolerance: the rule keeps the step
+    // from the last output to this one even, so it applies only when the last output is one
+    // present back (the target advanced between half and one and a half of this). After a
+    // stall, a run of holds, or on a present clock running faster than this, there is no such
+    // step and the decision is the one made with the rule off. The same holds for a bracket
+    // wider than a present and three quarters: a source well under the present rate, where the
+    // real frames are the ones worth keeping.
+    int64_t stepPresentPeriodQpc = 0;
 };
 
 // The resume snap moves the pull on the resume present and the target on the next one, so two
@@ -802,6 +817,17 @@ bool ConsumeGuardExemption(PhaseLockState& s);
 // non-decreasing by construction, the composite counterpart of SelectFrame's
 // monotonic lastShownTs.
 //
+// STEP TOLERANCE (cfg.stepToleranceQpc > 0): the gate asks how far a real frame sits from the
+// target, but what shows on screen as uneven motion is that distance CHANGING from one present
+// to the next. On a steady source the shown frame's offset from the target is the same every
+// present and a pass costs nothing. On a source with uneven frame times the offset of the
+// frame inside the gate differs present to present, and each pass moves the picture by more
+// or less than a present's worth. With the tolerance set, a pass whose offset differs from the
+// last output's by more than it synthesizes instead, at the offset the last output had less
+// cfg.stepOffsetDecayQpc, so the content time keeps advancing with the target. A synthesis
+// with no real frame in the gate takes the same carried offset. The carried offset is at most
+// the gate and is kept inside the bracket.
+//
 // TOOTH GUARD (cfg.srcPeriodQpc > 0): a would-be synthesis whose target advances on the
 // last CONSUMED target by less than 7/8 of a source period demotes to HoldComb instead.
 // A present clock faster than the source puts targets BETWEEN teeth of the source comb,
@@ -843,6 +869,16 @@ int64_t ToothGuardPeriod(int64_t srcPeriodQpc, int64_t sinkPeriodQpc, bool combO
 // widened gate often enough to pass when the even output is a blend. Each such pass is a
 // full-period step followed by a half-period step where two even steps were available.
 int64_t PassthroughThreshold(int64_t srcPeriodQpc, int64_t presentPeriodQpc);
+
+// The step tolerance and its offset decay, sized from the PRESENT period: what shows as uneven
+// motion is the step error as a share of one output frame's worth of motion, so the same
+// milliseconds matter twice as much at twice the output rate. percent is the tolerance as a
+// percentage of the present period; 0 leaves the rule off. The decay is 3% of the present
+// period (0.5 ms at 60 fps). The values to put in PolicyConfig::stepToleranceQpc and
+// stepOffsetDecayQpc.
+const int kStepOffsetDecayPercent = 3;
+int64_t StepTolerance(int64_t presentPeriodQpc, int percent);
+int64_t StepOffsetDecay(int64_t presentPeriodQpc, int percent);
 
 // The source rate every rate-derived quantity is sized from: the declared -src, or the default
 // when none was declared. The default is the slowest source served without configuration, at

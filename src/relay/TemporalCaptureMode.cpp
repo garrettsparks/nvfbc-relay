@@ -85,7 +85,8 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
                                          bool fgPhase, bool phaseKeep, unsigned int extraLagMs,
                                          bool d3d11Present, bool deferCopy, bool wgc,
                                          bool wgcDrop, bool wgcCursor, bool wgcOpen, int wgcScale,
-                                         bool wgcCopyEngine, int blendShader, bool tightWait)
+                                         bool wgcCopyEngine, int blendShader, bool tightWait,
+                                         int stepTolPct)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_present(NULL)
@@ -105,6 +106,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_fgPhase(fgPhase)
     , m_phaseKeep(phaseKeep && etw && !noJoin)
     , m_extraLagMs(extraLagMs)
+    , m_stepTolPct(stepTolPct)
     , m_deferCopy(deferCopy && !fgPhase && !phaseKeep)
     , m_wgc(wgc && d3d11Present)
     , m_wgcDrop(wgcDrop)
@@ -407,6 +409,22 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
                 m_policyCfg.combQpc <= 0
                     ? "needs the comb lock, and -nolock turned it off"
                     : "source is slower than the sink, so synthesis is rate conversion");
+        }
+        // The step tolerance: off unless -steptol names a percentage of the present period.
+        m_policyCfg.stepToleranceQpc =
+            policy::StepTolerance(m_scheduler.PeriodQpc(), m_stepTolPct);
+        m_policyCfg.stepOffsetDecayQpc =
+            policy::StepOffsetDecay(m_scheduler.PeriodQpc(), m_stepTolPct);
+        m_policyCfg.stepPresentPeriodQpc = m_scheduler.PeriodQpc();
+        if (m_policyCfg.stepToleranceQpc > 0) {
+            LOG("Step tolerance ACTIVE (-steptol %d): a real frame is shown only while its "
+                "offset from the target stays within %lld us of the last output's; otherwise "
+                "the present synthesizes and eases back %lld us a present",
+                m_stepTolPct,
+                m_policyCfg.stepToleranceQpc * 1000000 / m_scheduler.Freq(),
+                m_policyCfg.stepOffsetDecayQpc * 1000000 / m_scheduler.Freq());
+        } else {
+            LOG("Step tolerance off");
         }
     }
 

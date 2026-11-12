@@ -256,6 +256,9 @@ struct SimParams {
     // Let the lookahead plan a step whose first frame is already at the target, the rule before
     // lookaheadNeedsLead. Only for controls.
     bool noLookaheadLead = false;
+    // The composite's step tolerance and its offset decay (PolicyConfig); 0 leaves the rule off.
+    int64_t stepTolerance = 0;
+    int64_t stepOffsetDecay = 0;
     // The SINK period: the target display's refresh, which is what production compares the
     // source against when arming the guard. presentPeriod above is the tick spacing the
     // present loop actually runs at - DWM's compose clock under a vsync present (twice the
@@ -292,31 +295,49 @@ static bool EasedTarget(const SimResult& r, size_t i) {
 // present; what counts is the offset CHANGING, which is motion that speeds up and slows down
 // on screen. A step off by a refresh's worth or more is a repeat or a skip: counted apart and
 // kept out of the rms, so one hitch does not drown the unevenness between hitches.
+// A present the tooth guard held (HoldComb) is not a step: the present clock is running faster
+// than the source there and the guard re-presents on purpose, so the next step is measured
+// from the last present that was not such a hold, over the time since it.
 struct StepEvenness {
     double rmsUs = 0.0;       // rms of the step error, steps under kWholeStepUs only
     double over2Pct = 0.0;    // share of presents with a step error over 2 ms
     double over5Pct = 0.0;    // and over 5 ms
     int wholeSteps = 0;       // step errors of kWholeStepUs or more
+    // rms over EVERY step, each error capped at kWholeStepUs. The figure to compare two
+    // replays of one capture by: a rule that turns a repeat into a smaller error moves that
+    // step out of wholeSteps and INTO rmsUs, which then reads worse for an improvement.
+    double allRmsUs = 0.0;
 };
 static const int64_t kWholeStepUs = 12000;
+// The tolerance the corpus replays its step tolerance arm at, as -steptol takes it.
+static const int kStepToleranceArmPercent = 18;
 
 static StepEvenness MeasureStepEvenness(const SimResult& r, const std::vector<int64_t>& presents,
                                         size_t warmup) {
     StepEvenness e;
-    double sumSq = 0.0;
+    double sumSq = 0.0, sumSqAll = 0.0;
     long long n = 0, small = 0, over2 = 0, over5 = 0;
-    for (size_t i = warmup > 0 ? warmup : 1; i < r.outTs.size() && i < presents.size(); i++) {
-        const int64_t err = (r.outTs[i] - r.outTs[i - 1]) - (presents[i] - presents[i - 1]);
+    size_t from = (warmup > 0 ? warmup : 1) - 1;   // the present the next step is measured from
+    for (size_t i = from + 1; i < r.outTs.size() && i < presents.size(); i++) {
+        if (i < r.ops.size() && r.ops[i] == policy::CompositeOp::HoldComb) continue;
+        const int64_t err = (r.outTs[i] - r.outTs[from]) - (presents[i] - presents[from]);
+        from = i;
         const int64_t mag = err < 0 ? -err : err;
         n++;
         if (mag > 2000) over2++;
         if (mag > 5000) over5++;
-        if (mag >= kWholeStepUs) { e.wholeSteps++; continue; }
+        if (mag >= kWholeStepUs) {
+            e.wholeSteps++;
+            sumSqAll += (double)kWholeStepUs * (double)kWholeStepUs;
+            continue;
+        }
         sumSq += (double)err * (double)err;
+        sumSqAll += (double)err * (double)err;
         small++;
     }
     if (small > 0) e.rmsUs = std::sqrt(sumSq / (double)small);
     if (n > 0) {
+        e.allRmsUs = std::sqrt(sumSqAll / (double)n);
         e.over2Pct = 100.0 * (double)over2 / (double)n;
         e.over5Pct = 100.0 * (double)over5 / (double)n;
     }
@@ -467,6 +488,9 @@ static SimResult Simulate(const SimParams& p) {
     cfg.lateLookahead = cfg.phaseLookahead && !p.noLateLookahead;
     cfg.lookaheadNeedsLead = cfg.phaseLookahead && !p.noLookaheadLead;
     if (!p.noResumeGuardExemption) cfg.resumeGuardExemptPresents = policy::kResumeGuardExemptPresents;
+    cfg.stepToleranceQpc = p.stepTolerance;
+    cfg.stepOffsetDecayQpc = p.stepOffsetDecay;
+    cfg.stepPresentPeriodQpc = p.presentPeriod;
 
     const int64_t lag = BracketingLag(p);
 
@@ -2803,6 +2827,10 @@ struct TraceFixture {
     // run. Absent (-1) holds the dejitter arm to max_worst_run, so the plain arm keeps its
     // own tight bound either way.
     int maxWorstRunDejit = -1;
+    // Optional ceiling on the worst run of the step tolerance arm, for a capture where the rule
+    // makes a longer run than the arm's allowance and that is understood. Absent (-1) holds
+    // the arm to its allowance over the run the capture made without the rule.
+    int maxWorstRunStepTol = -1;
     // Optional ceilings on the rms of the content step error (MeasureStepEvenness), in
     // microseconds: the plain replay's, and the dejitter arm's own. Absent (-1) asserts
     // nothing; the evenness line prints either way.
@@ -2900,6 +2928,9 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         else if (std::strcmp(tag, "max_worst_run") == 0){ num(&n); out->maxWorstRun = (int)n; }
         else if (std::strcmp(tag, "max_worst_run_dejit") == 0) {
             num(&n); out->maxWorstRunDejit = (int)n;
+        }
+        else if (std::strcmp(tag, "max_worst_run_steptol") == 0) {
+            num(&n); out->maxWorstRunStepTol = (int)n;
         }
         else if (std::strcmp(tag, "max_step_rms_us") == 0)       { dbl(&out->maxStepRmsUs); }
         else if (std::strcmp(tag, "max_step_rms_us_dejit") == 0) { dbl(&out->maxStepRmsUsDejit); }
@@ -3690,6 +3721,11 @@ static void test_replay_capture_corpus() {
                   fx.description.c_str(), even.rmsUs, fx.maxStepRmsUs);
         }
 
+        // The evenness of the arm the capture ran: the plain replay's, or the dejitter arm's
+        // once the stage 6 block below has replayed it. The step tolerance arm is held to it.
+        StepEvenness evenAsRun = even;
+        int worstAsRun = worst;
+
         // STAGE 6 GATE: replay the same capture with delivery-lateness correction armed.
         // The design constraint is DO NO HARM on a steady capture: on-time batches are
         // untouched by construction, so a steady walk must replay inside its own bounds.
@@ -3733,6 +3769,8 @@ static void test_replay_capture_corpus() {
                   "[%s] DEJITTERED worst recovery %d exceeds the fixture bound %d",
                   fx.description.c_str(), worst6, worstBound6);
             const StepEvenness even6 = MeasureStepEvenness(r6, fx.presents, kWarmup);
+            evenAsRun = even6;
+            worstAsRun = worst6;
             std::printf("    stage6 evenness: rms %.0f us, off by over 2 ms %.2f%%, over 5 ms "
                         "%.2f%%, by a refresh or more %d\n",
                         even6.rmsUs, even6.over2Pct, even6.over5Pct, even6.wholeSteps);
@@ -3780,6 +3818,59 @@ static void test_replay_capture_corpus() {
                       "capture's late deliveries are no longer being corrected",
                       fx.description.c_str(), removed, fx.minBlendsRemoved);
             }
+        }
+
+        // STEP TOLERANCE ARM: the same capture, as it ran (the dejitter arm when the fixture
+        // has flips), with the step tolerance on. The rule exists to make the content step
+        // more even, so on a real capture it must not make it less even; its synth share and
+        // worst run are printed beside it, because evenness bought by synthesizing a stream
+        // of well-paced real frames is the failure this arm is here to show.
+        {
+            SimParams ps = p;
+            if (!fx.flipDisplay.empty() && !fx.flipKnown.empty()) {
+                ps.flipDisplay = fx.flipDisplay;
+                ps.flipKnown = fx.flipKnown;
+                ps.flipDejitter = true;
+            }
+            ps.stepTolerance = policy::StepTolerance(p.presentPeriod, kStepToleranceArmPercent);
+            ps.stepOffsetDecay =
+                policy::StepOffsetDecay(p.presentPeriod, kStepToleranceArmPercent);
+            const SimResult rs = Simulate(ps);
+            int runS = 0, worstS = 0, longRunsS = 0, synthS = 0;
+            for (size_t i = kWarmup; i < rs.ops.size(); i++) {
+                if (rs.ops[i] == policy::CompositeOp::Synthesize) {
+                    synthS++; runS++;
+                    if (runS > worstS) worstS = runS;
+                } else {
+                    if (runS >= 50) longRunsS++;
+                    runS = 0;
+                }
+            }
+            if (runS >= 50) longRunsS++;
+            const StepEvenness evenS = MeasureStepEvenness(rs, fx.presents, kWarmup);
+            std::printf("    step tolerance %d%%: synth %.1f%%, runs>=50 %d, worst %d; evenness "
+                        "over every step, rms %.0f us (as run %.0f); rms %.0f us (%.0f), off by "
+                        "over 2 ms %.2f%% (%.2f%%), by a refresh or more %d (%d)\n",
+                        kStepToleranceArmPercent,
+                        100.0 * synthS / (double)(rs.ops.size() - kWarmup), longRunsS, worstS,
+                        evenS.allRmsUs, evenAsRun.allRmsUs, evenS.rmsUs, evenAsRun.rmsUs,
+                        evenS.over2Pct, evenAsRun.over2Pct, evenS.wholeSteps,
+                        evenAsRun.wholeSteps);
+            // Evenness alone cannot judge the rule: synthesizing every present is perfectly
+            // even. The worst run of synthesized presents may grow by a quarter, or by 16
+            // presents where that is more, and no further; a 30 fps source replayed before
+            // the rule stood aside there went from runs of 3 to runs of 210 while reading
+            // more even.
+            int worstAllowed = worstAsRun + (worstAsRun / 4 > 16 ? worstAsRun / 4 : 16);
+            if (fx.maxWorstRunStepTol >= 0) worstAllowed = fx.maxWorstRunStepTol;
+            CHECK(worstS <= worstAllowed,
+                  "[%s] with the step tolerance the worst run of synthesized presents grew "
+                  "to %d from %d (allowed %d): real frames are being given up for evenness",
+                  fx.description.c_str(), worstS, worstAsRun, worstAllowed);
+            CHECK(evenS.allRmsUs <= evenAsRun.allRmsUs,
+                  "[%s] the step tolerance made the content step LESS even: rms over every "
+                  "step %.0f us against %.0f with the rule off",
+                  fx.description.c_str(), evenS.allRmsUs, evenAsRun.allRmsUs);
         }
 
         CheckDeferredCopy(fx, p, kWarmup);
@@ -4779,6 +4870,120 @@ static void test_resume_guard_exemption() {
 
 // Composite output content time is non-decreasing across pull wraps (the monotone
 // guard), on a run long enough to contain several beats.
+// The step tolerance: a pass is refused when it would move the output's offset from the target
+// by more than the tolerance, the refused present synthesizes at the carried offset eased
+// toward the real frame on offer, and a steady stream is decided exactly as with the rule off.
+static void test_composite_step_tolerance() {
+    std::printf("composite: step tolerance\n");
+    const int64_t kPer = 16667;
+    CHECK(policy::StepTolerance(kPer, 18) == 3000 && policy::StepTolerance(kPer, 12) == 2000,
+          "18%% and 12%% of a 60 fps present period must be 3000 and 2000 us");
+    CHECK(policy::StepTolerance(kPer / 2, 12) * 2 <= policy::StepTolerance(kPer, 12) &&
+              policy::StepTolerance(kPer / 2, 12) == 999,
+          "the tolerance must halve at twice the present rate");
+    CHECK(policy::StepTolerance(kPer, 0) == 0 && policy::StepOffsetDecay(kPer, 0) == 0,
+          "no percentage must leave the rule and its decay off");
+    CHECK(policy::StepOffsetDecay(kPer, 12) == 500 && policy::StepOffsetDecay(kPer, 18) == 500,
+          "the decay must be 3%% of the present period whatever the tolerance");
+
+    PolicyConfig off;
+    off.stickinessQpc = kStickinessUs;
+    off.passthroughQpc = policy::PassthroughThreshold(kPer, kPer);
+    PolicyConfig on = off;
+    on.stepToleranceQpc = policy::StepTolerance(kPer, 12);
+    on.stepOffsetDecayQpc = policy::StepOffsetDecay(kPer, 12);
+    on.stepPresentPeriodQpc = kPer;
+
+    // A bracket around target with one real frame at target + frameOffset and its neighbours a
+    // period either side.
+    auto bracket = [&](int64_t target, int64_t frameOffset) {
+        policy::BracketInfo b;
+        b.hasBefore = b.hasAfter = true;
+        const int64_t frame = target + frameOffset;
+        if (frameOffset <= 0) { b.beforeTs = frame; b.afterTs = frame + kPer; }
+        else                  { b.beforeTs = frame - kPer; b.afterTs = frame; }
+        b.beforeDiff = target - b.beforeTs;
+        b.afterDiff = b.afterTs - target;
+        return b;
+    };
+
+    // STEADY: the frame sits 3 ms behind the target every present. Both configs pass it every
+    // time; the offset never changes, so the rule has nothing to refuse.
+    policy::CompositeState sOff, sOn;
+    int64_t target = 1000000;
+    bool same = true, allPass = true;
+    for (int i = 0; i < 100; i++, target += kPer) {
+        const policy::BracketInfo b = bracket(target, -3000);
+        const policy::CompositeDecision a = policy::DecideComposite(b, sOff, off);
+        const policy::CompositeDecision c = policy::DecideComposite(b, sOn, on);
+        if (a.op != c.op || sOff.lastOutputTs != sOn.lastOutputTs) same = false;
+        if (c.op != policy::CompositeOp::PassthroughBefore) allPass = false;
+    }
+    CHECK(same && allPass, "a steady stream 3 ms off the target must pass every present, "
+                           "with the rule on as with it off");
+
+    // WITHIN THE TOLERANCE: the offset moves 1.5 ms, from -3000 to -1500. Still a pass.
+    {
+        policy::CompositeState s = sOn;
+        const policy::CompositeDecision d = policy::DecideComposite(bracket(target, -1500), s, on);
+        CHECK(d.op == policy::CompositeOp::PassthroughBefore && s.lastOutputTs == target - 1500,
+              "an offset change of 1.5 ms is inside a 2 ms tolerance and must pass");
+    }
+
+    // NO STEP TO JUDGE: the same 4 ms change, but the last output is three presents back (a
+    // stall, or holds between) or a quarter of a present back (a faster present clock). The
+    // rule stands aside and the frame passes, as with the rule off.
+    for (const int64_t gap : {kPer * 3, kPer / 4}) {
+        policy::CompositeState s = sOn;
+        const int64_t t = s.lastTargetTs + gap;
+        CHECK(policy::DecideComposite(bracket(t, 1000), s, on).op ==
+                  policy::CompositeOp::PassthroughAfter,
+              "with the last output %lld us back the rule has no step to judge and the frame "
+              "must pass", (long long)gap);
+    }
+
+    // BEYOND IT: the frame in the gate is now 1 ms AHEAD of the target, a change of 4 ms. The
+    // rule off passes it; the rule on synthesizes at the carried offset eased 0.5 ms toward it.
+    {
+        policy::CompositeState s = sOff;
+        CHECK(policy::DecideComposite(bracket(target, 1000), s, off).op ==
+                  policy::CompositeOp::PassthroughAfter,
+              "with the rule off the frame 1 ms ahead must pass");
+    }
+    policy::BracketInfo b = bracket(target, 1000);
+    policy::CompositeDecision d = policy::DecideComposite(b, sOn, on);
+    CHECK(d.op == policy::CompositeOp::Synthesize && sOn.lastOutputTs == target - 2500,
+          "an offset change of 4 ms must synthesize at the carried offset less the decay "
+          "(want output at target - 2500, got target %+lld)",
+          (long long)(sOn.lastOutputTs - target));
+    const double wantW = (double)(target - 2500 - b.beforeTs) / (double)(b.afterTs - b.beforeTs);
+    CHECK(d.weight > wantW - 1e-9 && d.weight < wantW + 1e-9,
+          "the synthesis weight must place the content at the carried offset (want %.4f, got "
+          "%.4f)", wantW, d.weight);
+
+    // EASING BACK: the source stays on the new phase. Each present gives back 0.5 ms, and the
+    // real frame passes again once its offset is within the tolerance of the carried one:
+    // -2000, -1500, -1000, then the pass at +1000.
+    int synths = 0;
+    bool stepsSmall = true, passed = false;
+    for (int i = 0; i < 8 && !passed; i++) {
+        target += kPer;
+        const int64_t lastOffset = sOn.lastOutputTs - (target - kPer);
+        d = policy::DecideComposite(bracket(target, 1000), sOn, on);
+        const int64_t change = (sOn.lastOutputTs - target) - lastOffset;
+        if (d.op == policy::CompositeOp::Synthesize) {
+            synths++;
+            if (change != 500) stepsSmall = false;
+        } else {
+            passed = d.op == policy::CompositeOp::PassthroughAfter && change == 2000;
+        }
+    }
+    CHECK(synths == 3 && stepsSmall && passed,
+          "the output must ease back 0.5 ms a present and pass the real frame after 3 more "
+          "synthesized presents (synthesized %d, eased evenly %d, passed %d)",
+          synths, (int)stepsSmall, (int)passed);
+}
+
 static void test_composite_monotone_output() {
     SimParams p{};
     p.srcPeriod = 16672;
@@ -5402,7 +5607,7 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.deferCopy == b.deferCopy && a.wgc == b.wgc && a.wgcDrop == b.wgcDrop &&
            a.wgcCursor == b.wgcCursor && a.wgcOpen == b.wgcOpen && a.wgcScale == b.wgcScale &&
            a.copyEngine == b.copyEngine && a.blendShader == b.blendShader &&
-           a.tightWait == b.tightWait && a.d3d9 == b.d3d9;
+           a.tightWait == b.tightWait && a.d3d9 == b.d3d9 && a.stepTolPct == b.stepTolPct;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
@@ -5567,6 +5772,23 @@ static void test_launch_option_parsing() {
         x = ParseOptionString("-lock -etw -defercopy -wgcdrop -wgccursor", nullptr, nullptr);
         CHECK(SameOptions(x, launch::Options()),
               "the positive spellings of the defaults must leave a default launch unchanged");
+    }
+
+    // -steptol takes a percentage from 1 to 50; anything else warns and leaves the rule off.
+    {
+        launch::Options x;
+        std::string w;
+        std::vector<std::string> t = launch::SplitTokens("-steptol 18");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.stepTolPct == 18 && w.empty(),
+              "-steptol 18 must set 18 and consume two tokens");
+        CHECK(launch::Options().stepTolPct == 0, "the step tolerance must default to off");
+        for (const char* bad : {"-steptol 0", "-steptol 51", "-steptol x"}) {
+            launch::Options y;
+            std::string warn;
+            t = launch::SplitTokens(bad);
+            CHECK(launch::ApplyOption(t, 0, &y, &warn) == 2 && y.stepTolPct == 0 && !warn.empty(),
+                  "%s must warn and leave the step tolerance off", bad);
+        }
     }
 
     // -mark takes an optional count, only when the next token is all digits.
@@ -6968,6 +7190,7 @@ int main(int argc, char** argv) {
     test_composite_unlocked_sweep();
     test_composite_gate_hysteresis();
     test_composite_v16_differential();
+    test_composite_step_tolerance();
     test_composite_monotone_output();
     test_wrap_easing();
     test_phase_lookahead();
@@ -7022,6 +7245,6 @@ int main(int argc, char** argv) {
         std::printf("POLICY TESTS FAILED: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("POLICY TESTS PASSED (7 selection + 18 composite suites)\n");
+    std::printf("POLICY TESTS PASSED\n");
     return 0;
 }
