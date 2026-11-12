@@ -54,6 +54,10 @@ SRC  = re.compile(r"Resolved options: src rate hint ([\d.]+) fps")
 # the part of a source period it adds moves the lock's pull, so a replay without it runs a
 # relay whose pull wraps at different moments from the one that made the capture.
 LAG  = re.compile(r"Resolved options: .*\bextra lag (\d+) ms")
+# The step tolerance the relay ran with, as a percentage of the present period. A capture made
+# with the rule on synthesizes where one without it passes a real frame, so the replay has to
+# run the same setting to be compared with the field.
+STEPTOL = re.compile(r"Step tolerance ACTIVE \(-steptol (\d+)\)")
 # The comb modulus the lock runs, and the pull it reports on every temporal line. A pull that
 # moves by more than half the modulus in one present has wrapped, which re-presents a frame or
 # skips one; the test counts the same thing in the replay.
@@ -103,6 +107,7 @@ def main():
     have_lag = True
     src_hint = 0.0
     extra_lag_ms = 0
+    step_tol_pct = 0
     comb = 0
     pulls = []
     skips_copies = False
@@ -135,6 +140,10 @@ def main():
         m = MOD.search(line)
         if m:
             comb = int(m.group(1))
+            continue
+        m = STEPTOL.search(line)
+        if m:
+            step_tol_pct = int(m.group(1))
             continue
         m = PRE.search(line)
         if m:
@@ -206,6 +215,8 @@ def main():
             f.write(f"compositor {compositor}\n")
         if extra_lag_ms > 0:
             f.write(f"extra_lag_ms {extra_lag_ms}\n")
+        if step_tol_pct > 0:
+            f.write(f"step_tolerance_pct {step_tol_pct}\n")
         if not skips_copies:
             f.write("# Recorded by a capture loop that stored the grab timeout's re-delivered picture as a new\n")
             f.write("# frame; the loader removes those wakes so the replay runs the loop that skips them.\n")

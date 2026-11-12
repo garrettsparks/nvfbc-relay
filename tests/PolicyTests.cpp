@@ -2867,6 +2867,10 @@ struct TraceFixture {
     // size its ring the way the relay does; absent (0) means no extra lag and the ring-8
     // depth, which every fixture recorded before the field existed was.
     int extraLagMs = 0;
+    // The step tolerance the relay ran with, as -steptol takes it. Every arm of the replay
+    // runs it; absent (0) means the rule was off, which every fixture recorded before the
+    // field existed was.
+    int stepTolPct = 0;
     // An x3 capture on which the rotation vote must REFUSE rather than decide. Smooth
     // Motion x3 rotates a real member through the batch and the vote has to find it; DLSS
     // frame generation delivers members the capture cannot tell apart, so there is no
@@ -2972,6 +2976,7 @@ static bool ParseFixture(const std::string& path, TraceFixture* out) {
         }
         else if (std::strcmp(tag, "src_hint") == 0)         { dbl(&out->srcHint); }
         else if (std::strcmp(tag, "extra_lag_ms") == 0)     { num(&n); out->extraLagMs = (int)n; }
+        else if (std::strcmp(tag, "step_tolerance_pct") == 0) { num(&n); out->stepTolPct = (int)n; }
         else if (std::strcmp(tag, "rotation_inert") == 0)   { num(&n); out->rotationInert = n != 0; }
         else if (std::strcmp(tag, "regrab_copies") == 0)    { num(&n); out->regrabCopies = n != 0; }
         else if (std::strcmp(tag, "min_placed_pct") == 0)  { num(&n); out->minPlacedPct = (int)n; }
@@ -3593,6 +3598,12 @@ static void test_replay_capture_corpus() {
         // lookahead off, as the relay's compositor setup does.
         const bool nearest = fx.compositor == "nearest";
         if (nearest) p.passthroughQpc = 0;
+        // A capture made with the step tolerance on replays with it on, in every arm.
+        if (fx.stepTolPct > 0) {
+            p.stepTolerancePercent = fx.stepTolPct;
+            std::printf("    step tolerance %d%%: the capture ran with the rule on, and so does "
+                        "the replay\n", fx.stepTolPct);
+        }
         // The flow planner runs beside this replay only; the other arms below copy p.
         SimParams pPlan = p;
         pPlan.planAhead = !nearest;
@@ -3837,7 +3848,49 @@ static void test_replay_capture_corpus() {
         // more even, so on a real capture it must not make it less even; its synth share and
         // worst run are printed beside it, because evenness bought by synthesizing a stream
         // of well-paced real frames is the failure this arm is here to show.
-        {
+        // A capture made with the rule on is compared the other way round: the arm replays it
+        // with the rule off, and the capture as it ran must be no less even than that, with a
+        // worst run inside the same allowance over the arm's.
+        if (fx.stepTolPct > 0) {
+            SimParams ps = p;
+            if (!fx.flipDisplay.empty() && !fx.flipKnown.empty()) {
+                ps.flipDisplay = fx.flipDisplay;
+                ps.flipKnown = fx.flipKnown;
+                ps.flipDejitter = true;
+            }
+            ps.stepTolerancePercent = 0;
+            const SimResult rs = Simulate(ps);
+            int runS = 0, worstS = 0, longRunsS = 0, synthS = 0;
+            for (size_t i = kWarmup; i < rs.ops.size(); i++) {
+                if (rs.ops[i] == policy::CompositeOp::Synthesize) {
+                    synthS++; runS++;
+                    if (runS > worstS) worstS = runS;
+                } else {
+                    if (runS >= 50) longRunsS++;
+                    runS = 0;
+                }
+            }
+            if (runS >= 50) longRunsS++;
+            const StepEvenness evenS = MeasureStepEvenness(rs, fx.presents, kWarmup);
+            std::printf("    step tolerance off: synth %.1f%%, runs>=50 %d, worst %d (as run "
+                        "%d); evenness over every step, rms %.0f us (as run %.0f); rms %.0f us "
+                        "(%.0f), off by over 2 ms %.2f%% (%.2f%%), by a refresh or more %d (%d)\n",
+                        100.0 * synthS / (double)(rs.ops.size() - kWarmup), longRunsS, worstS,
+                        worstAsRun, evenS.allRmsUs, evenAsRun.allRmsUs, evenS.rmsUs,
+                        evenAsRun.rmsUs, evenS.over2Pct, evenAsRun.over2Pct, evenS.wholeSteps,
+                        evenAsRun.wholeSteps);
+            int worstAllowed = worstS + (worstS / 4 > 16 ? worstS / 4 : 16);
+            if (fx.maxWorstRunStepTol >= 0) worstAllowed = fx.maxWorstRunStepTol;
+            CHECK(worstAsRun <= worstAllowed,
+                  "[%s] with the step tolerance the worst run of synthesized presents is %d "
+                  "against %d with the rule off (allowed %d): real frames are being given up "
+                  "for evenness",
+                  fx.description.c_str(), worstAsRun, worstS, worstAllowed);
+            CHECK(evenAsRun.allRmsUs <= evenS.allRmsUs,
+                  "[%s] the step tolerance made the content step LESS even: rms over every "
+                  "step %.0f us against %.0f with the rule off",
+                  fx.description.c_str(), evenAsRun.allRmsUs, evenS.allRmsUs);
+        } else {
             SimParams ps = p;
             if (!fx.flipDisplay.empty() && !fx.flipKnown.empty()) {
                 ps.flipDisplay = fx.flipDisplay;

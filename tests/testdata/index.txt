@@ -220,6 +220,12 @@ kcd_60x2_ovsync_2026_11_06_0.trace
 # night. 21 lock releases in the field, 22 on the replay (19 matched); worst blend run 32 in both,
 # in that 40 fps stretch. Of 2370 synthesized presents, 2281 warped and 89 drawn as the blend.
 kcd_60x2_ovsync_2026_11_10_0.trace
+# 74 minutes of the 2026-11-11 stream, o:vsync through Windows.Graphics.Capture, the first
+# capture made with the step tolerance on (18%). Its step_tolerance_pct key makes every arm of
+# the replay run the rule, so the rule's decisions are held against the field: synthesized
+# presents 814 an hour on the replay against 818, worst blend run 25 in both. 80 hitches and 22
+# stalls an hour in 28 bursts, stalls up to 518 ms; only 20 seconds of uneven frame times.
+kcd_60x2_ovsync_2026_11_11_0.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions
