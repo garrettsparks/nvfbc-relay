@@ -106,6 +106,7 @@ public:
     int LookaheadPresents() const override { return m_flow ? kFlowLookahead : 0; }
     void PlanAhead(const FrameBracket* upcoming, const LONGLONG* targets,
                    const bool* synthesizes, int count) override;
+    void SetMaxFlowGap(LONGLONG maxGapQpc) override { m_maxFlowGapQpc = maxGapQpc; }
 
     // Draw the step's decision onto the current back buffer. Fills out exactly as the D3D9
     // synthesizing compositor would, so the temporal log line reads the same.
@@ -197,8 +198,9 @@ private:
     void SubmitPlanned(bool drew, bool afterPresent = false);
     // A synthesized present's frame: the warp from the pair's flow when it was handed over at an
     // earlier present, or the lerp when it was not (it is handed over now, for later presents of
-    // the pair) or there is none. Sets exec (3 warp, 1 lerp), the cache slot it read (-1 for the
-    // lerp) and fl=.
+    // the pair) or there is none. A pair too far apart to flow (policy::PairTooFarToFlow) is the
+    // lerp, fl=gap, and is never handed over. Sets exec (3 warp, 1 lerp), the cache slot it read
+    // (-1 for the lerp) and fl=.
     bool DrawSynthesis(const FrameBracket& bracket, float w, int* exec, int* flowSlot,
                        const char** flowLabel);
 
@@ -324,6 +326,10 @@ private:
     policy::FlowPair m_lastHanded;
     bool m_haveLastHanded = false;
     long long m_flowHit = 0, m_flowLate = 0, m_flowOwn = 0, m_flowMiss = 0;
+    // The longest gap a pair is flowed across (SetMaxFlowGap; 0 for no limit) and the presents
+    // drawn as the blend because their pair was further apart.
+    LONGLONG m_maxFlowGapQpc = 0;
+    long long m_flowGap = 0;
     long long m_flowsRidden = 0, m_flowsAlone = 0, m_flowsAfterPresent = 0;
 
     bool m_mark;

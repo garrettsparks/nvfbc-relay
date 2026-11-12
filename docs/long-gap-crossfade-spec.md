@@ -1,7 +1,30 @@
 # Crossfade instead of warp across a long game stall
 
-2026-11-06. Status: a proposal for the user. Nothing built; the first part is a measurement that
-decides whether the rest is worth building and where its line sits.
+2026-11-06. Status, 2026-11-12: Part B is built (section 3) and **OFF by default** (the user,
+after the replay's numbers below: "kind of makes me want to hold off on the change now").
+`-maxflowgap 100` runs it. Not run on the rig or streamed. What would turn it on is a look at
+the video: how many of the stalls are mid-move, and how the warps out of them look.
+
+**What the corpus replay showed, 2026-11-12.** At 100 ms the rule takes 15 to 26% of the
+synthesized presents on the long streams (836 of 3775 over 132.6 min), and 7% on 2026-11-05
+(106 of 1473, over 26 pairs), the stream this spec was written from. The relay presents about
+96 ms behind capture (a source period and a quarter plus the 75 ms extra lag), so a gap up to
+about that never holds: the frame after it arrives before the target leaves the frame before
+it, and the relay interpolates across the whole gap. Only a longer gap shows a freeze first,
+followed by 5 or 6 synthesized presents (the lag's worth) leading out of it. So about the lag
+is a principled place for the line, and 100 ms sits on it. Not known: how many of those stalls
+are in the middle of a camera move, where the warp may be bridging the jump well and the blend
+would be a double image for those presents. The one hitch source characterised on the rig
+happens while walking.
+
+**The reasoning it was built on, 2026-11-12, before the replay's numbers.** The rule is worth having on principle, not only for the
+dialog: a flow across a stall is where a flow is least reliable, and by the time the frame after
+the stall arrives the viewer has watched the freeze, so the presents drawn across it only lead
+out of it. They are drawn as the blend. The line is 100 ms, and never less than three source
+periods, so a slow source keeps the flow between its own neighbouring frames. It does not follow
+the output rate: what breaks a flow is how much the scene changed between the two frames, which
+follows the time between them. 100 ms is a judgement: the one sequence looked at was bad at 180
+and 203 ms, and nothing between 50 and 180 ms has been graded.
 
 ## 1. Why
 
@@ -37,6 +60,10 @@ blend frame), where a warp of plain motion may look right even across a long gap
 
 ## 2. Part A: measure first (no relay change)
 
+As of 2026-11-12 the gaps of 100 ms and more are settled by the rule, so what is left to grade
+is the sample at 50 to 100 ms against the control under 25 ms: whether the line should come down
+toward 50. The steps below are as first written.
+
 From the 2026-11-05 VOD and log, with the corrected mapping (`checks-1105/flowclips/` in the
 analysis folder; log time = VOD time + 48.009 s, the video one frame later every 1490 s after
 850 s, checked against hold runs):
@@ -71,18 +98,19 @@ crossfade, the same draw the cut gate falls back to; no flow is planned or run f
 synthesizes, and how a synthesis is drawn is the compositor's choice, as with the cut gate. So
 the replay suite's output does not move, and the refactor gate stays byte-identical.
 
-- `src/core/FlowPlan.h`: one function, the rule, so the suite tests it as it ships:
-  `inline bool PairTooFarToFlow(const FlowPair& pair, int64_t maxGap)`. Stamps are in QPC ticks,
-  so the caller passes the threshold converted once at setup.
-- `D3D11PresentBackend::PlanAhead` (`src/relay/D3D11Present.cpp`): a predicted synthesis whose
+- `src/core/FlowPlan.h`: the rule, so the suite tests it as it ships:
+  `inline bool PairTooFarToFlow(const FlowPair& pair, int64_t maxGap)`, and
+  `MaxFlowGap(ticksPerSecond, srcPeriod, ms)`, which sizes the threshold once at setup in the
+  stamps' clock with the floor of three source periods.
+- `D3D11PresentBackend::PlanFlows` (`src/relay/D3D11Present.cpp`): a predicted synthesis whose
   pair the rule rejects is not given to the planner, so no flow is spent on it (that saves the
   flow engine's work, about 0.27 ms of submit per flow on the 11-05 log, and its GPU time).
 - `D3D11PresentBackend::DrawSynthesis`: checks the rule first; a rejected pair draws the blend
   with `fl=gap`, a label of its own beside `hit`, `late`, `own` and `miss`, so the log and the
   analysis tools tell it from a flow that was not ready. The exit summary counts it.
 - `TemporalCaptureMode`'s startup line for the compositor names the rule and its threshold.
-- A hidden option `-maxflowgap <ms>` (0 turns it off) for the tests below; the default from
-  Part A. Hidden as `-blend` is; listed only if the user wants it.
+- A hidden option `-maxflowgap <ms>` (0 to 1000), off by default (0). Hidden as
+  `-blend` is; listed only if the user wants it.
 
 **Holds.** After the last synthesized present of a stall the relay holds that output until the
 game's next frame arrives; with the rule, what is held is the crossfade. Nothing changes there.
@@ -107,7 +135,12 @@ that.
   it off. The replay output is byte-identical to the tree before (the rule is the compositor's).
 - **Controls that fail loudly:** the flow probe's self-test gets a case of a pair stamped
   200 ms apart, which must draw the crossfade and log `fl=gap`, and one 16.7 ms apart, which
-  must warp.
+  must warp. NOT built 2026-11-12: the self-test drives the flow engine directly and the rule
+  is the present's, so a case there would only test the header function a second time. The
+  rig control in its place: the same launch with `-maxflowgap 0` must log no `fl=gap` and
+  `Flow gap limit off`; with `-maxflowgap 1` the startup line must read the floor (three source
+  periods, 50000 us at a 60 fps source) and every synthesized present whose pair is further
+  apart than that must log `fl=gap`, none closer.
 - **Rig, KCD, marked, recorded through OBS:** the dialog provoked a few times on the old and the
   new build, `o:vsync -wgc -mark 5400` against the same with the rule; the new build's frames at
   the dialog must be crossfades (`fl=gap` on those presents), the old build's warps.

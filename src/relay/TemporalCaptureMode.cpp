@@ -86,7 +86,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
                                          bool d3d11Present, bool deferCopy, bool wgc,
                                          bool wgcDrop, bool wgcCursor, bool wgcOpen, int wgcScale,
                                          bool wgcCopyEngine, int blendShader, bool tightWait,
-                                         int stepTolPct)
+                                         int stepTolPct, unsigned int maxFlowGapMs)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_present(NULL)
@@ -107,6 +107,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_phaseKeep(phaseKeep && etw && !noJoin)
     , m_extraLagMs(extraLagMs)
     , m_stepTolPct(stepTolPct)
+    , m_maxFlowGapMs(maxFlowGapMs)
     , m_deferCopy(deferCopy && !fgPhase && !phaseKeep)
     , m_wgc(wgc && d3d11Present)
     , m_wgcDrop(wgcDrop)
@@ -417,6 +418,20 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
                 m_policyCfg.stepOffsetDecayQpc * 1000000 / m_scheduler.Freq());
         } else {
             LOG("Step tolerance off");
+        }
+        // The optical flow's long-gap rule (policy::MaxFlowGap), the compositor's own: the step
+        // has already decided a present synthesizes, and this only says how it is drawn.
+        if (interp) {
+            const LONGLONG maxFlowGapQpc = policy::MaxFlowGap(
+                m_scheduler.Freq(), m_assumedSrcPeriodQpc, (int)m_maxFlowGapMs);
+            m_present->SetMaxFlowGap(maxFlowGapQpc);
+            if (maxFlowGapQpc > 0) {
+                LOG("Flow gap limit ACTIVE (-maxflowgap %u): two frames more than %lld us apart "
+                    "are blended and not flowed; fl=gap on the temporal line",
+                    m_maxFlowGapMs, maxFlowGapQpc * 1000000 / m_scheduler.Freq());
+            } else {
+                LOG("Flow gap limit off");
+            }
         }
     }
 

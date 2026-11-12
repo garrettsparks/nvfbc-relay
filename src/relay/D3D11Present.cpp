@@ -977,6 +977,15 @@ bool D3D11PresentBackend::DrawSynthesis(const FrameBracket& bracket, float w, in
     policy::FlowPair pair;
     pair.beforeTs = bracket.info.beforeTs;
     pair.afterTs = bracket.info.afterTs;
+    // A pair too far apart to flow is drawn as the blend. It was never planned, and it is kept
+    // from the planner here so it does not count as a pair the plan missed.
+    if (policy::PairTooFarToFlow(pair, m_maxFlowGapQpc)) {
+        m_flowGap++;
+        *flowLabel = "gap";
+        *exec = kExecBlend;
+        *flowSlot = -1;
+        return Draw(bracket.beforeSlot, bracket.afterSlot, w);
+    }
     // A pair no prediction named has no slot: it is drawn as the blend and flows nothing.
     const int slot = m_planner.Use(pair, m_presents);
     bool ready = false;
@@ -1075,6 +1084,11 @@ void D3D11PresentBackend::PlanFlows() {
         add(upcoming[j].info.beforeTs);
         add(upcoming[j].info.afterTs);
         if (!m_aheadSynth[j]) continue;
+        // A pair too far apart to flow will be drawn as the blend: no flow is spent on it.
+        policy::FlowPair ahead;
+        ahead.beforeTs = upcoming[j].info.beforeTs;
+        ahead.afterTs = upcoming[j].info.afterTs;
+        if (policy::PairTooFarToFlow(ahead, m_maxFlowGapQpc)) continue;
         tg[synth] = targets[j];
         forPresent[synth] = j;
         synth++;
@@ -1216,10 +1230,11 @@ void D3D11PresentBackend::LogSummary() const {
         m_flow->LogSummary();
         LOG("optical flow presents: %lld warped from a flow handed over earlier (fl=hit); the "
             "blend drawn for %lld planned but handed over at the present (fl=late), %lld not "
-            "planned (fl=own) and %lld with no flow (fl=miss); flows planned or handed over %lld, "
+            "planned (fl=own), %lld with no flow (fl=miss) and %lld whose frames were too far "
+            "apart to flow (fl=gap); flows planned or handed over %lld, "
             "planned and used %lld, planned and unused %lld; %lld rode a present's draw, %lld "
             "went alone, %lld went after a copy-engine present", m_flowHit, m_flowLate,
-            m_flowOwn, m_flowMiss, m_planner.Flows(), m_planner.PredictedUsed(),
+            m_flowOwn, m_flowMiss, m_flowGap, m_planner.Flows(), m_planner.PredictedUsed(),
             m_planner.PredictedUnused(), m_flowsRidden, m_flowsAlone, m_flowsAfterPresent);
     }
     if (m_wgc) {

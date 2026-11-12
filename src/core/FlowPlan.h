@@ -26,6 +26,30 @@ inline bool SamePair(const FlowPair& a, const FlowPair& b) {
     return a.beforeTs == b.beforeTs && a.afterTs == b.afterTs;
 }
 
+// LONG GAPS. A flow assumes its two frames show one scene, moved a little. Across a game stall
+// they can be a fifth of a second apart, with a fade or a dialog box between them, which is not
+// motion a flow can follow: the warp tears and doubles what changed. By the time the frame
+// after a stall arrives the viewer has watched the freeze, so the presents drawn across it only
+// lead out of it, and they are drawn as the blend. Such a pair is not flowed at all.
+//
+// The longest gap a pair is flowed across: ms milliseconds, and never less than three source
+// periods, so a slow source keeps the flow between its own neighbouring frames. 0 ms leaves the
+// rule off. What breaks a flow is how much the scene changed, which follows the time between
+// the frames and not the rate they are presented at, so the present period has no part in it.
+const int kMaxFlowGapSrcPeriods = 3;
+inline int64_t MaxFlowGap(int64_t ticksPerSecond, int64_t srcPeriod, int ms) {
+    if (ms <= 0) return 0;
+    const int64_t gap = ticksPerSecond * ms / 1000;
+    const int64_t floor = srcPeriod * kMaxFlowGapSrcPeriods;
+    return gap > floor ? gap : floor;
+}
+
+// Whether pair's frames are too far apart to flow. maxGap is MaxFlowGap's, in the stamps' clock;
+// 0 never refuses.
+inline bool PairTooFarToFlow(const FlowPair& pair, int64_t maxGap) {
+    return maxGap > 0 && pair.afterTs - pair.beforeTs > maxGap;
+}
+
 // Whether a present at target would synthesize, and from which pair: the two stamps around
 // the target (stamps ascending, n of them), with neither inside gate of it. The prediction
 // uses the bare passthrough threshold for gate; the composite's one-sided band only widens

@@ -71,6 +71,9 @@ struct Options {
     int stepTolPct = -1;            // -steptol N: the step tolerance, as a percentage of the
                                     // output frame time (1 to 50), or 0 for the rule off; -1,
                                     // not typed, the mode's own (StepTolerancePercentFor)
+    unsigned int maxFlowGapMs = 0;  // -maxflowgap N: with o, two frames further apart than
+                                    // this many ms (1 to 1000) are blended and not flowed; 0,
+                                    // the default, leaves the rule off (policy::MaxFlowGap)
     bool d3d9 = false;              // -d3d9: the timer modes of t and b present on the D3D9
                                     // swapchain, as before they moved to the D3D11 present
 };
@@ -221,6 +224,11 @@ inline const std::vector<UsageRow>& OptionRows() {
                            "worth, off by more than this percentage of a frame (1-50), an "
                            "in-between frame is drawn instead. By default 18 with o:vsync and "
                            "off with every other mode; 0 turns it off",
+         false, false},
+        {"-maxflowgap", "100", "With o, when the game stalls and two of its frames are further "
+                               "apart than this many milliseconds (1-1000), the in-between "
+                               "frames across the stall are a plain mix of the two and not an "
+                               "optical flow frame. Off by default; 0 is off",
          false, false},
         {"-d3d9", "", "Show the timer modes of t and b (b:60, t:59.94) through the older "
                       "Direct3D 9 output, as before they moved to the newer one", false, false},
@@ -429,6 +437,14 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
         else if (warning) *warning = "-steptol takes a whole number from 0 to 50, not '" + tokens[i + 1] + "'";
         return 2;
     }
+    if (t == "-maxflowgap" && i + 1 < tokens.size()) {
+        const long v = std::strtol(tokens[i + 1].c_str(), NULL, 10);
+        const bool digits = !tokens[i + 1].empty() &&
+                            tokens[i + 1].find_first_not_of("0123456789") == std::string::npos;
+        if (digits && v >= 0 && v <= 1000) o->maxFlowGapMs = (unsigned int)v;
+        else if (warning) *warning = "-maxflowgap takes a whole number from 0 to 1000, not '" + tokens[i + 1] + "'";
+        return 2;
+    }
     if (t == "-lag" && i + 1 < tokens.size()) {
         const long v = std::strtol(tokens[i + 1].c_str(), NULL, 10);
         if (v >= 0 && v <= 200) o->extraLagMs = (unsigned int)v;
@@ -589,6 +605,7 @@ inline std::string FormatOptions(const Options& o) {
     if (o.blendShader >= 0) add(std::string("-blend ") + BlendShaderNames()[o.blendShader]);
     if (!o.tightWait) add("-notightwait");
     if (o.stepTolPct >= 0) add("-steptol " + std::to_string(o.stepTolPct));
+    if (o.maxFlowGapMs != d.maxFlowGapMs) add("-maxflowgap " + std::to_string(o.maxFlowGapMs));
     if (o.d3d9) add("-d3d9");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");

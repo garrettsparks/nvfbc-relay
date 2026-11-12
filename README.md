@@ -174,22 +174,41 @@ has looked right, which suggests the route itself adds most of the relay's
 delay. For a different route, start there and adjust by eye, or with a sync
 test video that flashes and beeps together.
 
-## 1440p output
+## Output resolution
 
 The relay outputs at the capture card display's resolution, so for 1440p set
 the card to 2560x1440 in Windows display settings. It costs the game no more
 than 1080p does.
 
-Use a mode that runs at exactly 60.000 Hz. The standard 2560x1440 "60 Hz" mode
-many cards offer really runs at 59.95 Hz. With a 60 FPS game that means a
-skipped frame about every 20 seconds, plus a repeated one where the stream fills
-back up to 60. An NVIDIA custom resolution fixes it. In the NVIDIA Control
-Panel, under Change resolution, choose Customize, create a 2560x1440 mode at
-60 Hz, test it, then select that custom entry. On the card this was tested
-with, the custom mode measures within a thousandth of a hertz of 60.
+Matching the capture card display's resolution to the game display's also keeps
+the picture exact: at equal sizes the relay passes the game's pixels through as
+they are, and at another size it resamples them.
 
-To check which one is running, the relay log's `Display mode on adapter` line
-reads `@60Hz` for the custom mode and `@59Hz` for the 59.95 Hz one.
+## Capture card refresh rate
+
+Run the capture card display at exactly the rate you stream, 60.000 Hz for a
+60 FPS stream. A display a little off it repeats or skips a frame on a steady
+schedule: at 59.95 Hz that is a skipped frame about every 20 seconds, plus a
+repeated one where the stream fills back up to 60. Whether a mode is exact
+depends on its timing, not its resolution. The common case is the standard
+2560x1440 "60 Hz" mode many cards offer, which really runs at 59.95 Hz, while
+the standard 1920x1080 one is exactly 60.
+
+An NVIDIA custom resolution fixes it. In the NVIDIA Control Panel, under Change
+resolution, choose Customize, create a mode at your resolution and 60 Hz, test
+it, then select that custom entry. On the card this was tested with, a custom
+2560x1440 mode measures within a thousandth of a hertz of 60.
+
+The relay checks this itself. Its display list shows each display's rate, and
+when the capture card display is far enough off a whole number to repeat or skip
+a frame more often than every 10 minutes, it says so in yellow above the mode
+prompt. A launch from a shortcut skips the prompts, so with logging on (see
+[Logging](#logging)) it writes the rate to the log instead, on the
+`Target display timing:` line.
+
+If the NVIDIA Control Panel shows the custom mode as selected but the rate
+doesn't change, pick 60 Hz for the capture card's display in Windows Settings,
+under System, Display, Advanced display, Choose a refresh rate.
 
 ## Present paths
 

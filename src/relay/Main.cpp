@@ -76,7 +76,7 @@ IFrameCaptureMode* CreateCaptureMode(const std::string& modeText, const launch::
                                    spec.d3d11Present && !d3d9, o.deferCopy, o.wgc, o.wgcDrop,
                                    o.wgcCursor, o.wgcOpen, o.wgcScale, o.copyEngine,
                                    o.blendShader, o.tightWait,
-                                   launch::StepTolerancePercentFor(spec, o));
+                                   launch::StepTolerancePercentFor(spec, o), o.maxFlowGapMs);
 }
 
 // Takes the named lock that keeps a second relay from starting. Two relays cannot share NvFBC,

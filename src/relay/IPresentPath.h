@@ -59,6 +59,11 @@ public:
     virtual void PlanAhead(const FrameBracket* /*upcoming*/, const LONGLONG* /*targets*/,
                            const bool* /*synthesizes*/, int /*count*/) {}
 
+    // The longest gap between a pair's frames the optical flow is run across
+    // (policy::MaxFlowGap), in QPC ticks; 0 for no limit. Set before Setup. A path without the
+    // flow has no use for it.
+    virtual void SetMaxFlowGap(LONGLONG /*maxGapQpc*/) {}
+
     // Draw this present's decision (step.pick for the nearest selection, step.decision for
     // the synthesizing compositors) onto this path's own target.
     virtual void Compose(const FrameBracket& bracket, const policy::PresentStepResult& step,

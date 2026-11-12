@@ -302,6 +302,24 @@ estimator if a driver runs it on the encoder, work outside them, and the game pa
 hand-off. `docs/optical-flow-interpolation-spec.md` (3.1 to 3.4) has the earlier survey these rows
 extend.
 
+### Added 2026-11-12: more ways the user asked about
+
+Kept so none is forgotten. Only the ANR page was read on this date; the rows for FILM, RIFE and
+DAIN are from memory and were not checked against their repositories, and nothing here has been
+run.
+
+| source | takes plain frames | runs on | output | what is known, and what is not |
+|---|---|---|---|---|
+| ANR FG (Apex Neural Rendering, beta) | no sign of it | NVIDIA RTX 20 and later and GTX 16, AMD RX 5000 and later, Intel Arc, on Windows and on Linux with Proton, by its README | whole frames, inside the game | installs in place of the game's DLSS frame generation DLL and bundles OptiScaler (GPL-3.0), so it is fed what the game gives its frame generation. The README names no mode that takes two frames, gives no license for ANR itself, no timings, and says the source is "coming soon"; its recorder's source is in the repository. Worth another look only if the source arrives with a colour-only path |
+| FILM (Google Research, "frame interpolation for large motion") | yes, two frames | TensorFlow; in practice a large GPU | whole frames | Apache 2.0 as remembered. Built for large motion between the two frames, which is the long-stall case (`docs/long-gap-crossfade-spec.md`). An offline model, seconds a frame as remembered: a quality reference, never a real-time path |
+| RIFE (already in the table above) | yes, two frames and a time between them | any vendor through its ncnn Vulkan port, or TensorRT on NVIDIA | whole frames | MIT. The only neural candidate near real time. It runs on the shader cores, so its whole time comes out of the game's frame; at 1440p that is expected to be tens of milliseconds a frame, not measured. A cost row on the rig beside a game would settle whether it is affordable at all |
+| DAIN (depth-aware interpolation, 2019) | yes, two frames | PyTorch and CUDA | whole frames | MIT as remembered. Older and slower than RIFE, which superseded it. Listed only so it is not looked up again |
+| Lossless Scaling's frame generation (LSFG) | yes | any vendor | whole frames | a closed commercial program, so not a part the relay can use. It is the evidence that interpolating from two plain frames in real time, on any vendor, on a GPU that is also running a game, can be done |
+
+What this adds to the appendix's conclusion: nothing changes for a relay that keeps its own warp
+(FidelityFX or the motion estimator off NVIDIA). For whole frames from a neural model, RIFE is the
+one to measure, and cost on the shader cores is what would rule it out.
+
 ## Sources
 
 - Windows.Graphics.Capture frame pool:
@@ -319,6 +337,8 @@ extend.
 - Intel VPL AI frame interpolation:
   https://community.intel.com/t5/Blogs/Tech-Innovation/Tools/Intel-VPL-Unveils-AI-Powered-Video-Frame-Interpolation/post/1670736
 - AMD FSR SDK 2.3 (frame generation 4.0.1, RDNA 4): https://gpuopen.com/learn/amd-fsr-sdk-2-3-blog/
+- ANR (read 2026-11-12): https://github.com/apex-compute/ANR
+- FILM (not read on 2026-11-12): https://github.com/google-research/frame-interpolation
 - FSR 4 source published by accident: https://www.guru3d.com/story/amd-accidentally-opensources-fsr-4-code-on-github
 - Intel XeSS: https://www.intel.com/content/www/us/en/developer/topic-technology/gamedev/xess.html ;
   the XeSS 3 SDK as binaries:

@@ -169,6 +169,15 @@ struct SimResult {
     std::vector<char> planSynth;
     std::vector<char> planNamedByStep;
     std::vector<char> planNamedByGuess;
+    // The same planner under the long-gap rule (SimParams::maxFlowGap), driven as the present
+    // drives its own: whether a synthesized present's pair was too far apart to flow (the
+    // relay's fl=gap), whether a pair that was not found its flow planned, and the flows the
+    // whole run planned without the rule and with it.
+    std::vector<char> planGap;
+    std::vector<int64_t> planGapBefore;   // a gap present's pair, by its earlier stamp; else -1
+    std::vector<char> planNamedWithLimit;
+    long long planFlows = 0;
+    long long planFlowsWithLimit = 0;
 };
 
 struct SimParams {
@@ -288,6 +297,10 @@ struct SimParams {
     // Run the optical flow's planner beside the replay, two presents ahead as the relay plans,
     // both ways (SimResult::planSynth and the named counts). Synthesizing runs only.
     bool planAhead = false;
+    // With planAhead: the longest gap a pair is flowed across (policy::MaxFlowGap), in this
+    // simulation's clock; 0 leaves the long-gap rule off. The rule is the present's, not the
+    // step's: it changes how a synthesized present is drawn and never what the step decides.
+    int64_t maxFlowGap = 0;
     // A live capture's target for each present (kNotForced where it has none). The run takes it
     // in place of its own, after any lookahead move lands, and sets its pull to match: the
     // decisions then come from the capture's timeline instead of the replay's own pull, which
@@ -335,6 +348,7 @@ static SimParams ScaledParams(const SimParams& p, int64_t k) {
     s.sinkPeriod *= k;
     s.recordLookaheadFrom *= k;
     s.recordLookaheadTo *= k;
+    s.maxFlowGap *= k;
     mul(s.forcedTargets);
     return s;
 }
@@ -727,11 +741,13 @@ static SimResult Simulate(const SimParams& p) {
     // its own: two presents ahead (its kFlowLookahead), the next presents planned before this
     // one's pair is used, the same four-slot cache.
     static const int kPlanAhead = 2;
-    policy::FlowPlanner plannerByStep, plannerByGuess;
+    policy::FlowPlanner plannerByStep, plannerByGuess, plannerWithLimit;
     // PlanFlows: the upcoming brackets' stamps, ascending, each once, and the targets of those
-    // that will synthesize, handed to the planner.
+    // that will synthesize, handed to the planner. A pair further apart than maxGap is left
+    // out, as the present leaves it out (0 leaves none out).
     auto planFlows = [&](policy::FlowPlanner& planner, const BracketInfo* upcoming,
-                         const int64_t* targets, const bool* synthesizes, int64_t present) {
+                         const int64_t* targets, const bool* synthesizes, int64_t present,
+                         int64_t maxGap) {
         int64_t stamps[2 * kPlanAhead];
         int n = 0;
         auto add = [&](int64_t ts) {
@@ -751,7 +767,12 @@ static SimResult Simulate(const SimParams& p) {
             if (!upcoming[j].hasBefore || !upcoming[j].hasAfter) continue;
             add(upcoming[j].beforeTs);
             add(upcoming[j].afterTs);
-            if (synthesizes[j]) tg[synth++] = targets[j];
+            if (!synthesizes[j]) continue;
+            policy::FlowPair ahead;
+            ahead.beforeTs = upcoming[j].beforeTs;
+            ahead.afterTs = upcoming[j].afterTs;
+            if (policy::PairTooFarToFlow(ahead, maxGap)) continue;
+            tg[synth++] = targets[j];
         }
         if (synth == 0) return;
         int planned[kPlanAhead];
@@ -884,7 +905,8 @@ static SimResult Simulate(const SimParams& p) {
                 targets[j] = planned[j].target;
                 synthesizes[j] = planned[j].decision.op == policy::CompositeOp::Synthesize;
             }
-            planFlows(plannerByStep, upcoming, targets, synthesizes, present);
+            planFlows(plannerByStep, upcoming, targets, synthesizes, present, 0);
+            planFlows(plannerWithLimit, upcoming, targets, synthesizes, present, p.maxFlowGap);
             // The rule before it: targets one present period on per present, the composite
             // decision alone on a copy of its state, incomplete brackets skipped.
             policy::CompositeState guess = step.comp;
@@ -896,22 +918,30 @@ static SimResult Simulate(const SimParams& p) {
                 synthesizes[j] = policy::DecideComposite(upcoming[j], guess, cfg).op ==
                                  policy::CompositeOp::Synthesize;
             }
-            planFlows(plannerByGuess, upcoming, targets, synthesizes, present);
+            planFlows(plannerByGuess, upcoming, targets, synthesizes, present, 0);
 
             const bool synth = res.decision.op == policy::CompositeOp::Synthesize;
-            bool byStep = false, byGuess = false;
+            bool byStep = false, byGuess = false, gap = false, withLimit = false;
             if (synth) {
                 policy::FlowPair pair;
                 pair.beforeTs = b.beforeTs;
                 pair.afterTs = b.afterTs;
                 byStep = plannerByStep.Use(pair, present) >= 0;
                 byGuess = plannerByGuess.Use(pair, present) >= 0;
+                // DrawSynthesis: a pair too far apart is the blend and never asks the planner.
+                gap = policy::PairTooFarToFlow(pair, p.maxFlowGap);
+                if (!gap) withLimit = plannerWithLimit.Use(pair, present) >= 0;
             }
             r.planSynth.push_back(synth);
             r.planNamedByStep.push_back(byStep);
             r.planNamedByGuess.push_back(byGuess);
+            r.planGap.push_back(gap);
+            r.planGapBefore.push_back(gap ? b.beforeTs : -1);
+            r.planNamedWithLimit.push_back(withLimit);
         }
     }
+    r.planFlows = plannerByStep.Flows();
+    r.planFlowsWithLimit = plannerWithLimit.Flows();
     return r;
 }
 
@@ -3739,6 +3769,10 @@ static void test_replay_capture_corpus() {
         // The flow planner runs beside this replay only; the other arms below copy p.
         SimParams pPlan = p;
         pPlan.planAhead = !nearest;
+        // The long-gap rule beside the planner without it. A launch runs with the rule off, so
+        // the corpus replays it at the limit it was built for, as -maxflowgap 100 would run it.
+        const int kFlowGapArmMs = 100;
+        pPlan.maxFlowGap = policy::MaxFlowGap(1000000 * p.ticksPerUs, p.srcPeriod, kFlowGapArmMs);
         const SimResult r = Simulate(pPlan);
 
         // The lock starts cold here where the relay had been running for minutes, so the head
@@ -3822,6 +3856,34 @@ static void test_replay_capture_corpus() {
                   "[%s] the flow planner planned %d of %d synthesized presents' pairs, fewer "
                   "than the %d a target guessed one present period on planned",
                   fx.description.c_str(), byStep, planSynth, byGuess);
+            // The long-gap rule on this capture: the synthesized presents whose pair is too far
+            // apart to flow (the relay's fl=gap), the stalls they lead out of (one per pair),
+            // and what the rule does to everything else, which must be nothing: a present whose
+            // pair is flowed finds it planned exactly as without the rule, and the run plans no
+            // more flows than before.
+            int gapPresents = 0, gapPairs = 0, lost = 0, gained = 0;
+            int64_t lastGapBefore = -1;
+            for (size_t i = kWarmup; i < r.planGap.size(); i++) {
+                if (r.planGap[i]) {
+                    gapPresents++;
+                    if (r.planGapBefore[i] != lastGapBefore) gapPairs++;
+                    lastGapBefore = r.planGapBefore[i];
+                    continue;
+                }
+                if (r.planNamedByStep[i] && !r.planNamedWithLimit[i]) lost++;
+                if (!r.planNamedByStep[i] && r.planNamedWithLimit[i]) gained++;
+            }
+            std::printf("    flow gap limit %lld us: %d synthesized presents over %d pairs drawn "
+                        "as the blend (fl=gap); of the rest %d lost a planned flow and %d gained "
+                        "one; flows planned %lld without the limit, %lld with it\n",
+                        (long long)pPlan.maxFlowGap, gapPresents, gapPairs, lost, gained,
+                        r.planFlows, r.planFlowsWithLimit);
+            // The rule only takes flows away (2026-11-12: at or under on all 78 fixtures). The
+            // lost and gained counts are printed and not held to nothing: leaving a pair out of
+            // the four-slot cache changes what it evicts, and one fixture loses one flow to it.
+            CHECK(r.planFlowsWithLimit <= r.planFlows,
+                  "[%s] the long-gap rule planned %lld flows, more than the %lld without it",
+                  fx.description.c_str(), r.planFlowsWithLimit, r.planFlows);
         }
 
         if (fx.maxWorstRun < 0) {
@@ -5801,7 +5863,8 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.deferCopy == b.deferCopy && a.wgc == b.wgc && a.wgcDrop == b.wgcDrop &&
            a.wgcCursor == b.wgcCursor && a.wgcOpen == b.wgcOpen && a.wgcScale == b.wgcScale &&
            a.copyEngine == b.copyEngine && a.blendShader == b.blendShader &&
-           a.tightWait == b.tightWait && a.d3d9 == b.d3d9 && a.stepTolPct == b.stepTolPct;
+           a.tightWait == b.tightWait && a.d3d9 == b.d3d9 && a.stepTolPct == b.stepTolPct &&
+           a.maxFlowGapMs == b.maxFlowGapMs;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
@@ -5987,6 +6050,33 @@ static void test_launch_option_parsing() {
             t = launch::SplitTokens(bad);
             CHECK(launch::ApplyOption(t, 0, &y, &warn) == 2 && y.stepTolPct == -1 && !warn.empty(),
                   "%s must warn and leave the step tolerance not typed", bad);
+        }
+    }
+
+    // -maxflowgap takes milliseconds from 0 to 1000, 0 being the rule off, which is the default;
+    // anything else warns and leaves it off. A typed value is written back for the relaunch.
+    {
+        launch::Options x;
+        std::string w;
+        std::vector<std::string> t = launch::SplitTokens("-maxflowgap 250");
+        CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.maxFlowGapMs == 250 && w.empty(),
+              "-maxflowgap 250 must set 250 and consume two tokens");
+        CHECK(launch::Options().maxFlowGapMs == 0, "the flow gap limit must default to off");
+        CHECK(launch::FormatOptions(x) == "-maxflowgap 250" &&
+                  launch::FormatOptions(launch::Options()).empty(),
+              "a typed -maxflowgap must be written back and the default must not");
+        launch::Options z;
+        t = launch::SplitTokens("-maxflowgap 0");
+        CHECK(launch::ApplyOption(t, 0, &z, &w) == 2 && z.maxFlowGapMs == 0 && w.empty(),
+              "-maxflowgap 0 must set 0 without a warning");
+        for (const char* bad : {"-maxflowgap -1", "-maxflowgap 1001", "-maxflowgap x",
+                                "-maxflowgap 100x"}) {
+            launch::Options y;
+            std::string warn;
+            t = launch::SplitTokens(bad);
+            CHECK(launch::ApplyOption(t, 0, &y, &warn) == 2 && y.maxFlowGapMs == 0 &&
+                      !warn.empty(),
+                  "%s must warn and leave the flow gap limit off", bad);
         }
     }
 
@@ -7009,6 +7099,113 @@ static void test_flow_plan() {
         CHECK(policy::FlowHintsUsable(a, b) && !policy::FlowHintsUsable(a, c),
               "hints: neighbour pair usable, unrelated pair not");
     }
+    // The long-gap rule, in QPC ticks as the relay passes them (10 MHz): 100 ms is 1000000
+    // ticks at a 60 fps source, whose three periods (500000) sit under it.
+    {
+        const int64_t kTicks = 10000000;
+        const int64_t kSrc60 = kTicks / 60;
+        const int64_t gap = policy::MaxFlowGap(kTicks, kSrc60, 100);
+        CHECK(gap == 1000000, "100 ms at 10 MHz must be 1000000 ticks, got %lld", (long long)gap);
+        policy::FlowPair at, under, over;
+        at.beforeTs = 5000; at.afterTs = 5000 + gap;
+        under.beforeTs = 5000; under.afterTs = 5000 + gap - 1;
+        over.beforeTs = 5000; over.afterTs = 5000 + gap + 1;
+        CHECK(!policy::PairTooFarToFlow(under, gap) && !policy::PairTooFarToFlow(at, gap) &&
+                  policy::PairTooFarToFlow(over, gap),
+              "a pair just under or at the limit must flow and one just over must not");
+        // The dialog of 2026-11-05: frames 180 and 203 ms apart are refused, 48 and 52 ms flow.
+        for (const int ms : {180, 203}) {
+            policy::FlowPair p;
+            p.beforeTs = 0; p.afterTs = kTicks * ms / 1000;
+            CHECK(policy::PairTooFarToFlow(p, gap), "a %d ms pair must not be flowed", ms);
+        }
+        for (const int ms : {17, 48, 52}) {
+            policy::FlowPair p;
+            p.beforeTs = 0; p.afterTs = kTicks * ms / 1000;
+            CHECK(!policy::PairTooFarToFlow(p, gap), "a %d ms pair must be flowed", ms);
+        }
+        // 0 ms turns the rule off whatever the gap.
+        CHECK(policy::MaxFlowGap(kTicks, kSrc60, 0) == 0 && !policy::PairTooFarToFlow(over, 0),
+              "0 ms must leave the rule off");
+        // The floor of three source periods: a 24 fps source's neighbours (41.7 ms) and one
+        // missing frame (83.3 ms) keep the flow at 100 ms, and at a 20 fps source the limit is
+        // lifted to three periods (150 ms), so one missing frame (100 ms) still flows.
+        const int64_t kSrc20 = kTicks / 20;
+        const int64_t gap20 = policy::MaxFlowGap(kTicks, kSrc20, 100);
+        CHECK(gap20 == 3 * kSrc20, "a 20 fps source's limit must be three periods, got %lld",
+              (long long)gap20);
+        policy::FlowPair missed;
+        missed.beforeTs = 0; missed.afterTs = 2 * kSrc20;
+        CHECK(!policy::PairTooFarToFlow(missed, gap20),
+              "one missing frame of a 20 fps source must still be flowed");
+    }
+}
+
+// The long-gap rule on a replay with one stall in it, driven as the present drives its planner.
+// A hitch whose frames come 200 ms apart leaves complete brackets twice the limit wide, and the
+// presents synthesized across them must be drawn as the blend with no flow planned for their
+// pairs. The controls: the same hitch with the rule off, and a hitch 80 ms a frame, under the
+// limit, must show none, and nothing the step decides may differ between the three.
+static void test_flow_gap_rule_in_replay() {
+    struct Row { const char* name; int64_t stallGap; int ms; bool wantGap; };
+    const Row kRows[] = {
+        {"200 ms hitch, 100 ms limit", 200000, 100, true},
+        {"200 ms hitch, rule off", 200000, 0, false},
+        {"80 ms hitch, 100 ms limit", 80000, 100, false},
+    };
+    std::vector<policy::CompositeOp> opsAt200;
+    for (const Row& row : kRows) {
+        SimParams p;
+        p.srcPeriod = 16667;
+        p.presentPeriod = 16667;
+        p.arrivalJitter = 0;
+        p.combQpc = 16667;
+        p.presents = 700;
+        p.phaseOffset = 0;
+        p.passthroughQpc = 4166;
+        p.lagOverride = 0;
+        p.stallAtArrival = 300;
+        p.stallArrivals = 3;
+        p.stallGap = row.stallGap;
+        p.postStallPhase = 8333;
+        p.planAhead = true;
+        p.maxFlowGap = policy::MaxFlowGap(1000000, p.srcPeriod, row.ms);
+        const SimResult r = Simulate(p);
+        CHECK(r.planGap.size() == r.span.size() && r.planSynth.size() == r.span.size(),
+              "%s: the planner did not run beside the replay", row.name);
+        if (r.planGap.size() != r.span.size()) continue;
+        int gap = 0, synthWide = 0, wrong = 0;
+        const int64_t limit = policy::MaxFlowGap(1000000, p.srcPeriod, 100);
+        for (size_t i = 0; i < r.planGap.size(); i++) {
+            const bool wide = r.planSynth[i] && r.span[i] > limit;
+            synthWide += wide;
+            gap += r.planGap[i];
+            // With the rule on, exactly the synthesized presents over a wide pair are gaps.
+            if (row.ms > 0 && (r.planGap[i] != 0) != wide) wrong++;
+        }
+        if (row.wantGap) {
+            CHECK(synthWide > 0, "%s: nothing synthesized across the stall: the control does "
+                  "not exercise the rule", row.name);
+            CHECK(gap == synthWide && wrong == 0,
+                  "%s: %d gap presents against %d synthesized across a wide pair (%d wrong)",
+                  row.name, gap, synthWide, wrong);
+            CHECK(r.planFlowsWithLimit < r.planFlows,
+                  "%s: the rule saved no flow (%lld with it, %lld without)", row.name,
+                  r.planFlowsWithLimit, r.planFlows);
+            opsAt200 = r.ops;
+        } else {
+            CHECK(gap == 0, "%s: %d gap presents, want none", row.name, gap);
+            CHECK(r.planFlowsWithLimit == r.planFlows,
+                  "%s: flows moved with nothing refused (%lld against %lld)", row.name,
+                  r.planFlowsWithLimit, r.planFlows);
+        }
+        if (row.stallGap == 200000 && row.ms == 0) {
+            CHECK(synthWide > 0, "%s: the off control synthesized nothing across the stall",
+                  row.name);
+            CHECK(r.ops == opsAt200, "%s: the step decided differently with the rule off; the "
+                  "rule must only change how a synthesis is drawn", row.name);
+        }
+    }
 }
 
 // A one-channel image sampled as the GPU's linear, clamped sampler samples it.
@@ -7887,6 +8084,7 @@ int main(int argc, char** argv) {
     test_launch_resolved_options_line();
     test_lock_anchor_and_comb();
     test_flow_plan();
+    test_flow_gap_rule_in_replay();
     test_flow_warp_math();
     test_replay_capture_corpus();
 
