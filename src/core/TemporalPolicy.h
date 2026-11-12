@@ -899,6 +899,51 @@ float LockAnchorFps(bool lock, float srcRateHint);
 // decides. Production and the replay size the comb with this one function.
 int CombDenominator(double srcFps, double presentFps, bool* matched);
 
+// The bracketing lag before any extra: a source period and a quarter, floored at the present
+// period. The lag exists so that a frame newer than the target has arrived by the time the
+// target is read; the longest wait is one source period, and the quarter covers arrival jitter.
+int64_t LagForSourcePeriod(int64_t srcPeriodQpc, int64_t presentPeriodQpc);
+
+// What the policy is sized from. Every time is in one clock, whose ticks per second is
+// ticksPerSecond: the relay passes QPC ticks, the replay microseconds.
+struct PolicySetupInputs {
+    int64_t ticksPerSecond = 0;
+    int64_t srcPeriodQpc = 0;       // the declared source period, or the assumed one
+    int64_t presentPeriodQpc = 0;   // the nominal step of the present clock
+    int64_t sinkPeriodQpc = 0;      // the target display's refresh
+    int64_t combQpc = 0;            // the comb lock's modulus; 0 = lock off
+    bool synthesizes = false;       // a blend or interp compositor: the composite decision runs
+    bool phaseKeep = false;         // phase-aware keep-real: one valid frame per source period
+    int stepTolerancePercent = 0;   // the step tolerance (StepTolerance); 0 = off
+    int64_t extraLagQpc = 0;        // lag added on top of the rate-sized lag
+    int ringSlotsDefault = 0;       // the ring depth without extra lag
+    int ringSlotsMax = 0;           // the deepest ring an extra lag may ask for
+};
+
+struct PolicySetup {
+    PolicyConfig cfg;
+    int64_t bracketingLagQpc = 0;
+    int ringSlots = 0;
+};
+
+// The one place the policy's configuration is sized. The relay and the replay both call it, so
+// a rule or a constant changed here reaches the field and the test corpus together. Lives here
+// rather than at the call sites because written out twice the two drifted apart unseen: a
+// threshold changed in the relay kept its old value in the replay for as long as nobody
+// compared them.
+//
+// Stickiness is 1 ms: above arrival jitter, below any source period served. The lock's slew
+// is 25 us a present. The stall span is twice the source period: wide enough that jitter and
+// one dropped frame stay under it, narrow enough that a source hitching at 100 ms a frame
+// reads as stalled on the first present. Under phase-aware keep-real one missing frame opens
+// a bracket of exactly two periods, so the span there is two and a half. The tooth guard, the
+// passthrough threshold and the step tolerance are sized by their own functions above. The
+// lookahead, its late moves and its refusal arm together, for a synthesizing compositor whose
+// comb is one source frame. The guard's stall-resume exemption arms wherever a synthesizing
+// compositor runs the guard. The ring grows past its default only under an extra lag, because
+// the default depth covers the rate-sized lag at every source rate served.
+PolicySetup BuildPolicySetup(const PolicySetupInputs& in);
+
 // ---------------------------------------------------------------------------------
 // The mouse pointer's frames under Windows.Graphics.Capture. While a WGC session is open,
 // Windows delivers a frame for each move of a visible pointer: a copy of the frame before it,

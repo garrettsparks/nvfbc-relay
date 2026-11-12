@@ -1363,6 +1363,40 @@ float LockAnchorFps(bool lock, float srcRateHint) {
     return lock ? AssumedSrcFps(srcRateHint) : 0.0f;
 }
 
+int64_t LagForSourcePeriod(int64_t srcPeriodQpc, int64_t presentPeriodQpc) {
+    int64_t lag = srcPeriodQpc + srcPeriodQpc / 4;
+    if (lag < presentPeriodQpc) lag = presentPeriodQpc;
+    return lag;
+}
+
+PolicySetup BuildPolicySetup(const PolicySetupInputs& in) {
+    PolicySetup out;
+    PolicyConfig& cfg = out.cfg;
+    cfg.stickinessQpc = in.ticksPerSecond / 1000;
+    cfg.phasePullSlewQpc = in.ticksPerSecond / 40000;
+    cfg.stallSpanQpc = in.phaseKeep ? in.srcPeriodQpc * 5 / 2 : in.srcPeriodQpc * 2;
+    cfg.combQpc = in.combQpc;
+    cfg.srcPeriodQpc = ToothGuardPeriod(in.srcPeriodQpc, in.sinkPeriodQpc, in.combQpc > 0);
+    if (in.synthesizes) {
+        cfg.passthroughQpc = PassthroughThreshold(in.srcPeriodQpc, in.presentPeriodQpc);
+        cfg.phaseLookahead = cfg.combQpc > 0 && cfg.combQpc == in.srcPeriodQpc;
+        cfg.lateLookahead = cfg.phaseLookahead;
+        cfg.lookaheadNeedsLead = cfg.phaseLookahead;
+        if (cfg.srcPeriodQpc > 0) cfg.resumeGuardExemptPresents = kResumeGuardExemptPresents;
+        cfg.stepToleranceQpc = StepTolerance(in.presentPeriodQpc, in.stepTolerancePercent);
+        cfg.stepOffsetDecayQpc = StepOffsetDecay(in.presentPeriodQpc, in.stepTolerancePercent);
+        cfg.stepPresentPeriodQpc = in.presentPeriodQpc;
+    }
+    out.bracketingLagQpc =
+        LagForSourcePeriod(in.srcPeriodQpc, in.presentPeriodQpc) + in.extraLagQpc;
+    out.ringSlots = in.ringSlotsDefault;
+    if (in.extraLagQpc > 0) {
+        out.ringSlots = RingSlotsForLag(out.bracketingLagQpc, in.srcPeriodQpc,
+                                        in.ringSlotsDefault, in.ringSlotsMax);
+    }
+    return out;
+}
+
 int CombDenominator(double srcFps, double presentFps, bool* matched) {
     const double ratio = srcFps / presentFps;
     for (int m = 1; m <= 8; m++) {

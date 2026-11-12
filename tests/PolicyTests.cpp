@@ -256,7 +256,11 @@ struct SimParams {
     // Let the lookahead plan a step whose first frame is already at the target, the rule before
     // lookaheadNeedsLead. Only for controls.
     bool noLookaheadLead = false;
-    // The composite's step tolerance and its offset decay (PolicyConfig); 0 leaves the rule off.
+    // The step tolerance as -steptol takes it, a percentage of the present period; 0 leaves the
+    // rule off.
+    int stepTolerancePercent = 0;
+    // The tolerance and its offset decay given outright (PolicyConfig), in place of what the
+    // percentage sizes. For the tools that sweep the two apart; no check in this file sets them.
     int64_t stepTolerance = 0;
     int64_t stepOffsetDecay = 0;
     // The SINK period: the target display's refresh, which is what production compares the
@@ -346,11 +350,31 @@ static StepEvenness MeasureStepEvenness(const SimResult& r, const std::vector<in
 
 // The bracketing lag a simulation runs: sized from the source rate as production sizes it,
 // plus the extra lag, unless overridden.
+// What the relay hands policy::BuildPolicySetup, read from a simulation's parameters. The
+// clock is microseconds, and a simulation synthesizes when it has a passthrough threshold.
+static policy::PolicySetupInputs SetupInputs(const SimParams& p) {
+    policy::PolicySetupInputs in;
+    in.ticksPerSecond = 1000000;
+    in.srcPeriodQpc = p.srcPeriod;
+    in.presentPeriodQpc = p.presentPeriod;
+    in.sinkPeriodQpc = p.sinkPeriod;
+    in.combQpc = p.combQpc;
+    in.synthesizes = p.passthroughQpc > 0;
+    in.stepTolerancePercent = p.stepTolerancePercent;
+    in.extraLagQpc = p.extraLag;
+    in.ringSlotsDefault = kShipRingMin;
+    in.ringSlotsMax = kShipRingMax;
+    return in;
+}
+
 static int64_t BracketingLag(const SimParams& p) {
     if (p.lagOverride > 0) return p.lagOverride;   // a mis-declared source rate, in effect
-    int64_t lag = p.srcPeriod + p.srcPeriod / 4;
-    if (lag < p.presentPeriod) lag = p.presentPeriod;
-    return lag + p.extraLag;
+    return policy::BuildPolicySetup(SetupInputs(p)).bracketingLagQpc;
+}
+
+// The ring depth the relay runs a simulation's lag at.
+static int ShipRingSlots(const SimParams& p) {
+    return policy::BuildPolicySetup(SetupInputs(p)).ringSlots;
 }
 
 // The deferred ring copy's limits as the relay sizes them, in the simulator's microseconds.
@@ -464,33 +488,24 @@ struct ReplayLateness : policy::ILatenessSource {
 
 static SimResult Simulate(const SimParams& p) {
     SeedRng();   // each simulation owns its jitter stream; see kRngSeed
-    PolicyConfig cfg;
-    cfg.stickinessQpc = kStickinessUs;
-    cfg.combQpc = p.combQpc;
-    cfg.phasePullSlewQpc = kSlewUs;
+    // The configuration is the relay's: policy::BuildPolicySetup sizes it here as it does
+    // there, so every test in this file runs the decision path the relay runs, and a pin
+    // failure is a rule changing a regime it was proven not to change. What follows the call
+    // is what only a test asks for: a threshold of its own, and the controls that reproduce
+    // the rule before each feature.
+    PolicyConfig cfg = policy::BuildPolicySetup(SetupInputs(p)).cfg;
     cfg.passthroughQpc = p.passthroughQpc;
-    cfg.stallSpanQpc = p.srcPeriod * 2;   // production sizes this from the declared source rate
-    // The tooth guard arms by production's own rule (comb on, source at or above the
-    // OUTPUT rate) rather than by a test knob, so every composite test in this file
-    // exercises the guarded decision path and a pin failure is the guard changing a
-    // regime it was proven not to change. noToothGuard reproduces the pre-guard rule.
-    if (!p.noToothGuard) {
-        cfg.srcPeriodQpc =
-            policy::ToothGuardPeriod(p.srcPeriod, p.sinkPeriod, cfg.combQpc > 0);
-    }
+    if (p.noToothGuard) cfg.srcPeriodQpc = 0;
     if (p.noWrapEase) cfg.wrapEasePresents = 1;
-    // Production's rule: a blend mode whose source is near the sink rate (comb ratio
-    // denominator 1).
-    cfg.phaseLookahead = !p.noLookahead && cfg.combQpc > 0 && cfg.combQpc == p.srcPeriod &&
-                         cfg.passthroughQpc > 0;
-    // Production arms late moves with the lookahead, and the guard's resume exemption in the
-    // blend modes, the only ones that run the composite decision.
+    if (p.noLookahead) cfg.phaseLookahead = false;
     cfg.lateLookahead = cfg.phaseLookahead && !p.noLateLookahead;
     cfg.lookaheadNeedsLead = cfg.phaseLookahead && !p.noLookaheadLead;
-    if (!p.noResumeGuardExemption) cfg.resumeGuardExemptPresents = policy::kResumeGuardExemptPresents;
-    cfg.stepToleranceQpc = p.stepTolerance;
-    cfg.stepOffsetDecayQpc = p.stepOffsetDecay;
-    cfg.stepPresentPeriodQpc = p.presentPeriod;
+    if (p.noResumeGuardExemption) cfg.resumeGuardExemptPresents = 0;
+    if (p.stepTolerance > 0) {
+        cfg.stepToleranceQpc = p.stepTolerance;
+        cfg.stepOffsetDecayQpc = p.stepOffsetDecay;
+        cfg.stepPresentPeriodQpc = p.presentPeriod;
+    }
 
     const int64_t lag = BracketingLag(p);
 
@@ -3560,12 +3575,9 @@ static void test_replay_capture_corpus() {
             // the part of a period left over moves the pull by that much (half a period for
             // 75 ms on a 60 fps source), and with it every moment the pull wraps.
             p.extraLag = (int64_t)fx.extraLagMs * 1000;
-            int64_t baseLag = p.srcPeriod + p.srcPeriod / 4;   // LagForSourcePeriod
-            if (baseLag < p.presentPeriod) baseLag = p.presentPeriod;
-            p.ringSlots = policy::RingSlotsForLag(baseLag + p.extraLag, p.srcPeriod,
-                                                  kShipRingMin, kShipRingMax);
+            p.ringSlots = ShipRingSlots(p);
             std::printf("    extra lag %d ms: bracketing lag %lld us, ring %d slots\n",
-                        fx.extraLagMs, (long long)(baseLag + p.extraLag), p.ringSlots);
+                        fx.extraLagMs, (long long)BracketingLag(p), p.ringSlots);
         }
         // Guard deliberately ARMED (production's rule) even though every fixture predates
         // it: at a present clock matching the source rate the target advances a full
@@ -3832,9 +3844,7 @@ static void test_replay_capture_corpus() {
                 ps.flipKnown = fx.flipKnown;
                 ps.flipDejitter = true;
             }
-            ps.stepTolerance = policy::StepTolerance(p.presentPeriod, kStepToleranceArmPercent);
-            ps.stepOffsetDecay =
-                policy::StepOffsetDecay(p.presentPeriod, kStepToleranceArmPercent);
+            ps.stepTolerancePercent = kStepToleranceArmPercent;
             const SimResult rs = Simulate(ps);
             int runS = 0, worstS = 0, longRunsS = 0, synthS = 0;
             for (size_t i = kWarmup; i < rs.ops.size(); i++) {
@@ -4538,8 +4548,7 @@ static void test_phase_lookahead() {
         p.presents = 9000;
         p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
         p.extraLag = 75000;
-        p.ringSlots = policy::RingSlotsForLag(p.srcPeriod + p.srcPeriod / 4 + p.extraLag,
-                                              p.srcPeriod, kShipRingMin, kShipRingMax);
+        p.ringSlots = ShipRingSlots(p);
         p.explicitArrivals = timeline(shift);
         return p;
     };
@@ -4620,8 +4629,7 @@ static void test_lookahead_late_moves() {
         p.presents = 9000;
         p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
         p.extraLag = 75000;
-        p.ringSlots = policy::RingSlotsForLag(p.srcPeriod + p.srcPeriod / 4 + p.extraLag,
-                                              p.srcPeriod, kShipRingMin, kShipRingMax);
+        p.ringSlots = ShipRingSlots(p);
         p.explicitArrivals = timeline(shift);
         return p;
     };
@@ -4744,8 +4752,7 @@ static void test_lookahead_needs_lead() {
     p.presents = 9000;
     p.passthroughQpc = cfg.passthroughQpc;
     p.extraLag = 75000;
-    p.ringSlots = policy::RingSlotsForLag(p.srcPeriod + p.srcPeriod / 4 + p.extraLag, p.srcPeriod,
-                                          kShipRingMin, kShipRingMax);
+    p.ringSlots = ShipRingSlots(p);
     for (int i = 0; i < 9100; i++) {
         const int64_t jitter = (int64_t)((i * 7919) % 401) - 200;   // +-200 us, fixed
         p.explicitArrivals.push_back((int64_t)i * comb + (i >= 6000 ? 6000 : 0) + jitter);
@@ -4781,8 +4788,7 @@ static void test_resume_guard_exemption() {
             p.presents = 5000;
             p.passthroughQpc = policy::PassthroughThreshold(p.srcPeriod, p.presentPeriod);
             p.extraLag = 75000;
-            p.ringSlots = policy::RingSlotsForLag(p.srcPeriod + p.srcPeriod / 4 + p.extraLag,
-                                                  p.srcPeriod, kShipRingMin, kShipRingMax);
+            p.ringSlots = ShipRingSlots(p);
             int64_t t = 0;
             for (int i = 0; i < 3000; i++) {
                 p.explicitArrivals.push_back(t + (int64_t)((i * 7919) % 401) - 200);
@@ -5774,21 +5780,53 @@ static void test_launch_option_parsing() {
               "the positive spellings of the defaults must leave a default launch unchanged");
     }
 
-    // -steptol takes a percentage from 1 to 50; anything else warns and leaves the rule off.
+    // -steptol takes a percentage from 0 to 50, 0 being the rule off; anything else warns and
+    // leaves it not typed.
     {
         launch::Options x;
         std::string w;
         std::vector<std::string> t = launch::SplitTokens("-steptol 18");
         CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.stepTolPct == 18 && w.empty(),
               "-steptol 18 must set 18 and consume two tokens");
-        CHECK(launch::Options().stepTolPct == 0, "the step tolerance must default to off");
-        for (const char* bad : {"-steptol 0", "-steptol 51", "-steptol x"}) {
+        CHECK(launch::Options().stepTolPct == -1, "the step tolerance must default to not typed");
+        launch::Options z;
+        t = launch::SplitTokens("-steptol 0");
+        CHECK(launch::ApplyOption(t, 0, &z, &w) == 2 && z.stepTolPct == 0 && w.empty(),
+              "-steptol 0 must set 0 without a warning");
+        for (const char* bad : {"-steptol -1", "-steptol 51", "-steptol x", "-steptol 18x"}) {
             launch::Options y;
             std::string warn;
             t = launch::SplitTokens(bad);
-            CHECK(launch::ApplyOption(t, 0, &y, &warn) == 2 && y.stepTolPct == 0 && !warn.empty(),
-                  "%s must warn and leave the step tolerance off", bad);
+            CHECK(launch::ApplyOption(t, 0, &y, &warn) == 2 && y.stepTolPct == -1 && !warn.empty(),
+                  "%s must warn and leave the step tolerance not typed", bad);
         }
+    }
+
+    // The step tolerance a launch runs: a typed -steptol decides in every mode, 0 included;
+    // without one only the optical flow on the output's own vblank runs the rule.
+    {
+        const launch::Options none;
+        struct { const char* mode; int want; } rows[] = {
+            {"o", launch::kFlowVsyncStepTolPct}, {"o:vsync", launch::kFlowVsyncStepTolPct},
+            {"o:60", 0}, {"o:59.94", 0}, {"b", 0}, {"b:vsync", 0}, {"b:dwm", 0}, {"b:60", 0},
+            {"t:vsync", 0}, {"vsync", 0},
+        };
+        for (const auto& row : rows) {
+            const int got = launch::StepTolerancePercentFor(launch::ParseMode(row.mode), none);
+            CHECK(got == row.want, "%s with no -steptol must run %d%%, got %d", row.mode,
+                  row.want, got);
+        }
+        CHECK(launch::kFlowVsyncStepTolPct == 18, "the optical flow's own tolerance is 18%%");
+        launch::Options off;
+        off.stepTolPct = 0;
+        CHECK(launch::StepTolerancePercentFor(launch::ParseMode("o:vsync"), off) == 0,
+              "-steptol 0 must turn the rule off with o:vsync");
+        launch::Options typed;
+        typed.stepTolPct = 12;
+        CHECK(launch::StepTolerancePercentFor(launch::ParseMode("o:vsync"), typed) == 12 &&
+                  launch::StepTolerancePercentFor(launch::ParseMode("b:vsync"), typed) == 12 &&
+                  launch::StepTolerancePercentFor(launch::ParseMode("o:60"), typed) == 12,
+              "a typed -steptol must decide in every mode");
     }
 
     // -mark takes an optional count, only when the next token is all digits.

@@ -68,8 +68,9 @@ struct Options {
                                     // drawn with BlendShaderNames()[blendShader]; -1, not
                                     // typed, the plain blend
     bool tightWait = true;          // -notightwait: a mode on a timer waits on the timer alone
-    unsigned int stepTolPct = 0;    // -steptol N: the step tolerance, as a percentage of the
-                                    // output frame time (1 to 50); 0, not typed, the rule off
+    int stepTolPct = -1;            // -steptol N: the step tolerance, as a percentage of the
+                                    // output frame time (1 to 50), or 0 for the rule off; -1,
+                                    // not typed, the mode's own (StepTolerancePercentFor)
     bool d3d9 = false;              // -d3d9: the timer modes of t and b present on the D3D9
                                     // swapchain, as before they moved to the D3D11 present
 };
@@ -218,7 +219,8 @@ inline const std::vector<UsageRow>& OptionRows() {
         {"-steptol", "18", "With b or o, show a real frame only while that keeps the motion "
                            "even: when it would move the picture by more or less than a frame's "
                            "worth, off by more than this percentage of a frame (1-50), an "
-                           "in-between frame is drawn instead. Off by default",
+                           "in-between frame is drawn instead. By default 18 with o:vsync and "
+                           "off with every other mode; 0 turns it off",
          false, false},
         {"-d3d9", "", "Show the timer modes of t and b (b:60, t:59.94) through the older "
                       "Direct3D 9 output, as before they moved to the newer one", false, false},
@@ -421,8 +423,10 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     }
     if (t == "-steptol" && i + 1 < tokens.size()) {
         const long v = std::strtol(tokens[i + 1].c_str(), NULL, 10);
-        if (v >= 1 && v <= 50) o->stepTolPct = (unsigned int)v;
-        else if (warning) *warning = "-steptol takes a whole number from 1 to 50, not '" + tokens[i + 1] + "'";
+        const bool digits = !tokens[i + 1].empty() &&
+                            tokens[i + 1].find_first_not_of("0123456789") == std::string::npos;
+        if (digits && v >= 0 && v <= 50) o->stepTolPct = (int)v;
+        else if (warning) *warning = "-steptol takes a whole number from 0 to 50, not '" + tokens[i + 1] + "'";
         return 2;
     }
     if (t == "-lag" && i + 1 < tokens.size()) {
@@ -584,7 +588,7 @@ inline std::string FormatOptions(const Options& o) {
     if (!o.copyEngine) add("-nocopyengine");
     if (o.blendShader >= 0) add(std::string("-blend ") + BlendShaderNames()[o.blendShader]);
     if (!o.tightWait) add("-notightwait");
-    if (o.stepTolPct > 0) add("-steptol " + std::to_string(o.stepTolPct));
+    if (o.stepTolPct >= 0) add("-steptol " + std::to_string(o.stepTolPct));
     if (o.d3d9) add("-d3d9");
     if (o.mark) add(o.markFrames ? "-mark " + std::to_string(o.markFrames) : "-mark");
     if (o.tint) add("-tint");
@@ -752,6 +756,20 @@ inline bool MovesToD3D9(const ModeSpec& s, bool d3d9Asked) {
         return false;
     }
     return !s.vsyncPresent;
+}
+
+// The step tolerance a launch runs, as a percentage of the output frame time; 0 is the rule
+// off. A typed -steptol decides, 0 included. Without one the optical flow on the output's own
+// vblank (o, o:vsync) runs kFlowVsyncStepTolPct, and every other mode runs without the rule.
+// With the optical flow an in-between frame is built from the motion of its two neighbours, so
+// trading a real frame shown off its time for one costs little; with the blend it is a double
+// image, and the timer modes of the optical flow have not been run with the rule.
+const int kFlowVsyncStepTolPct = 18;
+inline int StepTolerancePercentFor(const ModeSpec& s, const Options& o) {
+    if (o.stepTolPct >= 0) return o.stepTolPct;
+    const bool flowOnVblank = s.kind == ModeKind::Temporal &&
+                              s.compositor == Compositor::Interp && s.vsyncPresent;
+    return flowOnVblank ? kFlowVsyncStepTolPct : 0;
 }
 
 // Whether a command line can run as it stands. It can when it names two different displays that

@@ -178,9 +178,7 @@ bool TemporalCaptureMode::PresentsThroughComposition() const {
 }
 
 LONGLONG TemporalCaptureMode::LagForSourcePeriod(LONGLONG srcPeriodQpc) const {
-    LONGLONG lag = srcPeriodQpc + srcPeriodQpc / 4;
-    if (lag < m_scheduler.PeriodQpc()) lag = m_scheduler.PeriodQpc();
-    return lag;
+    return policy::LagForSourcePeriod(srcPeriodQpc, m_scheduler.PeriodQpc());
 }
 
 UINT TemporalCaptureMode::GetPresentationInterval() const {
@@ -249,17 +247,43 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
     // source period is not fed back into the lag; it only audits the assumption (telemetry).
     const float assumedFps = policy::AssumedSrcFps(m_srcRateHint);
     m_assumedSrcPeriodQpc = (LONGLONG)((double)m_scheduler.Freq() / assumedFps);
-    m_bracketingDelayQpc = LagForSourcePeriod(m_assumedSrcPeriodQpc);
+
+    // THE POLICY'S CONFIGURATION is sized in one place, policy::BuildPolicySetup, which the
+    // replay calls too: the lag, the ring depth and every PolicyConfig field come from it, and
+    // the blocks below only report what it decided. What is gathered here is what the relay
+    // alone knows: the clock, the periods, the comb and the options.
+    policy::PolicySetupInputs setupIn;
+    setupIn.ticksPerSecond = m_scheduler.Freq();
+    setupIn.srcPeriodQpc = m_assumedSrcPeriodQpc;
+    setupIn.presentPeriodQpc = m_scheduler.PeriodQpc();
+    // The sink is the target display's refresh, NOT the present period, which only coincides
+    // with it under a vsync present whose compose clock happens to run at the sink rate. A
+    // timer present (b:120) decouples the two, and reading the present period there would
+    // disarm the tooth guard in exactly the regime it exists for. Falls back to the present
+    // period when the refresh could not be read.
+    setupIn.sinkPeriodQpc = ctx.sinkRefreshHz > 0 ? m_scheduler.Freq() / ctx.sinkRefreshHz
+                                                  : m_scheduler.PeriodQpc();
+    const float lockAnchorFps = policy::LockAnchorFps(m_lock, m_srcRateHint);
+    bool combMatched = false;
+    int combM = 1;
+    if (lockAnchorFps > 0.0f) {
+        combM = policy::CombDenominator((double)lockAnchorFps, (double)m_targetFramerate,
+                                        &combMatched);
+        setupIn.combQpc = m_assumedSrcPeriodQpc / combM;
+    }
+    setupIn.synthesizes = m_compositorKind != kCompositorNearest;
+    setupIn.phaseKeep = m_phaseKeep;
+    setupIn.stepTolerancePercent = m_stepTolPct;
+    setupIn.extraLagQpc = (LONGLONG)m_extraLagMs * m_scheduler.Freq() / 1000;
+    setupIn.ringSlotsDefault = CaptureRing::kDefaultRingSlots;
+    setupIn.ringSlotsMax = CaptureRing::RING_SIZE;
+    const policy::PolicySetup setup = policy::BuildPolicySetup(setupIn);
+    m_policyCfg = setup.cfg;
+    m_bracketingDelayQpc = setup.bracketingLagQpc;
+    // Slots past the default cost VRAM only when the lag asks for them, so only an extra lag
+    // resizes the ring.
     if (m_extraLagMs > 0) {
-        m_bracketingDelayQpc += (LONGLONG)m_extraLagMs * m_scheduler.Freq() / 1000;
-        // Slots past the default cost VRAM only when the lag actually asks for them. The
-        // rule itself is policy::RingSlotsForLag so the suite can pin it; only the extra-lag
-        // case resizes, because the default depth already covers the unextended lag at every
-        // source rate the relay accepts.
-        m_ring.SetSlotsInUse(policy::RingSlotsForLag(m_bracketingDelayQpc,
-                                                    m_assumedSrcPeriodQpc,
-                                                    CaptureRing::kDefaultRingSlots,
-                                                    CaptureRing::RING_SIZE));
+        m_ring.SetSlotsInUse(setup.ringSlots);
     }
     // The deferred ring copy sizes its limits from this lag, with one refresh of the output as
     // the margin.
@@ -283,8 +307,6 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
     // (period-2 judder) every ~33.5 s. With the band, the pick holds one side through the dwell
     // and slips exactly once per sweep (a single 1-source-frame step — imperceptible). 1 ms:
     // comfortably above jitter, well below any source period we target (4.17 ms at 240 Hz).
-    m_policyCfg.stickinessQpc = m_scheduler.Freq() / 1000;
-
     LOG("Temporal mode initialized - paced by %s (%.2f fps nominal), nearest-frame selection + hysteresis",
         m_pacing->Name(), m_targetFramerate);
     if (m_srcRateHint <= 0.0f) {
@@ -318,25 +340,16 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
     // approaches arrival jitter, the stability gate cannot close, and the lock refuses -
     // correct for effectively-irrational ratios. Latency: the pull adds a bounded slow sawtooth
     // (<= one comb spacing peak-to-peak, drift-rate ramp, one discrete step per beat),
-    // accepted as a documented trade alongside the static lag (spec clause 4).
-    m_policyCfg.phasePullSlewQpc = m_scheduler.Freq() / 40000;   // 25 us per present
-    // Twice the declared source period: wide enough that ordinary jitter and a single
-    // dropped frame stay under it, narrow enough that a source hitching at ~100 ms per frame
-    // reads as stalled on the first present. A frozen source delivers nothing at all, and
-    // its one-sided brackets read as stalled whatever this is.
-    m_policyCfg.stallSpanQpc = m_assumedSrcPeriodQpc * 2;
+    // accepted as a documented trade alongside the static lag (spec clause 4). The lock slews
+    // 25 us per present. The stall span is twice the declared source period: wide enough that
+    // ordinary jitter and a single dropped frame stay under it, narrow enough that a source
+    // hitching at ~100 ms per frame reads as stalled on the first present. A frozen source
+    // delivers nothing at all, and its one-sided brackets read as stalled whatever the span is.
     // Under phase-aware keep-real the valid-frame cadence is ONE per source period (that is
     // the point), so a single missing real frame opens a bracket span of exactly two source
-    // periods - the 2x threshold above with one microsecond of margin, measured. 2.5x keeps
-    // one missing frame from reading as a stall while a genuinely hitching source still
-    // trips it on the first present.
-    if (m_phaseKeep) m_policyCfg.stallSpanQpc = m_assumedSrcPeriodQpc * 5 / 2;
-    const float lockAnchorFps = policy::LockAnchorFps(m_lock, m_srcRateHint);
+    // periods, and the span there is 2.5x: one missing frame does not read as a stall while a
+    // genuinely hitching source still trips it on the first present.
     if (lockAnchorFps > 0.0f) {
-        bool combMatched = false;
-        const int combM = policy::CombDenominator((double)lockAnchorFps,
-                                                  (double)m_targetFramerate, &combMatched);
-        m_policyCfg.combQpc = m_assumedSrcPeriodQpc / combM;
         LOG("Phase comb lock ACTIVE (-lock): modulus %lld us (ratio denominator M=%d%s); pull=/lk= on the temporal line",
             m_policyCfg.combQpc * 1000000 / m_scheduler.Freq(), combM,
             combMatched ? "" : ", no rational match: M=1 fallback, stability gate decides");
@@ -346,17 +359,6 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
         // source rate the extra frames are discarded by the display and all a mid-tooth
         // blend does is make which frames survive a matter of sampling phase, while above
         // it they are genuinely shown and the synthesis is rate conversion doing its job.
-        //
-        // NOT the present period, which only coincides with the sink under a vsync present
-        // whose compose clock happens to run at the sink rate. A timer present (b:120)
-        // decouples the two, and reading the present period there would disarm the guard
-        // in exactly the regime it exists for. Falls back to the present period when the
-        // refresh could not be read, which is the pre-existing behavior.
-        const LONGLONG sinkPeriodQpc = ctx.sinkRefreshHz > 0
-                                           ? m_scheduler.Freq() / ctx.sinkRefreshHz
-                                           : m_scheduler.PeriodQpc();
-        m_policyCfg.srcPeriodQpc =
-            policy::ToothGuardPeriod(m_assumedSrcPeriodQpc, sinkPeriodQpc, /*combOn=*/true);
     } else {
         LOG("Phase comb lock off (-nolock); target rides the static lag alone");
     }
@@ -373,8 +375,6 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
     // The compositor itself lives behind the present path and initializes there, once
     // the ring has created the slot shared handles.
     if (m_compositorKind != kCompositorNearest) {
-        m_policyCfg.passthroughQpc =
-            policy::PassthroughThreshold(m_assumedSrcPeriodQpc, m_scheduler.PeriodQpc());
         const bool interp = m_compositorKind == kCompositorInterp;
         LOG("%s compositor ACTIVE on the %s: passthrough threshold %lld us; %s on the temporal line",
             interp ? "Interp" : "Blend", m_present->Name(),
@@ -384,19 +384,14 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
         // The phase-step lookahead needs the comb to be one source frame, which is where a step
         // leaves the target between real frames. It reads frames ahead of the target, so it
         // only has room to work when the lag is longer than a few source periods.
-        m_policyCfg.phaseLookahead =
-            m_policyCfg.combQpc > 0 && m_policyCfg.combQpc == m_assumedSrcPeriodQpc;
         // A step that settles in the ring too late to plan ahead (right after a hitch) is met
-        // once the target reaches it.
-        m_policyCfg.lateLookahead = m_policyCfg.phaseLookahead;
+        // once the target reaches it (the late moves, armed with the lookahead).
         // Right after a hitch a step can be measured from the hitch's uneven frames; one whose
         // first frame is already at the target is refused and left to a late move or the lock.
-        m_policyCfg.lookaheadNeedsLead = m_policyCfg.phaseLookahead;
         LOG("Phase-step lookahead %s", m_policyCfg.phaseLookahead
                                             ? "ACTIVE with late moves, refusing a step first seen at the target: rephase: lines when a step is seen, moved, cancelled or refused"
                                             : "off (comb lock off, or its comb is finer than a source frame)");
         if (m_policyCfg.srcPeriodQpc > 0) {
-            m_policyCfg.resumeGuardExemptPresents = policy::kResumeGuardExemptPresents;
             LOG("Composite tooth guard ACTIVE: synthesis must advance a full source period "
                 "(%lld us teeth); op=hold-comb between teeth; stands aside for %d presents after a "
                 "stall resume while presenting at the source rate",
@@ -410,12 +405,8 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
                     ? "needs the comb lock, and -nolock turned it off"
                     : "source is slower than the sink, so synthesis is rate conversion");
         }
-        // The step tolerance: off unless -steptol names a percentage of the present period.
-        m_policyCfg.stepToleranceQpc =
-            policy::StepTolerance(m_scheduler.PeriodQpc(), m_stepTolPct);
-        m_policyCfg.stepOffsetDecayQpc =
-            policy::StepOffsetDecay(m_scheduler.PeriodQpc(), m_stepTolPct);
-        m_policyCfg.stepPresentPeriodQpc = m_scheduler.PeriodQpc();
+        // The step tolerance, at the percentage of the present period the launch resolved
+        // (launch::StepTolerancePercentFor): a typed -steptol, else the mode's own.
         if (m_policyCfg.stepToleranceQpc > 0) {
             LOG("Step tolerance ACTIVE (-steptol %d): a real frame is shown only while its "
                 "offset from the target stays within %lld us of the last output's; otherwise "
