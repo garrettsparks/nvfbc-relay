@@ -316,6 +316,29 @@ run.
 | DAIN (depth-aware interpolation, 2019) | yes, two frames | PyTorch and CUDA | whole frames | MIT as remembered. Older and slower than RIFE, which superseded it. Listed only so it is not looked up again |
 | Lossless Scaling's frame generation (LSFG) | yes | any vendor | whole frames | a closed commercial program, so not a part the relay can use. It is the evidence that interpolating from two plain frames in real time, on any vendor, on a GPU that is also running a game, can be done |
 
+**How Lossless Scaling does it on every vendor**, from two web searches on 2026-11-12 (articles
+and the Linux port's README; the program's own code was not read):
+
+- LSFG is a machine learning model its developer built for the program. Nothing found says it
+  calls a vendor's flow engine or ML runtime.
+- It runs as ordinary shaders. The evidence is the Linux port, lsfg-vk: a report on it says its
+  author ran the Windows program through DXVK, hooked every shader it loaded and translated
+  those Direct3D 11 shaders to Vulkan, comparing the two bit for bit. So on Windows the whole
+  pipeline is D3D11 shaders on the shader cores, which is why its requirement is a DirectX 11
+  GPU from any vendor. The Steam page's minimum is an RTX 30, RX 6000 or Arc class GPU.
+- It works from outside the game on finished frames, in windowed or borderless mode only
+  (exclusive fullscreen only with its output on a second display). That fits a desktop or window
+  capture; no source found names the capture API.
+- Its cost comes out of the game's GPU, since it shares the shader cores. The program's answer
+  is an option to run it on a second GPU. One report says LSFG 3 cut GPU load by up to 40%
+  against LSFG 2 in its 2x mode.
+- There is no official Linux version. lsfg-vk is a community Vulkan layer that needs the Steam
+  copy of Lossless Scaling installed and reuses its shaders.
+
+What it means here: the route to any vendor that is known to work is a small network written as
+plain shaders, the same shape as RIFE through its Vulkan port, and it pays on the shader cores
+unless a second GPU carries it.
+
 What this adds to the appendix's conclusion: nothing changes for a relay that keeps its own warp
 (FidelityFX or the motion estimator off NVIDIA). For whole frames from a neural model, RIFE is the
 one to measure, and cost on the shader cores is what would rule it out.
@@ -339,6 +362,13 @@ one to measure, and cost on the shader cores is what would rule it out.
 - AMD FSR SDK 2.3 (frame generation 4.0.1, RDNA 4): https://gpuopen.com/learn/amd-fsr-sdk-2-3-blog/
 - ANR (read 2026-11-12): https://github.com/apex-compute/ANR
 - FILM (not read on 2026-11-12): https://github.com/google-research/frame-interpolation
+- Lossless Scaling's frame generation (search results, 2026-11-12):
+  https://losslessscaling.com/introducing-frame-generation-lsfg/ ;
+  https://www.igorslab.de/en/lossless-scaling-scaling-without-blur-frame-generation-without-hardware-binding/ ;
+  https://store.steampowered.com/app/993090 ;
+  the Linux port: https://www.kitguru.net/components/cpu/joao-silva/lossless-scaling-frame-generation-is-coming-to-linux/ ;
+  https://blog.desdelinux.net/en/lsfg-vk-is-an-excellent-option-for-scaling-games-on-Linux-with-Vulkan-and-dxvk./ ;
+  https://github.com/PancakeTAS/lsfg-vk
 - FSR 4 source published by accident: https://www.guru3d.com/story/amd-accidentally-opensources-fsr-4-code-on-github
 - Intel XeSS: https://www.intel.com/content/www/us/en/developer/topic-technology/gamedev/xess.html ;
   the XeSS 3 SDK as binaries:
