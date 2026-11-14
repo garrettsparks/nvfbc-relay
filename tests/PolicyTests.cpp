@@ -3769,8 +3769,9 @@ static void test_replay_capture_corpus() {
         // The flow planner runs beside this replay only; the other arms below copy p.
         SimParams pPlan = p;
         pPlan.planAhead = !nearest;
-        // The long-gap rule beside the planner without it. A launch runs with the rule off, so
-        // the corpus replays it at the limit it was built for, as -maxflowgap 100 would run it.
+        // The long-gap rule beside the planner without it, at 100 ms as a launch runs it by
+        // default. Fixtures captured with the rule off replay the planner without it as the
+        // main line.
         const int kFlowGapArmMs = 100;
         pPlan.maxFlowGap = policy::MaxFlowGap(1000000 * p.ticksPerUs, p.srcPeriod, kFlowGapArmMs);
         const SimResult r = Simulate(pPlan);
@@ -6053,15 +6054,16 @@ static void test_launch_option_parsing() {
         }
     }
 
-    // -maxflowgap takes milliseconds from 0 to 1000, 0 being the rule off, which is the default;
-    // anything else warns and leaves it off. A typed value is written back for the relaunch.
+    // -maxflowgap takes milliseconds from 0 to 1000, 0 being the rule off; the default is 100.
+    // Anything else warns and leaves the default. A typed value other than the default is
+    // written back for the relaunch, 0 included.
     {
         launch::Options x;
         std::string w;
         std::vector<std::string> t = launch::SplitTokens("-maxflowgap 250");
         CHECK(launch::ApplyOption(t, 0, &x, &w) == 2 && x.maxFlowGapMs == 250 && w.empty(),
               "-maxflowgap 250 must set 250 and consume two tokens");
-        CHECK(launch::Options().maxFlowGapMs == 0, "the flow gap limit must default to off");
+        CHECK(launch::Options().maxFlowGapMs == 100, "the flow gap limit must default to 100 ms");
         CHECK(launch::FormatOptions(x) == "-maxflowgap 250" &&
                   launch::FormatOptions(launch::Options()).empty(),
               "a typed -maxflowgap must be written back and the default must not");
@@ -6069,14 +6071,16 @@ static void test_launch_option_parsing() {
         t = launch::SplitTokens("-maxflowgap 0");
         CHECK(launch::ApplyOption(t, 0, &z, &w) == 2 && z.maxFlowGapMs == 0 && w.empty(),
               "-maxflowgap 0 must set 0 without a warning");
+        CHECK(launch::FormatOptions(z) == "-maxflowgap 0",
+              "-maxflowgap 0 turns the default off and must be written back");
         for (const char* bad : {"-maxflowgap -1", "-maxflowgap 1001", "-maxflowgap x",
                                 "-maxflowgap 100x"}) {
             launch::Options y;
             std::string warn;
             t = launch::SplitTokens(bad);
-            CHECK(launch::ApplyOption(t, 0, &y, &warn) == 2 && y.maxFlowGapMs == 0 &&
+            CHECK(launch::ApplyOption(t, 0, &y, &warn) == 2 && y.maxFlowGapMs == 100 &&
                       !warn.empty(),
-                  "%s must warn and leave the flow gap limit off", bad);
+                  "%s must warn and leave the flow gap limit at its default", bad);
         }
     }
 

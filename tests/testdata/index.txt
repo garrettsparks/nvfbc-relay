@@ -232,6 +232,12 @@ kcd_60x2_ovsync_2026_11_10_0.trace
 # presents 814 an hour on the replay against 818, worst blend run 25 in both. 80 hitches and 22
 # stalls an hour in 28 bursts, stalls up to 518 ms; only 20 seconds of uneven frame times.
 kcd_60x2_ovsync_2026_11_11_0.trace
+# 95 minutes of the 2026-11-12 stream, o:vsync through Windows.Graphics.Capture, the first
+# capture made with the step tolerance on by default (18%, no -steptol typed). Synthesized
+# presents 2015 on the replay against 2014, worst blend run 40 on the dejitter arm and in the
+# field (44 on the plain arm, at the fidelity limit). 140 hitches and 21 stalls an hour in 88
+# bursts, three stalls near 500 ms; 17 lock releases in the field and 17 on the replay.
+kcd_60x2_ovsync_2026_11_12_0.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions

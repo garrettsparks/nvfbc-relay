@@ -71,9 +71,11 @@ struct Options {
     int stepTolPct = -1;            // -steptol N: the step tolerance, as a percentage of the
                                     // output frame time (1 to 50), or 0 for the rule off; -1,
                                     // not typed, the mode's own (StepTolerancePercentFor)
-    unsigned int maxFlowGapMs = 0;  // -maxflowgap N: with o, two frames further apart than
-                                    // this many ms (1 to 1000) are blended and not flowed; 0,
-                                    // the default, leaves the rule off (policy::MaxFlowGap)
+    unsigned int maxFlowGapMs = 100; // -maxflowgap N: with o, two frames further apart than
+                                     // this many ms (1 to 1000) are blended and not flowed; 0
+                                     // leaves the rule off (policy::MaxFlowGap). 100 by
+                                     // default: a stall that long is 5 missing frames at 60 fps,
+                                     // more than a flow can bridge
     bool d3d9 = false;              // -d3d9: the timer modes of t and b present on the D3D9
                                     // swapchain, as before they moved to the D3D11 present
 };
@@ -228,7 +230,7 @@ inline const std::vector<UsageRow>& OptionRows() {
         {"-maxflowgap", "100", "With o, when the game stalls and two of its frames are further "
                                "apart than this many milliseconds (1-1000), the in-between "
                                "frames across the stall are a plain mix of the two and not an "
-                               "optical flow frame. Off by default; 0 is off",
+                               "optical flow frame. 100 by default; 0 turns it off",
          false, false},
         {"-d3d9", "", "Show the timer modes of t and b (b:60, t:59.94) through the older "
                       "Direct3D 9 output, as before they moved to the newer one", false, false},

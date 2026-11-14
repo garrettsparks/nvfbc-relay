@@ -1,9 +1,18 @@
 # Crossfade instead of warp across a long game stall
 
-2026-11-06. Status, 2026-11-12: Part B is built (section 3) and **OFF by default** (the user,
-after the replay's numbers below: "kind of makes me want to hold off on the change now").
-`-maxflowgap 100` runs it. Not run on the rig or streamed. What would turn it on is a look at
-the video: how many of the stalls are mid-move, and how the warps out of them look.
+2026-11-06. Status, 2026-11-12 night: Part B is built (section 3) and **ON by default at
+100 ms** for every `o` mode; `-maxflowgap 0` turns it off. The user had first held it off after
+the replay's numbers below, then turned it on after the video check: "a drop to a 100ms frame
+time is not something we're going to be able to reliably fill I don't think". Not yet
+streamed.
+
+**The video check, 2026-11-12.** On two streams the gaps of 100 ms or more were almost never
+mid-move (0 of 26 on 2026-11-05, 1 of 40 on 2026-11-12; at random moments the same test reads
+10% and 35%): they sat at menus, dialogs and loading screens. Of the 7 on 2026-11-05 whose
+picture changed, the warps were bad on 3 (UI popping in, the dialog below twice) and fine on 4
+(fades). In fights on the rig (2026-11-11) the game dropped to 18 to 50 fps and the long gaps
+were mid-move, every one of the 23 at 100 ms or more in one launch, with the relay synthesizing
+most of the picture. A 100 ms gap is 5 missing frames at 60 fps, more than a flow bridges.
 
 **What the corpus replay showed, 2026-11-12.** At 100 ms the rule takes 15 to 26% of the
 synthesized presents on the long streams (836 of 3775 over 132.6 min), and 7% on 2026-11-05
@@ -109,8 +118,8 @@ the replay suite's output does not move, and the refactor gate stays byte-identi
   with `fl=gap`, a label of its own beside `hit`, `late`, `own` and `miss`, so the log and the
   analysis tools tell it from a flow that was not ready. The exit summary counts it.
 - `TemporalCaptureMode`'s startup line for the compositor names the rule and its threshold.
-- A hidden option `-maxflowgap <ms>` (0 to 1000), off by default (0). Hidden as
-  `-blend` is; listed only if the user wants it.
+- A hidden option `-maxflowgap <ms>` (0 to 1000; 0 is off). Built off by default, 100 by
+  default since 2026-11-12 night. Hidden as `-blend` is; listed only if the user wants it.
 
 **Holds.** After the last synthesized present of a stall the relay holds that output until the
 game's next frame arrives; with the rule, what is held is the crossfade. Nothing changes there.
