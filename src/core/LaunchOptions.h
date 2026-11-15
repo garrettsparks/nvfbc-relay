@@ -76,6 +76,8 @@ struct Options {
                                      // leaves the rule off (policy::MaxFlowGap). 100 by
                                      // default: a stall that long is 5 missing frames at 60 fps,
                                      // more than a flow can bridge
+    bool splitPairs = false;        // -splitpairs: read a frame-generated pair whose two frames
+                                    // arrive a few ms apart as a pair (policy SPLIT PAIRS)
     bool d3d9 = false;              // -d3d9: the timer modes of t and b present on the D3D9
                                     // swapchain, as before they moved to the D3D11 present
 };
@@ -241,6 +243,8 @@ inline const std::vector<UsageRow>& OptionRows() {
         {"-fgphase", "", "Frame-generation phase instrument; stalls the capture thread every wake",
          false, false},
         {"-phasekeep", "", "Phase-aware keep-real, the x3 rotation vote", false, false},
+        {"-splitpairs", "", "Read a frame-generated pair whose two frames arrive a few ms apart "
+                            "as a pair", false, false},
         {"-flipex", "", "D3D9Ex flip-ex swap effect on the D3D9 present path", false, false},
         {"-source", "0", "Capture display index, for a launch without the prompts", false, true},
         {"-target", "1", "Output display index, for a launch without the prompts", false, true},
@@ -399,6 +403,7 @@ inline size_t ApplyOption(const std::vector<std::string>& tokens, size_t i, Opti
     if (t == "-d3d9")      { o->d3d9 = true;      return 1; }
     if (t == "-fgphase")   { o->fgPhase = true;   return 1; }
     if (t == "-phasekeep") { o->phaseKeep = true; return 1; }
+    if (t == "-splitpairs") { o->splitPairs = true; return 1; }
     if (t == "-flipex")    { o->flipEx = true;    return 1; }
     if (t == "-mark") {
         o->mark = true;
@@ -613,6 +618,7 @@ inline std::string FormatOptions(const Options& o) {
     if (o.tint) add("-tint");
     if (o.fgPhase) add("-fgphase");
     if (o.phaseKeep) add("-phasekeep");
+    if (o.splitPairs) add("-splitpairs");
     if (o.flipEx) add("-flipex");
     return s;
 }

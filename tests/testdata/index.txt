@@ -238,6 +238,12 @@ kcd_60x2_ovsync_2026_11_11_0.trace
 # field (44 on the plain arm, at the fidelity limit). 140 hitches and 21 stalls an hour in 88
 # bursts, three stalls near 500 ms; 17 lock releases in the field and 17 on the replay.
 kcd_60x2_ovsync_2026_11_12_0.trace
+# 108 minutes of the 2026-11-13 stream, o:vsync through Windows.Graphics.Capture, the first
+# capture made with the long-gap rule on by default (100 ms, no -maxflowgap typed). The
+# highest hitch rate in the corpus: 671 hitches and 114 stalls an hour in 202 bursts, the
+# longest stall 877 ms. Synthesized presents 5994 on the replay against 6004, worst blend run
+# 35 on both; 1027 of them over 215 pairs drawn as the blend; 8 of 8 lock releases match.
+kcd_60x2_ovsync_2026_11_13_0.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions

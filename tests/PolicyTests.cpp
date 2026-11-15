@@ -140,6 +140,7 @@ struct SimResult {
     long long deferNeverCopied = 0;
     long long deferCopiedLate = 0;      // copied when the next wake opened a new batch
     long long deferCopiedAtLimit = 0;   // copied when the wait limit came first
+    int splitPairs = 0;                 // pairs joined by the split-pair rule (splitWindowQpc)
     // Presents whose nearest frame on either side had arrived and survived keep-real but was
     // still waiting to be copied, so the bracket had to use an older or a newer one. starved
     // marks them present by present, for a count that leaves out a replay's cold start.
@@ -226,6 +227,9 @@ struct SimParams {
     // Batch-collapse window. Production sizes this at 3 ms; frame generation submits a
     // pair well inside it and no real content cadence produces gaps that short.
     int64_t batchThresholdQpc = 3000;
+    // The split-pair rule's window (policy SPLIT PAIRS); 0 leaves it off, as a launch without
+    // -splitpairs runs.
+    int64_t splitWindowQpc = 0;
     // The deferred ring copy as the relay runs it: a paired batch's first member waits
     // uncopied, under the limits policy::SizeDeferLimits gives this simulation's lag with the
     // sink period as the margin. A waiting frame is not visible to the bracket until the
@@ -637,15 +641,18 @@ static SimResult Simulate(const SimParams& p) {
     std::vector<char> valid(arrivals.size(), 1);
     std::vector<int64_t> batchStart(arrivals.size(), 0);
     std::vector<int> member(arrivals.size(), 0);
+    int splitPairs = 0;
     {
         policy::BatchState bs;
         for (size_t i = 0; i < arrivals.size(); i++) {
             const policy::BatchDecision bd =
-                policy::UpdateBatch(bs, arrivals[i], p.batchThresholdQpc);
+                policy::UpdateBatch(bs, arrivals[i], p.batchThresholdQpc, p.splitWindowQpc,
+                                    p.srcPeriod);
             stamps[i] = bd.stampTs;
             batchStart[i] = bd.stampTs;   // batch-start IS the pre-upgrade stamp, both members
             member[i] = bd.member;
             if (bd.retractPrevious && i >= 1) valid[i - 1] = 0;
+            if (bd.split) splitPairs++;
         }
     }
     // Stage 6 state, mirroring production's wiring exactly: flips enter history when they
@@ -675,6 +682,7 @@ static SimResult Simulate(const SimParams& p) {
     // memory; the step runs only the decision the mode makes.
     SelectionState sel;
     SimResult r;
+    r.splitPairs = splitPairs;
     // When each slot's pixels are in the ring: at its own arrival, unless the capture loop
     // left the frame waiting. Then it is when the loop copies it, which production's
     // DecideDefer says is at the next wake if that opens a new batch, or at the wait limit if
@@ -699,7 +707,8 @@ static SimResult Simulate(const SimParams& p) {
                 pendingIdx = -1;
             }
             const policy::BatchDecision bd =
-                policy::UpdateBatch(bs, arrivals[i], p.batchThresholdQpc);
+                policy::UpdateBatch(bs, arrivals[i], p.batchThresholdQpc, p.splitWindowQpc,
+                                    p.srcPeriod);
             const policy::DeferDecision dd =
                 policy::DecideDefer(ds, bd, deferLimits.maxGapTicks);
             if (dd.hadPending && pendingIdx >= 0) {
@@ -2811,6 +2820,138 @@ static void test_batch_collapse_keep_real() {
     std::printf("  batch-collapse keep-real: stamping, retraction, chaining, thresholds\n");
 }
 
+// SPLIT PAIRS: after a late source frame a pair's two frames can arrive 3 to 5 ms apart, over
+// the fixed threshold. With the rule armed and the source delivering pairs, the late second
+// frame is still the pair's real member. The cases are the ones a wider fixed threshold gets
+// wrong, and the ones the rule must leave alone.
+static void test_split_pairs() {
+    const int64_t kThreshold = 3000, kWindow = 6000, kPeriod = 16667;
+
+    // Steady pairs up to time t: each batch a generated frame and its real twin 150 us on.
+    auto steadyPairs = [&](policy::BatchState& s, int batches, int64_t window) {
+        int64_t t = 0;
+        for (int i = 0; i < batches; i++) {
+            policy::UpdateBatch(s, t, kThreshold, window, kPeriod);
+            policy::UpdateBatch(s, t + 150, kThreshold, window, kPeriod);
+            t += kPeriod;
+        }
+        return t;
+    };
+
+    // A pair 3.2 ms apart after a run of pairs: the second frame joins, takes the batch
+    // start as its stamp and retracts the first.
+    {
+        policy::BatchState s;
+        const int64_t t = steadyPairs(s, policy::kSplitPairRun + 2, kWindow);
+        policy::BatchDecision d = policy::UpdateBatch(s, t, kThreshold, kWindow, kPeriod);
+        CHECK(!d.intraBatch && !d.split, "the first frame of a split pair opens a batch");
+        d = policy::UpdateBatch(s, t + 3200, kThreshold, kWindow, kPeriod);
+        CHECK(d.intraBatch && d.split && d.retractPrevious && d.member == 1,
+              "a frame 3.2 ms after a batch's first joins it as the real member "
+              "(intra %d split %d retract %d member %d)",
+              (int)d.intraBatch, (int)d.split, (int)d.retractPrevious, d.member);
+        CHECK(d.stampTs == t, "the split member stamps at batch start, got %lld want %lld",
+              (long long)d.stampTs, (long long)t);
+        // One partner a batch: the next pair's generated frame 5.8 ms on opens a new batch
+        // and leaves the real frame in place, where a 6 ms fixed threshold would retract it.
+        d = policy::UpdateBatch(s, t + 3200 + 5800, kThreshold, kWindow, kPeriod);
+        CHECK(!d.intraBatch && !d.retractPrevious,
+              "a frame 5.8 ms after a completed pair opens a batch and retracts nothing");
+        d = policy::UpdateBatch(s, t + 3200 + 5800 + 1100, kThreshold, kWindow, kPeriod);
+        CHECK(d.intraBatch && !d.split && d.member == 1,
+              "its twin 1.1 ms on joins by the fixed threshold");
+    }
+
+    // Off: the same wakes with no window are two batches, as the relay has always read them.
+    {
+        policy::BatchState s;
+        const int64_t t = steadyPairs(s, policy::kSplitPairRun + 2, 0);
+        policy::UpdateBatch(s, t, kThreshold);
+        const policy::BatchDecision d = policy::UpdateBatch(s, t + 3200, kThreshold);
+        CHECK(!d.intraBatch && !d.split && !d.retractPrevious,
+              "with the rule off a frame 3.2 ms on opens its own batch");
+    }
+
+    // A source that is not delivering pairs (frame generation off, or a 240 fps source whose
+    // frames are 4.2 ms apart) never arms the rule.
+    {
+        policy::BatchState s;
+        int joined = 0;
+        for (int i = 0; i < 200; i++) {
+            const policy::BatchDecision d =
+                policy::UpdateBatch(s, (int64_t)i * 4167, kThreshold, kWindow, kPeriod);
+            if (d.intraBatch) joined++;
+        }
+        CHECK(joined == 0, "a 240 fps source of single frames had %d frames joined", joined);
+    }
+
+    // Frame generation at x3: tight pairs, but two thirds of a source period apart, and which
+    // member is real rotates. Those pairs are no evidence, so a split there is left alone.
+    {
+        policy::BatchState s;
+        const int64_t kX3Pair = kPeriod * 2 / 3;
+        int64_t t = 0;
+        for (int i = 0; i < 100; i++) {
+            policy::UpdateBatch(s, t, kThreshold, kWindow, kPeriod);
+            policy::UpdateBatch(s, t + 150, kThreshold, kWindow, kPeriod);
+            t += kX3Pair;
+        }
+        policy::UpdateBatch(s, t, kThreshold, kWindow, kPeriod);
+        const policy::BatchDecision d =
+            policy::UpdateBatch(s, t + 3200, kThreshold, kWindow, kPeriod);
+        CHECK(!d.split && !d.intraBatch,
+              "x3 pairs (%lld us apart) armed the rule: a split there was joined",
+              (long long)kX3Pair);
+        // And a source that goes from x2 to x3 loses the evidence it had.
+        policy::BatchState v;
+        int64_t tv = steadyPairs(v, policy::kSplitPairRunCap + 4, kWindow);
+        for (int i = 0; i < policy::kSplitPairRunCap; i++) {
+            policy::UpdateBatch(v, tv, kThreshold, kWindow, kPeriod);
+            policy::UpdateBatch(v, tv + 150, kThreshold, kWindow, kPeriod);
+            tv += kX3Pair;
+        }
+        policy::UpdateBatch(v, tv, kThreshold, kWindow, kPeriod);
+        CHECK(!policy::UpdateBatch(v, tv + 3200, kThreshold, kWindow, kPeriod).split,
+              "%d x3 pairs after x2 did not turn the rule off", policy::kSplitPairRunCap);
+    }
+
+    // A hitch does not turn it off: a late pair and four uneven ones, then a split pair.
+    {
+        policy::BatchState s;
+        int64_t t = steadyPairs(s, policy::kSplitPairRunCap + 4, kWindow);
+        const int64_t uneven[] = {kPeriod * 2, 9500, 5200, 15700, 31000};
+        for (int64_t gap : uneven) {
+            t += gap - kPeriod;
+            policy::UpdateBatch(s, t, kThreshold, kWindow, kPeriod);
+            policy::UpdateBatch(s, t + 150, kThreshold, kWindow, kPeriod);
+            t += kPeriod;
+        }
+        policy::UpdateBatch(s, t, kThreshold, kWindow, kPeriod);
+        CHECK(policy::UpdateBatch(s, t + 4500, kThreshold, kWindow, kPeriod).split,
+              "a split pair right after five uneven pairs was not joined");
+    }
+
+    // A lone frame ends the run: the rule waits for kSplitPairRun pairs again.
+    {
+        policy::BatchState s;
+        int64_t t = steadyPairs(s, policy::kSplitPairRun + 2, kWindow);
+        policy::UpdateBatch(s, t, kThreshold, kWindow, kPeriod);   // a lone frame
+        t += kPeriod;
+        policy::UpdateBatch(s, t, kThreshold, kWindow, kPeriod);   // opens; the lone one closed
+        policy::BatchDecision d =
+            policy::UpdateBatch(s, t + 3200, kThreshold, kWindow, kPeriod);
+        CHECK(!d.split, "a split right after a lone frame is not joined: the run restarted");
+        // And at the window's edge the rule does not fire.
+        policy::BatchState e;
+        const int64_t te = steadyPairs(e, policy::kSplitPairRun + 2, kWindow);
+        policy::UpdateBatch(e, te, kThreshold, kWindow, kPeriod);
+        d = policy::UpdateBatch(e, te + kWindow, kThreshold, kWindow, kPeriod);
+        CHECK(!d.intraBatch, "a frame exactly a window after the first opens its own batch");
+    }
+    std::printf("  split pairs: joined after a run of pairs a source period apart, one partner a "
+                "batch, through a hitch; off at x3, without pairs or a window\n");
+}
+
 // The same stall on the arrival cadence the relay actually sees with frame generation on.
 // Smooth Motion x2 delivers the real frame and its generated twin about 0.4 ms apart, then
 // the rest of the source period to the next pair, so the ring takes two arrivals per source
@@ -3826,6 +3967,36 @@ static void test_replay_capture_corpus() {
         std::printf("    evenness: content step against the present step, rms %.0f us, off by "
                     "over 2 ms %.2f%%, over 5 ms %.2f%%, by a refresh or more %d\n",
                     even.rmsUs, even.over2Pct, even.over5Pct, even.wholeSteps);
+        // The split-pair rule beside the replay without it, at the window -splitpairs runs.
+        // Printed, not bounded: the fixtures were captured with the rule off.
+        {
+            SimParams pSplit = pPlan;
+            pSplit.splitWindowQpc = (int64_t)policy::kSplitPairWindowMs * 1000 * p.ticksPerUs;
+            const SimResult rs = Simulate(pSplit);
+            int runS = 0, worstS = 0, synthS = 0;
+            for (size_t i = kWarmup; i < rs.ops.size(); i++) {
+                if (rs.ops[i] == policy::CompositeOp::Synthesize) {
+                    synthS++; runS++;
+                    if (runS > worstS) worstS = runS;
+                } else {
+                    runS = 0;
+                }
+            }
+            const StepEvenness evenS = MeasureStepEvenness(rs, fx.presents, kWarmup);
+            // Aggregates cannot see a few hundred presents among hundreds of thousands, so
+            // count the presents whose output differs between the two arms.
+            int differ = 0;
+            for (size_t i = kWarmup; i < r.outTs.size() && i < rs.outTs.size(); i++) {
+                if (r.outTs[i] != rs.outTs[i]) differ++;
+            }
+            std::printf("    split pairs (%d ms): %d pairs joined, %d presents show a different "
+                        "frame; synth %.1f%%, worst %d; "
+                        "evenness rms %.0f us, off by over 2 ms %.2f%%, over 5 ms %.2f%%, by a "
+                        "refresh or more %d\n",
+                        policy::kSplitPairWindowMs, rs.splitPairs, differ,
+                        100.0 * synthS / (double)(rs.ops.size() - kWarmup), worstS,
+                        evenS.rmsUs, evenS.over2Pct, evenS.over5Pct, evenS.wholeSteps);
+        }
         if (fx.regrabCopies) {
             std::printf("    grab-timeout copies removed before replay: %d\n",
                         fx.regrabCopiesDropped);
@@ -5852,7 +6023,8 @@ static launch::Options ParseOptionString(const char* text, std::vector<std::stri
 static int CountSwitchesOn(const launch::Options& o) {
     return (int)o.lock + (int)o.tint + (int)o.etw + (int)o.noJoin + (int)o.dejitter +
            (int)o.fgPhase + (int)o.phaseKeep + (int)o.flipEx + (int)o.mark + (int)o.deferCopy +
-           (int)o.wgc + (int)o.wgcDrop + (int)o.wgcCursor + (int)o.wgcOpen + (int)o.d3d9;
+           (int)o.wgc + (int)o.wgcDrop + (int)o.wgcCursor + (int)o.wgcOpen + (int)o.d3d9 +
+           (int)o.splitPairs;
 }
 
 static bool SameOptions(const launch::Options& a, const launch::Options& b) {
@@ -5865,7 +6037,7 @@ static bool SameOptions(const launch::Options& a, const launch::Options& b) {
            a.wgcCursor == b.wgcCursor && a.wgcOpen == b.wgcOpen && a.wgcScale == b.wgcScale &&
            a.copyEngine == b.copyEngine && a.blendShader == b.blendShader &&
            a.tightWait == b.tightWait && a.d3d9 == b.d3d9 && a.stepTolPct == b.stepTolPct &&
-           a.maxFlowGapMs == b.maxFlowGapMs;
+           a.maxFlowGapMs == b.maxFlowGapMs && a.splitPairs == b.splitPairs;
 }
 
 // Every switch at one value, so a flag's effect can be seen against either side.
@@ -5873,7 +6045,7 @@ static launch::Options SwitchesAt(bool on) {
     launch::Options o;
     o.lock = o.tint = o.etw = o.noJoin = o.dejitter = on;
     o.fgPhase = o.phaseKeep = o.flipEx = o.mark = o.deferCopy = o.wgc = o.wgcDrop = on;
-    o.wgcCursor = o.wgcOpen = o.d3d9 = on;
+    o.wgcCursor = o.wgcOpen = o.d3d9 = o.splitPairs = on;
     o.dejitterRequested = on;
     return o;
 }
@@ -5989,7 +6161,7 @@ static void test_launch_option_parsing() {
         {"-mark", &launch::Options::mark},         {"-defercopy", &launch::Options::deferCopy},
         {"-wgc", &launch::Options::wgc},           {"-wgcdrop", &launch::Options::wgcDrop},
         {"-wgccursor", &launch::Options::wgcCursor}, {"-wgcopen", &launch::Options::wgcOpen},
-        {"-d3d9", &launch::Options::d3d9},
+        {"-d3d9", &launch::Options::d3d9},         {"-splitpairs", &launch::Options::splitPairs},
     };
     for (const Switch& s : switches) {
         launch::Options x = SwitchesAt(false);
@@ -6015,7 +6187,7 @@ static void test_launch_option_parsing() {
         const std::vector<std::string> t = {s.flag};
         std::string w;
         const size_t n = launch::ApplyOption(t, 0, &x, &w);
-        CHECK(n == 1 && !(x.*(s.field)) && CountSwitchesOn(x) == 14 && w.empty(),
+        CHECK(n == 1 && !(x.*(s.field)) && CountSwitchesOn(x) == 15 && w.empty(),
               "%s must clear exactly its own switch and consume one token", s.flag);
     }
 
@@ -8071,6 +8243,7 @@ int main(int argc, char** argv) {
     test_rotation_phase();
     test_dejit_removes_late_blends();
     test_batch_collapse_keep_real();
+    test_split_pairs();
     test_lock_reseed_wide_bracket_stall();
     test_lock_engage_window();
     test_lock_reseed_stall_paired_cadence();

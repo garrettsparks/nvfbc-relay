@@ -228,6 +228,15 @@ public:
     // plain keep-real, so the failure mode is exactly today's behaviour.
     void EnablePhaseKeep(IRotationOracle* oracle) { m_rotationOracle = oracle; }
 
+    // Arm the split-pair rule (-splitpairs, policy SPLIT PAIRS) before Start: a pair whose
+    // members arrive up to windowMs apart is still read as a pair while the source has been
+    // delivering one pair a source period (srcPeriodQpc, the declared or assumed one). 0 leaves
+    // the fixed threshold alone.
+    void EnableSplitPairs(int windowMs, LONGLONG srcPeriodQpc) {
+        m_splitPairWindowMs = windowMs;
+        m_splitPairSrcPeriodQpc = srcPeriodQpc;
+    }
+
     // Session telemetry for the phase vote, logged at exit by the owner.
     long long PhaseKeepBatches() const { return m_phaseKeepBatches; }
     long long PhaseKeepFlipped() const { return m_phaseKeepFlipped; }
@@ -303,6 +312,8 @@ private:
     // Phase-aware keep-real state, capture-thread-owned end to end: the vote is fed and read
     // on the same thread that retracts, so there is no cross-thread publication to get wrong.
     IRotationOracle* m_rotationOracle = NULL;
+    int m_splitPairWindowMs = 0;        // -splitpairs: the split window in ms; 0 = rule off
+    LONGLONG m_splitPairSrcPeriodQpc = 0;   // the source period its evidence is measured against
     policy::RotationPhase m_rotation;
     long long m_phaseKeepBatches = 0;   // batches the vote was consulted for
     long long m_phaseKeepFlipped = 0;   // batches that kept a member plain keep-real would not

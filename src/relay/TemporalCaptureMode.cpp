@@ -86,7 +86,8 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
                                          bool d3d11Present, bool deferCopy, bool wgc,
                                          bool wgcDrop, bool wgcCursor, bool wgcOpen, int wgcScale,
                                          bool wgcCopyEngine, int blendShader, bool tightWait,
-                                         int stepTolPct, unsigned int maxFlowGapMs)
+                                         int stepTolPct, unsigned int maxFlowGapMs,
+                                         bool splitPairs)
     : m_bracketingDelayQpc(0)
     , m_assumedSrcPeriodQpc(0)
     , m_present(NULL)
@@ -108,6 +109,7 @@ TemporalCaptureMode::TemporalCaptureMode(float framerate, bool vsyncPresent, flo
     , m_extraLagMs(extraLagMs)
     , m_stepTolPct(stepTolPct)
     , m_maxFlowGapMs(maxFlowGapMs)
+    , m_splitPairs(splitPairs)
     , m_deferCopy(deferCopy && !fgPhase && !phaseKeep)
     , m_wgc(wgc && d3d11Present)
     , m_wgcDrop(wgcDrop)
@@ -289,6 +291,9 @@ MaybeFailure TemporalCaptureMode::Setup(const RelayContext& ctx) {
     }
     // The deferred ring copy sizes its limits from this lag, with one refresh of the output as
     // the margin.
+    if (m_splitPairs) {
+        m_ring.EnableSplitPairs(policy::kSplitPairWindowMs, m_assumedSrcPeriodQpc);
+    }
     if (m_deferCopy) {
         m_ring.EnableDeferCopy(m_bracketingDelayQpc, m_assumedSrcPeriodQpc,
                                ctx.sinkRefreshHz > 0 ? m_scheduler.Freq() / ctx.sinkRefreshHz

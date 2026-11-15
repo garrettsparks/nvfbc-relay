@@ -712,6 +712,15 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
     policy::BatchState batchState;
     LOG("CaptureRing: batch-collapse keep-real (intra-batch wake <%lldms = real member; "
         "previous slot retracted)", (long long)(batchThresholdQpc * 1000 / m_freqQuad));
+    const LONGLONG splitWindowQpc = (m_freqQuad * m_splitPairWindowMs) / 1000;
+    if (splitWindowQpc > 0) {
+        LOG("CaptureRing: split pairs ACTIVE (-splitpairs): while pairs come one a source period "
+            "(%lld us), a wake under %d ms after a batch's first frame is its real member; "
+            "'split' on the capture line",
+            (long long)(m_splitPairSrcPeriodQpc * 1000000 / m_freqQuad), m_splitPairWindowMs);
+    } else {
+        LOG("CaptureRing: split pairs off");
+    }
     source->LogStart();
     long long wakesStored = 0;   // by the source capturing now
 
@@ -762,7 +771,8 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
 
         const LONGLONG prevArrival = batchState.lastArrivalTs;
         const policy::BatchDecision batch =
-            policy::UpdateBatch(batchState, now.QuadPart, batchThresholdQpc);
+            policy::UpdateBatch(batchState, now.QuadPart, batchThresholdQpc, splitWindowQpc,
+                                m_splitPairSrcPeriodQpc);
 
         // The source says whether this frame's picture goes into its slot now or waits.
         const ICaptureSource::Placement placement = source->Place(batch);
@@ -985,12 +995,13 @@ void CaptureRing::CaptureLoop(NVFBC_TODX9VID_GRAB_FRAME_PARAMS* grabParams) {
         // flush = GPU-completion wait added by the cross-device coherency fix; col = cumulative
         // batch-collapsed wakes (skipped or retracted frame-gen members).
         LONGLONG dt = (prevArrival != 0) ? (now.QuadPart - prevArrival) : 0;
-        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld",
+        LOG("capture #%lld arr=%lldus dt=%lldus flush=%lldus col=%lld%s",
             count,
             (long long)((now.QuadPart - m_baseQpc.QuadPart) * usPerTick),
             (long long)(dt * usPerTick),
             (long long)flushUs,
-            collapsed);
+            collapsed,
+            batch.split ? " split" : "");
 
         if (m_fgPhaseActive) {
             FgPhaseOnWake(batch.member, slot,

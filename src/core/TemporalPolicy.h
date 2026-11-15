@@ -62,7 +62,34 @@ struct BatchState {
     // simulated timelines legitimately start at 0, and a sentinel would silently treat
     // the second wake of such a run as batch-opening.
     bool started = false;
+    // Evidence that the source is delivering one pair a source period, kept when a batch
+    // closes: a pair that came about a period after the one before adds one (up to
+    // kSplitPairRunCap), a pair at any other spacing takes one away, and a lone frame clears
+    // it. The split-pair rule reads a late wake as a partner only at kSplitPairRun or more.
+    int pairRun = 0;
+    int64_t lastBatchGap = 0;    // start to start of the two newest batches
 };
+
+// SPLIT PAIRS. After a source frame that comes a period late, the next pair or two can reach
+// the capture 3 to 5 ms apart, where a pair normally takes under a fifth of a millisecond.
+// The fixed threshold then reads the two as separate frames: the generated member stays in
+// the ring as a real one, and the present shows it and passes over the real frame beside it.
+// While the source has been delivering pairs (BatchState::pairRun at kSplitPairRun), a wake
+// that follows a batch's lone first member inside the split window is that member's partner.
+// A batch takes one partner this way: a third wake needs the fixed threshold as before, so a
+// real frame followed a few milliseconds later by the next pair's generated frame keeps its
+// place. A wider fixed threshold cannot do this, because it would join exactly those two.
+//
+// Only one pair a source period is evidence. That is frame generation at x2, where the pair
+// is always [generated, real]. At x3 the pairs come two thirds of a period apart and which
+// member is real rotates, so those pairs take the evidence away and the rule stays off. The
+// cap leaves room for the uneven pairs around a hitch, which is where the rule is needed:
+// from the cap it takes more than 16 of them in a row to turn the rule off.
+const int kSplitPairRun = 8;
+const int kSplitPairRunCap = 24;
+// The split window. On a 108 minute stream 182 of 199 split pairs came 3 to 5 ms apart and the
+// rest under 8; 6 ms stays under the half period a 120 Hz pair of flips is apart.
+const int kSplitPairWindowMs = 6;
 
 // What one capture wake does to the ring. stampTs is the timestamp to publish the slot
 // with: the intra-batch member takes BATCH-START so the ring timeline stays at base
@@ -77,13 +104,19 @@ struct BatchDecision {
     // 0 for the wake that opens a batch, 1 for the next, and so on. Carried on the ring
     // slot so a later flip lookup can ask which flip this frame actually scanned out on.
     int member = 0;
+    // This wake joined its batch by the split-pair rule, not by the fixed threshold.
+    bool split = false;
 };
 
 // Fold one capture wake into the batch timeline. Wake order is measured
 // [GENERATED, REAL], so the intra-batch member is the REAL frame: it publishes and the
 // previous slot (the generated member) is retracted. Callers apply retractPrevious only
-// when a previous slot exists.
-BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTicks);
+// when a previous slot exists. splitWindowTicks arms the split-pair rule (SPLIT PAIRS above);
+// 0 leaves it off, and the fixed threshold alone decides. srcPeriodTicks is the declared
+// source period the rule's evidence is measured against (a pair counts when it starts
+// between three quarters and five quarters of a period after the one before).
+BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTicks,
+                          int64_t splitWindowTicks = 0, int64_t srcPeriodTicks = 0);
 
 // A flip the display driver intends to scan out, as plain data. Deliberately free of any
 // ETW or Windows type: the platform layer decodes the driver's events, this is what the

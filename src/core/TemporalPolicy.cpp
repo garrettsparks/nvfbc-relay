@@ -193,13 +193,34 @@ int64_t FlipHistory::MedianSpacing(int64_t lo, int64_t hi, uint32_t head) const 
     return sorted[n / 2];
 }
 
-BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTicks) {
+BatchDecision UpdateBatch(BatchState& s, int64_t arrivalTs, int64_t thresholdTicks,
+                          int64_t splitWindowTicks, int64_t srcPeriodTicks) {
     BatchDecision d;
-    d.intraBatch = s.started && (arrivalTs - s.lastArrivalTs) < thresholdTicks;
+    const int64_t gap = arrivalTs - s.lastArrivalTs;
+    d.intraBatch = s.started && gap < thresholdTicks;
+    if (!d.intraBatch && s.started && s.member == 0 && s.pairRun >= kSplitPairRun &&
+        gap < splitWindowTicks) {
+        d.intraBatch = true;
+        d.split = true;
+    }
     if (!d.intraBatch) {
         // Batch-start to batch-start, so the submission epsilon between a generated
         // frame and its real twin never pollutes the source-period estimate.
-        if (s.started) d.batchGap = arrivalTs - s.batchStartTs;
+        if (s.started) {
+            d.batchGap = arrivalTs - s.batchStartTs;
+            // The batch this wake closes: a lone frame clears the evidence, a pair that came a
+            // source period after the batch before adds to it, any other pair takes from it.
+            const bool onPeriod = s.lastBatchGap * 4 >= srcPeriodTicks * 3 &&
+                                  s.lastBatchGap * 4 <= srcPeriodTicks * 5;
+            if (s.member == 0) {
+                s.pairRun = 0;
+            } else if (onPeriod) {
+                if (s.pairRun < kSplitPairRunCap) s.pairRun++;
+            } else if (s.pairRun > 0) {
+                s.pairRun--;
+            }
+            s.lastBatchGap = d.batchGap;
+        }
         s.batchStartTs = arrivalTs;
     }
     // Chain: a third member an epsilon after the second is still inside the batch.
