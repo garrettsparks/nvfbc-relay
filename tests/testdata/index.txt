@@ -244,6 +244,30 @@ kcd_60x2_ovsync_2026_11_12_0.trace
 # longest stall 877 ms. Synthesized presents 5994 on the replay against 6004, worst blend run
 # 35 on both; 1027 of them over 215 pairs drawn as the blend; 8 of 8 lock releases match.
 kcd_60x2_ovsync_2026_11_13_0.trace
+# 110 minutes of the first 2026-11-14 stream, the same launch as 2026-11-13 (o:vsync through
+# Windows.Graphics.Capture, step tolerance 18%, long-gap rule 100 ms). 706 hitches and 78 stalls
+# an hour in 217 bursts, the longest stall 591 ms. Synthesized presents 6520 on the replay
+# against 6536; worst blend run 29 on the dejitter arm against 30 in the field (22 on the plain
+# arm); 797 of them over 164 pairs drawn as the blend; 9 of 10 lock releases match.
+kcd_60x2_ovsync_2026_11_14_0.trace
+# 103 minutes of the second 2026-11-14 stream, the same launch. 656 hitches and 73 stalls an
+# hour, the longest stall 878 ms, and two tournament fights below 60 fps (12 s and 5 s). Holds
+# the only blend run of 50 or more among the step-tolerance fixtures, 60 presents at 3011.86 s
+# in steady footage, reproduced at the same present on the dejitter arm (37 on the plain arm); synthesized
+# presents 5449 on the replay against 5461; 10 of 11 lock releases match.
+kcd_60x2_ovsync_2026_11_14_1.trace
+# 148 minutes of the 2026-11-15 stream, the longest in the corpus, the same launch as 2026-11-14
+# on 35ce285 (split-pair rule off). 406 hitches and 83 stalls an hour in 226 bursts, the longest
+# stall 477 ms. Synthesized presents 5875 on the replay against 5870; worst blend run 43 on the
+# dejitter arm and in the field (47 on the plain arm); 1015 of them over 209 pairs drawn as the
+# blend; 13 of 15 lock releases match.
+kcd_60x2_ovsync_2026_11_15_0.trace
+# 54 minutes of Spider-Man at 120 fps native, no frame generation, with -src 120 declared: the
+# first 120 fps source in the corpus, every second frame passed over by design. 86 hitches an
+# hour and no stall over 100 ms. The lock releases about 500 times an hour (KCD: under 10), and
+# the replay follows: 440 against 451, 368 within 0.5 ms; worst blend run 16 on the dejitter
+# arm and in the field (14 on the plain arm).
+spiderman_120x1_ovsync_gameplay_2026_11_15_1.trace
 # THE D3D11 FLIP-MODEL PRESENT (b:vsync), on Avatar. Everything above is the D3D9 present
 # (b:dwm), where a frame-generated source runs the compose clock at the DISPLAYED rate: two
 # presents per source frame, the comb lock structurally unable to engage, half the decisions
